@@ -131,7 +131,9 @@ html.dark body {
 /* 统计徽章(总记录/占用) */
 .stat-badge {
   display: inline-flex;
-  align-items: center;
+  /* 文本按基线对齐:中文与数字走不同回退字体,行高盒不等高,
+     居中对齐会让数字看起来上下错位 */
+  align-items: baseline;
   gap: 6px;
   padding: 6px 12px;
   border-radius: 12px;
@@ -139,6 +141,11 @@ html.dark body {
   background: var(--tile-bg);
   border: 1px solid var(--glass-border);
   white-space: nowrap;
+}
+/* 图标和分隔线没有基线,仍垂直居中 */
+.stat-badge .el-icon,
+.stat-badge .sep {
+  align-self: center;
 }
 .stat-badge b {
   color: var(--el-color-primary);
