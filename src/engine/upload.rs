@@ -1,0 +1,321 @@
+//! 流式分块上传管线
+//!
+//! 生产者(HTTP 上传 / WebDAV PUT)通过 mpsc 通道喂入字节,管线在独立任务中
+//! 攒块并发上传;生产者中途消失(未发 Eof 就断开)视为失败,自动回滚已传分块。
+
+use crate::db::{Db, Node};
+use crate::error::{AppError, AppResult};
+use crate::telegram::{TgApi, UploadBody};
+use bytes::{Bytes, BytesMut};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
+
+pub enum UploadMsg {
+    Data(Bytes),
+    /// 输入正常结束(与「通道被丢弃」区分,后者按失败回滚)
+    Eof,
+}
+
+/// 字节 → 十六进制(sha256 入库格式)
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub struct UploadHandle {
+    pub tx: mpsc::Sender<UploadMsg>,
+    pub join: tokio::task::JoinHandle<AppResult<Node>>,
+}
+
+impl UploadHandle {
+    pub async fn feed(&self, data: Bytes) -> AppResult<()> {
+        self.tx
+            .send(UploadMsg::Data(data))
+            .await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("上传管线已终止")))
+    }
+
+    /// 宣告输入结束并等待管线收尾,返回最终节点
+    pub async fn finish(self) -> AppResult<Node> {
+        let _ = self.tx.send(UploadMsg::Eof).await;
+        self.join
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("上传任务崩溃: {e}")))?
+    }
+}
+
+/// 可在运行时热调的上传参数。放进 `Arc` 共享,后台改配置后
+/// 已被克隆的 Uploader(含 DavHandler 内部那份)立即看到新值。
+pub struct UploadKnobs {
+    chunk_size: AtomicU64,
+    tmp_dir: RwLock<PathBuf>,
+    /// 改并发度即整体替换信号量;在途任务持旧信号量正常收尾
+    semaphore: RwLock<Arc<Semaphore>>,
+}
+
+impl UploadKnobs {
+    pub fn new(chunk_size: u64, tmp_dir: PathBuf, concurrency: usize) -> Self {
+        UploadKnobs {
+            chunk_size: AtomicU64::new(chunk_size),
+            tmp_dir: RwLock::new(tmp_dir),
+            semaphore: RwLock::new(Arc::new(Semaphore::new(concurrency))),
+        }
+    }
+
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size.load(Ordering::Relaxed)
+    }
+
+    pub fn set_chunk_size(&self, v: u64) {
+        self.chunk_size.store(v, Ordering::Relaxed);
+    }
+
+    /// 取值均先 clone 出来,guard 不跨 await
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.tmp_dir.read().unwrap().clone()
+    }
+
+    pub fn set_tmp_dir(&self, v: PathBuf) {
+        *self.tmp_dir.write().unwrap() = v;
+    }
+
+    pub fn semaphore(&self) -> Arc<Semaphore> {
+        self.semaphore.read().unwrap().clone()
+    }
+
+    pub fn set_concurrency(&self, n: usize) {
+        *self.semaphore.write().unwrap() = Arc::new(Semaphore::new(n));
+    }
+}
+
+#[derive(Clone)]
+pub struct Uploader {
+    pub tg: Arc<dyn TgApi>,
+    pub db: Db,
+    pub knobs: Arc<UploadKnobs>,
+    /// 分块超过该值转入临时文件(生产用 MEMORY_CHUNK_LIMIT,测试可调小)
+    pub mem_limit: u64,
+}
+
+impl Uploader {
+    /// 启动一次上传:先建 uploading 占位节点,返回喂数据的句柄
+    pub async fn start(
+        &self,
+        parent_id: i64,
+        name: &str,
+        display_path: &str,
+    ) -> AppResult<UploadHandle> {
+        let node_id = self.db.create_uploading(parent_id, name).await?;
+        let (tx, rx) = mpsc::channel::<UploadMsg>(4);
+        let this = self.clone();
+        let name = name.to_string();
+        let display_path = display_path.to_string();
+        let join = tokio::spawn(async move {
+            match this.pipeline(node_id, &name, &display_path, rx).await {
+                Ok(node) => Ok(node),
+                Err(e) => {
+                    tracing::warn!("上传 {display_path} 失败,回滚: {e}");
+                    match this.db.abort_upload(node_id).await {
+                        Ok(freed) => this.delete_messages_best_effort(freed),
+                        Err(e2) => tracing::error!("回滚上传记录失败: {e2}"),
+                    }
+                    Err(e)
+                }
+            }
+        });
+        Ok(UploadHandle { tx, join })
+    }
+
+    /// 后台尽力删除 TG 消息(引用归零的分块)
+    pub fn delete_messages_best_effort(&self, message_ids: Vec<i64>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        let tg = self.tg.clone();
+        tokio::spawn(async move {
+            for mid in message_ids {
+                if let Err(e) = tg.delete_message(mid).await {
+                    tracing::warn!("删除 TG 消息 {mid} 失败(可手动清理): {e}");
+                }
+            }
+        });
+    }
+
+    async fn pipeline(
+        &self,
+        node_id: i64,
+        name: &str,
+        display_path: &str,
+        mut rx: mpsc::Receiver<UploadMsg>,
+    ) -> AppResult<Node> {
+        let mut uploads: JoinSet<AppResult<()>> = JoinSet::new();
+        let result = self.pipeline_inner(&mut uploads, node_id, name, display_path, &mut rx).await;
+        if result.is_err() {
+            // 出错时不 abort 在途任务:消息可能已发到 TG,必须等它落定并记入
+            // chunks 表,随后的 abort_upload 才能把它们一并清理,避免孤儿消息
+            while let Some(res) = uploads.join_next().await {
+                if let Ok(Err(e)) = res {
+                    tracing::debug!("在途分块在回滚前失败: {e}");
+                }
+            }
+        }
+        result
+    }
+
+    async fn pipeline_inner(
+        &self,
+        uploads: &mut JoinSet<AppResult<()>>,
+        node_id: i64,
+        name: &str,
+        display_path: &str,
+        rx: &mut mpsc::Receiver<UploadMsg>,
+    ) -> AppResult<Node> {
+        // 整次上传用同一份分块参数快照,中途改配置不会切出大小不一的块
+        let mut buf =
+            ChunkBuf::new(self.knobs.chunk_size(), self.mem_limit, self.knobs.tmp_dir());
+        let mut idx: i64 = 0;
+        let mut total: u64 = 0;
+        let mut clean_eof = false;
+        // 顺路算内容哈希,供秒传去重索引
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+
+        'outer: loop {
+            match rx.recv().await {
+                Some(UploadMsg::Data(mut data)) => {
+                    total += data.len() as u64;
+                    sha2::Digest::update(&mut hasher, &data);
+                    while !data.is_empty() {
+                        if let Some(full) = buf.push(&mut data)? {
+                            self.spawn_chunk(uploads, node_id, name, display_path, idx, full)
+                                .await?;
+                            idx += 1;
+                        }
+                        // 上传任务出错时尽早终止,不再收数据
+                        while let Some(res) = uploads.try_join_next() {
+                            res.map_err(|e| anyhow::anyhow!("上传任务崩溃: {e}"))??;
+                        }
+                    }
+                }
+                Some(UploadMsg::Eof) => {
+                    clean_eof = true;
+                    break 'outer;
+                }
+                None => break 'outer, // 生产者异常消失
+            }
+        }
+        if !clean_eof {
+            return Err(AppError::BadRequest("上传中断:输入流提前关闭".into()));
+        }
+        // 机会性提前发现已失败的分块,避免再白传最后一块
+        while let Some(res) = uploads.try_join_next() {
+            res.map_err(|e| anyhow::anyhow!("上传任务崩溃: {e}"))??;
+        }
+        if let Some(last) = buf.take_partial()? {
+            self.spawn_chunk(uploads, node_id, name, display_path, idx, last).await?;
+        }
+        while let Some(res) = uploads.join_next().await {
+            res.map_err(|e| anyhow::anyhow!("上传任务崩溃: {e}"))??;
+        }
+
+        let sha = to_hex(&sha2::Digest::finalize(hasher));
+        let freed = self.db.finalize_upload(node_id, total as i64, Some(&sha)).await?;
+        self.delete_messages_best_effort(freed); // 覆盖写释放的旧版本
+        self.db.node(node_id).await
+    }
+
+    /// 信号量内并发上传一个分块;插 chunks 行在任务内完成
+    async fn spawn_chunk(
+        &self,
+        uploads: &mut JoinSet<AppResult<()>>,
+        node_id: i64,
+        name: &str,
+        display_path: &str,
+        idx: i64,
+        body: UploadBody,
+    ) -> AppResult<()> {
+        let permit = self
+            .knobs
+            .semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("信号量已关闭")))?;
+        let tg = self.tg.clone();
+        let db = self.db.clone();
+        // 分块 0 用原始文件名(单块文件在 TG 里保持原名),后续块加 .partN 后缀
+        let filename =
+            if idx == 0 { name.to_string() } else { format!("{name}.part{idx}") };
+        // caption 记录路径与序号,供元数据库丢失时人工恢复(截断避免超限)
+        let cap_path: String = display_path.chars().take(700).collect();
+        let caption = format!("tgdrive {{\"p\":\"{}\",\"i\":{}}}", cap_path.replace('"', "'"), idx);
+        uploads.spawn(async move {
+            let _permit = permit;
+            let size = body.len();
+            let msg = tg.send_document(&filename, Some(caption), &body).await?;
+            db.add_chunk(node_id, idx, size as i64, &msg.file_id, msg.message_id).await?;
+            Ok(())
+        });
+        Ok(())
+    }
+}
+
+/// 攒块缓冲:内存起步,超过 mem_limit 落临时文件
+struct ChunkBuf {
+    chunk_size: u64,
+    mem_limit: u64,
+    tmp_dir: PathBuf,
+    mem: BytesMut,
+    spill: Option<(tempfile::NamedTempFile, u64)>,
+}
+
+impl ChunkBuf {
+    fn new(chunk_size: u64, mem_limit: u64, tmp_dir: PathBuf) -> Self {
+        ChunkBuf { chunk_size, mem_limit, tmp_dir, mem: BytesMut::new(), spill: None }
+    }
+
+    fn filled(&self) -> u64 {
+        self.spill.as_ref().map(|(_, n)| *n).unwrap_or(0) + self.mem.len() as u64
+    }
+
+    /// 从 data 消费字节;攒满一个分块时返回之(data 剩余部分留给下一块)
+    fn push(&mut self, data: &mut Bytes) -> AppResult<Option<UploadBody>> {
+        let room = (self.chunk_size - self.filled()) as usize;
+        let take = room.min(data.len());
+        let piece = data.split_to(take);
+
+        if self.spill.is_some() {
+            let (file, n) = self.spill.as_mut().unwrap();
+            file.write_all(&piece)?;
+            *n += piece.len() as u64;
+        } else {
+            self.mem.extend_from_slice(&piece);
+            // 内存超限且分块还没攒满 → 转入临时文件
+            if self.mem.len() as u64 > self.mem_limit && (self.mem.len() as u64) < self.chunk_size {
+                let mut file = tempfile::NamedTempFile::new_in(&self.tmp_dir)?;
+                file.write_all(&self.mem)?;
+                let n = self.mem.len() as u64;
+                self.mem = BytesMut::new();
+                self.spill = Some((file, n));
+            }
+        }
+        if self.filled() >= self.chunk_size {
+            return self.take_partial();
+        }
+        Ok(None)
+    }
+
+    /// 取出当前已攒的(可能不满的)分块;空则返回 None
+    fn take_partial(&mut self) -> AppResult<Option<UploadBody>> {
+        if let Some((mut file, len)) = self.spill.take() {
+            file.flush()?;
+            return Ok(Some(UploadBody::TempFile { file, len }));
+        }
+        if self.mem.is_empty() {
+            return Ok(None);
+        }
+        let bytes = std::mem::take(&mut self.mem).freeze();
+        Ok(Some(UploadBody::Memory(bytes)))
+    }
+}

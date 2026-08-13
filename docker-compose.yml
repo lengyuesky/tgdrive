@@ -1,0 +1,29 @@
+services:
+  tgdrive:
+    build: .
+    image: tgdrive:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/data
+      # local 模式下直读 telegram-bot-api 的文件;官方 API 模式挂着也无害
+      # 重要:挂载路径必须与 telegram-bot-api 容器内一致(getFile 返回绝对路径)
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+
+  # 自部署 Bot API 服务器,随项目默认启动。
+  # 需要在 .env 里配置 TELEGRAM_API_ID / TELEGRAM_API_HASH(https://my.telegram.org 申请);
+  # 没配置时该容器会报错重启,但不影响 tgdrive 走官方端点,不用自建可 docker compose stop telegram-bot-api
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      # local 模式:上传上限 2000MB,getFile 返回本地路径,tgdrive 经共享卷直读
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api

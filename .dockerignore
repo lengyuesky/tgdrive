@@ -1,0 +1,10 @@
+target
+frontend/node_modules
+frontend/dist
+.env
+*.db
+*.db-shm
+*.db-wal
+.git
+data
+telegram-bot-api-data
