@@ -127,6 +127,16 @@ export interface AdminStatus {
   now: number
 }
 
+/** 检测到的会话(最近向 bot 发过消息的频道/用户/群) */
+export interface DetectedChat {
+  id: number
+  /** channel / private / group / supergroup / user */
+  kind: string
+  name: string
+  username: string | null
+  at: number
+}
+
 /** 保存配置的结果 */
 export interface ApplyOutcome {
   changed: CfgKey[]
@@ -247,6 +257,9 @@ export const api = {
     reset: (keys: CfgKey[]) => http.post<ApplyOutcome>('/admin/config/reset', { keys }),
     test: (probe: { api_base?: string; bot_token?: string; chat_id?: string } = {}) =>
       http.post<{ ok: boolean; bot: string; api_base: string }>('/admin/test', probe),
+    /** 根据 Bot Token 检测最近向 bot 发过消息的频道/用户,辅助填 chat_id */
+    detectChats: (probe: { api_base?: string; bot_token?: string } = {}) =>
+      http.post<{ bot: string; chats: DetectedChat[] }>('/admin/detect-chats', probe),
     status: () => http.get<AdminStatus>('/admin/status'),
     cleanup: () => http.post<{ cleaned: number }>('/admin/cleanup'),
     logoutAll: () => http.post('/admin/logout-all'),

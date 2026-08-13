@@ -55,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/config", get(admin_config).post(admin_save))
         .route("/admin/config/reset", post(admin_reset))
         .route("/admin/test", post(admin_test))
+        .route("/admin/detect-chats", post(admin_detect_chats))
         .route("/admin/status", get(admin_status))
         .route("/admin/cleanup", post(admin_cleanup))
         .route("/admin/logout-all", post(admin_logout_all))
@@ -435,6 +436,48 @@ async fn admin_test(
     }
     let bot = Runtime::probe(&api_base, &token, &chat_id).await?;
     Ok(Json(serde_json::json!({ "ok": true, "bot": bot, "api_base": api_base })))
+}
+
+#[derive(Deserialize, Default)]
+struct DetectBody {
+    api_base: Option<String>,
+    bot_token: Option<String>,
+}
+
+/// 根据 Bot Token 探测最近向 bot 发过消息的频道/用户/群,辅助填写
+/// 存储频道 chat_id 与收件白名单;不保存任何配置
+async fn admin_detect_chats(
+    State(state): State<AppState>,
+    body: Option<Json<DetectBody>>,
+) -> AppResult<Json<serde_json::Value>> {
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let c = state.rt.current();
+    // 表单原样回传脱敏占位时用已保存的值,与 admin_test 同规则
+    let pick = |given: Option<String>, cur: &str| -> String {
+        match given {
+            Some(v) if !v.trim().is_empty() && v != settings::mask(cur) => v.trim().to_string(),
+            _ => cur.to_string(),
+        }
+    };
+    let api_base = pick(b.api_base, &c.api_base).trim_end_matches('/').to_string();
+    let token = pick(b.bot_token, &c.bot_token);
+    if token.trim().is_empty() {
+        return Err(AppError::BadRequest("请先填写 Bot Token".into()));
+    }
+    // 先验证 token 可用,顺带拿 bot 用户名给前端展示操作指引
+    let bot = Runtime::probe(&api_base, &token, "0").await?;
+    // 快速拉一次未确认的消息。收件轮询开着时消息会被它抢走(但它会记进
+    // seen_chats),这里失败/为空都不致命,合并库里的记录照样能列出来
+    match crate::inbox::probe_updates(&api_base, &token).await {
+        Ok(found) => {
+            if let Err(e) = crate::inbox::remember_chats(&state.vfs.db, found).await {
+                tracing::warn!("检测:记录会话失败: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("检测:getUpdates 失败(继续用已记录的结果): {e}"),
+    }
+    let chats = crate::inbox::seen_chats(&state.vfs.db).await?;
+    Ok(Json(serde_json::json!({ "bot": bot, "chats": chats })))
 }
 
 /// 数据库占用(含 WAL/SHM 边车文件)

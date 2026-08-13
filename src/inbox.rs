@@ -8,15 +8,21 @@
 //!
 //! 官方 Bot API 下载单文件上限 20MB:超限的文件照样入库,下载时才会受限(自建端点无此限制)。
 
+use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::settings::{Runtime, RuntimeCfg};
 use crate::vfs::Vfs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
 const POLL_TIMEOUT_SECS: u64 = 25;
 const OFFSET_KEY: &str = "extra.inbox_offset";
+/// 见过的会话列表(JSON),供后台「检测频道/用户 ID」使用
+const SEEN_CHATS_KEY: &str = "extra.seen_chats";
+const SEEN_CHATS_MAX: usize = 30;
+/// getUpdates 一次订阅这些类型;my_chat_member 用于捕捉「bot 被拉进频道/群」
+const ALLOWED_UPDATES: [&str; 3] = ["message", "channel_post", "my_chat_member"];
 
 #[derive(Deserialize)]
 struct ApiResp<T> {
@@ -30,12 +36,20 @@ struct Update {
     update_id: i64,
     message: Option<Msg>,
     channel_post: Option<Msg>,
+    my_chat_member: Option<ChatMemberUpd>,
+}
+
+/// bot 被拉进/移出频道、群时的成员变动事件,只关心是哪个会话
+#[derive(Deserialize)]
+struct ChatMemberUpd {
+    chat: Chat,
 }
 
 #[derive(Deserialize)]
 struct Msg {
     message_id: i64,
     chat: Chat,
+    from: Option<User>,
     caption: Option<String>,
     document: Option<FileRef>,
     video: Option<FileRef>,
@@ -49,6 +63,18 @@ struct Chat {
     username: Option<String>,
     #[serde(rename = "type")]
     kind: String,
+    title: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct User {
+    id: i64,
+    username: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    is_bot: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -115,7 +141,7 @@ async fn poll_once(
         .json(&serde_json::json!({
             "offset": offset,
             "timeout": POLL_TIMEOUT_SECS,
-            "allowed_updates": ["message", "channel_post"],
+            "allowed_updates": ALLOWED_UPDATES,
         }))
         .send()
         .await
@@ -132,6 +158,12 @@ async fn poll_once(
     }
 
     let updates = parsed.result.unwrap_or_default();
+    // 顺手记下消息来源,供后台「检测频道/用户 ID」展示
+    // (收件轮询会把 offset 推进、消息被"收走",不记的话检测接口就看不到了)
+    let found: Vec<SeenChat> = updates.iter().flat_map(chats_from_update).collect();
+    if let Err(e) = remember_chats(&vfs.db, found).await {
+        tracing::warn!("收件:记录会话来源失败: {e}");
+    }
     let mut max_id = offset - 1;
     for up in &updates {
         max_id = max_id.max(up.update_id);
@@ -310,4 +342,129 @@ async fn reply(http: &reqwest::Client, cfg: &RuntimeCfg, to: &Msg, text: &str) {
     if let Err(e) = r {
         tracing::warn!("收件:回复失败: {e}");
     }
+}
+
+// ---------- 会话来源记录(后台「检测频道/用户 ID」) ----------
+
+/// 一个向 bot 发过消息(或把 bot 拉进过频道/群)的会话
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeenChat {
+    pub id: i64,
+    /// channel / private / group / supergroup / user(群消息的发送者)
+    pub kind: String,
+    pub name: String,
+    pub username: Option<String>,
+    /// 最近一次见到的时间戳
+    pub at: i64,
+}
+
+fn display_name(title: &Option<String>, first: &Option<String>, last: &Option<String>, username: &Option<String>, id: i64) -> String {
+    if let Some(t) = title.as_deref().filter(|s| !s.trim().is_empty()) {
+        return t.to_string();
+    }
+    let person = [first.as_deref(), last.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !person.trim().is_empty() {
+        return person;
+    }
+    if let Some(u) = username.as_deref().filter(|s| !s.trim().is_empty()) {
+        return format!("@{u}");
+    }
+    id.to_string()
+}
+
+/// 从一条 update 里提取所有可见会话
+fn chats_from_update(up: &Update) -> Vec<SeenChat> {
+    let now = crate::db::now_ts();
+    let mut out = Vec::new();
+    let mut push_chat = |c: &Chat| {
+        out.push(SeenChat {
+            id: c.id,
+            kind: c.kind.clone(),
+            name: display_name(&c.title, &c.first_name, &c.last_name, &c.username, c.id),
+            username: c.username.clone(),
+            at: now,
+        });
+    };
+    if let Some(p) = &up.channel_post {
+        push_chat(&p.chat);
+    }
+    if let Some(mc) = &up.my_chat_member {
+        push_chat(&mc.chat);
+    }
+    if let Some(m) = &up.message {
+        push_chat(&m.chat);
+        // 群消息的发送者是另一个 id,也记下(可用于私聊白名单)
+        if let Some(u) = &m.from {
+            if u.id != m.chat.id && !u.is_bot.unwrap_or(false) {
+                out.push(SeenChat {
+                    id: u.id,
+                    kind: "user".into(),
+                    name: display_name(&None, &u.first_name, &u.last_name, &u.username, u.id),
+                    username: u.username.clone(),
+                    at: now,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// 合并进库里的会话列表:按 id 去重,最新的排最前,只留最近若干条
+pub async fn remember_chats(db: &Db, found: Vec<SeenChat>) -> AppResult<()> {
+    if found.is_empty() {
+        return Ok(());
+    }
+    let mut list = seen_chats(db).await?;
+    for c in found {
+        list.retain(|x| x.id != c.id);
+        list.insert(0, c);
+    }
+    list.truncate(SEEN_CHATS_MAX);
+    let json = serde_json::to_string(&list)
+        .map_err(|e| AppError::Telegram(format!("序列化会话列表失败: {e}")))?;
+    db.setting_set(SEEN_CHATS_KEY, &json).await
+}
+
+/// 库里记录过的会话(损坏时静默从空开始)
+pub async fn seen_chats(db: &Db) -> AppResult<Vec<SeenChat>> {
+    Ok(db
+        .setting_get(SEEN_CHATS_KEY)
+        .await?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default())
+}
+
+/// 用给定 token 快速拉一次待处理的 updates(不带 offset,不确认任何消息),
+/// 提取消息来源。收件轮询开着时消息多半已被它收走(并已记进 seen_chats),
+/// 此时这里拿到空结果甚至 409 冲突都正常,调用方应把错误当非致命处理。
+pub async fn probe_updates(api_base: &str, token: &str) -> AppResult<Vec<SeenChat>> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| AppError::Telegram(format!("构造 HTTP 客户端失败: {e}")))?;
+    let url = format!("{}/bot{}/getUpdates", api_base.trim_end_matches('/'), token);
+    let resp = http
+        .post(&url)
+        .json(&serde_json::json!({
+            "timeout": 0,
+            "allowed_updates": ALLOWED_UPDATES,
+        }))
+        .send()
+        .await
+        .map_err(|e| AppError::Telegram(format!("getUpdates 请求失败: {e}")))?;
+    let parsed: ApiResp<Vec<Update>> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Telegram(format!("getUpdates 响应解析失败: {e}")))?;
+    if !parsed.ok {
+        return Err(AppError::Telegram(format!(
+            "getUpdates: {}",
+            parsed.description.unwrap_or_else(|| "未知错误".into())
+        )));
+    }
+    Ok(parsed.result.unwrap_or_default().iter().flat_map(chats_from_update).collect())
 }

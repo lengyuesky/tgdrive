@@ -14,6 +14,7 @@ import {
   type AdminStatus,
   type CfgKey,
   type ConfigPatch,
+  type DetectedChat,
   type Extras,
 } from '../api'
 
@@ -224,6 +225,57 @@ async function test() {
   } finally {
     testing.value = false
   }
+}
+
+// ---- 检测频道 / 用户 ID ----
+const detectDialog = ref(false)
+const detecting = ref(false)
+const detectBot = ref('')
+const detectedChats = ref<DetectedChat[]>([])
+
+const KIND_LABEL: Record<string, string> = {
+  channel: '频道',
+  private: '用户',
+  user: '用户',
+  group: '群组',
+  supergroup: '群组',
+}
+const isUserKind = (k: string) => k === 'private' || k === 'user'
+
+async function detect() {
+  detecting.value = true
+  try {
+    const { data } = await api.admin.detectChats({
+      api_base: form.value.api_base,
+      bot_token: form.value.bot_token,
+    })
+    detectBot.value = data.bot
+    detectedChats.value = data.chats
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  } finally {
+    detecting.value = false
+  }
+}
+function openDetect() {
+  detectDialog.value = true
+  detect()
+}
+function useChatId(c: DetectedChat) {
+  form.value.chat_id = String(c.id)
+  detectDialog.value = false
+  ElMessage.success(`已填入存储频道 ${c.id},记得点「保存并生效」`)
+}
+function addWhitelist(c: DetectedChat) {
+  if (!extras.value) return
+  const ids = extras.value.inbox_allowed_chats.split(',').map((s) => s.trim()).filter(Boolean)
+  if (ids.includes(String(c.id))) {
+    ElMessage.info('已经在白名单里了')
+    return
+  }
+  ids.push(String(c.id))
+  extras.value.inbox_allowed_chats = ids.join(',')
+  ElMessage.success(`已把 ${c.id} 填进白名单,记得点「保存收件设置」`)
 }
 
 async function cleanup() {
@@ -452,6 +504,7 @@ function downloadBackup() {
         <el-form-item label="存储频道">
           <div class="row">
             <el-input v-model="form.chat_id" placeholder="-100xxxxxxxxxx 或 @channelname" />
+            <el-button @click="openDetect">检测 ID</el-button>
             <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.chat_id ?? ''] }}</el-tag>
             <el-button
               v-if="cfg?.sources.chat_id === 'db'"
@@ -461,6 +514,7 @@ function downloadBackup() {
               >恢复</el-button
             >
           </div>
+          <div class="tip">不知道频道 ID?填好 Bot Token 后点「检测 ID」,按提示操作即可。</div>
         </el-form-item>
 
         <el-form-item label="分块大小">
@@ -645,9 +699,10 @@ function downloadBackup() {
               v-model="extras.inbox_allowed_chats"
               placeholder="如 123456789,987654321;留空则只收频道直发"
             />
+            <el-button @click="openDetect">检测 ID</el-button>
           </div>
           <div class="tip">
-            数字为 Telegram 用户 ID(私聊 @userinfobot 可查自己的);不在名单里的私聊消息一律忽略。
+            数字为 Telegram 用户 ID:用对方账号私聊 bot 发条消息,点「检测 ID」就能看到;不在名单里的私聊消息一律忽略。
           </div>
         </el-form-item>
       </el-form>
@@ -696,6 +751,56 @@ function downloadBackup() {
       <el-button :disabled="!dirty" @click="load">放弃改动</el-button>
       <span class="tip">保存后立即生效,不需要重启容器。</span>
     </div>
+
+    <el-dialog v-model="detectDialog" title="检测频道 / 用户 ID" width="680px">
+      <el-alert type="info" :closable="false" show-icon class="alert">
+        <div>
+          找<b>频道 ID</b>:把 bot{{ detectBot ? `(@${detectBot})` : '' }}
+          拉进目标频道并设为<b>管理员</b>,在频道里随便发一条消息,再点「重新检测」。
+        </div>
+        <div>找<b>用户 ID</b>(收件白名单用):用该账号<b>私聊 bot</b> 随便发一条消息,再点「重新检测」。</div>
+      </el-alert>
+      <el-table
+        :data="detectedChats"
+        size="small"
+        v-loading="detecting"
+        empty-text="还没检测到会话,按上面的提示给 bot 发条消息后点「重新检测」"
+      >
+        <el-table-column label="类型" width="76">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.kind === 'channel' ? 'primary' : 'info'">
+              {{ KIND_LABEL[row.kind] ?? row.kind }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="名称" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ row.name }}<span v-if="row.username" class="tip"> @{{ row.username }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="id" label="ID" width="150" />
+        <el-table-column label="最近出现" width="90">
+          <template #default="{ row }">{{ fmtTime(row.at).slice(5, 16) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="130">
+          <template #default="{ row }">
+            <el-button v-if="!isUserKind(row.kind)" link type="primary" @click="useChatId(row)">
+              填入存储频道
+            </el-button>
+            <el-button v-else-if="extras" link type="primary" @click="addWhitelist(row)">
+              加入白名单
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div class="tip" style="margin-top: 8px">
+        列表来自 bot 最近收到的消息(开启收件后也会持续记录),不会保存任何配置改动。
+      </div>
+      <template #footer>
+        <el-button @click="detectDialog = false">关闭</el-button>
+        <el-button type="primary" :loading="detecting" @click="detect">重新检测</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="envDialog" title="当前生效配置(.env 格式)" width="640px">
       <el-alert type="warning" :closable="false" show-icon class="alert">
