@@ -25,6 +25,15 @@ pub struct TgMessage {
     pub file_id: String,
 }
 
+/// 视频显示元数据(从文件头解析);sendVideo 不带宽高时
+/// Telegram 不探测内容,消息气泡的长宽比是猜的
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoMeta {
+    pub width: u32,
+    pub height: u32,
+    pub duration_secs: Option<u32>,
+}
+
 /// 上传体:小分块驻内存,大分块经临时文件(重试时可重复读取)
 pub enum UploadBody {
     Memory(Bytes),
@@ -48,6 +57,19 @@ pub trait TgApi: Send + Sync + 'static {
         caption: Option<String>,
         body: &UploadBody,
     ) -> AppResult<TgMessage>;
+    /// 以「视频消息」发送,客户端可直接流式播放;默认实现退回文档发送,
+    /// 只有真实客户端(以及需要转发的代理)才覆写
+    async fn send_video(
+        &self,
+        filename: &str,
+        mime: &str,
+        meta: Option<VideoMeta>,
+        caption: Option<String>,
+        body: &UploadBody,
+    ) -> AppResult<TgMessage> {
+        let _ = (mime, meta);
+        self.send_document(filename, caption, body).await
+    }
     async fn delete_message(&self, message_id: i64) -> AppResult<()>;
     async fn get_me(&self) -> AppResult<String>;
     /// 打开某个分块的字节流,从块内 offset 开始读
@@ -73,11 +95,20 @@ struct ApiParams {
 #[derive(Deserialize)]
 struct RawMessage {
     message_id: i64,
-    document: Option<RawDocument>,
+    document: Option<RawFileRef>,
+    /// sendVideo 成功时在此;Telegram 也可能改以 document/animation 存储
+    video: Option<RawFileRef>,
+    animation: Option<RawFileRef>,
+}
+
+impl RawMessage {
+    fn any_file_id(self) -> Option<String> {
+        self.video.or(self.document).or(self.animation).map(|f| f.file_id)
+    }
 }
 
 #[derive(Deserialize)]
-struct RawDocument {
+struct RawFileRef {
     file_id: String,
 }
 
@@ -124,6 +155,18 @@ impl TgApi for SwitchableTg {
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
         self.current().send_document(filename, caption, body).await
+    }
+
+    // 必须显式转发:走 trait 默认实现会在代理层退回 send_document,内层真客户端就收不到视频请求
+    async fn send_video(
+        &self,
+        filename: &str,
+        mime: &str,
+        meta: Option<VideoMeta>,
+        caption: Option<String>,
+        body: &UploadBody,
+    ) -> AppResult<TgMessage> {
+        self.current().send_video(filename, mime, meta, caption, body).await
     }
 
     async fn delete_message(&self, message_id: i64) -> AppResult<()> {
@@ -303,7 +346,12 @@ impl TgClient {
         Ok(path)
     }
 
-    fn body_to_part(&self, filename: &str, body: &UploadBody) -> AppResult<reqwest::multipart::Part> {
+    fn body_to_part(
+        &self,
+        filename: &str,
+        mime: &str,
+        body: &UploadBody,
+    ) -> AppResult<reqwest::multipart::Part> {
         let part = match body {
             UploadBody::Memory(b) => reqwest::multipart::Part::stream_with_length(
                 reqwest::Body::from(b.clone()),
@@ -320,10 +368,56 @@ impl TgClient {
                 )
             }
         };
-        Ok(part
-            .file_name(filename.to_string())
-            .mime_str("application/octet-stream")
-            .map_err(|e| AppError::Telegram(e.to_string()))?)
+        part.file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(|e| AppError::Telegram(e.to_string()))
+    }
+
+    /// sendDocument / sendVideo 共用的 multipart 发送
+    #[allow(clippy::too_many_arguments)]
+    async fn send_media(
+        &self,
+        method: &str,
+        field: &'static str,
+        filename: &str,
+        mime: &str,
+        meta: Option<VideoMeta>,
+        caption: Option<String>,
+        body: &UploadBody,
+    ) -> AppResult<TgMessage> {
+        let url = self.method_url(method);
+        let msg: RawMessage = self
+            .call_with_retry(method, || {
+                let mut form = reqwest::multipart::Form::new()
+                    .text("chat_id", self.chat_id.clone())
+                    .text("disable_notification", "true");
+                if field == "video" {
+                    // 让客户端不必下完整个文件就能拖动播放
+                    form = form.text("supports_streaming", "true");
+                }
+                if let Some(m) = meta {
+                    // 不带宽高时 Telegram 不探测内容,气泡长宽比是猜的
+                    form = form
+                        .text("width", m.width.to_string())
+                        .text("height", m.height.to_string());
+                    if let Some(d) = m.duration_secs {
+                        form = form.text("duration", d.to_string());
+                    }
+                }
+                if let Some(c) = &caption {
+                    form = form.text("caption", c.clone());
+                }
+                // Part 构造失败会在 send 时报网络错误重试后放弃,此处直接 expect 简化
+                let part = self.body_to_part(filename, mime, body).expect("构造上传体失败");
+                form = form.part(field, part);
+                self.http.post(&url).multipart(form).send()
+            })
+            .await?;
+        let message_id = msg.message_id;
+        let file_id = msg.any_file_id().ok_or_else(|| {
+            AppError::Telegram(format!("{method} 响应缺少文件字段"))
+        })?;
+        Ok(TgMessage { message_id, file_id })
     }
 
     /// HTTP 下载分块;offset>0 时先试 Range,服务器不支持则丢弃前缀
@@ -370,25 +464,27 @@ impl TgApi for TgClient {
         caption: Option<String>,
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
-        let url = self.method_url("sendDocument");
-        let msg: RawMessage = self
-            .call_with_retry("sendDocument", || {
-                let mut form = reqwest::multipart::Form::new()
-                    .text("chat_id", self.chat_id.clone())
-                    .text("disable_notification", "true");
-                if let Some(c) = &caption {
-                    form = form.text("caption", c.clone());
-                }
-                // Part 构造失败会在 send 时报网络错误重试后放弃,此处直接 expect 简化
-                let part = self.body_to_part(filename, body).expect("构造上传体失败");
-                form = form.part("document", part);
-                self.http.post(&url).multipart(form).send()
-            })
-            .await?;
-        let doc = msg.document.ok_or_else(|| {
-            AppError::Telegram("sendDocument 响应缺少 document 字段".into())
-        })?;
-        Ok(TgMessage { message_id: msg.message_id, file_id: doc.file_id })
+        self.send_media(
+            "sendDocument",
+            "document",
+            filename,
+            "application/octet-stream",
+            None,
+            caption,
+            body,
+        )
+        .await
+    }
+
+    async fn send_video(
+        &self,
+        filename: &str,
+        mime: &str,
+        meta: Option<VideoMeta>,
+        caption: Option<String>,
+        body: &UploadBody,
+    ) -> AppResult<TgMessage> {
+        self.send_media("sendVideo", "video", filename, mime, meta, caption, body).await
     }
 
     async fn delete_message(&self, message_id: i64) -> AppResult<()> {

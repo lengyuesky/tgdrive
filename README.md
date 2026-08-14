@@ -85,6 +85,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_API_BASE` | | `https://api.telegram.org` | ✔ | Bot API 端点 |
 | `TGDRIVE_CHUNK_SIZE` | | 官方 18MB / 自建 1900MB | ✔ | 分块大小,支持 `18MB`/`1g` 写法;官方端点上限 19.5MB(受 getFile 20MB 限制),自建上限 1900MB |
 | `TGDRIVE_UPLOAD_CONCURRENCY` | | `2` | ✔ | 分块并发上传数,调大易触发 429 限流 |
+| `TGDRIVE_SEND_VIDEO` | | 官方 `false` / 自建 `true` | ✔ | 视频消息模式:不超过分块大小的 mp4/mov/m4v 以「视频消息」发送(自动带宽高时长),Telegram 里可直接播放,文件内容不变;mkv/webm 仍走文档(Telegram 播放器不支持其常见编码);超过分块大小的视频仍按文档分块存储 |
 | `TGDRIVE_TMP_DIR` | | 系统临时目录 | ✔ | 大分块暂存目录,需 ≥ 分块大小×(并发+1) 的空间 |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | | — | ✔* | 自建 Bot API 服务器的凭据,在 <https://my.telegram.org> 申请;\*后台可编辑并导出,但由 telegram-bot-api 容器读取,**必须重建那个容器才生效** |
 | `TGDRIVE_LISTEN` | | `0.0.0.0:8080` | | 监听地址(端口由 compose 映射,改需重启) |
@@ -98,7 +99,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 右上角用户名菜单 → **系统设置**(`/admin`)。
 
 - **系统状态**:bot、端点、分块、文件数与占用、元数据库体积、运行时长
-- **Telegram 存储**:bot token、存储频道、接口端点、分块大小、上传并发
+- **Telegram 存储**:bot token、存储频道、接口端点、分块大小、上传并发、视频消息模式
 - **自建 Bot API 服务器**:api_id / api_hash,以及切换到自建端点的操作步骤
 - **账号**、**高级**(临时目录)、需重启才能改的项(监听地址、数据库路径等)
 

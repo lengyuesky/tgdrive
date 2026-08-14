@@ -34,6 +34,8 @@ pub struct Config {
     /// 收在这里只为让后台能查看/编辑/导出(改动需重建那个容器才生效)。
     pub telegram_api_id: String,
     pub telegram_api_hash: String,
+    /// 单块以内的视频文件改用 sendVideo 发送,在 Telegram 里可直接播放
+    pub send_video: bool,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -76,6 +78,21 @@ pub fn default_chunk_size(api_base: &str) -> u64 {
     }
 }
 
+/// 视频消息模式的默认值:自建端点默认开(分块大、多数视频单块放得下),
+/// 官方端点默认关(18MB 以内的视频才有意义)
+pub fn default_send_video(api_base: &str) -> bool {
+    !is_official(api_base)
+}
+
+/// 解析布尔开关,支持 true/false、1/0、yes/no、on/off
+pub fn parse_bool(s: &str) -> anyhow::Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => anyhow::bail!("无法解析布尔值: {other}(可用 true/false)"),
+    }
+}
+
 /// 分块大小校验;启动解析与后台改配置共用同一套规则
 pub fn validate_chunk_size(api_base: &str, chunk_size: u64) -> anyhow::Result<()> {
     if is_official(api_base) && chunk_size > OFFICIAL_CHUNK_MAX {
@@ -109,6 +126,11 @@ impl Config {
         validate_chunk_size(&api_base, chunk_size)
             .map_err(|e| anyhow::anyhow!("TGDRIVE_CHUNK_SIZE 无效: {e}"))?;
 
+        let send_video = match env_opt("TGDRIVE_SEND_VIDEO") {
+            Some(v) => parse_bool(&v).map_err(|e| anyhow::anyhow!("TGDRIVE_SEND_VIDEO 无效: {e}"))?,
+            None => default_send_video(&api_base),
+        };
+
         let cfg = Config {
             listen: env_opt("TGDRIVE_LISTEN")
                 .unwrap_or_else(|| "0.0.0.0:8080".into())
@@ -135,6 +157,7 @@ impl Config {
             secret: env_opt("TGDRIVE_SECRET"),
             telegram_api_id: env_opt("TELEGRAM_API_ID").unwrap_or_default(),
             telegram_api_hash: env_opt("TELEGRAM_API_HASH").unwrap_or_default(),
+            send_video,
         };
         Ok(cfg)
     }
@@ -151,5 +174,21 @@ mod tests {
         assert_eq!(parse_size("1.5g").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
         assert_eq!(parse_size("19500000").unwrap(), 19_500_000);
         assert!(parse_size("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_bool() {
+        assert!(parse_bool("true").unwrap());
+        assert!(parse_bool("1").unwrap());
+        assert!(parse_bool("ON").unwrap());
+        assert!(!parse_bool("false").unwrap());
+        assert!(!parse_bool("off").unwrap());
+        assert!(parse_bool("maybe").is_err());
+    }
+
+    #[test]
+    fn test_default_send_video() {
+        assert!(!default_send_video(OFFICIAL_API_BASE));
+        assert!(default_send_video("http://telegram-bot-api:8081"));
     }
 }

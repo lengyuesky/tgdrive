@@ -9,7 +9,7 @@ use crate::telegram::{TgApi, UploadBody};
 use bytes::{Bytes, BytesMut};
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
@@ -23,6 +23,19 @@ pub enum UploadMsg {
 /// 字节 → 十六进制(sha256 入库格式)
 pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 按扩展名判断能否作为 Telegram 视频消息发送,返回对应 MIME。
+/// 只收 mp4 家族:Telegram 客户端仅保证播放 MPEG-4 视频,
+/// mkv/webm 常见的 HEVC/VP9 轨道在手机端只有声音没画面,发视频消息反而更糟。
+pub fn video_mime(filename: &str) -> Option<&'static str> {
+    let ext = filename.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "mp4" => Some("video/mp4"),
+        "m4v" => Some("video/x-m4v"),
+        "mov" => Some("video/quicktime"),
+        _ => None,
+    }
 }
 
 pub struct UploadHandle {
@@ -54,14 +67,17 @@ pub struct UploadKnobs {
     tmp_dir: RwLock<PathBuf>,
     /// 改并发度即整体替换信号量;在途任务持旧信号量正常收尾
     semaphore: RwLock<Arc<Semaphore>>,
+    /// 单块以内的视频改用 sendVideo 发送(Telegram 里可直接播放)
+    send_video: AtomicBool,
 }
 
 impl UploadKnobs {
-    pub fn new(chunk_size: u64, tmp_dir: PathBuf, concurrency: usize) -> Self {
+    pub fn new(chunk_size: u64, tmp_dir: PathBuf, concurrency: usize, send_video: bool) -> Self {
         UploadKnobs {
             chunk_size: AtomicU64::new(chunk_size),
             tmp_dir: RwLock::new(tmp_dir),
             semaphore: RwLock::new(Arc::new(Semaphore::new(concurrency))),
+            send_video: AtomicBool::new(send_video),
         }
     }
 
@@ -71,6 +87,14 @@ impl UploadKnobs {
 
     pub fn set_chunk_size(&self, v: u64) {
         self.chunk_size.store(v, Ordering::Relaxed);
+    }
+
+    pub fn send_video(&self) -> bool {
+        self.send_video.load(Ordering::Relaxed)
+    }
+
+    pub fn set_send_video(&self, v: bool) {
+        self.send_video.store(v, Ordering::Relaxed);
     }
 
     /// 取值均先 clone 出来,guard 不跨 await
@@ -189,7 +213,8 @@ impl Uploader {
                     sha2::Digest::update(&mut hasher, &data);
                     while !data.is_empty() {
                         if let Some(full) = buf.push(&mut data)? {
-                            self.spawn_chunk(uploads, node_id, name, display_path, idx, full)
+                            // 攒满整块即被切分,该文件必然多于一块,不是视频消息候选
+                            self.spawn_chunk(uploads, node_id, name, display_path, idx, full, false)
                                 .await?;
                             idx += 1;
                         }
@@ -214,7 +239,8 @@ impl Uploader {
             res.map_err(|e| anyhow::anyhow!("上传任务崩溃: {e}"))??;
         }
         if let Some(last) = buf.take_partial()? {
-            self.spawn_chunk(uploads, node_id, name, display_path, idx, last).await?;
+            // EOF 时的尾块若是第 0 块,说明整个文件只有这一块 → 视频消息候选
+            self.spawn_chunk(uploads, node_id, name, display_path, idx, last, idx == 0).await?;
         }
         while let Some(res) = uploads.join_next().await {
             res.map_err(|e| anyhow::anyhow!("上传任务崩溃: {e}"))??;
@@ -226,7 +252,9 @@ impl Uploader {
         self.db.node(node_id).await
     }
 
-    /// 信号量内并发上传一个分块;插 chunks 行在任务内完成
+    /// 信号量内并发上传一个分块;插 chunks 行在任务内完成。
+    /// `single_chunk`:该块就是整个文件(仅此时才可能改用 sendVideo)
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_chunk(
         &self,
         uploads: &mut JoinSet<AppResult<()>>,
@@ -235,6 +263,7 @@ impl Uploader {
         display_path: &str,
         idx: i64,
         body: UploadBody,
+        single_chunk: bool,
     ) -> AppResult<()> {
         let permit = self
             .knobs
@@ -247,13 +276,34 @@ impl Uploader {
         // 分块 0 用原始文件名(单块文件在 TG 里保持原名),后续块加 .partN 后缀
         let filename =
             if idx == 0 { name.to_string() } else { format!("{name}.part{idx}") };
+        // 完整的视频文件按「视频消息」发,Telegram 里可直接播放;开关关闭或非视频照旧走文档
+        let mime = (single_chunk && self.knobs.send_video())
+            .then(|| video_mime(name))
+            .flatten();
         // caption 记录路径与序号,供元数据库丢失时人工恢复(截断避免超限)
         let cap_path: String = display_path.chars().take(700).collect();
         let caption = format!("tgdrive {{\"p\":\"{}\",\"i\":{}}}", cap_path.replace('"', "'"), idx);
         uploads.spawn(async move {
             let _permit = permit;
             let size = body.len();
-            let msg = tg.send_document(&filename, Some(caption), &body).await?;
+            let msg = match mime {
+                Some(m) => {
+                    // 从文件头解析宽高/时长;解析不了就不带(Telegram 会按默认比例显示)
+                    let meta = crate::engine::probe::probe_body(m, &body);
+                    if meta.is_none() {
+                        tracing::debug!("{filename} 未解析出视频宽高,按无元数据发送");
+                    }
+                    match tg.send_video(&filename, m, meta, Some(caption.clone()), &body).await {
+                        Ok(msg) => msg,
+                        // 端点/内容不被 sendVideo 接受时退回文档,别让整次上传失败
+                        Err(e) => {
+                            tracing::warn!("{filename} 以视频消息发送失败({e}),回退为文档");
+                            tg.send_document(&filename, Some(caption), &body).await?
+                        }
+                    }
+                }
+                None => tg.send_document(&filename, Some(caption), &body).await?,
+            };
             db.add_chunk(node_id, idx, size as i64, &msg.file_id, msg.message_id).await?;
             Ok(())
         });

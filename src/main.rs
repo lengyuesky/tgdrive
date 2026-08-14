@@ -69,6 +69,7 @@ async fn serve() -> anyhow::Result<()> {
         cfg.chunk_size,
         cfg.tmp_dir.clone(),
         cfg.upload_concurrency,
+        cfg.send_video,
     ));
     let uploader = Uploader {
         tg: tg.clone(),

@@ -32,6 +32,7 @@ const form = ref({
   chat_id: '',
   chunk_size: '',
   upload_concurrency: 2,
+  send_video: false,
   tmp_dir: '',
   username: '',
   password: '',
@@ -66,6 +67,7 @@ async function load() {
       chat_id: c.data.values.chat_id,
       chunk_size: sizeInput(c.data.values.chunk_size),
       upload_concurrency: c.data.values.upload_concurrency,
+      send_video: c.data.values.send_video,
       tmp_dir: c.data.values.tmp_dir,
       username: c.data.values.username,
       password: c.data.values.password, // 占位符,同上
@@ -91,6 +93,8 @@ const LOCAL_API_BASE = 'http://telegram-bot-api:8081'
 let lastLocalBase = ''
 /** 各端点各自记住上一次的分块大小,来回切换互不污染 */
 const lastChunk: Record<'official' | 'local', string> = { official: '', local: '' }
+/** 视频消息开关同理;没动过则取端点默认(自建开、官方关) */
+const lastVideo: Record<'official' | 'local', boolean | null> = { official: null, local: null }
 const apiMode = computed<'official' | 'local'>({
   get: () => (isOfficial.value ? 'official' : 'local'),
   set: (m) => {
@@ -110,6 +114,9 @@ const apiMode = computed<'official' | 'local'>({
       form.value.chunk_size = next
       ElMessage.info(`分块大小已随端点切换为 ${next}`)
     }
+    // 视频消息模式也跟着端点走
+    lastVideo[m === 'official' ? 'local' : 'official'] = form.value.send_video
+    form.value.send_video = lastVideo[m] ?? m === 'local'
   },
 })
 const uptime = computed(() =>
@@ -126,6 +133,7 @@ function buildPatch(): ConfigPatch {
   if (f.chat_id !== o.chat_id) p.chat_id = f.chat_id
   if (f.chunk_size !== o.chunk_size) p.chunk_size = f.chunk_size
   if (f.upload_concurrency !== o.upload_concurrency) p.upload_concurrency = f.upload_concurrency
+  if (f.send_video !== o.send_video) p.send_video = f.send_video
   if (f.tmp_dir !== o.tmp_dir) p.tmp_dir = f.tmp_dir
   if (f.username !== o.username) p.username = f.username
   if (f.password !== o.password) p.password = f.password
@@ -552,6 +560,25 @@ function downloadBackup() {
               >恢复</el-button
             >
             <span class="tip">同时发往频道的分块数;调太高容易触发限流</span>
+          </div>
+        </el-form-item>
+
+        <el-form-item label="视频消息模式">
+          <div class="row">
+            <el-switch v-model="form.send_video" />
+            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.send_video ?? ''] }}</el-tag>
+            <el-button
+              v-if="cfg?.sources.send_video === 'db'"
+              link
+              type="primary"
+              @click="resetKey('send_video', '视频消息模式')"
+              >恢复</el-button
+            >
+          </div>
+          <div class="tip">
+            开启后,不超过分块大小的 mp4 / mov / m4v 会以「视频消息」发到频道,在
+            Telegram 里可直接播放(文件内容不变,下载不受影响)。mkv / webm 仍走文档
+            —— Telegram 播放器不支持其常见编码,发成视频消息只有声音没画面。超过分块大小的视频按文档分块存储。自建端点默认开启,官方端点默认关闭。
           </div>
         </el-form-item>
       </el-form>

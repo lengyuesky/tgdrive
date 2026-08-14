@@ -77,6 +77,7 @@ export type CfgKey =
   | 'chat_id'
   | 'chunk_size'
   | 'upload_concurrency'
+  | 'send_video'
   | 'tmp_dir'
   | 'username'
   | 'password'
@@ -93,6 +94,8 @@ export interface AdminConfig {
     chat_id: string
     chunk_size: number
     upload_concurrency: number
+    /** 单块以内的视频以「视频消息」发送,Telegram 里可直接播放 */
+    send_video: boolean
     tmp_dir: string
     username: string
     password: string
@@ -153,6 +156,7 @@ export type ConfigPatch = Partial<{
   chat_id: string
   chunk_size: string
   upload_concurrency: number
+  send_video: boolean
   tmp_dir: string
   username: string
   password: string

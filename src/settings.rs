@@ -29,6 +29,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("chat_id", "TGDRIVE_CHAT_ID"),
     ("chunk_size", "TGDRIVE_CHUNK_SIZE"),
     ("upload_concurrency", "TGDRIVE_UPLOAD_CONCURRENCY"),
+    ("send_video", "TGDRIVE_SEND_VIDEO"),
     ("tmp_dir", "TGDRIVE_TMP_DIR"),
     ("username", "TGDRIVE_USERNAME"),
     ("password", "TGDRIVE_PASSWORD"),
@@ -48,6 +49,8 @@ pub struct RuntimeCfg {
     pub chat_id: String,
     pub chunk_size: u64,
     pub upload_concurrency: usize,
+    /// 单块以内的视频改用 sendVideo 发送,在 Telegram 里可直接播放
+    pub send_video: bool,
     pub tmp_dir: PathBuf,
     pub username: String,
     pub password: String,
@@ -79,6 +82,13 @@ impl RuntimeCfg {
             chunk_size = fallback;
         }
 
+        // 视频消息模式:同分块一样,默认值跟随实际生效的端点(自建默认开)
+        let send_video = match get("send_video").and_then(|v| config::parse_bool(v).ok()) {
+            Some(v) => v,
+            None if env_present("TGDRIVE_SEND_VIDEO") => env.send_video,
+            None => config::default_send_video(&api_base),
+        };
+
         Ok(RuntimeCfg {
             api_base,
             bot_token: get("bot_token").map(str::to_string).unwrap_or_else(|| env.bot_token.clone()),
@@ -88,6 +98,7 @@ impl RuntimeCfg {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(env.upload_concurrency)
                 .clamp(1, 16),
+            send_video,
             tmp_dir: get("tmp_dir").map(PathBuf::from).unwrap_or_else(|| env.tmp_dir.clone()),
             username: get("username").map(str::to_string).unwrap_or_else(|| env.username.clone()),
             password: get("password").map(str::to_string).unwrap_or_else(|| env.password.clone()),
@@ -127,6 +138,7 @@ impl RuntimeCfg {
             "chat_id" => self.chat_id.clone(),
             "chunk_size" => self.chunk_size.to_string(),
             "upload_concurrency" => self.upload_concurrency.to_string(),
+            "send_video" => self.send_video.to_string(),
             "tmp_dir" => self.tmp_dir.display().to_string(),
             "username" => self.username.clone(),
             "password" => self.password.clone(),
@@ -150,6 +162,7 @@ pub struct ConfigPatch {
     /// 字符串以支持 "18MB" 这类写法
     pub chunk_size: Option<String>,
     pub upload_concurrency: Option<usize>,
+    pub send_video: Option<bool>,
     pub tmp_dir: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -279,6 +292,9 @@ impl Runtime {
         }
         if let Some(v) = patch.upload_concurrency {
             next.upload_concurrency = v;
+        }
+        if let Some(v) = patch.send_video {
+            next.send_video = v;
         }
         if let Some(v) = &patch.tmp_dir {
             next.tmp_dir = PathBuf::from(v.trim());
@@ -415,6 +431,9 @@ impl Runtime {
         if next.upload_concurrency != prev.upload_concurrency {
             self.knobs.set_concurrency(next.upload_concurrency);
         }
+        if next.send_video != prev.send_video {
+            self.knobs.set_send_video(next.send_video);
+        }
         let account_changed =
             next.username != prev.username || next.password != prev.password;
         if account_changed {
@@ -497,6 +516,7 @@ mod tests {
             secret: None,
             telegram_api_id: String::new(),
             telegram_api_hash: String::new(),
+            send_video: false,
         }
     }
 
@@ -521,6 +541,24 @@ mod tests {
         assert_eq!(c.bot_token, "dbtoken");
         assert_eq!(c.chunk_size, 2 * 1024 * 1024);
         assert_eq!(c.username, "envuser"); // 未覆盖的仍来自 env
+    }
+
+    #[tokio::test]
+    async fn send_video_default_follows_endpoint() {
+        let (db, _g) = test_db().await;
+        // 官方端点默认关
+        let c = RuntimeCfg::load(&db, &env_cfg()).await.unwrap();
+        assert!(!c.send_video);
+
+        // 端点改成自建(db 覆盖)→ 默认开
+        db.setting_set("cfg.api_base", "http://tg:8081").await.unwrap();
+        let c = RuntimeCfg::load(&db, &env_cfg()).await.unwrap();
+        assert!(c.send_video);
+
+        // 后台显式关掉 → 以 db 为准
+        db.setting_set("cfg.send_video", "false").await.unwrap();
+        let c = RuntimeCfg::load(&db, &env_cfg()).await.unwrap();
+        assert!(!c.send_video);
     }
 
     #[tokio::test]
