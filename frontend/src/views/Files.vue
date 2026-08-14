@@ -40,6 +40,14 @@
         <el-tooltip content="刷新">
           <el-button class="icon-btn" :icon="Refresh" @click="refresh" />
         </el-tooltip>
+        <el-tooltip content="全选 / 取消全选(Ctrl+A)">
+          <el-button
+            class="icon-btn"
+            :class="{ active: allSelected }"
+            :icon="Finished"
+            @click="toggleSelectAll"
+          />
+        </el-tooltip>
         <el-tooltip v-if="selected.length" content="移动所选">
           <el-button class="icon-btn" :icon="Rank" @click="moveSelected" />
         </el-tooltip>
@@ -224,7 +232,7 @@
       </aside>
 
       <!-- 主内容 -->
-      <div class="panel glass">
+      <div class="panel glass" @contextmenu="onBlankCtx">
         <!-- 全局搜索结果 -->
         <div v-if="searchMode">
           <div class="search-head">
@@ -265,10 +273,12 @@
 
         <el-table
           v-else-if="viewMode === 'list'"
+          ref="tableRef"
           v-loading="loading"
           :data="displayEntries"
           class="table"
           @selection-change="(rows: Entry[]) => (selected = rows)"
+          @row-contextmenu="onRowCtx"
         >
           <el-table-column type="selection" width="42" />
           <el-table-column label="名称" min-width="320" sortable :sort-by="(r: Entry) => (r.is_dir ? '0' : '1') + r.name">
@@ -289,6 +299,11 @@
                     <div class="thumb-fallback"><el-icon color="#10b981"><Picture /></el-icon></div>
                   </template>
                 </el-image>
+                <VideoThumb
+                  v-else-if="isVideo(row.name)"
+                  class="thumb"
+                  :src="fileUrl(row)"
+                />
                 <el-icon v-else class="fico" :color="iconOf(row.name).color">
                   <component :is="iconOf(row.name).icon" />
                 </el-icon>
@@ -339,8 +354,12 @@
             <div
               v-else
               class="tile"
-              :class="{ sel: isSelected(cell), img: !cell.is_dir && isImage(cell.name) }"
+              :class="{
+                sel: isSelected(cell),
+                img: !cell.is_dir && (isImage(cell.name) || isVideo(cell.name)),
+              }"
               @click="openEntry(cell)"
+              @contextmenu.prevent.stop="openCtxMenu($event, cell)"
             >
               <span class="tile-check" @click.stop="toggleSelect(cell)">
                 <el-checkbox :model-value="isSelected(cell)" />
@@ -374,6 +393,10 @@
                     <div class="thumb-fallback"><el-icon color="#10b981"><Picture /></el-icon></div>
                   </template>
                 </el-image>
+                <VideoThumb
+                  v-else-if="!cell.is_dir && isVideo(cell.name)"
+                  :src="fileUrl(cell)"
+                />
                 <el-icon v-else-if="cell.is_dir" color="#f6a821"><Folder /></el-icon>
                 <el-icon v-else :color="iconOf(cell.name).color">
                   <component :is="iconOf(cell.name).icon" />
@@ -416,15 +439,33 @@
     <ShareDialog ref="shareDlg" />
     <ShareManager ref="shareMgr" />
     <TrashPanel ref="trashPanel" @changed="onTrashChanged" />
+
+    <!-- 自定义右键菜单 -->
+    <teleport to="body">
+      <div
+        v-if="ctx.show"
+        class="ctx-menu"
+        :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }"
+        @click.stop
+        @contextmenu.prevent
+      >
+        <template v-for="(it, i) in ctxItems" :key="i">
+          <div v-if="it.divided" class="ctx-sep" />
+          <div class="ctx-item" :class="{ danger: it.danger }" @click="runCtx(it)">
+            {{ it.label }}
+          </div>
+        </template>
+      </div>
+    </teleport>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox, ElTree } from 'element-plus'
+import { ElMessage, ElMessageBox, ElTable, ElTree } from 'element-plus'
 import {
-  ArrowDown, Box, Calendar, Delete, DeleteFilled, Document, Film, Folder, FolderAdd,
+  ArrowDown, Box, Calendar, Delete, DeleteFilled, Document, Film, Finished, Folder, FolderAdd,
   FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position, Promotion, Rank,
   Refresh, Search, Setting, Share, Sort, Sunny, SwitchButton, Tickets, TrendCharts, Upload,
 } from '@element-plus/icons-vue'
@@ -432,6 +473,7 @@ import { api, errMsg, fmtSize, fmtTime, type Entry, type SearchHit, type ServerI
 import { isDark, toggleDark } from '../theme'
 import UploadDrawer, { type UploadFile } from '../components/UploadDrawer.vue'
 import PreviewDialog from '../components/PreviewDialog.vue'
+import VideoThumb from '../components/VideoThumb.vue'
 import DirPicker from '../components/DirPicker.vue'
 import ShareDialog from '../components/ShareDialog.vue'
 import ShareManager from '../components/ShareManager.vue'
@@ -451,13 +493,19 @@ const dirPicker = ref<InstanceType<typeof DirPicker>>()
 const shareDlg = ref<InstanceType<typeof ShareDialog>>()
 const shareMgr = ref<InstanceType<typeof ShareManager>>()
 const trashPanel = ref<InstanceType<typeof TrashPanel>>()
+const tableRef = ref<InstanceType<typeof ElTable>>()
 
 const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico']
+/** 浏览器 <video> 大概率能解码的容器(mkv 在 Chrome/Edge 可播 H.264/VP9 轨) */
+const VIDEO_EXT = ['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv']
 function extOf(name: string) {
   return name.split('.').pop()?.toLowerCase() ?? ''
 }
 function isImage(name: string) {
   return IMG_EXT.includes(extOf(name))
+}
+function isVideo(name: string) {
+  return VIDEO_EXT.includes(extOf(name))
 }
 
 /** 按扩展名给非图片文件配图标与颜色 */
@@ -608,6 +656,135 @@ function onTileCmd(cmd: string, row: Entry) {
   else onRowCmd(cmd, row)
 }
 
+// ---- 全选(工具栏按钮 / Ctrl+A):时间线只有文件,其余模式含文件夹 ----
+function selectableEntries(): Entry[] {
+  return viewMode.value === 'timeline'
+    ? filtered.value.filter((e) => !e.is_dir)
+    : displayEntries.value
+}
+const allSelected = computed(() => {
+  const all = selectableEntries()
+  return all.length > 0 && selected.value.length >= all.length
+})
+function setAllSelected(on: boolean) {
+  if (viewMode.value === 'list') {
+    // 列表模式经表格 API 走,保证复选框状态同步(selection-change 会回写 selected)
+    tableRef.value?.clearSelection()
+    if (on) selectableEntries().forEach((r) => tableRef.value?.toggleRowSelection(r, true))
+  } else {
+    selected.value = on ? selectableEntries() : []
+  }
+}
+function toggleSelectAll() {
+  setAllSelected(!allSelected.value)
+}
+
+// ---- 右键菜单 ----
+interface CtxItem {
+  label: string
+  action: () => void
+  danger?: boolean
+  /** 在该项上方画分隔线 */
+  divided?: boolean
+}
+const ctx = ref<{ show: boolean; x: number; y: number; row: Entry | null }>({
+  show: false,
+  x: 0,
+  y: 0,
+  row: null,
+})
+
+function openCtxMenu(ev: MouseEvent, row: Entry | null) {
+  ctx.value = {
+    show: true,
+    // 贴边时向内收,避免菜单溢出视口
+    x: Math.min(ev.clientX, window.innerWidth - 200),
+    y: Math.min(ev.clientY, window.innerHeight - 340),
+    row,
+  }
+}
+function onRowCtx(row: Entry, _col: unknown, ev: Event) {
+  ev.preventDefault()
+  ev.stopPropagation()
+  openCtxMenu(ev as MouseEvent, row)
+}
+function onBlankCtx(ev: MouseEvent) {
+  if (searchMode.value) return // 搜索结果里用浏览器原生菜单
+  ev.preventDefault()
+  openCtxMenu(ev, null)
+}
+function closeCtx() {
+  ctx.value.show = false
+}
+
+const ctxItems = computed<CtxItem[]>(() => {
+  const row = ctx.value.row
+  if (!row) {
+    return [
+      { label: '上传文件', action: () => fileInput.value?.click() },
+      { label: '上传文件夹', action: () => dirInput.value?.click() },
+      { label: '新建文件夹', action: mkdir },
+      { label: '刷新', action: refresh },
+      { label: allSelected.value ? '取消全选' : '全选', action: toggleSelectAll, divided: true },
+    ]
+  }
+  const items: CtxItem[] = []
+  // 右键落在多选集合里 → 先给批量操作
+  if (selected.value.length > 1 && isSelected(row)) {
+    items.push({ label: `移动所选 ${selected.value.length} 项到 ...`, action: moveSelected })
+    items.push({
+      label: `删除所选 ${selected.value.length} 项`,
+      action: removeSelected,
+      danger: true,
+    })
+  }
+  items.push({
+    label: row.is_dir ? '打开' : '打开 / 预览',
+    action: () => openEntry(row),
+    divided: items.length > 0,
+  })
+  if (!row.is_dir) items.push({ label: '下载', action: () => download(row) })
+  items.push({ label: '分享', action: () => onRowCmd('share', row) })
+  items.push({ label: '重命名', action: () => rename(row) })
+  items.push({ label: '移动到 ...', action: () => onRowCmd('move', row) })
+  items.push({ label: '复制到 ...', action: () => onRowCmd('copy', row) })
+  items.push({
+    label: '删除(进回收站)',
+    action: () => onRowCmd('delete', row),
+    danger: true,
+    divided: true,
+  })
+  return items
+})
+
+function runCtx(it: CtxItem) {
+  closeCtx()
+  it.action()
+}
+
+function onGlobalKey(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    closeCtx()
+    return
+  }
+  const tag = (e.target as HTMLElement)?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+    e.preventDefault()
+    setAllSelected(true)
+  }
+}
+onMounted(() => {
+  document.addEventListener('click', closeCtx)
+  document.addEventListener('keydown', onGlobalKey)
+  window.addEventListener('scroll', closeCtx, true)
+})
+onUnmounted(() => {
+  document.removeEventListener('click', closeCtx)
+  document.removeEventListener('keydown', onGlobalKey)
+  window.removeEventListener('scroll', closeCtx, true)
+})
+
 // ---- 图片浏览器:目录内所有图片可左右翻页/缩放 ----
 const viewerShow = ref(false)
 const viewerIndex = ref(0)
@@ -700,6 +877,12 @@ function openEntry(row: Entry) {
   } else if (isImage(row.name)) {
     viewerIndex.value = Math.max(0, images.value.findIndex((e) => e.name === row.name))
     viewerShow.value = true
+  } else if (isVideo(row.name)) {
+    // 播放器带上同目录其余视频,可上一个/下一个切换
+    const list = displayEntries.value
+      .filter((e) => !e.is_dir && isVideo(e.name))
+      .map((e) => joinPath(cur.value, e.name))
+    preview.value?.open(joinPath(cur.value, row.name), list)
   } else {
     preview.value?.open(joinPath(cur.value, row.name))
   }
@@ -1116,6 +1299,24 @@ async function logout() {
   justify-content: center;
   font-size: 18px;
 }
+/* 列表视图里的视频小缩略图:压缩角标与回退图标 */
+.thumb:deep(.vthumb-fallback) {
+  font-size: 18px;
+}
+.thumb:deep(.vthumb-play) {
+  font-size: 15px;
+}
+/* 网格磁贴里的视频缩略图回退图标与普通图标同尺寸 */
+.tile-media .vthumb {
+  width: 100%;
+  height: 100%;
+}
+.tile-media :deep(.vthumb-fallback) {
+  font-size: 52px;
+}
+.grid.photo .tile-media :deep(.vthumb-fallback) {
+  font-size: 76px;
+}
 
 /* 网格:K-Vault 式相框卡片 */
 .grid {
@@ -1271,5 +1472,39 @@ html.dark .tile-check {
   .hide-sm {
     display: none;
   }
+}
+
+/* 自定义右键菜单(teleport 到 body,fixed 定位) */
+.ctx-menu {
+  position: fixed;
+  z-index: 3000;
+  min-width: 168px;
+  padding: 5px;
+  border-radius: 10px;
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color-light);
+  box-shadow: var(--el-box-shadow-light);
+  user-select: none;
+}
+.ctx-item {
+  padding: 7px 14px;
+  font-size: 13px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-item:hover {
+  background: var(--el-fill-color);
+}
+.ctx-item.danger {
+  color: var(--el-color-danger);
+}
+.ctx-item.danger:hover {
+  background: var(--el-color-danger-light-9);
+}
+.ctx-sep {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--el-border-color-lighter);
 }
 </style>
