@@ -135,7 +135,10 @@ fn parse_mvhd(p: &[u8]) -> Option<u32> {
     u32::try_from(duration / timescale).ok()
 }
 
-/// tkhd:宽高为 16.16 定点;手机竖拍视频宽高是编码尺寸,旋转在变换矩阵里 → 按矩阵交换
+/// tkhd:宽高为 16.16 定点;手机竖拍视频宽高是编码尺寸,旋转在变换矩阵里 → 按矩阵交换。
+/// 交换仅限「横 → 竖」:相机传感器输出总是横向,横尺寸 + 90° 矩阵才是真实直拍;
+/// 竖尺寸 + 90° 矩阵是转码工具把像素转正后残留的垃圾矩阵(旋转后反而变横屏,
+/// 不存在这样的正常内容),交换会把竖屏视频报成横屏气泡
 fn parse_tkhd(p: &[u8]) -> Option<(u32, u32)> {
     let matrix_off = match p.first()? {
         0 => 4 + 20 + 16,
@@ -153,7 +156,7 @@ fn parse_tkhd(p: &[u8]) -> Option<(u32, u32)> {
     if w == 0 || h == 0 {
         return None; // 音频轨等宽高为 0,跳过
     }
-    Some(if a == 0 && d == 0 { (h, w) } else { (w, h) })
+    Some(if a == 0 && d == 0 && w > h { (h, w) } else { (w, h) })
 }
 
 /// 测试用的最小 mp4 合成工具(probe 单测与上传管线集成测试共用)
@@ -220,6 +223,15 @@ mod tests {
         let f = mp4_file(1920, 1080, true);
         let m = probe_video("video/quicktime", &mut Cursor::new(f)).unwrap();
         assert_eq!((m.width, m.height), (1080, 1920));
+    }
+
+    #[test]
+    fn mp4_stale_rotation_on_portrait_encoding_is_ignored() {
+        // 像素已被转码成竖屏(2160x3840)、tkhd 残留 90° 矩阵的野生文件:
+        // 按矩阵交换会报成横屏,必须按原尺寸发
+        let f = mp4_file(2160, 3840, true);
+        let m = probe_video("video/mp4", &mut Cursor::new(f)).unwrap();
+        assert_eq!((m.width, m.height), (2160, 3840));
     }
 
     #[test]
