@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/fs/list", get(list))
         .route("/fs/mkdir", post(mkdir))
         .route("/fs/upload", post(upload))
+        .route("/fs/exists", post(exists))
         .route("/fs/download", get(download))
         .route("/fs/rename", post(rename))
         .route("/fs/copy", post(copy_entry))
@@ -162,6 +163,36 @@ fn clean_filename(raw: &str) -> AppResult<String> {
         [one] => Ok(one.clone()),
         _ => Err(AppError::InvalidPath(format!("非法文件名: {raw}"))),
     }
+}
+
+#[derive(Deserialize)]
+struct ExistsBody {
+    dir: String,
+    names: Vec<String>,
+}
+
+/// 上传前批量查重:返回目录下已存在的名字,前端据此询问覆盖还是跳过。
+/// 跳过的文件由前端直接不发请求,大文件零流量
+async fn exists(
+    State(state): State<AppState>,
+    Json(b): Json<ExistsBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    // 目录还不存在(如文件夹上传将要新建的子目录)自然没有重名
+    let Ok(dir) = state.vfs.resolve(&b.dir).await else {
+        return Ok(Json(serde_json::json!({ "existing": [] })));
+    };
+    if !dir.is_dir {
+        return Err(AppError::NotDirectory);
+    }
+    let mut existing = Vec::new();
+    for raw in &b.names {
+        // 名字不合法的留给上传时报错,查重阶段跳过
+        let Ok(name) = clean_filename(raw) else { continue };
+        if state.vfs.db.child(dir.id, &name).await?.is_some() {
+            existing.push(raw.clone());
+        }
+    }
+    Ok(Json(serde_json::json!({ "existing": existing })))
 }
 
 async fn upload(

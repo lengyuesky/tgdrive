@@ -212,6 +212,9 @@ export const api = {
   },
   downloadUrl: (path: string, inline = false) =>
     `/api/fs/download?path=${encodeURIComponent(path)}${inline ? '&inline=1' : ''}`,
+  /** 上传前批量查重:返回目录下已存在的名字 */
+  exists: (dir: string, names: string[]) =>
+    http.post<{ existing: string[] }>('/fs/exists', { dir, names }),
 
   search: (q: string) => http.get<{ results: SearchHit[] }>('/fs/search', { params: { q } }),
   /** 秒传探测:库里有同内容文件则零流量落位 */

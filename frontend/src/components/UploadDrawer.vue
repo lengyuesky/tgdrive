@@ -17,9 +17,11 @@
     <div v-for="it in items" :key="it.id" class="upload-item">
       <div class="upload-name" :title="displayName(it)">
         <el-tag v-if="it.status === 'instant'" size="small" type="success" class="badge">秒传</el-tag>
+        <el-tag v-else-if="it.status === 'skipped'" size="small" type="info" class="badge">跳过</el-tag>
         {{ displayName(it) }}
       </div>
       <el-progress
+        v-if="it.status !== 'skipped'"
         :percentage="it.pct"
         :status="it.status === 'error' ? 'exception' : isDone(it) ? 'success' : undefined"
       />
@@ -27,6 +29,7 @@
         <span v-if="it.status === 'hashing'" class="state">校验中(秒传检测)…</span>
         <span v-else-if="it.status === 'waiting'" class="state">排队中</span>
         <span v-else-if="it.status === 'uploading'" class="state">上传中</span>
+        <span v-else-if="it.status === 'skipped'" class="state">已跳过(目录里有同名文件)</span>
         <span v-if="it.error" class="upload-err">{{ it.error }}</span>
         <div class="spacer" />
         <el-button v-if="it.status === 'error'" text size="small" type="primary" @click="retry(it)">
@@ -38,6 +41,25 @@
       </div>
     </div>
   </el-drawer>
+
+  <!-- 上传前发现同名文件时的三选一;X/ESC 关闭视为取消 -->
+  <el-dialog
+    v-model="conflictVisible"
+    title="同名文件已存在"
+    width="440px"
+    append-to-body
+    @close="onConflictClose"
+  >
+    <p class="conflict-hint">目标目录已有 {{ conflictNames.length }} 个同名文件,覆盖会替换原文件:</p>
+    <ul class="conflict-list">
+      <li v-for="n in conflictNames" :key="n" :title="n">{{ n }}</li>
+    </ul>
+    <template #footer>
+      <el-button @click="resolveConflict('cancel')">取消上传</el-button>
+      <el-button @click="resolveConflict('skip')">跳过这些</el-button>
+      <el-button type="primary" @click="resolveConflict('overwrite')">全部覆盖</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script lang="ts">
@@ -59,7 +81,7 @@ interface Item {
   rel: string
   file: File
   pct: number
-  status: 'hashing' | 'waiting' | 'uploading' | 'instant' | 'done' | 'error'
+  status: 'hashing' | 'waiting' | 'uploading' | 'instant' | 'done' | 'skipped' | 'error'
   error?: string
 }
 
@@ -71,7 +93,7 @@ const totalCount = computed(() => items.value.length)
 const doneCount = computed(() => items.value.filter(isDone).length)
 const finishedExists = computed(() => items.value.some((i) => isDone(i) || i.status === 'error'))
 function isDone(it: Item) {
-  return it.status === 'done' || it.status === 'instant'
+  return it.status === 'done' || it.status === 'instant' || it.status === 'skipped'
 }
 function displayName(it: Item) {
   return it.rel ? `${it.rel}/${it.file.name}` : it.file.name
@@ -87,16 +109,78 @@ function joinPath(dir: string, name: string) {
   return dir === '/' ? `/${name}` : `${dir}/${name}`
 }
 
-/** 入队一批文件并打开抽屉,逐个串行处理(后端再按分块并发) */
-function enqueue(dir: string, files: UploadFile[]) {
+// ---------- 重名冲突询问 ----------
+
+type ConflictAction = 'overwrite' | 'skip' | 'cancel'
+const conflictVisible = ref(false)
+const conflictNames = ref<string[]>([])
+let conflictResolve: ((a: ConflictAction) => void) | null = null
+
+function askConflict(names: string[]): Promise<ConflictAction> {
+  conflictNames.value = names
+  conflictVisible.value = true
+  return new Promise((res) => (conflictResolve = res))
+}
+
+function resolveConflict(a: ConflictAction) {
+  const r = conflictResolve
+  conflictResolve = null
+  conflictVisible.value = false
+  r?.(a)
+}
+
+/** 点 X / 按 ESC 关闭对话框视为取消上传 */
+function onConflictClose() {
+  if (conflictResolve) resolveConflict('cancel')
+}
+
+/** 入队一批文件并打开抽屉,逐个串行处理(后端再按分块并发)。
+ *  入队前按目标目录批量查重,有同名文件时让用户选覆盖/跳过/取消 */
+async function enqueue(dir: string, files: UploadFile[]) {
+  const relOf = (f: UploadFile) => (f.rel ?? '').replace(/^\/+|\/+$/g, '')
+  // 按目标目录分组查一次重;查重失败不阻塞上传(与秒传探测同样宽容)
+  const groups = new Map<string, UploadFile[]>()
+  for (const f of files) {
+    const rel = relOf(f)
+    const target = rel ? joinPath(dir, rel) : dir
+    const g = groups.get(target)
+    if (g) g.push(f)
+    else groups.set(target, [f])
+  }
+  const dupes = new Set<UploadFile>()
+  for (const [target, fs] of groups) {
+    try {
+      const r = await api.exists(target, fs.map((f) => f.file.name))
+      const hit = new Set(r.data.existing)
+      for (const f of fs) if (hit.has(f.file.name)) dupes.add(f)
+    } catch {
+      // 查重接口不可用就当没有重名,行为退回旧版(直接覆盖)
+    }
+  }
+
+  let action: ConflictAction = 'overwrite'
+  if (dupes.size > 0) {
+    const names = files
+      .filter((f) => dupes.has(f))
+      .map((f) => (relOf(f) ? `${relOf(f)}/${f.file.name}` : f.file.name))
+    action = await askConflict(names)
+    if (action === 'cancel') return
+  }
+
   for (const f of files) {
     const item: Item = {
       id: ++seq,
       dir,
-      rel: (f.rel ?? '').replace(/^\/+|\/+$/g, ''),
+      rel: relOf(f),
       file: f.file,
       pct: 0,
       status: 'waiting',
+    }
+    if (action === 'skip' && dupes.has(f)) {
+      item.status = 'skipped'
+      item.pct = 100
+      items.value.unshift(item)
+      continue // 不进处理队列,不发任何请求
     }
     items.value.unshift(item)
     queue.push(item)
@@ -236,5 +320,22 @@ defineExpose({ enqueue })
 .upload-err {
   color: #f56c6c;
   font-size: 12px;
+}
+.conflict-hint {
+  margin: 0 0 8px;
+  color: var(--text-soft);
+  font-size: 13px;
+}
+.conflict-list {
+  max-height: 200px;
+  overflow: auto;
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+}
+.conflict-list li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
