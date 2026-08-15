@@ -62,6 +62,14 @@ export interface ShareMeta {
   max_downloads: number | null
 }
 
+export interface InboxRouteRule {
+  /** 后台显示的类型名称。 */
+  name: string
+  /** 不带点的文件后缀；支持 tar.gz 这类多段后缀。 */
+  extensions: string[]
+  dir: string
+}
+
 /** 维护类可调项(后台「维护」「Bot 收件」区块) */
 export interface Extras {
   trash_retention_days: number
@@ -69,6 +77,10 @@ export interface Extras {
   inbox_enabled: boolean
   inbox_allowed_chats: string
   inbox_dir: string
+  inbox_video_dir: string
+  inbox_image_dir: string
+  inbox_book_dir: string
+  inbox_rules: InboxRouteRule[]
 }
 
 /** 可在后台修改的配置项键名 */

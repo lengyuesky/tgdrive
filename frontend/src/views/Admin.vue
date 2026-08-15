@@ -16,7 +16,9 @@ import {
   type ConfigPatch,
   type DetectedChat,
   type Extras,
+  type InboxRouteRule,
 } from '../api'
+import DirPicker from '../components/DirPicker.vue'
 
 const router = useRouter()
 const cfg = ref<AdminConfig>()
@@ -353,11 +355,88 @@ const backupLastTs = ref<number | null>(null)
 const trashCount = ref(0)
 const extrasSaving = ref(false)
 const backingUp = ref(false)
+const inboxDirPicker = ref<InstanceType<typeof DirPicker>>()
+const inboxRuleExtensionDrafts = ref<string[]>([])
+
+type InboxDirKey = 'inbox_dir' | 'inbox_video_dir' | 'inbox_image_dir' | 'inbox_book_dir'
+const INBOX_DIR_LABEL: Record<InboxDirKey, string> = {
+  inbox_dir: '默认收件目录',
+  inbox_video_dir: '视频目录',
+  inbox_image_dir: '图片目录',
+  inbox_book_dir: '书籍目录',
+}
+
+async function chooseInboxDir(key: InboxDirKey) {
+  if (!extras.value) return
+  const picked = await inboxDirPicker.value?.open(
+    `选择${INBOX_DIR_LABEL[key]}`,
+    extras.value[key],
+  )
+  if (!picked) return
+  if (picked === '/') {
+    ElMessage.warning('收件目录不能是根目录，请选择或新建一个文件夹')
+    return
+  }
+  extras.value[key] = picked
+}
+
+async function chooseRuleDir(rule: InboxRouteRule) {
+  const picked = await inboxDirPicker.value?.open(
+    `选择「${rule.name.trim() || '自定义类型'}」的目录`,
+    rule.dir || extras.value?.inbox_dir || '/收件箱',
+  )
+  if (!picked) return
+  if (picked === '/') {
+    ElMessage.warning('收件目录不能是根目录，请选择或新建一个文件夹')
+    return
+  }
+  rule.dir = picked
+}
+
+function addInboxRule() {
+  if (!extras.value) return
+  extras.value.inbox_rules.push({
+    name: '',
+    extensions: [],
+    dir: extras.value.inbox_dir,
+  })
+  inboxRuleExtensionDrafts.value.push('')
+}
+
+function removeInboxRule(index: number) {
+  extras.value?.inbox_rules.splice(index, 1)
+  inboxRuleExtensionDrafts.value.splice(index, 1)
+}
+
+function addRuleExtensions(rule: InboxRouteRule, index: number) {
+  const draft = inboxRuleExtensionDrafts.value[index] ?? ''
+  const parts = draft
+    .split(/[,;\s]+/)
+    .map((value) => value.trim().replace(/^\.+/, '').toLowerCase())
+    .filter(Boolean)
+  if (!parts.length) return
+
+  const seen = new Set(rule.extensions.map((value) => value.replace(/^\.+/, '').toLowerCase()))
+  let added = 0
+  for (const extension of parts) {
+    if (seen.has(extension)) continue
+    rule.extensions.push(extension)
+    seen.add(extension)
+    added++
+  }
+  inboxRuleExtensionDrafts.value[index] = ''
+  if (!added) ElMessage.info('这些文件后缀已经添加过了')
+}
+
+function removeRuleExtension(rule: InboxRouteRule, extensionIndex: number) {
+  rule.extensions.splice(extensionIndex, 1)
+}
 
 async function loadExtras() {
   try {
     const { data } = await api.admin.extras()
     extras.value = data.extras
+    inboxRuleExtensionDrafts.value = data.extras.inbox_rules.map(() => '')
     backupLastTs.value = data.backup_last_ts
     trashCount.value = data.trash_count
   } catch (e) {
@@ -368,6 +447,8 @@ onMounted(loadExtras)
 
 async function saveExtras() {
   if (!extras.value) return
+  // 用户直接点保存时，也要收下输入框里尚未按回车的后缀，避免静默丢失。
+  extras.value.inbox_rules.forEach((rule, index) => addRuleExtensions(rule, index))
   extrasSaving.value = true
   try {
     await api.admin.saveExtras(extras.value)
@@ -707,18 +788,40 @@ function downloadBackup() {
     <el-card v-if="extras" shadow="never" class="card">
       <template #header><b>Bot 收件</b></template>
       <el-alert type="info" :closable="false" show-icon class="alert">
-        <div>开启后:<b>直接往存储频道发文件</b>会自动登记进网盘(零流量);白名单用户<b>私聊发文件给 bot</b> 会自动转存到频道并入库。</div>
+        <div>开启后:<b>直接往存储频道发媒体</b>会自动登记进网盘(零流量);白名单用户私聊发送<b>文件、视频、图片或音频</b>也会按原类型零流量转存。</div>
         <div>官方 Bot API 下载单文件上限 20MB:更大的文件也会入库,但需要自建端点才能下载。</div>
       </el-alert>
       <el-form label-width="110px" label-position="left">
         <el-form-item label="启用收件">
           <el-switch v-model="extras.inbox_enabled" />
         </el-form-item>
-        <el-form-item label="收件目录">
+        <el-form-item label="默认目录">
           <div class="row">
-            <el-input v-model="extras.inbox_dir" placeholder="/收件箱" style="max-width: 240px" />
-            <span class="tip">收到的文件放进这个目录(自动创建)</span>
+            <el-input v-model="extras.inbox_dir" placeholder="/收件箱" style="max-width: 360px" />
+            <el-button @click="chooseInboxDir('inbox_dir')">选择目录</el-button>
           </div>
+          <div class="tip">没有命中任何类型规则的文件放在这里，目录不存在时自动创建。</div>
+        </el-form-item>
+        <el-form-item label="视频目录">
+          <div class="row">
+            <el-input v-model="extras.inbox_video_dir" style="max-width: 360px" />
+            <el-button @click="chooseInboxDir('inbox_video_dir')">选择目录</el-button>
+          </div>
+          <div class="tip">mp4、mkv、mov、avi、webm、flv、wmv、ts、m2ts、mpeg、3gp 等。</div>
+        </el-form-item>
+        <el-form-item label="图片目录">
+          <div class="row">
+            <el-input v-model="extras.inbox_image_dir" style="max-width: 360px" />
+            <el-button @click="chooseInboxDir('inbox_image_dir')">选择目录</el-button>
+          </div>
+          <div class="tip">jpg、png、gif、webp、bmp、avif、heic、tiff、svg 等。</div>
+        </el-form-item>
+        <el-form-item label="书籍目录">
+          <div class="row">
+            <el-input v-model="extras.inbox_book_dir" style="max-width: 360px" />
+            <el-button @click="chooseInboxDir('inbox_book_dir')">选择目录</el-button>
+          </div>
+          <div class="tip">pdf、epub、mobi、azw3、fb2、djvu、cbz、cbr、txt、rtf 等。</div>
         </el-form-item>
         <el-form-item label="私聊白名单">
           <div class="row">
@@ -733,7 +836,67 @@ function downloadBackup() {
           </div>
         </el-form-item>
       </el-form>
-      <el-button type="primary" :loading="extrasSaving" @click="saveExtras">保存收件设置</el-button>
+
+      <el-divider content-position="left">自定义类型路由</el-divider>
+      <el-alert type="info" :closable="false" class="route-help">
+        自定义规则优先于上面的内置类型；按文件名后缀匹配，忽略大小写，并支持
+        <code>tar.gz</code> 这类多段后缀，重叠时更长的后缀优先。同一个后缀不能出现在两条自定义规则中。
+      </el-alert>
+      <div v-if="extras.inbox_rules.length" class="route-list">
+        <div v-for="(rule, index) in extras.inbox_rules" :key="index" class="route-card">
+          <div class="route-head">
+            <b>规则 {{ index + 1 }}{{ rule.name.trim() ? ` · ${rule.name.trim()}` : '' }}</b>
+            <el-button type="danger" link @click="removeInboxRule(index)">删除</el-button>
+          </div>
+          <div class="route-grid">
+            <label class="route-field">
+              <span>类型名称</span>
+              <el-input
+                v-model="rule.name"
+                maxlength="40"
+                placeholder="例如：音乐、压缩包、项目源码"
+              />
+            </label>
+            <label class="route-field route-extensions">
+              <span>文件后缀</span>
+              <div class="extension-editor">
+                <div v-if="rule.extensions.length" class="extension-tags">
+                  <el-tag
+                    v-for="(extension, extensionIndex) in rule.extensions"
+                    :key="`${extension}-${extensionIndex}`"
+                    closable
+                    @close="removeRuleExtension(rule, extensionIndex)"
+                  >
+                    {{ extension.startsWith('.') ? extension : `.${extension}` }}
+                  </el-tag>
+                </div>
+                <div class="row">
+                  <el-input
+                    v-model="inboxRuleExtensionDrafts[index]"
+                    class="route-extension-input"
+                    placeholder="输入 mp3、flac 或 tar.gz"
+                    @keydown.enter.prevent="addRuleExtensions(rule, index)"
+                  />
+                  <el-button @click="addRuleExtensions(rule, index)">添加</el-button>
+                </div>
+                <span class="tip">可用逗号、分号或空格一次添加多个后缀。</span>
+              </div>
+            </label>
+            <label class="route-field route-target">
+              <span>存储目录</span>
+              <div class="row">
+                <el-input v-model="rule.dir" placeholder="/收件箱/自定义" />
+                <el-button @click="chooseRuleDir(rule)">选择目录</el-button>
+              </div>
+            </label>
+          </div>
+        </div>
+      </div>
+      <el-empty v-else description="还没有自定义类型，未匹配文件会使用内置类型或默认目录" :image-size="56" />
+      <div class="row route-actions">
+        <el-button plain @click="addInboxRule">添加自定义类型</el-button>
+        <el-button type="primary" :loading="extrasSaving" @click="saveExtras">保存收件设置</el-button>
+      </div>
     </el-card>
 
     <el-card shadow="never" class="card">
@@ -778,6 +941,8 @@ function downloadBackup() {
       <el-button :disabled="!dirty" @click="load">放弃改动</el-button>
       <span class="tip">保存后立即生效,不需要重启容器。</span>
     </div>
+
+    <DirPicker ref="inboxDirPicker" />
 
     <el-dialog v-model="detectDialog" title="检测频道 / 用户 ID" width="680px">
       <el-alert type="info" :closable="false" show-icon class="alert">
@@ -893,6 +1058,59 @@ function downloadBackup() {
 .alert {
   margin-bottom: 12px;
 }
+.route-help {
+  margin-bottom: 10px;
+}
+.route-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.route-card {
+  padding: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: var(--tile-bg);
+}
+.route-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.route-grid {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(260px, 1.3fr);
+  gap: 10px;
+}
+.route-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+.route-field .el-input {
+  width: 100%;
+  max-width: none;
+}
+.extension-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.extension-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.route-target {
+  grid-column: 1 / -1;
+}
+.route-actions {
+  margin-top: 12px;
+}
 .actions {
   position: sticky;
   bottom: 12px;
@@ -901,5 +1119,13 @@ function downloadBackup() {
   gap: 8px;
   padding: 12px 16px;
   border-radius: 16px;
+}
+@media (max-width: 700px) {
+  .route-grid {
+    grid-template-columns: 1fr;
+  }
+  .route-target {
+    grid-column: auto;
+  }
 }
 </style>
