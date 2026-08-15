@@ -1,8 +1,10 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import Login from './views/Login.vue'
-import Files from './views/Files.vue'
-import Admin from './views/Admin.vue'
-import Share from './views/Share.vue'
+
+// 页面按路由拆包；公开分享页、后台与主文件页不再挤进同一个首屏脚本。
+const Login = () => import('./views/Login.vue')
+const Files = () => import('./views/Files.vue')
+const Admin = () => import('./views/Admin.vue')
+const Share = () => import('./views/Share.vue')
 
 export const router = createRouter({
   history: createWebHistory(),

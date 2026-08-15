@@ -118,7 +118,11 @@ fn parse_moov(moov: &[u8]) -> Option<VideoMeta> {
         _ => {}
     });
     let (width, height) = dims?;
-    Some(VideoMeta { width, height, duration_secs })
+    Some(VideoMeta {
+        width,
+        height,
+        duration_secs,
+    })
 }
 
 /// mvhd:timescale + duration → 秒
@@ -156,7 +160,11 @@ fn parse_tkhd(p: &[u8]) -> Option<(u32, u32)> {
     if w == 0 || h == 0 {
         return None; // 音频轨等宽高为 0,跳过
     }
-    Some(if a == 0 && d == 0 && w > h { (h, w) } else { (w, h) })
+    Some(if a == 0 && d == 0 && w > h {
+        (h, w)
+    } else {
+        (w, h)
+    })
 }
 
 /// 测试用的最小 mp4 合成工具(probe 单测与上传管线集成测试共用)
@@ -198,8 +206,10 @@ pub mod testutil {
     pub fn mp4_file(w: u32, h: u32, rotated: bool) -> Vec<u8> {
         let audio_trak = bx(b"trak", &tkhd(0, 0, false)); // 音频轨宽高为 0,应被跳过
         let video_trak = bx(b"trak", &tkhd(w, h, rotated));
-        let moov =
-            bx(b"moov", &[mvhd(1000, 60_000), audio_trak, video_trak].concat());
+        let moov = bx(
+            b"moov",
+            &[mvhd(1000, 60_000), audio_trak, video_trak].concat(),
+        );
         [bx(b"ftyp", b"isom0000"), bx(b"mdat", &[0u8; 500]), moov].concat()
     }
 }

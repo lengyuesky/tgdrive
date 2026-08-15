@@ -140,7 +140,9 @@ fn split_extensions(values: &[String]) -> AppResult<Vec<String>> {
         }
     }
     if normalized.is_empty() {
-        return Err(AppError::BadRequest("自定义类型至少需要一个文件后缀".into()));
+        return Err(AppError::BadRequest(
+            "自定义类型至少需要一个文件后缀".into(),
+        ));
     }
     if normalized.len() > MAX_RULE_EXTENSIONS {
         return Err(AppError::BadRequest(format!(
@@ -152,7 +154,9 @@ fn split_extensions(values: &[String]) -> AppResult<Vec<String>> {
 
 fn normalize_rules(rules: &[InboxRouteRule]) -> AppResult<Vec<InboxRouteRule>> {
     if rules.len() > MAX_INBOX_RULES {
-        return Err(AppError::BadRequest(format!("自定义类型最多 {MAX_INBOX_RULES} 条")));
+        return Err(AppError::BadRequest(format!(
+            "自定义类型最多 {MAX_INBOX_RULES} 条"
+        )));
     }
     let mut normalized = Vec::with_capacity(rules.len());
     let mut all_extensions = HashSet::new();
@@ -160,10 +164,14 @@ fn normalize_rules(rules: &[InboxRouteRule]) -> AppResult<Vec<InboxRouteRule>> {
     for rule in rules {
         let name = rule.name.trim();
         if name.is_empty() || name.chars().count() > 40 || name.chars().any(|c| c.is_control()) {
-            return Err(AppError::BadRequest("自定义类型名称需为 1~40 个字符".into()));
+            return Err(AppError::BadRequest(
+                "自定义类型名称需为 1~40 个字符".into(),
+            ));
         }
         if !all_names.insert(name.to_lowercase()) {
-            return Err(AppError::BadRequest(format!("自定义类型名称「{name}」重复")));
+            return Err(AppError::BadRequest(format!(
+                "自定义类型名称「{name}」重复"
+            )));
         }
         let extensions = split_extensions(&rule.extensions)?;
         for ext in &extensions {
@@ -184,10 +192,12 @@ fn normalize_rules(rules: &[InboxRouteRule]) -> AppResult<Vec<InboxRouteRule>> {
 
 pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     // 先完成全部校验，再写数据库，避免后面的字段无效造成部分保存。
-    if let Some(d) = p.trash_retention_days {
-        if !(0..=3650).contains(&d) {
-            return Err(AppError::BadRequest("保留天数需在 0~3650 之间(0 为永不清理)".into()));
-        }
+    if let Some(d) = p.trash_retention_days
+        && !(0..=3650).contains(&d)
+    {
+        return Err(AppError::BadRequest(
+            "保留天数需在 0~3650 之间(0 为永不清理)".into(),
+        ));
     }
     let inbox_allowed_chats = if let Some(v) = &p.inbox_allowed_chats {
         // 只允许数字(可带负号)的 chat id 列表
@@ -222,11 +232,7 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
         .as_deref()
         .map(|v| normalize_dir(v, "书籍目录"))
         .transpose()?;
-    let inbox_rules = p
-        .inbox_rules
-        .as_deref()
-        .map(normalize_rules)
-        .transpose()?;
+    let inbox_rules = p.inbox_rules.as_deref().map(normalize_rules).transpose()?;
 
     if let Some(d) = p.trash_retention_days {
         set(db, "trash_retention_days", &d.to_string()).await?;
@@ -294,7 +300,9 @@ mod tests {
     #[tokio::test]
     async fn inbox_routing_settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("extras.db").to_str().unwrap()).await.unwrap();
+        let db = Db::open(dir.path().join("extras.db").to_str().unwrap())
+            .await
+            .unwrap();
 
         // 新增分类目录没有历史配置时，应跟随原有默认收件目录派生。
         save(
@@ -340,7 +348,9 @@ mod tests {
     #[tokio::test]
     async fn invalid_rule_does_not_partially_save_other_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("atomic.db").to_str().unwrap()).await.unwrap();
+        let db = Db::open(dir.path().join("atomic.db").to_str().unwrap())
+            .await
+            .unwrap();
         save(
             &db,
             &ExtrasPatch {

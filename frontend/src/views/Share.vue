@@ -34,7 +34,7 @@
           <el-image
             v-if="isImage(meta.name)"
             class="preview"
-            :src="api.share.downloadUrl(token, '', pwd, true)"
+            :src="api.share.downloadUrl(token, '', true)"
             fit="contain"
           />
           <el-icon v-else class="big-ico" color="#64748b"><Document /></el-icon>
@@ -62,7 +62,7 @@
           <el-table :data="entries" v-loading="listing" size="small" class="dir-table">
             <el-table-column label="名称" min-width="220">
               <template #default="{ row }">
-                <span class="name-cell clickable" @click="openEntry(row)">
+                <span class="name-cell clickable" @click="openEntry(row as Entry)">
                   <el-icon v-if="row.is_dir" color="#f6a821"><Folder /></el-icon>
                   <el-icon v-else color="#64748b"><Document /></el-icon>
                   {{ row.name }}
@@ -74,7 +74,13 @@
             </el-table-column>
             <el-table-column label="" width="90" align="right">
               <template #default="{ row }">
-                <el-button v-if="!row.is_dir" text size="small" type="primary" @click="dl(row)">
+                <el-button
+                  v-if="!row.is_dir"
+                  text
+                  size="small"
+                  type="primary"
+                  @click="dl(row as Entry)"
+                >
                   下载
                 </el-button>
               </template>
@@ -111,7 +117,7 @@ const remain = computed(() =>
   meta.value?.max_downloads ? Math.max(0, meta.value.max_downloads - meta.value.downloads) : 0,
 )
 
-const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico']
+const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif', 'ico']
 function isImage(name: string) {
   return IMG_EXT.includes(name.split('.').pop()?.toLowerCase() ?? '')
 }
@@ -120,6 +126,7 @@ onMounted(async () => {
   try {
     meta.value = (await api.share.meta(token)).data
     if (!meta.value.need_password) {
+      await api.share.authorize(token)
       unlocked.value = true
       if (meta.value.is_dir) await goto('')
     }
@@ -128,11 +135,12 @@ onMounted(async () => {
   }
 })
 
-/** 目录分享用 list 请求验证提取码;文件分享无从验证,放行到下载时再校验 */
 async function unlock() {
   if (!pwd.value.trim()) return
   unlocking.value = true
   try {
+    await api.share.authorize(token, pwd.value)
+    pwd.value = ''
     if (meta.value?.is_dir) {
       await goto('')
     }
@@ -147,7 +155,7 @@ async function unlock() {
 async function goto(p: string) {
   listing.value = true
   try {
-    entries.value = (await api.share.list(token, p, pwd.value)).data.entries
+    entries.value = (await api.share.list(token, p)).data.entries
     rel.value = p
   } catch (e) {
     ElMessage.error(errMsg(e))
@@ -167,11 +175,11 @@ function openEntry(row: Entry) {
 
 function dl(row: Entry) {
   const p = rel.value ? `${rel.value}/${row.name}` : row.name
-  window.open(api.share.downloadUrl(token, p, pwd.value), '_blank')
+  window.open(api.share.downloadUrl(token, p), '_blank')
 }
 
 function downloadRoot() {
-  window.open(api.share.downloadUrl(token, '', pwd.value), '_blank')
+  window.open(api.share.downloadUrl(token), '_blank')
 }
 </script>
 

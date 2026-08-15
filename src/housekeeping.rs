@@ -1,7 +1,7 @@
 //! 定期维护任务:回收站超期清理 + 每日自动备份数据库到存储频道。
 //! 每 30 分钟检查一次;备份保留最近 7 份,更早的消息尽力删除。
 
-use crate::db::now_ts;
+use crate::db::{StoredMessage, now_ts};
 use crate::error::{AppError, AppResult};
 use crate::settings::Runtime;
 use crate::telegram::UploadBody;
@@ -13,16 +13,27 @@ const TICK: Duration = Duration::from_secs(30 * 60);
 const BACKUP_INTERVAL_SECS: i64 = 86400;
 const BACKUP_KEEP: usize = 7;
 
-pub async fn run(vfs: Vfs, rt: Arc<Runtime>) {
+pub async fn run(vfs: Vfs, rt: Arc<Runtime>, task: crate::tasks::TaskReporter) {
     loop {
-        if let Err(e) = tick(&vfs, &rt).await {
-            tracing::warn!("维护任务出错(下轮重试): {e}");
+        if task.is_cancelled() {
+            return;
         }
-        tokio::time::sleep(TICK).await;
+        task.heartbeat();
+        match tick(&vfs, &rt).await {
+            Ok(()) => task.clear_error(),
+            Err(e) => {
+                task.report_error(&e.to_string());
+                tracing::warn!("维护任务出错(下轮重试): {e}");
+            }
+        }
+        if !task.sleep(TICK).await {
+            return;
+        }
     }
 }
 
 async fn tick(vfs: &Vfs, rt: &Runtime) -> AppResult<()> {
+    vfs.uploader.process_pending_deletes();
     let ex = crate::extras::load(&vfs.db).await?;
 
     let removed_thumbnails = vfs.db.cleanup_orphan_thumbnails().await?;
@@ -58,38 +69,57 @@ async fn tick(vfs: &Vfs, rt: &Runtime) -> AppResult<()> {
 pub async fn backup_to_channel(vfs: &Vfs, rt: &Runtime) -> AppResult<String> {
     let cfg = rt.current();
     if !cfg.is_configured() {
-        return Err(AppError::BadRequest("还没配置 Telegram 存储,无法备份到频道".into()));
+        return Err(AppError::BadRequest(
+            "还没配置 Telegram 存储,无法备份到频道".into(),
+        ));
     }
+    let target_id = cfg
+        .storage_target_id
+        .ok_or_else(|| AppError::BadRequest("当前 Telegram 配置缺少存储目标".into()))?;
+    let target = vfs.tg.binding(target_id)?;
     let ts = now_ts();
-    let tmp = cfg.tmp_dir.join(format!("tgdrive-backup-{ts}.tmp.db"));
-    let tmp_str =
-        tmp.to_str().ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("tgdrive-backup-")
+        .tempdir_in(&cfg.tmp_dir)?;
+    let tmp = temp_dir.path().join("snapshot.db");
+    let tmp_str = tmp
+        .to_str()
+        .ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
     vfs.db.vacuum_into(tmp_str).await?;
-    let data = tokio::fs::read(&tmp).await?;
-    let _ = std::fs::remove_file(&tmp);
+    let file = std::fs::File::open(&tmp)?;
+    let len = file.metadata()?.len();
+    let temp_path = tempfile::TempPath::try_from_path(tmp)?;
+    let body = tempfile::NamedTempFile::from_parts(file, temp_path);
 
     let name = format!("tgdrive-backup-{}.db", fmt_compact_utc8(ts));
-    let msg = vfs
-        .tg
+    let msg = target
+        .api
         .send_document(
             &name,
             Some("tgdrive 数据库备份(含配置与文件索引,勿删最近几份)".into()),
-            &UploadBody::Memory(bytes::Bytes::from(data)),
+            &UploadBody::TempFile { file: body, len },
         )
         .await?;
 
     // 滚动保留最近 N 份
-    let mut ids: Vec<i64> = vfs
-        .db
-        .setting_get("extra.backup_msg_ids")
-        .await?
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or_default();
-    ids.push(msg.message_id);
+    let raw_history = vfs.db.setting_get("extra.backup_msg_ids").await?;
+    let mut ids: Vec<StoredMessage> = raw_history
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_else(|| {
+            if raw_history.is_some() {
+                tracing::warn!("旧版备份记录缺少频道信息，为避免误删已停止自动清理这些历史记录");
+            }
+            Vec::new()
+        });
+    ids.push(StoredMessage {
+        storage_target_id: target_id,
+        message_id: msg.message_id,
+    });
     while ids.len() > BACKUP_KEEP {
         let old = ids.remove(0);
-        if let Err(e) = vfs.tg.delete_message(old).await {
-            tracing::warn!("删除旧备份消息 {old} 失败(可手动清理): {e}");
+        if let Err(e) = vfs.db.enqueue_delete_message(old).await {
+            tracing::warn!("旧备份消息加入删除队列失败: {e}");
         }
     }
     vfs.db
@@ -98,7 +128,10 @@ pub async fn backup_to_channel(vfs: &Vfs, rt: &Runtime) -> AppResult<String> {
             &serde_json::to_string(&ids).map_err(|e| AppError::Internal(e.into()))?,
         )
         .await?;
-    vfs.db.setting_set("extra.backup_last_ts", &ts.to_string()).await?;
+    vfs.db
+        .setting_set("extra.backup_last_ts", &ts.to_string())
+        .await?;
+    vfs.uploader.process_pending_deletes();
     Ok(name)
 }
 
@@ -107,7 +140,11 @@ fn fmt_compact_utc8(ts: i64) -> String {
     let t = ts + 8 * 3600;
     let (y, m, d) = civil_from_days(t.div_euclid(86400));
     let secs = t.rem_euclid(86400);
-    format!("{y:04}{m:02}{d:02}-{:02}{:02}", secs / 3600, (secs % 3600) / 60)
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}",
+        secs / 3600,
+        (secs % 3600) / 60
+    )
 }
 
 /// 天数(自 1970-01-01) → 公历年月日;Howard Hinnant 的 civil_from_days

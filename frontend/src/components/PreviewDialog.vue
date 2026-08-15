@@ -11,6 +11,7 @@
       <img v-if="kind === 'image'" :src="url" class="preview-media" />
       <VideoPlayer
         v-else-if="kind === 'video'"
+        ref="player"
         :key="url"
         :src="url"
         @meta="onVideoMeta"
@@ -47,7 +48,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import axios from 'axios'
 import { ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
 import { api } from '../api'
@@ -62,8 +63,19 @@ const url = computed(() => api.downloadUrl(path.value, true))
 const text = ref('')
 /** 当前视频是否竖屏(9:16 等),竖屏时收窄对话框避免两侧大黑边 */
 const portrait = ref(false)
-const autoNext = ref(localStorage.getItem('tgdrive.autoNext') !== '0')
+// 连播必须由用户主动开启，避免仅打开预览后连续拉取整个目录的视频。
+const autoNext = ref(localStorage.getItem('tgdrive.autoNext') === '1')
 watch(autoNext, (v) => localStorage.setItem('tgdrive.autoNext', v ? '1' : '0'))
+const player = ref<InstanceType<typeof VideoPlayer>>()
+
+// 对话框关闭动画期间组件仍然存在，因此在 visible 变更时立即主动断流。
+watch(
+  visible,
+  (v) => {
+    if (!v) player.value?.stop()
+  },
+  { flush: 'sync' },
+)
 
 const playIndex = computed(() => playlist.value.indexOf(path.value))
 
@@ -80,7 +92,8 @@ onMounted(() => {
 onUnmounted(() => mq?.removeEventListener('change', onMq))
 
 const EXT: Record<string, string[]> = {
-  image: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico'],
+  // SVG 可携带脚本，不在网盘同源下内联；仍可作为普通文件下载。
+  image: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif', 'ico'],
   // mkv 在 Chrome/Edge 可播 H.264/VP9 轨(具体取决于浏览器解码器)
   video: ['mp4', 'webm', 'ogv', 'mov', 'm4v', 'mkv'],
   audio: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'opus'],
@@ -107,8 +120,12 @@ function onVideoMeta(w: number, h: number) {
   portrait.value = h > w
 }
 
-function onEnded() {
-  if (autoNext.value && playIndex.value < playlist.value.length - 1) step(1)
+async function onEnded() {
+  if (autoNext.value && playIndex.value < playlist.value.length - 1) {
+    step(1)
+    await nextTick()
+    await player.value?.play()
+  }
 }
 
 async function loadText() {

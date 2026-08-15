@@ -37,7 +37,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, type LoadFunction } from 'element-plus'
 import { Folder, FolderAdd } from '@element-plus/icons-vue'
 import { api, errMsg } from '../api'
 
@@ -56,11 +56,8 @@ function joinPath(dir: string, name: string) {
   return dir === '/' ? `/${name}` : `${dir}/${name}`
 }
 
-async function loadDirs(
-  node: { level: number; data: DirNode },
-  resolve: (data: DirNode[]) => void,
-) {
-  const base = node.level === 0 ? '/' : node.data.path
+const loadDirs: LoadFunction = async (node, resolve) => {
+  const base = node.level === 0 ? '/' : (node.data as DirNode).path
   try {
     const r = await api.list(base)
     resolve(

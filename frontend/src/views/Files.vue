@@ -245,7 +245,7 @@
           <el-table :data="searchHits" size="default">
             <el-table-column label="名称" min-width="240">
               <template #default="{ row }">
-                <span class="name-cell clickable" @click="openHit(row)">
+                <span class="name-cell clickable" @click="openHit(row as SearchHit)">
                   <el-icon v-if="row.is_dir" class="fico" color="#f6a821"><Folder /></el-icon>
                   <el-icon v-else class="fico" :color="iconOf(row.name).color">
                     <component :is="iconOf(row.name).icon" />
@@ -311,17 +311,37 @@
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="大小" width="120" sortable :sort-by="(r: Entry) => r.size">
+          <el-table-column
+            label="大小"
+            width="120"
+            sortable
+            :sort-method="(a: Entry, b: Entry) => a.size - b.size"
+          >
             <template #default="{ row }">{{ row.is_dir ? '—' : fmtSize(row.size) }}</template>
           </el-table-column>
-          <el-table-column label="修改时间" width="180" sortable :sort-by="(r: Entry) => r.modified_at">
+          <el-table-column
+            label="修改时间"
+            width="180"
+            sortable
+            :sort-method="(a: Entry, b: Entry) => a.modified_at - b.modified_at"
+          >
             <template #default="{ row }">{{ fmtTime(row.modified_at) }}</template>
           </el-table-column>
           <el-table-column label="操作" width="230" align="right">
             <template #default="{ row }">
-              <el-button v-if="!row.is_dir" text size="small" @click="download(row)">下载</el-button>
-              <el-button text size="small" @click="rename(row)">重命名</el-button>
-              <el-dropdown trigger="click" @command="(c: string) => onRowCmd(c, row)">
+              <el-button
+                v-if="!row.is_dir"
+                text
+                size="small"
+                @click="download(row as Entry)"
+              >
+                下载
+              </el-button>
+              <el-button text size="small" @click="rename(row as Entry)">重命名</el-button>
+              <el-dropdown
+                trigger="click"
+                @command="(c: string) => onRowCmd(c, row as Entry)"
+              >
                 <el-button text size="small">
                   更多<el-icon><ArrowDown /></el-icon>
                 </el-button>
@@ -463,7 +483,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox, ElTable, ElTree } from 'element-plus'
+import { ElMessage, ElMessageBox, ElTree, type LoadFunction, type TableInstance } from 'element-plus'
 import {
   ArrowDown, Box, Calendar, Delete, DeleteFilled, Document, Film, Finished, Folder, FolderAdd,
   FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position, Promotion, Rank,
@@ -493,9 +513,9 @@ const dirPicker = ref<InstanceType<typeof DirPicker>>()
 const shareDlg = ref<InstanceType<typeof ShareDialog>>()
 const shareMgr = ref<InstanceType<typeof ShareManager>>()
 const trashPanel = ref<InstanceType<typeof TrashPanel>>()
-const tableRef = ref<InstanceType<typeof ElTable>>()
+const tableRef = ref<TableInstance>()
 
-const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico']
+const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif', 'ico']
 /** 浏览器 <video> 大概率能解码的容器(mkv 在 Chrome/Edge 可播 H.264/VP9 轨) */
 const VIDEO_EXT = ['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv']
 function extOf(name: string) {
@@ -825,11 +845,8 @@ interface DirNode {
 }
 const treeRef = ref<InstanceType<typeof ElTree>>()
 const treeKey = ref(0)
-async function loadDirs(
-  node: { level: number; data: DirNode },
-  resolve: (data: DirNode[]) => void,
-) {
-  const base = node.level === 0 ? '/' : node.data.path
+const loadDirs: LoadFunction = async (node, resolve) => {
+  const base = node.level === 0 ? '/' : (node.data as DirNode).path
   try {
     const r = await api.list(base)
     resolve(

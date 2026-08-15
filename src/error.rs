@@ -1,8 +1,8 @@
 //! 统一错误类型:业务错误 → HTTP 状态码映射
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -22,6 +22,8 @@ pub enum AppError {
     Forbidden(String),
     #[error("请求无效: {0}")]
     BadRequest(String),
+    #[error("请求过于频繁，请在 {0} 秒后重试")]
+    RateLimited(u64),
     #[error("Telegram API 错误: {0}")]
     Telegram(String),
     #[error("Telegram API 明确拒绝: {0}")]
@@ -42,6 +44,7 @@ impl AppError {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::AlreadyExists => StatusCode::CONFLICT,
             AppError::InvalidPath(_) | AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::IsDirectory | AppError::NotDirectory => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -58,10 +61,35 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
+        let retry_after = match &self {
+            AppError::RateLimited(seconds) => Some(*seconds),
+            _ => None,
+        };
         if status.is_server_error() {
             tracing::error!(error = %self, "请求处理失败");
         }
-        (status, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
+        // 数据库、IO 与网络错误可能携带本地路径或上游 URL；详细信息只进服务端
+        // 日志，HTTP 客户端拿到稳定且不泄密的提示。
+        let public_error = if status.is_server_error() {
+            match &self {
+                AppError::Telegram(_)
+                | AppError::TelegramRejected(_)
+                | AppError::TelegramUncertain(_) => "上游存储暂时不可用".to_string(),
+                _ => "服务内部错误".to_string(),
+            }
+        } else {
+            self.to_string()
+        };
+        let mut response =
+            (status, Json(serde_json::json!({ "error": public_error }))).into_response();
+        if let Some(seconds) = retry_after
+            && let Ok(value) = seconds.to_string().parse()
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 

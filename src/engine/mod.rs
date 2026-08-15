@@ -13,7 +13,7 @@ mod tests {
     use super::upload::Uploader;
     use crate::db::{Db, ROOT_ID};
     use crate::error::{AppError, AppResult};
-    use crate::telegram::{ByteReader, TgApi, TgMessage, UploadBody, VideoMeta};
+    use crate::telegram::{ByteReader, TgApi, TgMessage, TgRegistry, UploadBody, VideoMeta};
     use bytes::Bytes;
     use std::collections::HashMap;
     use std::io::Read as _;
@@ -71,8 +71,14 @@ mod tests {
             };
             let fid = format!("f{n}");
             self.store.lock().unwrap().insert(fid.clone(), data);
-            self.sent.lock().unwrap().push((filename.to_string(), video));
-            Ok(TgMessage { message_id: 1000 + n, file_id: fid })
+            self.sent
+                .lock()
+                .unwrap()
+                .push((filename.to_string(), video));
+            Ok(TgMessage {
+                message_id: 1000 + n,
+                file_id: fid,
+            })
         }
     }
 
@@ -114,7 +120,13 @@ mod tests {
             Ok("mock".into())
         }
 
-        async fn open_chunk_stream(&self, file_id: &str, offset: u64) -> AppResult<ByteReader> {
+        async fn open_chunk_stream(
+            &self,
+            file_id: &str,
+            _message_id: i64,
+            _chunk_size: u64,
+            offset: u64,
+        ) -> AppResult<ByteReader> {
             let data = self
                 .store
                 .lock()
@@ -122,7 +134,9 @@ mod tests {
                 .get(file_id)
                 .cloned()
                 .ok_or_else(|| AppError::Telegram(format!("mock: {file_id} 不存在")))?;
-            Ok(Box::pin(std::io::Cursor::new(data.slice(offset as usize..))))
+            Ok(Box::pin(std::io::Cursor::new(
+                data.slice(offset as usize..),
+            )))
         }
     }
 
@@ -132,23 +146,35 @@ mod tests {
         fail_on_send: Option<i64>,
     ) -> (Uploader, Arc<MockTg>, Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("t.db").to_str().unwrap()).await.unwrap();
+        let db = Db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
         let tg = MockTg::new(fail_on_send);
-        let up = Uploader {
-            tg: tg.clone(),
-            db: db.clone(),
-            knobs: Arc::new(super::upload::UploadKnobs::new(
+        let target = db
+            .ensure_storage_target("http://mock", "mock-token", "-1001")
+            .await
+            .unwrap();
+        let registry = Arc::new(TgRegistry::with_client(target.id, tg.clone()));
+        let up = Uploader::new(
+            registry,
+            db.clone(),
+            Arc::new(super::upload::UploadKnobs::new(
                 chunk_size,
                 dir.path().to_path_buf(),
-                1, // 测试用串行,保证 seq 顺序确定
+                1,    // 测试用串行,保证 seq 顺序确定
                 true, // 视频消息模式默认开,便于测视频路径;普通扩展名不受影响
             )),
             mem_limit,
-        };
+        );
         (up, tg, db, dir)
     }
 
-    async fn feed_all(up: &Uploader, name: &str, data: &[u8], piece: usize) -> AppResult<crate::db::Node> {
+    async fn feed_all(
+        up: &Uploader,
+        name: &str,
+        data: &[u8],
+        piece: usize,
+    ) -> AppResult<crate::db::Node> {
         let h = up.start(ROOT_ID, name, &format!("/{name}")).await?;
         for chunk in data.chunks(piece.max(1)) {
             h.feed(Bytes::copy_from_slice(chunk)).await?;
@@ -158,22 +184,25 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_multi_chunk() {
-        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        let (up, _tg, db, _g) = fixture(4, 1024, None).await;
         let data: Vec<u8> = (0..10u8).collect();
         let node = feed_all(&up, "a.bin", &data, 3).await.unwrap();
         assert_eq!(node.size, 10);
 
         let chunks = db.chunks_of(node.id).await.unwrap();
-        assert_eq!(chunks.iter().map(|c| c.size).collect::<Vec<_>>(), vec![4, 4, 2]);
+        assert_eq!(
+            chunks.iter().map(|c| c.size).collect::<Vec<_>>(),
+            vec![4, 4, 2]
+        );
 
         // 顺序读全量
-        let mut r = ChunkedReader::new(tg.clone(), &chunks, 0);
+        let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 0);
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
 
         // seek 到跨块位置读尾部
-        let mut r = ChunkedReader::new(tg.clone(), &chunks, 0);
+        let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 0);
         r.seek(std::io::SeekFrom::Start(5)).await.unwrap();
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
@@ -186,7 +215,7 @@ mod tests {
         assert_eq!(got, &data[2..]);
 
         // 直接从偏移构造(REST Range 场景)
-        let mut r = ChunkedReader::new(tg.clone(), &chunks, 9);
+        let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 9);
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, &data[9..]);
@@ -195,14 +224,17 @@ mod tests {
     #[tokio::test]
     async fn spill_to_tempfile_roundtrip() {
         // mem_limit=8 强制走临时文件路径:chunk 20 > 8
-        let (up, tg, db, _g) = fixture(20, 8, None).await;
+        let (up, _tg, db, _g) = fixture(20, 8, None).await;
         let data: Vec<u8> = (0..50u8).collect();
         let node = feed_all(&up, "big.bin", &data, 7).await.unwrap();
         assert_eq!(node.size, 50);
         let chunks = db.chunks_of(node.id).await.unwrap();
-        assert_eq!(chunks.iter().map(|c| c.size).collect::<Vec<_>>(), vec![20, 20, 10]);
+        assert_eq!(
+            chunks.iter().map(|c| c.size).collect::<Vec<_>>(),
+            vec![20, 20, 10]
+        );
 
-        let mut r = ChunkedReader::new(tg.clone(), &chunks, 0);
+        let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 0);
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
@@ -210,12 +242,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_file() {
-        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        let (up, _tg, db, _g) = fixture(4, 1024, None).await;
         let node = feed_all(&up, "empty", &[], 1).await.unwrap();
         assert_eq!(node.size, 0);
         let chunks = db.chunks_of(node.id).await.unwrap();
         assert!(chunks.is_empty());
-        let mut r = ChunkedReader::new(tg, &chunks, 0);
+        let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 0);
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert!(got.is_empty());
@@ -232,8 +264,14 @@ mod tests {
         // 已成功上传的分块被清理;失败的分块(seq 1)从未产生消息
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let deleted = tg.deleted.lock().unwrap().clone();
-        assert!(deleted.contains(&1000), "分块 0 的消息应被清理: {deleted:?}");
-        assert!(!deleted.contains(&1001), "失败分块不应有删除记录: {deleted:?}");
+        assert!(
+            deleted.contains(&1000),
+            "分块 0 的消息应被清理: {deleted:?}"
+        );
+        assert!(
+            !deleted.contains(&1001),
+            "失败分块不应有删除记录: {deleted:?}"
+        );
     }
 
     #[tokio::test]
@@ -270,11 +308,14 @@ mod tests {
         let data: Vec<u8> = (0..10u8).collect();
         let node = feed_all(&up, "movie.mp4", &data, 3).await.unwrap();
         assert_eq!(node.size, 10);
-        assert_eq!(*tg.sent.lock().unwrap(), vec![("movie.mp4".to_string(), true)]);
+        assert_eq!(
+            *tg.sent.lock().unwrap(),
+            vec![("movie.mp4".to_string(), true)]
+        );
 
         // 读回的字节与上传一致
         let chunks = db.chunks_of(node.id).await.unwrap();
-        let mut r = ChunkedReader::new(tg.clone(), &chunks, 0);
+        let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 0);
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
@@ -285,7 +326,10 @@ mod tests {
         let (up, tg, _db, _g) = fixture(100, 1024, None).await;
         feed_all(&up, "movie.mkv", &[1, 2, 3], 3).await.unwrap();
         // mkv 即使开着视频消息模式也按文档发送
-        assert_eq!(*tg.sent.lock().unwrap(), vec![("movie.mkv".to_string(), false)]);
+        assert_eq!(
+            *tg.sent.lock().unwrap(),
+            vec![("movie.mkv".to_string(), false)]
+        );
     }
 
     #[tokio::test]
@@ -296,7 +340,10 @@ mod tests {
         // 3 个分块全部按文档发送(分块不是完整视频,发视频消息没有意义)
         let sent = tg.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 3);
-        assert!(sent.iter().all(|(_, video)| !video), "分块不应按视频发送: {sent:?}");
+        assert!(
+            sent.iter().all(|(_, video)| !video),
+            "分块不应按视频发送: {sent:?}"
+        );
     }
 
     #[tokio::test]
@@ -304,7 +351,10 @@ mod tests {
         let (up, tg, _db, _g) = fixture(100, 1024, None).await;
         up.knobs.set_send_video(false);
         feed_all(&up, "movie.mp4", &[1, 2, 3], 3).await.unwrap();
-        assert_eq!(*tg.sent.lock().unwrap(), vec![("movie.mp4".to_string(), false)]);
+        assert_eq!(
+            *tg.sent.lock().unwrap(),
+            vec![("movie.mp4".to_string(), false)]
+        );
     }
 
     #[tokio::test]
@@ -314,9 +364,12 @@ mod tests {
         let data = [9u8, 8, 7];
         let node = feed_all(&up, "movie.mp4", &data, 3).await.unwrap();
         // sendVideo 失败后回退文档,上传仍成功
-        assert_eq!(*tg.sent.lock().unwrap(), vec![("movie.mp4".to_string(), false)]);
+        assert_eq!(
+            *tg.sent.lock().unwrap(),
+            vec![("movie.mp4".to_string(), false)]
+        );
         let chunks = db.chunks_of(node.id).await.unwrap();
-        let mut r = ChunkedReader::new(tg.clone(), &chunks, 0);
+        let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 0);
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
@@ -328,7 +381,10 @@ mod tests {
         tg.uncertain_video.store(true, Ordering::SeqCst);
         let err = feed_all(&up, "movie.mp4", &[9, 8, 7], 3).await.unwrap_err();
         assert!(matches!(err, AppError::TelegramUncertain(_)));
-        assert!(tg.sent.lock().unwrap().is_empty(), "结果不确定时不得再按文档发送");
+        assert!(
+            tg.sent.lock().unwrap().is_empty(),
+            "结果不确定时不得再按文档发送"
+        );
         assert!(db.resolve(&["movie.mp4"]).await.unwrap().is_none());
     }
 
@@ -338,10 +394,17 @@ mod tests {
         // 合成 mp4(1920x1080、60 秒)走完整上传管线,宽高应传到 sendVideo
         let data = crate::engine::probe::testutil::mp4_file(1920, 1080, false);
         feed_all(&up, "movie.mp4", &data, 128).await.unwrap();
-        assert_eq!(*tg.sent.lock().unwrap(), vec![("movie.mp4".to_string(), true)]);
+        assert_eq!(
+            *tg.sent.lock().unwrap(),
+            vec![("movie.mp4".to_string(), true)]
+        );
         assert_eq!(
             *tg.video_meta.lock().unwrap(),
-            vec![Some(VideoMeta { width: 1920, height: 1080, duration_secs: Some(60) })]
+            vec![Some(VideoMeta {
+                width: 1920,
+                height: 1080,
+                duration_secs: Some(60)
+            })]
         );
     }
 
@@ -350,7 +413,10 @@ mod tests {
         let (up, tg, _db, _g) = fixture(100, 1024, None).await;
         // 扩展名是视频但内容解析不了 → 仍按视频发送,只是不带宽高
         feed_all(&up, "movie.mp4", &[1, 2, 3], 3).await.unwrap();
-        assert_eq!(*tg.sent.lock().unwrap(), vec![("movie.mp4".to_string(), true)]);
+        assert_eq!(
+            *tg.sent.lock().unwrap(),
+            vec![("movie.mp4".to_string(), true)]
+        );
         assert_eq!(*tg.video_meta.lock().unwrap(), vec![None]);
     }
 }

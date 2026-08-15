@@ -3,9 +3,9 @@
     <div class="vp-stage" :style="{ height: stageH }">
       <video
         ref="vid"
-        :src="src"
+        :src="activeSrc || undefined"
         controls
-        autoplay
+        preload="none"
         playsinline
         :loop="loop"
         :style="videoStyle"
@@ -13,6 +13,16 @@
         @ended="emit('ended')"
         @ratechange="onRateChange"
       />
+      <el-button
+        v-if="!activeSrc"
+        class="vp-start"
+        type="primary"
+        size="large"
+        :icon="VideoPlay"
+        @click="startPlayback"
+      >
+        点击播放
+      </el-button>
     </div>
     <div class="vp-bar">
       <el-dropdown trigger="click" @command="setSpeed">
@@ -58,14 +68,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { CopyDocument, FullScreen, Refresh, RefreshRight } from '@element-plus/icons-vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
+import {
+  CopyDocument,
+  FullScreen,
+  Refresh,
+  RefreshRight,
+  VideoPlay,
+} from '@element-plus/icons-vue'
 
 const props = defineProps<{ src: string }>()
 const emit = defineEmits<{ ended: []; meta: [w: number, h: number] }>()
 
 const wrap = ref<HTMLElement>()
 const vid = ref<HTMLVideoElement>()
+// 只有用户明确点击播放后才把地址交给 <video>，避免打开预览就触发 Telegram 下载。
+const activeSrc = ref('')
 const loop = ref(false)
 const rot = ref(0)
 const natural = ref<{ w: number; h: number } | null>(null)
@@ -123,6 +141,38 @@ function onMeta() {
   layout()
 }
 
+/** 用户明确播放后才装载媒体地址。 */
+async function startPlayback() {
+  const v = vid.value
+  if (!v) return
+  if (activeSrc.value !== props.src) {
+    activeSrc.value = props.src
+    await nextTick()
+  }
+  v.playbackRate = speed.value
+  try {
+    await v.play()
+  } catch {
+    // 浏览器策略或格式不支持时保留原生控件，让用户可以重试或看到错误。
+  }
+}
+
+/**
+ * 立即断开媒体资源。单纯 pause 只会停播放，不保证浏览器停止预加载；
+ * 清空 src 后调用 load 才会主动取消仍在进行的 Range 请求。
+ */
+function stop() {
+  const v = vid.value
+  if (v) {
+    v.pause()
+    v.removeAttribute('src')
+    v.load()
+  }
+  activeSrc.value = ''
+  natural.value = null
+  fit.value = null
+}
+
 function rotate() {
   rot.value = (rot.value + 90) % 360
   layout()
@@ -169,7 +219,7 @@ function onKey(e: KeyboardEvent) {
   switch (e.key) {
     case ' ':
       e.preventDefault()
-      if (v.paused) v.play()
+      if (v.paused) void startPlayback()
       else v.pause()
       break
     case 'ArrowLeft':
@@ -216,11 +266,11 @@ onUnmounted(() => {
   document.removeEventListener('fullscreenchange', onFsChange)
   ro?.disconnect()
 })
-watch(() => props.src, () => {
-  // 切换视频后由新的 loadedmetadata 重新布局
-  natural.value = null
-  fit.value = null
-})
+// 在 Vue 开始移除 DOM 前主动断流；仅依赖浏览器回收元素可能让下载继续一段时间。
+onBeforeUnmount(stop)
+watch(() => props.src, stop)
+
+defineExpose({ play: startPlayback, stop })
 </script>
 
 <style scoped>
@@ -235,11 +285,19 @@ watch(() => props.src, () => {
   border-radius: 0;
 }
 .vp-stage {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
   background: #000;
+}
+.vp-start {
+  position: absolute;
+  z-index: 1;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
 }
 .vp-stage video {
   outline: none;

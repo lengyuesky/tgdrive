@@ -1,10 +1,12 @@
-//! Telegram Bot API 轻量客户端:仅封装本项目需要的四个方法 + 分块字节流下载。
+//! Telegram 客户端：Bot API 负责上传/删除，MTProto 或本地缓存负责分块字节流下载。
 //!
 //! 端点可切换:官方 api.telegram.org 或自部署 telegram-bot-api。
-//! 自部署 --local 模式下 getFile 返回容器内绝对路径,此时若本地(共享卷)存在
-//! 该文件则直接读盘,否则回退 HTTP。
+//! 自部署 --local 模式下，已知且仍存在的共享卷文件直接读盘；否则文档型文件
+//! 通过 MTProto 按 512 KiB 读取，避免 `getFile` 先拉取完整的大分块。
 
+use crate::db::StorageTarget;
 use crate::error::{AppError, AppResult};
+use crate::mtproto::{MtprotoClient, MtprotoConfig};
 use bytes::Bytes;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -15,7 +17,26 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 /// getFile 结果缓存时长(官方 file_path 约 1 小时失效,留余量)
 const FILE_PATH_TTL: Duration = Duration::from_secs(30 * 60);
+const FILE_PATH_CACHE_CAPACITY: usize = 4096;
 const MAX_RETRIES: u32 = 5;
+
+/// reqwest 错误通常携带完整请求 URL，而 Telegram URL 中含 Bot Token。
+/// 对外只保留故障类别，绝不格式化原始错误对象。
+pub fn reqwest_error_summary(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "请求超时"
+    } else if error.is_connect() {
+        "连接失败"
+    } else if error.is_body() {
+        "传输请求体失败"
+    } else if error.is_decode() {
+        "响应解析失败"
+    } else if error.is_redirect() {
+        "重定向失败"
+    } else {
+        "网络请求失败"
+    }
+}
 
 /// 普通查询/删除可放心重试；发送媒体必须避免在结果不确定时再次发送。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,8 +78,8 @@ fn classify_malformed_response(
             )
         }
     } else {
-        let retry = (status.is_server_error() || status.as_u16() == 429)
-            .then(|| Duration::from_secs(2));
+        let retry =
+            (status.is_server_error() || status.as_u16() == 429).then(|| Duration::from_secs(2));
         (retry, AppError::Telegram(detail))
     }
 }
@@ -83,7 +104,10 @@ pub struct VideoMeta {
 /// 上传体:小分块驻内存,大分块经临时文件(重试时可重复读取)
 pub enum UploadBody {
     Memory(Bytes),
-    TempFile { file: tempfile::NamedTempFile, len: u64 },
+    TempFile {
+        file: tempfile::NamedTempFile,
+        len: u64,
+    },
 }
 
 impl UploadBody {
@@ -118,8 +142,15 @@ pub trait TgApi: Send + Sync + 'static {
     }
     async fn delete_message(&self, message_id: i64) -> AppResult<()>;
     async fn get_me(&self) -> AppResult<String>;
-    /// 打开某个分块的字节流,从块内 offset 开始读
-    async fn open_chunk_stream(&self, file_id: &str, offset: u64) -> AppResult<ByteReader>;
+    /// 打开某个分块的字节流，从块内 offset 开始读。
+    /// message_id 用于定位日志/后续刷新引用，chunk_size 用于严格限制读取边界。
+    async fn open_chunk_stream(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        chunk_size: u64,
+        offset: u64,
+    ) -> AppResult<ByteReader>;
 }
 
 // ---------- Bot API 响应结构 ----------
@@ -149,7 +180,10 @@ struct RawMessage {
 
 impl RawMessage {
     fn any_file_id(self) -> Option<String> {
-        self.video.or(self.document).or(self.animation).map(|f| f.file_id)
+        self.video
+            .or(self.document)
+            .or(self.animation)
+            .map(|f| f.file_id)
     }
 }
 
@@ -165,66 +199,147 @@ struct RawFile {
 
 #[derive(Deserialize)]
 struct RawUser {
+    id: i64,
     username: Option<String>,
     first_name: Option<String>,
 }
 
-// ---------- 可热切换代理 ----------
-
-/// 包一层可替换的实现:后台改了 token/chat_id/端点后,
-/// 已被 Vfs / Uploader / DavHandler 克隆持有的 `Arc<dyn TgApi>` 无需重建即可指向新客户端。
-pub struct SwitchableTg {
-    inner: std::sync::RwLock<Arc<dyn TgApi>>,
+#[derive(Deserialize)]
+struct RawChat {
+    #[serde(rename = "type")]
+    kind: String,
 }
 
-impl SwitchableTg {
-    pub fn new(inner: Arc<dyn TgApi>) -> Self {
-        SwitchableTg { inner: std::sync::RwLock::new(inner) }
-    }
-
-    pub fn replace(&self, new: Arc<dyn TgApi>) {
-        *self.inner.write().unwrap() = new;
-    }
-
-    /// 取出当前实现;guard 立即释放,不跨 await
-    fn current(&self) -> Arc<dyn TgApi> {
-        self.inner.read().unwrap().clone()
-    }
+#[derive(Deserialize)]
+struct RawChatMember {
+    status: String,
+    can_post_messages: Option<bool>,
+    can_delete_messages: Option<bool>,
 }
 
-#[async_trait::async_trait]
-impl TgApi for SwitchableTg {
-    async fn send_document(
-        &self,
-        filename: &str,
-        caption: Option<String>,
-        body: &UploadBody,
-    ) -> AppResult<TgMessage> {
-        self.current().send_document(filename, caption, body).await
+fn validate_storage_member(kind: &str, member: &RawChatMember) -> AppResult<()> {
+    if !matches!(kind, "channel" | "group" | "supergroup") {
+        return Ok(());
+    }
+    if member.status == "creator" {
+        return Ok(());
+    }
+    if member.status != "administrator" {
+        return Err(AppError::BadRequest(
+            "Bot 必须是存储频道/群组的管理员".into(),
+        ));
+    }
+    if kind == "channel" && member.can_post_messages != Some(true) {
+        return Err(AppError::BadRequest(
+            "Bot 缺少在存储频道发布消息的权限".into(),
+        ));
+    }
+    if member.can_delete_messages != Some(true) {
+        return Err(AppError::BadRequest("Bot 缺少删除存储消息的权限".into()));
+    }
+    Ok(())
+}
+
+// ---------- 存储目标注册表 ----------
+
+/// 上传开始时取得的不可变目标快照；配置热更新不会把同一文件的分块发往不同频道。
+#[derive(Clone)]
+pub struct TgBinding {
+    pub storage_target_id: i64,
+    pub api: Arc<dyn TgApi>,
+}
+
+/// 同时保留历史存储目标和当前写入目标。读取、删除按分块记录的 target_id 路由，
+/// 当前目标只影响之后开始的上传。
+pub struct TgRegistry {
+    current: std::sync::RwLock<Option<i64>>,
+    clients: std::sync::RwLock<HashMap<i64, Arc<dyn TgApi>>>,
+    mtproto: Option<MtprotoConfig>,
+}
+
+impl TgRegistry {
+    pub fn new(
+        targets: &[StorageTarget],
+        current: Option<i64>,
+        mtproto: Option<MtprotoConfig>,
+    ) -> AppResult<Self> {
+        let registry = TgRegistry {
+            current: std::sync::RwLock::new(current),
+            clients: std::sync::RwLock::new(HashMap::new()),
+            mtproto,
+        };
+        for target in targets {
+            registry.register(target)?;
+        }
+        Ok(registry)
     }
 
-    // 必须显式转发:走 trait 默认实现会在代理层退回 send_document,内层真客户端就收不到视频请求
-    async fn send_video(
-        &self,
-        filename: &str,
-        mime: &str,
-        meta: Option<VideoMeta>,
-        caption: Option<String>,
-        body: &UploadBody,
-    ) -> AppResult<TgMessage> {
-        self.current().send_video(filename, mime, meta, caption, body).await
+    #[cfg(test)]
+    pub fn with_client(storage_target_id: i64, api: Arc<dyn TgApi>) -> Self {
+        TgRegistry {
+            current: std::sync::RwLock::new(Some(storage_target_id)),
+            clients: std::sync::RwLock::new(HashMap::from([(storage_target_id, api)])),
+            mtproto: None,
+        }
     }
 
-    async fn delete_message(&self, message_id: i64) -> AppResult<()> {
-        self.current().delete_message(message_id).await
+    pub fn register(&self, target: &StorageTarget) -> AppResult<TgBinding> {
+        if let Some(api) = self.clients.read().unwrap().get(&target.id).cloned() {
+            return Ok(TgBinding {
+                storage_target_id: target.id,
+                api,
+            });
+        }
+        let api: Arc<dyn TgApi> = Arc::new(
+            TgClient::new_with_mtproto(
+                &target.api_base,
+                &target.bot_token,
+                &target.chat_id,
+                self.mtproto.clone(),
+                target.id,
+            )
+            .map_err(|e| AppError::BadRequest(format!("Telegram 客户端构造失败: {e}")))?,
+        );
+        self.clients.write().unwrap().insert(target.id, api.clone());
+        Ok(TgBinding {
+            storage_target_id: target.id,
+            api,
+        })
     }
 
-    async fn get_me(&self) -> AppResult<String> {
-        self.current().get_me().await
+    pub fn set_current_id(&self, id: Option<i64>) -> AppResult<()> {
+        if let Some(id) = id {
+            self.binding(id)?;
+        }
+        *self.current.write().unwrap() = id;
+        Ok(())
     }
 
-    async fn open_chunk_stream(&self, file_id: &str, offset: u64) -> AppResult<ByteReader> {
-        self.current().open_chunk_stream(file_id, offset).await
+    pub fn current(&self) -> AppResult<TgBinding> {
+        let id = self.current.read().unwrap().ok_or_else(|| {
+            AppError::BadRequest(
+                "还没配置 Telegram 存储:请到「系统设置」填写 Bot Token 与存储频道".into(),
+            )
+        })?;
+        self.binding(id)
+    }
+
+    pub fn binding(&self, storage_target_id: i64) -> AppResult<TgBinding> {
+        let api = self
+            .clients
+            .read()
+            .unwrap()
+            .get(&storage_target_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "历史存储目标 {storage_target_id} 不可用，请检查数据库与配置"
+                ))
+            })?;
+        Ok(TgBinding {
+            storage_target_id,
+            api,
+        })
     }
 }
 
@@ -232,8 +347,10 @@ impl TgApi for SwitchableTg {
 
 /// 还没填 Bot Token / 存储频道时装在 `SwitchableTg` 里的占位实现。
 /// 这样上传、下载、WebDAV 各条路径都能拿到同一句可读的提示,而不是 Telegram 的 401。
+#[cfg(test)]
 pub struct UnconfiguredTg;
 
+#[cfg(test)]
 impl UnconfiguredTg {
     fn err<T>() -> AppResult<T> {
         Err(AppError::BadRequest(
@@ -243,6 +360,7 @@ impl UnconfiguredTg {
 }
 
 #[async_trait::async_trait]
+#[cfg(test)]
 impl TgApi for UnconfiguredTg {
     async fn send_document(
         &self,
@@ -261,7 +379,13 @@ impl TgApi for UnconfiguredTg {
         Self::err()
     }
 
-    async fn open_chunk_stream(&self, _file_id: &str, _offset: u64) -> AppResult<ByteReader> {
+    async fn open_chunk_stream(
+        &self,
+        _file_id: &str,
+        _message_id: i64,
+        _chunk_size: u64,
+        _offset: u64,
+    ) -> AppResult<ByteReader> {
         Self::err()
     }
 }
@@ -273,12 +397,86 @@ pub struct TgClient {
     api_base: String,
     token: String,
     chat_id: String,
-    /// file_id → (file_path, 缓存时间)
-    path_cache: Mutex<HashMap<String, (String, Instant)>>,
+    /// 有界 LRU：file_id → file_path。
+    path_cache: Mutex<FilePathCache>,
+    local_data_root: std::path::PathBuf,
+    mtproto: Option<Arc<MtprotoClient>>,
+}
+
+struct CachedFilePath {
+    path: String,
+    cached_at: Instant,
+    touched: u64,
+}
+
+#[derive(Default)]
+struct FilePathCache {
+    entries: HashMap<String, CachedFilePath>,
+    clock: u64,
+}
+
+impl FilePathCache {
+    fn get(&mut self, file_id: &str) -> Option<String> {
+        let expired = self
+            .entries
+            .get(file_id)
+            .is_some_and(|entry| entry.cached_at.elapsed() >= FILE_PATH_TTL);
+        if expired {
+            self.entries.remove(file_id);
+            return None;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(file_id)?;
+        entry.touched = self.clock;
+        Some(entry.path.clone())
+    }
+
+    fn insert(&mut self, file_id: String, path: String) {
+        if self.entries.len() >= FILE_PATH_CACHE_CAPACITY
+            && !self.entries.contains_key(&file_id)
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(
+            file_id,
+            CachedFilePath {
+                path,
+                cached_at: Instant::now(),
+                touched: self.clock,
+            },
+        );
+    }
 }
 
 impl TgClient {
     pub fn new(api_base: &str, token: &str, chat_id: &str) -> anyhow::Result<Self> {
+        Self::build(api_base, token, chat_id, None)
+    }
+
+    fn new_with_mtproto(
+        api_base: &str,
+        token: &str,
+        chat_id: &str,
+        config: Option<MtprotoConfig>,
+        storage_target_id: i64,
+    ) -> anyhow::Result<Self> {
+        let mtproto =
+            config.map(|config| Arc::new(MtprotoClient::new(config, storage_target_id, token)));
+        Self::build(api_base, token, chat_id, mtproto)
+    }
+
+    fn build(
+        api_base: &str,
+        token: &str,
+        chat_id: &str,
+        mtproto: Option<Arc<MtprotoClient>>,
+    ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(60))
@@ -289,7 +487,14 @@ impl TgClient {
             api_base: api_base.trim_end_matches('/').to_string(),
             token: token.to_string(),
             chat_id: chat_id.to_string(),
-            path_cache: Mutex::new(HashMap::new()),
+            path_cache: Mutex::new(FilePathCache::default()),
+            local_data_root: std::env::var("TGDRIVE_LOCAL_DATA_ROOT")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(Into::into)
+                .unwrap_or_else(|| crate::config::DEFAULT_LOCAL_DATA_ROOT.into()),
+            mtproto,
         })
     }
 
@@ -301,9 +506,56 @@ impl TgClient {
         format!("{}/file/bot{}/{}", self.api_base, self.token, file_path)
     }
 
+    async fn raw_me(&self) -> AppResult<RawUser> {
+        let url = self.method_url("getMe");
+        self.call_with_retry("getMe", || self.http.get(&url).send())
+            .await
+    }
+
+    /// 验证 Bot 身份、目标会话以及频道/群组内的发消息和删除权限。
+    pub async fn probe_storage(&self) -> AppResult<String> {
+        let user = self.raw_me().await?;
+        let name = user
+            .username
+            .or(user.first_name)
+            .unwrap_or_else(|| "bot".into());
+        // 会话探测页只需要验证 Token，使用内部哨兵值跳过目标检查。
+        if self.chat_id == "0" {
+            return Ok(name);
+        }
+
+        let get_chat_url = self.method_url("getChat");
+        let chat: RawChat = self
+            .call_with_retry("getChat", || {
+                self.http
+                    .post(&get_chat_url)
+                    .json(&serde_json::json!({ "chat_id": self.chat_id }))
+                    .send()
+            })
+            .await?;
+
+        if matches!(chat.kind.as_str(), "channel" | "group" | "supergroup") {
+            let member_url = self.method_url("getChatMember");
+            let member: RawChatMember = self
+                .call_with_retry("getChatMember", || {
+                    self.http
+                        .post(&member_url)
+                        .json(&serde_json::json!({
+                            "chat_id": self.chat_id,
+                            "user_id": user.id,
+                        }))
+                        .send()
+                })
+                .await?;
+            validate_storage_member(&chat.kind, &member)?;
+        }
+        Ok(name)
+    }
+
     /// 解析响应体；发送媒体时，只有 Telegram 明确返回失败才允许重试。
     /// 响应在回程中损坏时消息可能已经写入，此时必须停止，避免产生重复消息。
     async fn parse<T: serde::de::DeserializeOwned>(
+        &self,
         resp: reqwest::Response,
         mode: CallMode,
     ) -> Result<T, (Option<Duration>, AppError)> {
@@ -313,11 +565,15 @@ impl TgClient {
                 (
                     None,
                     AppError::TelegramUncertain(format!(
-                        "请求已发出，但读取响应失败: {e}；请检查存储频道中的对应分块"
+                        "请求已发出，但{}；请检查存储频道中的对应分块",
+                        reqwest_error_summary(&e)
                     )),
                 )
             } else {
-                (Some(Duration::from_secs(2)), AppError::Telegram(format!("读取响应失败: {e}")))
+                (
+                    Some(Duration::from_secs(2)),
+                    AppError::Telegram(reqwest_error_summary(&e).into()),
+                )
             }
         })?;
         let parsed: Result<ApiResponse<T>, _> = serde_json::from_slice(&body);
@@ -333,7 +589,10 @@ impl TgClient {
                 (None, err)
             }),
             Ok(r) => {
-                let desc = r.description.unwrap_or_else(|| "未知错误".into());
+                let desc = r
+                    .description
+                    .unwrap_or_else(|| "未知错误".into())
+                    .replace(&self.token, "[已脱敏]");
                 let code = r.error_code.unwrap_or(status.as_u16() as i64);
                 let retry = r
                     .parameters
@@ -347,10 +606,7 @@ impl TgClient {
                 Err(classify_api_failure(mode, retry, detail))
             }
             Err(_) => {
-                let detail = format!(
-                    "HTTP {status}: {}",
-                    String::from_utf8_lossy(&body[..body.len().min(200)])
-                );
+                let detail = format!("HTTP {status}: 响应不是合法的 Telegram JSON");
                 Err(classify_malformed_response(mode, status, detail))
             }
         }
@@ -367,10 +623,10 @@ impl TgClient {
         loop {
             attempt += 1;
             let outcome = match make_req().await {
-                Ok(resp) => Self::parse::<T>(resp, CallMode::Idempotent).await,
+                Ok(resp) => self.parse::<T>(resp, CallMode::Idempotent).await,
                 Err(e) => Err((
                     Some(Duration::from_secs(2u64.pow(attempt.min(4)))),
-                    AppError::Telegram(format!("{what} 网络错误: {e}")),
+                    AppError::Telegram(format!("{what}: {}", reqwest_error_summary(&e))),
                 )),
             };
             match outcome {
@@ -378,7 +634,10 @@ impl TgClient {
                 Err((Some(wait), err)) if attempt < MAX_RETRIES => {
                     // flood 控制:叠加少量抖动,避免并发任务同时重试
                     let jitter = Duration::from_millis((attempt as u64 * 137) % 500);
-                    tracing::warn!("{what} 第 {attempt} 次失败({err}),{:?} 后重试", wait + jitter);
+                    tracing::warn!(
+                        "{what} 第 {attempt} 次失败({err}),{:?} 后重试",
+                        wait + jitter
+                    );
                     tokio::time::sleep(wait + jitter).await;
                 }
                 Err((_, err)) => return Err(err),
@@ -387,10 +646,8 @@ impl TgClient {
     }
 
     async fn get_file_path(&self, file_id: &str) -> AppResult<String> {
-        if let Some((path, at)) = self.path_cache.lock().unwrap().get(file_id) {
-            if at.elapsed() < FILE_PATH_TTL {
-                return Ok(path.clone());
-            }
+        if let Some(path) = self.path_cache.lock().unwrap().get(file_id) {
+            return Ok(path);
         }
         let url = self.method_url("getFile");
         let file: RawFile = self
@@ -404,7 +661,7 @@ impl TgClient {
         self.path_cache
             .lock()
             .unwrap()
-            .insert(file_id.to_string(), (path.clone(), Instant::now()));
+            .insert(file_id.to_string(), path.clone());
         Ok(path)
     }
 
@@ -475,17 +732,18 @@ impl TgClient {
             form = form.part(field, part);
 
             let outcome = match self.http.post(&url).multipart(form).send().await {
-                Ok(resp) => Self::parse::<RawMessage>(resp, CallMode::SendMedia).await,
+                Ok(resp) => self.parse::<RawMessage>(resp, CallMode::SendMedia).await,
                 // 连接尚未建立或请求体没有发完整时，Telegram 不可能成功解析媒体，可安全重试。
                 Err(e) if e.is_connect() || e.is_body() => Err((
                     Some(Duration::from_secs(2u64.pow(attempt.min(4)))),
-                    AppError::Telegram(format!("{method} 网络错误: {e}")),
+                    AppError::Telegram(format!("{method}: {}", reqwest_error_summary(&e))),
                 )),
                 // 请求体可能已经完整送达，仅响应头丢失；此时重试会制造重复消息。
                 Err(e) => Err((
                     None,
                     AppError::TelegramUncertain(format!(
-                        "{method} 请求已发出但未收到可靠响应: {e}；请检查存储频道中的对应分块"
+                        "{method} 请求已发出但未收到可靠响应（{}）；请检查存储频道中的对应分块",
+                        reqwest_error_summary(&e)
                     )),
                 )),
             };
@@ -513,7 +771,10 @@ impl TgClient {
                 return Err(AppError::Telegram(format!("{method} 响应缺少文件字段")));
             }
         };
-        Ok(TgMessage { message_id, file_id })
+        Ok(TgMessage {
+            message_id,
+            file_id,
+        })
     }
 
     /// HTTP 下载分块;offset>0 时先试 Range,服务器不支持则丢弃前缀
@@ -523,7 +784,10 @@ impl TgClient {
         if offset > 0 {
             req = req.header(http::header::RANGE, format!("bytes={offset}-"));
         }
-        let resp = req.send().await.map_err(|e| AppError::Telegram(format!("下载失败: {e}")))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Telegram(format!("下载失败: {}", reqwest_error_summary(&e))))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(AppError::Telegram(format!("下载分块 HTTP {status}")));
@@ -532,7 +796,7 @@ impl TgClient {
         let stream = resp.bytes_stream();
         let reader = tokio_util::io::StreamReader::new(futures_util::TryStreamExt::map_err(
             stream,
-            std::io::Error::other,
+            |error| std::io::Error::other(reqwest_error_summary(&error)),
         ));
         let mut reader: ByteReader = Box::pin(reader);
         if offset > 0 && !got_range {
@@ -549,6 +813,37 @@ impl TgClient {
             }
         }
         Ok(reader)
+    }
+
+    /// 尝试使用已经知道的 file_path。这个函数本身不会调用 getFile，因此不会触发
+    /// 本地 Bot API 为了生成路径而先下载完整 Telegram 文件。
+    async fn open_known_path(&self, file_path: &str, offset: u64) -> AppResult<Option<ByteReader>> {
+        if !file_path.starts_with('/') {
+            return self.open_http_stream(file_path, offset).await.map(Some);
+        }
+
+        // local 模式的绝对路径必须位于显式数据根目录中，避免上游返回任意主机路径。
+        let root = tokio::fs::canonicalize(&self.local_data_root).await;
+        let candidate = tokio::fs::canonicalize(file_path).await;
+        match (root, candidate) {
+            (Ok(root), Ok(candidate)) if !candidate.starts_with(&root) => Err(AppError::Telegram(
+                "Bot API 返回的本地文件路径超出允许的数据目录，已拒绝读取".into(),
+            )),
+            (Ok(_), Ok(candidate)) => match tokio::fs::File::open(candidate).await {
+                Ok(mut file) => {
+                    if offset > 0 {
+                        file.seek(std::io::SeekFrom::Start(offset)).await?;
+                    }
+                    Ok(Some(Box::pin(file)))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => {
+                    tracing::warn!(error = %error, "本地 Bot API 缓存文件无法读取");
+                    Ok(None)
+                }
+            },
+            _ => Ok(None),
+        }
     }
 }
 
@@ -580,7 +875,8 @@ impl TgApi for TgClient {
         caption: Option<String>,
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
-        self.send_media("sendVideo", "video", filename, mime, meta, caption, body).await
+        self.send_media("sendVideo", "video", filename, mime, meta, caption, body)
+            .await
     }
 
     async fn delete_message(&self, message_id: i64) -> AppResult<()> {
@@ -605,30 +901,47 @@ impl TgApi for TgClient {
     }
 
     async fn get_me(&self) -> AppResult<String> {
-        let url = self.method_url("getMe");
-        let user: RawUser = self.call_with_retry("getMe", || self.http.get(&url).send()).await?;
-        Ok(user.username.or(user.first_name).unwrap_or_else(|| "bot".into()))
+        let user = self.raw_me().await?;
+        Ok(user
+            .username
+            .or(user.first_name)
+            .unwrap_or_else(|| "bot".into()))
     }
 
-    async fn open_chunk_stream(&self, file_id: &str, offset: u64) -> AppResult<ByteReader> {
-        let file_path = self.get_file_path(file_id).await?;
-        // local 模式:file_path 是绝对路径且共享卷里能找到 → 直接读盘(支持 seek)
-        if file_path.starts_with('/') {
-            match tokio::fs::File::open(&file_path).await {
-                Ok(mut f) => {
-                    if offset > 0 {
-                        f.seek(std::io::SeekFrom::Start(offset)).await?;
-                    }
-                    return Ok(Box::pin(f));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "local 模式路径 {file_path} 无法直接读取({e}),回退 HTTP;\
-                         如使用 --local 请把 telegram-bot-api 数据卷以相同路径挂载到本容器"
-                    );
-                }
-            }
+    async fn open_chunk_stream(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        chunk_size: u64,
+        offset: u64,
+    ) -> AppResult<ByteReader> {
+        // 已经明确知道并且仍可用的本地缓存最快，也完全没有外网流量。
+        let cached_path = self.path_cache.lock().unwrap().get(file_id);
+        if let Some(path) = cached_path
+            && let Some(reader) = self.open_known_path(&path, offset).await?
+        {
+            return Ok(reader);
         }
+
+        // 文档/视频直接走 MTProto 小块读取。失败时不回退 getFile，避免一次 Range
+        // 请求悄悄变成最多 1.9GB 的整块下载。
+        if let Some(mtproto) = &self.mtproto
+            && let Some(reader) = mtproto
+                .open_stream(file_id, message_id, chunk_size, offset)
+                .await?
+        {
+            return Ok(reader);
+        }
+
+        // 未配置 MTProto，或照片等不支持的 file_id，保留原 Bot API 路径。
+        let file_path = self.get_file_path(file_id).await?;
+        if let Some(reader) = self.open_known_path(&file_path, offset).await? {
+            return Ok(reader);
+        }
+        tracing::warn!(
+            message_id,
+            "本地 Bot API 文件无法从共享卷直接读取，回退其 HTTP 文件端点"
+        );
         self.open_http_stream(&file_path, offset).await
     }
 }
@@ -662,5 +975,34 @@ mod tests {
         );
         assert!(retry.is_none());
         assert!(matches!(err, AppError::TelegramRejected(_)));
+    }
+
+    #[test]
+    fn file_path_cache_is_bounded_and_refreshes_hits() {
+        let mut cache = FilePathCache::default();
+        for i in 0..=FILE_PATH_CACHE_CAPACITY {
+            cache.insert(format!("f{i}"), format!("p{i}"));
+        }
+        assert_eq!(cache.entries.len(), FILE_PATH_CACHE_CAPACITY);
+        assert_eq!(
+            cache.get(&format!("f{FILE_PATH_CACHE_CAPACITY}")),
+            Some(format!("p{FILE_PATH_CACHE_CAPACITY}"))
+        );
+    }
+
+    #[test]
+    fn storage_member_requires_channel_permissions() {
+        let member = RawChatMember {
+            status: "administrator".into(),
+            can_post_messages: Some(true),
+            can_delete_messages: Some(true),
+        };
+        assert!(validate_storage_member("channel", &member).is_ok());
+
+        let missing_delete = RawChatMember {
+            can_delete_messages: Some(false),
+            ..member
+        };
+        assert!(validate_storage_member("channel", &missing_delete).is_err());
     }
 }

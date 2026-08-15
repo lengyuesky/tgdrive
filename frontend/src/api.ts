@@ -141,6 +141,26 @@ export interface AdminStatus {
   listen: string
   started_at: number
   now: number
+  pending_deletes: number
+  inbox_failures: number
+  tasks: TaskStatus[]
+}
+
+export interface TaskStatus {
+  name: string
+  running: boolean
+  started_at: number
+  last_heartbeat: number
+  restarts: number
+  last_error: string | null
+}
+
+export interface InboxFailure {
+  update_id: number
+  attempts: number
+  last_error: string
+  failed_at: number
+  update: unknown
 }
 
 /** 检测到的会话(最近向 bot 发过消息的频道/用户/群) */
@@ -274,12 +294,15 @@ export const api = {
   /** 分享的公开访问(免登录) */
   share: {
     meta: (token: string) => http.get<ShareMeta>(`/share/${token}`),
-    list: (token: string, path: string, pwd?: string) =>
-      http.get<{ entries: Entry[] }>(`/share/${token}/list`, { params: { path, pwd } }),
-    downloadUrl: (token: string, path = '', pwd = '', inline = false) => {
+    authorize: (token: string, password?: string) =>
+      http.post<{ expires_at: number }>(`/share/${token}/authorize`, {
+        password,
+      }),
+    list: (token: string, path: string) =>
+      http.get<{ entries: Entry[] }>(`/share/${token}/list`, { params: { path } }),
+    downloadUrl: (token: string, path = '', inline = false) => {
       const p = new URLSearchParams()
       if (path) p.set('path', path)
-      if (pwd) p.set('pwd', pwd)
       if (inline) p.set('inline', '1')
       const qs = p.toString()
       return `/api/share/${token}/download${qs ? '?' + qs : ''}`
@@ -296,6 +319,12 @@ export const api = {
     detectChats: (probe: { api_base?: string; bot_token?: string } = {}) =>
       http.post<{ bot: string; chats: DetectedChat[] }>('/admin/detect-chats', probe),
     status: () => http.get<AdminStatus>('/admin/status'),
+    inboxFailures: () =>
+      http.get<{ items: InboxFailure[] }>('/admin/inbox-failures'),
+    removeInboxFailure: (updateId: number) =>
+      http.delete(`/admin/inbox-failures/${updateId}`),
+    clearInboxFailures: () =>
+      http.delete<{ cleared: number }>('/admin/inbox-failures'),
     cleanup: () => http.post<{ cleaned: number }>('/admin/cleanup'),
     logoutAll: () => http.post('/admin/logout-all'),
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),

@@ -1,13 +1,13 @@
 //! ChunkedReader:把一个文件的若干 Telegram 分块拼成连续的 AsyncRead + AsyncSeek
 //!
 //! seek 只移动游标并丢弃当前流,下次读取时按新位置重新打开对应分块
-//! (块内偏移由 TgApi::open_chunk_stream 负责:local 直读 seek / HTTP Range / 丢前缀)。
+//! (块内偏移由 TgApi::open_chunk_stream 负责：local 直读 seek / MTProto 小块读取 / HTTP Range)。
 
 use crate::db::Chunk;
 use crate::error::AppResult;
-use crate::telegram::{ByteReader, TgApi};
-use futures_util::future::BoxFuture;
+use crate::telegram::{ByteReader, TgRegistry};
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,16 +18,24 @@ struct ChunkPos {
     start: u64,
     size: u64,
     file_id: String,
+    message_id: i64,
+    storage_target_id: Option<i64>,
 }
 
 enum State {
     Idle,
-    Opening { fut: BoxFuture<'static, AppResult<ByteReader>>, remain: u64 },
-    Reading { reader: ByteReader, remain: u64 },
+    Opening {
+        fut: BoxFuture<'static, AppResult<ByteReader>>,
+        remain: u64,
+    },
+    Reading {
+        reader: ByteReader,
+        remain: u64,
+    },
 }
 
 pub struct ChunkedReader {
-    tg: Arc<dyn TgApi>,
+    tg: Arc<TgRegistry>,
     chunks: Vec<ChunkPos>,
     total: u64,
     pos: u64,
@@ -35,14 +43,26 @@ pub struct ChunkedReader {
 }
 
 impl ChunkedReader {
-    pub fn new(tg: Arc<dyn TgApi>, chunks: &[Chunk], start_pos: u64) -> Self {
+    pub fn new(tg: Arc<TgRegistry>, chunks: &[Chunk], start_pos: u64) -> Self {
         let mut list = Vec::with_capacity(chunks.len());
         let mut off = 0u64;
         for c in chunks {
-            list.push(ChunkPos { start: off, size: c.size as u64, file_id: c.tg_file_id.clone() });
+            list.push(ChunkPos {
+                start: off,
+                size: c.size as u64,
+                file_id: c.tg_file_id.clone(),
+                message_id: c.tg_message_id,
+                storage_target_id: c.storage_target_id,
+            });
             off += c.size as u64;
         }
-        ChunkedReader { tg, chunks: list, total: off, pos: start_pos.min(off), state: State::Idle }
+        ChunkedReader {
+            tg,
+            chunks: list,
+            total: off,
+            pos: start_pos.min(off),
+            state: State::Idle,
+        }
     }
 
     pub fn total_size(&self) -> u64 {
@@ -73,7 +93,21 @@ impl AsyncRead for ChunkedReader {
                     let remain = chunk.size - in_off;
                     let tg = self.tg.clone();
                     let fid = chunk.file_id.clone();
-                    let fut = async move { tg.open_chunk_stream(&fid, in_off).await }.boxed();
+                    let message_id = chunk.message_id;
+                    let chunk_size = chunk.size;
+                    let target_id = chunk.storage_target_id;
+                    let fut = async move {
+                        let target_id = target_id.ok_or_else(|| {
+                            crate::error::AppError::BadRequest(
+                                "历史分块尚未关联存储目标，请先恢复原 Telegram 配置".into(),
+                            )
+                        })?;
+                        tg.binding(target_id)?
+                            .api
+                            .open_chunk_stream(&fid, message_id, chunk_size, in_off)
+                            .await
+                    }
+                    .boxed();
                     self.state = State::Opening { fut, remain };
                 }
                 State::Opening { fut, remain } => match fut.as_mut().poll(cx) {

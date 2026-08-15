@@ -18,18 +18,19 @@ use std::time::Duration;
 
 const POLL_TIMEOUT_SECS: u64 = 25;
 const OFFSET_KEY: &str = "extra.inbox_offset";
+const FAILURE_KEY_PREFIX: &str = "extra.inbox_failure.";
+const MAX_UPDATE_ATTEMPTS: i64 = 5;
 /// 见过的会话列表(JSON),供后台「检测频道/用户 ID」使用
 const SEEN_CHATS_KEY: &str = "extra.seen_chats";
 const SEEN_CHATS_MAX: usize = 30;
 /// getUpdates 一次订阅这些类型;my_chat_member 用于捕捉「bot 被拉进频道/群」
 const ALLOWED_UPDATES: [&str; 3] = ["message", "channel_post", "my_chat_member"];
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mkv", "mov", "m4v", "avi", "webm", "flv", "wmv", "ts", "m2ts", "mpeg",
-    "mpg", "3gp", "ogv",
+    "mp4", "mkv", "mov", "m4v", "avi", "webm", "flv", "wmv", "ts", "m2ts", "mpeg", "mpg", "3gp",
+    "ogv",
 ];
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "heic", "heif", "tiff", "tif",
-    "svg", "ico",
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "avif", "heic", "heif", "tiff", "tif", "svg", "ico",
 ];
 const BOOK_EXTENSIONS: &[&str] = &[
     "pdf", "epub", "mobi", "azw", "azw3", "fb2", "djvu", "cbz", "cbr", "txt", "rtf",
@@ -42,7 +43,7 @@ struct ApiResp<T> {
     description: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Update {
     update_id: i64,
     message: Option<Msg>,
@@ -51,12 +52,12 @@ struct Update {
 }
 
 /// bot 被拉进/移出频道、群时的成员变动事件,只关心是哪个会话
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ChatMemberUpd {
     chat: Chat,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Msg {
     message_id: i64,
     chat: Chat,
@@ -69,7 +70,7 @@ struct Msg {
     photo: Option<Vec<PhotoSize>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Chat {
     id: i64,
     username: Option<String>,
@@ -80,7 +81,7 @@ struct Chat {
     last_name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct User {
     id: i64,
     username: Option<String>,
@@ -89,20 +90,20 @@ struct User {
     is_bot: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct FileRef {
     file_id: String,
     file_size: Option<i64>,
     file_name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct PhotoSize {
     file_id: String,
     file_size: Option<i64>,
 }
 
-pub async fn run(vfs: Vfs, rt: Arc<Runtime>) {
+pub async fn run(vfs: Vfs, rt: Arc<Runtime>, task: crate::tasks::TaskReporter) {
     // 长轮询本身要 25s,请求超时给足余量
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(POLL_TIMEOUT_SECS + 15))
@@ -110,24 +111,40 @@ pub async fn run(vfs: Vfs, rt: Arc<Runtime>) {
         .expect("构造 HTTP 客户端失败");
     let mut backoff = 5u64;
     loop {
+        if task.is_cancelled() {
+            return;
+        }
+        task.heartbeat();
         let cfg = rt.current();
         let ex = match crate::extras::load(&vfs.db).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("收件:读配置失败: {e}");
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                task.report_error(&e.to_string());
+                if !task.sleep(Duration::from_secs(30)).await {
+                    return;
+                }
                 continue;
             }
         };
         if !ex.inbox_enabled || !cfg.is_configured() {
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            task.clear_error();
+            if !task.sleep(Duration::from_secs(15)).await {
+                return;
+            }
             continue;
         }
         match poll_once(&http, &vfs, &cfg, &ex).await {
-            Ok(()) => backoff = 5,
+            Ok(()) => {
+                backoff = 5;
+                task.clear_error();
+            }
             Err(e) => {
+                task.report_error(&e.to_string());
                 tracing::warn!("收件轮询失败({e}),{backoff}s 后重试");
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                if !task.sleep(Duration::from_secs(backoff)).await {
+                    return;
+                }
                 backoff = (backoff * 2).min(300);
             }
         }
@@ -157,15 +174,25 @@ async fn poll_once(
         }))
         .send()
         .await
-        .map_err(|e| AppError::Telegram(format!("getUpdates 请求失败: {e}")))?;
-    let parsed: ApiResp<Vec<Update>> = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Telegram(format!("getUpdates 响应解析失败: {e}")))?;
+        .map_err(|e| {
+            AppError::Telegram(format!(
+                "getUpdates 请求失败: {}",
+                crate::telegram::reqwest_error_summary(&e)
+            ))
+        })?;
+    let parsed: ApiResp<Vec<Update>> = resp.json().await.map_err(|e| {
+        AppError::Telegram(format!(
+            "getUpdates 响应解析失败: {}",
+            crate::telegram::reqwest_error_summary(&e)
+        ))
+    })?;
     if !parsed.ok {
         return Err(AppError::Telegram(format!(
             "getUpdates: {}",
-            parsed.description.unwrap_or_else(|| "未知错误".into())
+            parsed
+                .description
+                .unwrap_or_else(|| "未知错误".into())
+                .replace(&cfg.bot_token, "[已脱敏]")
         )));
     }
 
@@ -176,18 +203,70 @@ async fn poll_once(
     if let Err(e) = remember_chats(&vfs.db, found).await {
         tracing::warn!("收件:记录会话来源失败: {e}");
     }
-    let mut max_id = offset - 1;
     for up in &updates {
-        max_id = max_id.max(up.update_id);
-        if let Err(e) = handle_update(http, vfs, cfg, ex, up).await {
-            // 单条失败不阻塞后续;offset 照常推进,靠日志排查
-            tracing::warn!("收件:处理 update {} 失败: {e}", up.update_id);
+        match handle_update(http, vfs, cfg, ex, up).await {
+            Ok(()) => {
+                // 每条成功后立即推进，后续消息失败或进程退出都不会让已完成消息重复转存。
+                vfs.db
+                    .setting_set(OFFSET_KEY, &(up.update_id + 1).to_string())
+                    .await?;
+                let _ = vfs
+                    .db
+                    .setting_del(&format!("{FAILURE_KEY_PREFIX}{}", up.update_id))
+                    .await;
+            }
+            Err(e) => {
+                let attempts = remember_update_failure(&vfs.db, up, &e.to_string()).await?;
+                if attempts < MAX_UPDATE_ATTEMPTS {
+                    tracing::warn!(
+                        "收件:处理 update {} 失败(第 {attempts}/{MAX_UPDATE_ATTEMPTS} 次): {e}",
+                        up.update_id
+                    );
+                    return Err(e);
+                }
+                // 持续失败的消息保留完整载荷供人工处理，避免永久阻塞后续收件。
+                tracing::error!(
+                    "收件:update {} 连续失败 {attempts} 次，已进入死信并继续处理后续消息: {e}",
+                    up.update_id
+                );
+                vfs.db
+                    .setting_set(OFFSET_KEY, &(up.update_id + 1).to_string())
+                    .await?;
+            }
         }
     }
-    if !updates.is_empty() {
-        vfs.db.setting_set(OFFSET_KEY, &(max_id + 1).to_string()).await?;
-    }
     Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct InboxFailure {
+    attempts: i64,
+    last_error: String,
+    failed_at: i64,
+    update: serde_json::Value,
+}
+
+async fn remember_update_failure(db: &Db, update: &Update, error: &str) -> AppResult<i64> {
+    let key = format!("{FAILURE_KEY_PREFIX}{}", update.update_id);
+    let previous = db
+        .setting_get(&key)
+        .await?
+        .and_then(|raw| serde_json::from_str::<InboxFailure>(&raw).ok());
+    let attempts = previous.map(|failure| failure.attempts).unwrap_or(0) + 1;
+    let failure = InboxFailure {
+        attempts,
+        last_error: error.chars().take(500).collect(),
+        failed_at: crate::db::now_ts(),
+        update: serde_json::to_value(update)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("序列化收件死信失败: {e}")))?,
+    };
+    db.setting_set(
+        &key,
+        &serde_json::to_string(&failure)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("保存收件死信失败: {e}")))?,
+    )
+    .await?;
+    Ok(attempts)
 }
 
 async fn handle_update(
@@ -208,6 +287,9 @@ async fn handle_update(
                     file.size,
                     &file.file_id,
                     post.message_id,
+                    cfg.storage_target_id.ok_or_else(|| {
+                        AppError::BadRequest("当前 Telegram 配置缺少存储目标".into())
+                    })?,
                 )
                 .await?;
                 tracing::info!("收件:频道文件已入库 {path}");
@@ -219,7 +301,9 @@ async fn handle_update(
     }
 
     // 私聊:白名单内的媒体转存到频道再登记
-    let Some(msg) = &up.message else { return Ok(()) };
+    let Some(msg) = &up.message else {
+        return Ok(());
+    };
     if msg.chat.kind != "private" {
         return Ok(());
     }
@@ -241,11 +325,18 @@ async fn handle_update(
             }
         };
         let size = size.filter(|n| *n > 0).unwrap_or(file.size);
-        let path = match ingest(vfs, ex, &file.name, size, &fid, mid).await {
+        let storage_target_id = cfg
+            .storage_target_id
+            .ok_or_else(|| AppError::BadRequest("当前 Telegram 配置缺少存储目标".into()))?;
+        let path = match ingest(vfs, ex, &file.name, size, &fid, mid, storage_target_id).await {
             Ok(path) => path,
             Err(e) => {
                 // 私聊文件已经转发成功但落库失败时补偿删除，不能在频道留下孤儿消息。
-                if let Err(cleanup) = vfs.tg.delete_message(mid).await {
+                let cleanup_result = match vfs.tg.binding(storage_target_id) {
+                    Ok(binding) => binding.api.delete_message(mid).await,
+                    Err(binding_error) => Err(binding_error),
+                };
+                if let Err(cleanup) = cleanup_result {
                     tracing::error!("收件消息 {mid} 落库失败({e})，且清理频道消息失败:{cleanup}");
                 }
                 reply(http, cfg, msg, "❌ 文件登记失败，请稍后重新发送").await;
@@ -254,7 +345,13 @@ async fn handle_update(
         };
         reply(http, cfg, msg, &format!("✅ 已存入 {path}")).await;
     } else if has_supported_media(msg) {
-        reply(http, cfg, msg, "❌ Telegram 没有返回有效的文件大小，无法登记").await;
+        reply(
+            http,
+            cfg,
+            msg,
+            "❌ Telegram 没有返回有效的文件大小，无法登记",
+        )
+        .await;
     }
     Ok(())
 }
@@ -314,7 +411,10 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
     // Telegram 为兼容旧客户端，动画消息可能同时带 animation 和 document；
     // 必须先判断 animation，才能按原媒体类型转存。
     if let Some(a) = &m.animation {
-        let name = a.file_name.clone().unwrap_or_else(|| format!("animation_{}.gif", m.message_id));
+        let name = a
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("animation_{}.gif", m.message_id));
         return Some(PickedFile {
             kind: MediaKind::Animation,
             name,
@@ -323,7 +423,10 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
         });
     }
     if let Some(d) = &m.document {
-        let name = d.file_name.clone().unwrap_or_else(|| format!("file_{}", m.message_id));
+        let name = d
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("file_{}", m.message_id));
         return Some(PickedFile {
             kind: MediaKind::Document,
             name,
@@ -332,7 +435,10 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
         });
     }
     if let Some(v) = &m.video {
-        let name = v.file_name.clone().unwrap_or_else(|| format!("video_{}.mp4", m.message_id));
+        let name = v
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("video_{}.mp4", m.message_id));
         return Some(PickedFile {
             kind: MediaKind::Video,
             name,
@@ -341,7 +447,10 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
         });
     }
     if let Some(a) = &m.audio {
-        let name = a.file_name.clone().unwrap_or_else(|| format!("audio_{}.mp3", m.message_id));
+        let name = a
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("audio_{}.mp3", m.message_id));
         return Some(PickedFile {
             kind: MediaKind::Audio,
             name,
@@ -365,14 +474,18 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
 /// tgdrive 自己传的分块 caption 以 "tgdrive {" 开头;正常情况 getUpdates
 /// 收不到 bot 自己的消息,这里只是多一道保险
 fn is_own_chunk(m: &Msg) -> bool {
-    m.caption.as_deref().is_some_and(|c| c.starts_with("tgdrive {"))
+    m.caption
+        .as_deref()
+        .is_some_and(|c| c.starts_with("tgdrive {"))
 }
 
 fn is_storage_chat(cfg_chat: &str, chat: &Chat) -> bool {
     if let Ok(id) = cfg_chat.trim().parse::<i64>() {
         return chat.id == id;
     }
-    cfg_chat.strip_prefix('@').is_some_and(|n| chat.username.as_deref() == Some(n))
+    cfg_chat
+        .strip_prefix('@')
+        .is_some_and(|n| chat.username.as_deref() == Some(n))
 }
 
 fn has_extension(lower_name: &str, extension: &str) -> bool {
@@ -397,11 +510,20 @@ fn inbox_dir_for<'a>(ex: &'a crate::extras::Extras, name: &str) -> &'a str {
     if let Some((dir, _)) = custom_match {
         return dir;
     }
-    if VIDEO_EXTENSIONS.iter().any(|ext| has_extension(&lower_name, ext)) {
+    if VIDEO_EXTENSIONS
+        .iter()
+        .any(|ext| has_extension(&lower_name, ext))
+    {
         &ex.inbox_video_dir
-    } else if IMAGE_EXTENSIONS.iter().any(|ext| has_extension(&lower_name, ext)) {
+    } else if IMAGE_EXTENSIONS
+        .iter()
+        .any(|ext| has_extension(&lower_name, ext))
+    {
         &ex.inbox_image_dir
-    } else if BOOK_EXTENSIONS.iter().any(|ext| has_extension(&lower_name, ext)) {
+    } else if BOOK_EXTENSIONS
+        .iter()
+        .any(|ext| has_extension(&lower_name, ext))
+    {
         &ex.inbox_book_dir
     } else {
         &ex.inbox_dir
@@ -416,19 +538,32 @@ async fn ingest(
     size: i64,
     file_id: &str,
     message_id: i64,
+    storage_target_id: i64,
 ) -> AppResult<String> {
     // 文件名可能含路径分隔符等,压成单段安全名
     let name: String = raw_name
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
-    let name = if name.trim().is_empty() { format!("file_{message_id}") } else { name };
+    let name = if name.trim().is_empty() {
+        format!("file_{message_id}")
+    } else {
+        name
+    };
 
     let target_dir = inbox_dir_for(ex, &name);
     let dir = vfs.mkdir_p(target_dir).await?;
     let node_id = vfs.db.create_uploading(dir.id, &name).await?;
     let result = async {
-        vfs.db.add_chunk(node_id, 0, size, file_id, message_id).await?;
+        vfs.db
+            .add_chunk(node_id, 0, size, file_id, message_id, storage_target_id)
+            .await?;
         vfs.db.finalize_upload(node_id, size, None).await
     }
     .await;
@@ -437,7 +572,7 @@ async fn ingest(
         Err(e) => {
             // 不能留下 uploading 占位，否则同名文件之后会一直被判定为正在上传。
             // 返回的消息 ID 由调用方决定是否删除：频道直发必须保留原消息，私聊转存会补偿删除。
-            if let Err(cleanup) = vfs.db.abort_upload(node_id).await {
+            if let Err(cleanup) = vfs.db.abort_upload_keep_messages(node_id).await {
                 tracing::error!("收件节点 {node_id} 登记失败({e})，且回滚临时记录失败:{cleanup}");
             }
             return Err(e);
@@ -469,23 +604,28 @@ async fn resend_file(
     body.insert("chat_id".into(), serde_json::json!(cfg.chat_id));
     body.insert(kind.field().into(), serde_json::json!(file_id));
     body.insert("disable_notification".into(), serde_json::json!(true));
-    let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Telegram(format!("转存失败: {e}")))?;
-    let parsed: ApiResp<Sent> = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Telegram(format!("转存响应解析失败: {e}")))?;
+    let resp = http.post(&url).json(&body).send().await.map_err(|e| {
+        AppError::Telegram(format!(
+            "转存失败: {}",
+            crate::telegram::reqwest_error_summary(&e)
+        ))
+    })?;
+    let parsed: ApiResp<Sent> = resp.json().await.map_err(|e| {
+        AppError::Telegram(format!(
+            "转存响应解析失败: {}",
+            crate::telegram::reqwest_error_summary(&e)
+        ))
+    })?;
     let sent = match (parsed.ok, parsed.result) {
         (true, Some(s)) => s,
         _ => {
             return Err(AppError::Telegram(format!(
                 "转存被拒: {}",
-                parsed.description.unwrap_or_else(|| "未知错误".into())
-            )))
+                parsed
+                    .description
+                    .unwrap_or_else(|| "未知错误".into())
+                    .replace(&cfg.bot_token, "[已脱敏]")
+            )));
         }
     };
     let media = match kind {
@@ -515,7 +655,10 @@ async fn reply(http: &reqwest::Client, cfg: &RuntimeCfg, to: &Msg, text: &str) {
         .send()
         .await;
     if let Err(e) = r {
-        tracing::warn!("收件:回复失败: {e}");
+        tracing::warn!(
+            "收件:回复失败: {}",
+            crate::telegram::reqwest_error_summary(&e)
+        );
     }
 }
 
@@ -533,7 +676,13 @@ pub struct SeenChat {
     pub at: i64,
 }
 
-fn display_name(title: &Option<String>, first: &Option<String>, last: &Option<String>, username: &Option<String>, id: i64) -> String {
+fn display_name(
+    title: &Option<String>,
+    first: &Option<String>,
+    last: &Option<String>,
+    username: &Option<String>,
+    id: i64,
+) -> String {
     if let Some(t) = title.as_deref().filter(|s| !s.trim().is_empty()) {
         return t.to_string();
     }
@@ -573,16 +722,17 @@ fn chats_from_update(up: &Update) -> Vec<SeenChat> {
     if let Some(m) = &up.message {
         push_chat(&m.chat);
         // 群消息的发送者是另一个 id,也记下(可用于私聊白名单)
-        if let Some(u) = &m.from {
-            if u.id != m.chat.id && !u.is_bot.unwrap_or(false) {
-                out.push(SeenChat {
-                    id: u.id,
-                    kind: "user".into(),
-                    name: display_name(&None, &u.first_name, &u.last_name, &u.username, u.id),
-                    username: u.username.clone(),
-                    at: now,
-                });
-            }
+        if let Some(u) = &m.from
+            && u.id != m.chat.id
+            && !u.is_bot.unwrap_or(false)
+        {
+            out.push(SeenChat {
+                id: u.id,
+                kind: "user".into(),
+                name: display_name(&None, &u.first_name, &u.last_name, &u.username, u.id),
+                username: u.username.clone(),
+                at: now,
+            });
         }
     }
     out
@@ -620,7 +770,7 @@ pub async fn probe_updates(api_base: &str, token: &str) -> AppResult<Vec<SeenCha
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|e| AppError::Telegram(format!("构造 HTTP 客户端失败: {e}")))?;
+        .map_err(|_| AppError::Telegram("构造 HTTP 客户端失败".into()))?;
     let url = format!("{}/bot{}/getUpdates", api_base.trim_end_matches('/'), token);
     let resp = http
         .post(&url)
@@ -630,18 +780,33 @@ pub async fn probe_updates(api_base: &str, token: &str) -> AppResult<Vec<SeenCha
         }))
         .send()
         .await
-        .map_err(|e| AppError::Telegram(format!("getUpdates 请求失败: {e}")))?;
-    let parsed: ApiResp<Vec<Update>> = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Telegram(format!("getUpdates 响应解析失败: {e}")))?;
+        .map_err(|e| {
+            AppError::Telegram(format!(
+                "getUpdates 请求失败: {}",
+                crate::telegram::reqwest_error_summary(&e)
+            ))
+        })?;
+    let parsed: ApiResp<Vec<Update>> = resp.json().await.map_err(|e| {
+        AppError::Telegram(format!(
+            "getUpdates 响应解析失败: {}",
+            crate::telegram::reqwest_error_summary(&e)
+        ))
+    })?;
     if !parsed.ok {
         return Err(AppError::Telegram(format!(
             "getUpdates: {}",
-            parsed.description.unwrap_or_else(|| "未知错误".into())
+            parsed
+                .description
+                .unwrap_or_else(|| "未知错误".into())
+                .replace(token, "[已脱敏]")
         )));
     }
-    Ok(parsed.result.unwrap_or_default().iter().flat_map(chats_from_update).collect())
+    Ok(parsed
+        .result
+        .unwrap_or_default()
+        .iter()
+        .flat_map(chats_from_update)
+        .collect())
 }
 
 #[cfg(test)]

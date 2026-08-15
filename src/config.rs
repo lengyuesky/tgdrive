@@ -13,8 +13,9 @@ pub const SELF_HOSTED_CHUNK_MAX: u64 = 1_900 * 1024 * 1024;
 /// 自建端点默认分块直接取上限
 pub const LOCAL_CHUNK_DEFAULT: u64 = SELF_HOSTED_CHUNK_MAX;
 pub const MIN_CHUNK: u64 = 1024 * 1024;
+pub const DEFAULT_LOCAL_DATA_ROOT: &str = "/var/lib/telegram-bot-api";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
     pub bot_token: String,
@@ -26,12 +27,16 @@ pub struct Config {
     pub upload_concurrency: usize,
     pub db_path: String,
     pub tmp_dir: PathBuf,
+    /// 自建 Bot API `--local` 返回的绝对路径只能从此目录下读取。
+    pub local_data_root: PathBuf,
     pub username: String,
     pub password: String,
     /// cookie 签名密钥;为空则首次启动生成并存入 settings 表
     pub secret: Option<String>,
-    /// 以下两项 tgdrive 自己不用,是 compose 里 telegram-bot-api 服务的凭据。
-    /// 收在这里只为让后台能查看/编辑/导出(改动需重建那个容器才生效)。
+    /// 由 HTTPS 提供服务时给认证 Cookie 加上 Secure 属性。
+    pub cookie_secure: bool,
+    /// Telegram 应用凭据：tgdrive 用于 MTProto Range 下载，compose 中的
+    /// telegram-bot-api 服务也会读取；改动后需重启/重建两个服务。
     pub telegram_api_id: String,
     pub telegram_api_hash: String,
     /// 单块以内的视频文件改用 sendVideo 发送,在 Telegram 里可直接播放
@@ -39,7 +44,10 @@ pub struct Config {
 }
 
 fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn env_required(key: &str) -> anyhow::Result<String> {
@@ -60,7 +68,10 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     } else {
         (s.as_str(), 1)
     };
-    let n: f64 = num.trim().parse().map_err(|_| anyhow::anyhow!("无法解析大小: {s}"))?;
+    let n: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("无法解析大小: {s}"))?;
     Ok((n * mul as f64) as u64)
 }
 
@@ -127,7 +138,9 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("TGDRIVE_CHUNK_SIZE 无效: {e}"))?;
 
         let send_video = match env_opt("TGDRIVE_SEND_VIDEO") {
-            Some(v) => parse_bool(&v).map_err(|e| anyhow::anyhow!("TGDRIVE_SEND_VIDEO 无效: {e}"))?,
+            Some(v) => {
+                parse_bool(&v).map_err(|e| anyhow::anyhow!("TGDRIVE_SEND_VIDEO 无效: {e}"))?
+            }
             None => default_send_video(&api_base),
         };
 
@@ -151,10 +164,18 @@ impl Config {
             tmp_dir: env_opt("TGDRIVE_TMP_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir),
+            local_data_root: env_opt("TGDRIVE_LOCAL_DATA_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCAL_DATA_ROOT)),
             // 账号是唯一必填项:没有它就没法登录后台去配其余部分
             username: env_required("TGDRIVE_USERNAME")?,
             password: env_required("TGDRIVE_PASSWORD")?,
             secret: env_opt("TGDRIVE_SECRET"),
+            cookie_secure: env_opt("TGDRIVE_COOKIE_SECURE")
+                .map(|v| parse_bool(&v))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("TGDRIVE_COOKIE_SECURE 无效: {e}"))?
+                .unwrap_or(false),
             telegram_api_id: env_opt("TELEGRAM_API_ID").unwrap_or_default(),
             telegram_api_hash: env_opt("TELEGRAM_API_HASH").unwrap_or_default(),
             send_video,
@@ -171,7 +192,10 @@ mod tests {
     fn test_parse_size() {
         assert_eq!(parse_size("18MB").unwrap(), 18 * 1024 * 1024);
         assert_eq!(parse_size("512m").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_size("1.5g").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_size("1.5g").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
         assert_eq!(parse_size("19500000").unwrap(), 19_500_000);
         assert!(parse_size("abc").is_err());
     }

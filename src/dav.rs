@@ -13,13 +13,13 @@ use crate::vfs::Vfs;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use bytes::{Buf, Bytes};
+use dav_server::DavHandler;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{
     DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, FsStream,
     OpenOptions, ReadDirMeta,
 };
 use dav_server::memls::MemLs;
-use dav_server::DavHandler;
 use std::io::SeekFrom;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
@@ -138,7 +138,8 @@ impl DavFileSystem for TgDavFs {
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
             let p = path_str(path);
-            let is_write = options.write || options.append || options.truncate || options.create_new;
+            let is_write =
+                options.write || options.append || options.truncate || options.create_new;
             if is_write {
                 if options.append {
                     return Err(FsError::NotImplemented); // 不支持追加写
@@ -153,7 +154,11 @@ impl DavFileSystem for TgDavFs {
                     _ => {}
                 }
                 let (parent, name) = self.vfs.resolve_parent(&p).await.map_err(app_to_fs)?;
-                let handle = self.vfs.start_upload(&parent, &name).await.map_err(app_to_fs)?;
+                let handle = self
+                    .vfs
+                    .start_upload(&parent, &name)
+                    .await
+                    .map_err(app_to_fs)?;
                 Ok(Box::new(TgDavFile {
                     node: None,
                     reader: None,
@@ -231,7 +236,10 @@ impl DavFileSystem for TgDavFs {
     fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
         Box::pin(async move {
             // Overwrite:T 时 dav-server 已先删除目标
-            self.vfs.rename(&path_str(from), &path_str(to)).await.map_err(app_to_fs)
+            self.vfs
+                .rename(&path_str(from), &path_str(to))
+                .await
+                .map_err(app_to_fs)
         })
     }
 
@@ -239,12 +247,15 @@ impl DavFileSystem for TgDavFs {
         Box::pin(async move {
             let to_s = path_str(to);
             // 文件级覆盖复制:目标若还存在则先删(dav-server 对 Depth:0 的场景不预删)
-            if let Ok(existing) = self.vfs.resolve(&to_s).await {
-                if !existing.is_dir {
-                    self.vfs.delete(&to_s).await.map_err(app_to_fs)?;
-                }
+            if let Ok(existing) = self.vfs.resolve(&to_s).await
+                && !existing.is_dir
+            {
+                self.vfs.delete(&to_s).await.map_err(app_to_fs)?;
             }
-            self.vfs.copy(&path_str(from), &to_s).await.map_err(app_to_fs)
+            self.vfs
+                .copy(&path_str(from), &to_s)
+                .await
+                .map_err(app_to_fs)
         })
     }
 }
@@ -262,7 +273,14 @@ struct TgDavFile {
 impl std::fmt::Debug for TgDavFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TgDavFile")
-            .field("mode", &if self.writer.is_some() { "write" } else { "read" })
+            .field(
+                "mode",
+                &if self.writer.is_some() {
+                    "write"
+                } else {
+                    "read"
+                },
+            )
             .finish()
     }
 }
@@ -310,7 +328,11 @@ impl DavFile for TgDavFile {
 
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
         Box::pin(async move {
-            let r = self.reader.as_mut().ok_or(FsError::GeneralFailure)?.get_mut();
+            let r = self
+                .reader
+                .as_mut()
+                .ok_or(FsError::GeneralFailure)?
+                .get_mut();
             let mut out = vec![0u8; count];
             let mut filled = 0;
             while filled < count {
@@ -331,7 +353,11 @@ impl DavFile for TgDavFile {
     fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
         Box::pin(async move {
             if let Some(r) = self.reader.as_mut() {
-                return r.get_mut().seek(pos).await.map_err(|_| FsError::GeneralFailure);
+                return r
+                    .get_mut()
+                    .seek(pos)
+                    .await
+                    .map_err(|_| FsError::GeneralFailure);
             }
             // 写模式:只接受停留在当前位置的 seek(不支持部分 PUT)
             match pos {

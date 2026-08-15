@@ -12,6 +12,10 @@ bytes = "1.12.1"
 dav-server = "0.11.0"
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
+grammers-client = { version = "0.10.0", default-features = false }
+grammers-mtsender = "0.10.0"
+grammers-session = { version = "0.10.0", default-features = false, features = ["serde"] }
+grammers-tl-types = "0.10.0"
 hmac = "0.13.0"
 http = "1.5.0"
 http-body-util = "0.1.4"
@@ -30,6 +34,6 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["fs", "trace"] }
+tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -5,16 +5,17 @@ use crate::db::Node;
 use crate::error::{AppError, AppResult};
 use crate::settings::{self, ApplyOutcome, ConfigPatch, Runtime};
 use crate::vfs::Vfs;
-use axum::extract::{Multipart, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Multipart, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt as _;
 use tokio_util::io::ReaderStream;
@@ -26,6 +27,32 @@ pub struct AppState {
     /// 运行时配置与热更句柄
     pub rt: Arc<Runtime>,
     pub dav: dav_server::DavHandler,
+    /// 登录与分享提取码的失败限流。
+    pub attempts: crate::security::AttemptLimiter,
+    pub tasks: crate::tasks::TaskManager,
+}
+
+/// 就绪探针：数据库可用、存储目标已装载且关键后台任务仍有心跳。
+pub async fn readyz(State(state): State<AppState>) -> Response {
+    let db_ok = state.vfs.db.ping().await.is_ok();
+    let configured = state.rt.current().is_configured();
+    let target_ok = !configured || state.vfs.tg.current().is_ok();
+    let tasks_ok = state.tasks.healthy(&["housekeeping", "inbox"], 2 * 60);
+    let ready = db_ok && target_ok && tasks_ok;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(serde_json::json!({
+            "ready": ready,
+            "database": db_ok,
+            "storage_target": target_ok,
+            "background_tasks": tasks_ok,
+        })),
+    )
+        .into_response()
 }
 
 pub fn router(state: AppState) -> Router {
@@ -33,6 +60,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", post(login))
         // 分享链接:免登录访问
         .route("/share/{token}", get(share_meta))
+        .route("/share/{token}/authorize", post(share_authorize))
         .route("/share/{token}/list", get(share_list_dir))
         .route("/share/{token}/download", get(share_download));
     let protected = Router::new()
@@ -40,7 +68,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/me", get(me))
         .route("/fs/list", get(list))
         .route("/fs/mkdir", post(mkdir))
-        .route("/fs/upload", post(upload))
+        .route(
+            "/fs/upload",
+            post(upload).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .route("/fs/exists", post(exists))
         .route("/fs/download", get(download))
         .route(
@@ -65,22 +96,32 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/test", post(admin_test))
         .route("/admin/detect-chats", post(admin_detect_chats))
         .route("/admin/status", get(admin_status))
+        .route(
+            "/admin/inbox-failures",
+            get(admin_inbox_failures).delete(admin_inbox_failures_clear),
+        )
+        .route(
+            "/admin/inbox-failures/{update_id}",
+            axum::routing::delete(admin_inbox_failure_remove),
+        )
         .route("/admin/cleanup", post(admin_cleanup))
         .route("/admin/logout-all", post(admin_logout_all))
         .route("/admin/env-export", get(admin_env_export))
         .route("/admin/backup", get(admin_backup))
         .route("/admin/backup-to-channel", post(admin_backup_to_channel))
         .route("/admin/extras", get(extras_get).post(extras_set))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
-    Router::new().merge(public).merge(protected).with_state(state)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+    Router::new()
+        .merge(public)
+        .merge(protected)
+        .with_state(state)
 }
 
 /// cookie 或 Basic 任一通过即放行
-pub async fn auth_middleware(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if state.auth.check_headers(req.headers()) {
         return next.run(req).await;
     }
@@ -89,21 +130,49 @@ pub async fn auth_middleware(
 
 // ---------- 认证 ----------
 
-async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> AppResult<Response> {
-    req.verify(&state.auth)?;
+fn peer_key(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
+    addr.ip().to_string()
+}
+
+async fn login(
+    State(state): State<AppState>,
+    peer: ConnectInfo<SocketAddr>,
+    Json(req): Json<LoginReq>,
+) -> AppResult<Response> {
+    const LIMIT: usize = 5;
+    const WINDOW: i64 = 15 * 60;
+    let key = format!("login:{}", peer_key(peer));
+    if let Some(wait) = state.attempts.retry_after(&key, LIMIT, WINDOW) {
+        return Err(AppError::RateLimited(wait));
+    }
+    if let Err(error) = req.verify(&state.auth) {
+        state.attempts.record_failure(&key, WINDOW);
+        return Err(error);
+    }
+    state.attempts.clear(&key);
     let token = state.auth.issue_token();
     let mut resp = Json(serde_json::json!({ "username": state.auth.username() })).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        state.auth.cookie_header(&token).parse().expect("cookie 头合法"),
+        state
+            .auth
+            .cookie_header(&token)
+            .parse()
+            .expect("cookie 头合法"),
     );
     Ok(resp)
 }
 
-async fn logout() -> Response {
+async fn logout(State(state): State<AppState>) -> Response {
     let mut resp = Json(serde_json::json!({ "ok": true })).into_response();
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, Auth::clear_cookie_header().parse().expect("cookie 头合法"));
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        state
+            .auth
+            .clear_cookie_header()
+            .parse()
+            .expect("cookie 头合法"),
+    );
     resp
 }
 
@@ -149,7 +218,9 @@ async fn list(
 ) -> AppResult<Json<serde_json::Value>> {
     let nodes = state.vfs.list(&q.path).await?;
     let entries: Vec<Entry> = nodes.iter().map(Entry::from).collect();
-    Ok(Json(serde_json::json!({ "path": q.path, "entries": entries })))
+    Ok(Json(
+        serde_json::json!({ "path": q.path, "entries": entries }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -196,7 +267,9 @@ async fn exists(
     let mut existing = Vec::new();
     for raw in &b.names {
         // 名字不合法的留给上传时报错,查重阶段跳过
-        let Ok(name) = clean_filename(raw) else { continue };
+        let Ok(name) = clean_filename(raw) else {
+            continue;
+        };
         if state.vfs.db.child(dir.id, &name).await?.is_some() {
             existing.push(raw.clone());
         }
@@ -216,7 +289,9 @@ async fn upload(
         .await
         .map_err(|e| AppError::BadRequest(format!("multipart 解析失败: {e}")))?
     {
-        let Some(fname) = field.file_name().map(str::to_string) else { continue };
+        let Some(fname) = field.file_name().map(str::to_string) else {
+            continue;
+        };
         let name = clean_filename(&fname)?;
         let handle = state.vfs.start_upload(&dir, &name).await?;
         loop {
@@ -266,7 +341,9 @@ fn detect_thumbnail_mime(declared: &str, data: &[u8]) -> AppResult<&'static str>
     } else if declared == "image/jpeg" && data.starts_with(&[0xff, 0xd8, 0xff]) {
         Ok("image/jpeg")
     } else {
-        Err(AppError::BadRequest("只接受有效的 WebP 或 JPEG 缩略图".into()))
+        Err(AppError::BadRequest(
+            "只接受有效的 WebP 或 JPEG 缩略图".into(),
+        ))
     }
 }
 
@@ -286,7 +363,11 @@ async fn thumbnail_get(
             .expect("构造缩略图未命中响应失败"));
     };
     let etag = format!("\"thumbnail-{sha}\"");
-    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        == Some(etag.as_str())
+    {
         return Ok(Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, etag)
@@ -297,7 +378,10 @@ async fn thumbnail_get(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
         .header(header::CONTENT_LENGTH, data.len())
-        .header(header::CACHE_CONTROL, "private, max-age=31536000, immutable")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
         .header(header::ETAG, etag)
         .header("x-content-type-options", "nosniff")
         .body(axum::body::Body::from(data))
@@ -312,13 +396,18 @@ async fn thumbnail_put(
     data: Bytes,
 ) -> AppResult<Json<serde_json::Value>> {
     let sha = normalized_sha256(&q.sha256)?;
-    let path = q.path.as_deref().ok_or_else(|| AppError::BadRequest("缺少文件路径".into()))?;
+    let path = q
+        .path
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("缺少文件路径".into()))?;
     let node = state.vfs.resolve(path).await?;
     if node.is_dir {
         return Err(AppError::IsDirectory);
     }
     if node.sha256.as_deref() != Some(sha.as_str()) {
-        return Err(AppError::BadRequest("文件内容已经变化，拒绝写入旧缩略图".into()));
+        return Err(AppError::BadRequest(
+            "文件内容已经变化，拒绝写入旧缩略图".into(),
+        ));
     }
     if data.is_empty() || data.len() > MAX_THUMBNAIL_SIZE {
         return Err(AppError::BadRequest(format!(
@@ -341,9 +430,13 @@ fn parse_range(headers: &HeaderMap, total: u64) -> Result<Option<(u64, u64)>, ()
     let Some(h) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
         return Ok(None);
     };
-    let Some(spec) = h.strip_prefix("bytes=") else { return Ok(None) };
+    let Some(spec) = h.strip_prefix("bytes=") else {
+        return Ok(None);
+    };
     let first = spec.split(',').next().unwrap_or("").trim();
-    let Some((a, b)) = first.split_once('-') else { return Err(()) };
+    let Some((a, b)) = first.split_once('-') else {
+        return Err(());
+    };
     let (start, end) = match (a.trim(), b.trim()) {
         ("", n) => {
             // 后缀范围:最后 n 字节
@@ -381,9 +474,22 @@ async fn stream_node(
     if node.is_dir {
         return Err(AppError::IsDirectory);
     }
-    let mime = mime_guess::from_path(&node.name).first_or_octet_stream();
+    let guessed_mime = mime_guess::from_path(&node.name).first_or_octet_stream();
+    let safe_inline = inline_mime_allowed(guessed_mime.as_ref());
+    let effective_inline = inline && safe_inline;
+    // 主动内容即使带 inline=1 也只按二进制附件返回，避免 HTML/SVG/脚本在网盘
+    // 自身域名下执行并读取认证 Cookie。
+    let response_mime = if inline && !safe_inline {
+        "application/octet-stream"
+    } else {
+        guessed_mime.as_ref()
+    };
     let disposition = {
-        let kind = if inline { "inline" } else { "attachment" };
+        let kind = if effective_inline {
+            "inline"
+        } else {
+            "attachment"
+        };
         let enc = utf8_percent_encode(&node.name, NON_ALPHANUMERIC);
         format!("{kind}; filename*=UTF-8''{enc}")
     };
@@ -401,7 +507,7 @@ async fn stream_node(
             let body = axum::body::Body::from_stream(ReaderStream::new(reader));
             Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CONTENT_TYPE, response_mime)
                 .header(header::CONTENT_LENGTH, total)
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_DISPOSITION, disposition)
@@ -414,15 +520,46 @@ async fn stream_node(
             let body = axum::body::Body::from_stream(ReaderStream::new(reader.take(len)));
             Ok(Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CONTENT_TYPE, response_mime)
                 .header(header::CONTENT_LENGTH, len)
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", node.size))
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", node.size),
+                )
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_DISPOSITION, disposition)
                 .body(body)
                 .expect("响应构造失败"))
         }
     }
+}
+
+fn inline_mime_allowed(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/jpeg"
+            | "image/png"
+            | "image/gif"
+            | "image/webp"
+            | "image/avif"
+            | "image/bmp"
+            | "image/x-icon"
+            | "image/vnd.microsoft.icon"
+            | "audio/mpeg"
+            | "audio/mp4"
+            | "audio/aac"
+            | "audio/ogg"
+            | "audio/webm"
+            | "audio/wav"
+            | "audio/flac"
+            | "video/mp4"
+            | "video/webm"
+            | "video/ogg"
+            | "video/quicktime"
+            | "video/x-matroska"
+            | "text/plain"
+            | "application/pdf"
+    )
 }
 
 #[derive(Deserialize)]
@@ -464,7 +601,9 @@ async fn delete(
             Err(e) => failed.push(serde_json::json!({ "path": p, "error": e.to_string() })),
         }
     }
-    Ok(Json(serde_json::json!({ "deleted": deleted, "failed": failed })))
+    Ok(Json(
+        serde_json::json!({ "deleted": deleted, "failed": failed }),
+    ))
 }
 
 async fn info(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
@@ -567,14 +706,18 @@ async fn admin_test(
             _ => cur.to_string(),
         }
     };
-    let api_base = pick(b.api_base, &c.api_base).trim_end_matches('/').to_string();
+    let api_base = pick(b.api_base, &c.api_base)
+        .trim_end_matches('/')
+        .to_string();
     let token = pick(b.bot_token, &c.bot_token);
     let chat_id = pick(b.chat_id, &c.chat_id);
     if token.trim().is_empty() || chat_id.trim().is_empty() {
         return Err(AppError::BadRequest("请先填写 Bot Token 与存储频道".into()));
     }
     let bot = Runtime::probe(&api_base, &token, &chat_id).await?;
-    Ok(Json(serde_json::json!({ "ok": true, "bot": bot, "api_base": api_base })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "bot": bot, "api_base": api_base }),
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -598,7 +741,9 @@ async fn admin_detect_chats(
             _ => cur.to_string(),
         }
     };
-    let api_base = pick(b.api_base, &c.api_base).trim_end_matches('/').to_string();
+    let api_base = pick(b.api_base, &c.api_base)
+        .trim_end_matches('/')
+        .to_string();
     let token = pick(b.bot_token, &c.bot_token);
     if token.trim().is_empty() {
         return Err(AppError::BadRequest("请先填写 Bot Token".into()));
@@ -630,6 +775,13 @@ fn db_file_size(path: &str) -> u64 {
 
 async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let (files, dirs, total) = state.vfs.db.stats().await?;
+    let pending_deletes = state.vfs.db.pending_delete_count().await?;
+    let inbox_failures = state
+        .vfs
+        .db
+        .settings_with_prefix("extra.inbox_failure.")
+        .await?
+        .len();
     let c = state.rt.current();
     let db_path = state.rt.env.db_path.clone();
     Ok(Json(serde_json::json!({
@@ -649,7 +801,60 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "listen": state.rt.env.listen.to_string(),
         "started_at": state.rt.started_at,
         "now": crate::db::now_ts(),
+        "pending_deletes": pending_deletes,
+        "inbox_failures": inbox_failures,
+        "tasks": state.tasks.snapshots(),
     })))
+}
+
+async fn admin_inbox_failures(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+    let rows = state
+        .vfs
+        .db
+        .settings_with_prefix("extra.inbox_failure.")
+        .await?;
+    let mut items = Vec::new();
+    for (update_id, raw) in rows {
+        if let Ok(serde_json::Value::Object(mut value)) =
+            serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            value.insert(
+                "update_id".into(),
+                serde_json::json!(update_id.parse::<i64>().unwrap_or(0)),
+            );
+            items.push(serde_json::Value::Object(value));
+        }
+    }
+    items.sort_by_key(|item| item["update_id"].as_i64().unwrap_or(0));
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+async fn admin_inbox_failure_remove(
+    State(state): State<AppState>,
+    axum::extract::Path(update_id): axum::extract::Path<i64>,
+) -> AppResult<Json<serde_json::Value>> {
+    state
+        .vfs
+        .db
+        .setting_del(&format!("extra.inbox_failure.{update_id}"))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn admin_inbox_failures_clear(
+    State(state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    let rows = state
+        .vfs
+        .db
+        .settings_with_prefix("extra.inbox_failure.")
+        .await?;
+    let deletes: Vec<String> = rows
+        .keys()
+        .map(|update_id| format!("extra.inbox_failure.{update_id}"))
+        .collect();
+    state.vfs.db.settings_apply(&[], &deletes).await?;
+    Ok(Json(serde_json::json!({ "cleared": deletes.len() })))
 }
 
 async fn admin_cleanup(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
@@ -663,8 +868,14 @@ async fn admin_cleanup(State(state): State<AppState>) -> AppResult<Json<serde_js
 async fn admin_logout_all(State(state): State<AppState>) -> AppResult<Response> {
     state.auth.rotate_secret(&state.vfs.db).await?;
     let mut resp = Json(serde_json::json!({ "ok": true })).into_response();
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, Auth::clear_cookie_header().parse().expect("cookie 头合法"));
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        state
+            .auth
+            .clear_cookie_header()
+            .parse()
+            .expect("cookie 头合法"),
+    );
     Ok(resp)
 }
 
@@ -729,7 +940,12 @@ async fn instant(
     if !dir.is_dir {
         return Err(AppError::NotDirectory);
     }
-    match state.vfs.db.instant_link(&sha, b.size, dir.id, &name).await? {
+    match state
+        .vfs
+        .db
+        .instant_link(&sha, b.size, dir.id, &name)
+        .await?
+    {
         Some((id, freed)) => {
             state.vfs.uploader.delete_messages_best_effort(freed);
             let node = state.vfs.db.node(id).await?;
@@ -741,7 +957,9 @@ async fn instant(
         }
         None => {
             let pending = state.vfs.db.uploading_child_exists(dir.id, &name).await?;
-            Ok(Json(serde_json::json!({ "linked": false, "pending": pending })))
+            Ok(Json(
+                serde_json::json!({ "linked": false, "pending": pending }),
+            ))
         }
     }
 }
@@ -776,11 +994,22 @@ struct TrashBody {
 
 /// 只接受确实在回收站里的 id,防止借这个口子删任意节点
 async fn trash_targets(state: &AppState, b: &TrashBody) -> AppResult<Vec<i64>> {
-    let in_trash: Vec<i64> = state.vfs.db.trash_list().await?.iter().map(|(n, _, _)| n.id).collect();
+    let in_trash: Vec<i64> = state
+        .vfs
+        .db
+        .trash_list()
+        .await?
+        .iter()
+        .map(|(n, _, _)| n.id)
+        .collect();
     if b.all {
         return Ok(in_trash);
     }
-    Ok(b.ids.iter().copied().filter(|id| in_trash.contains(id)).collect())
+    Ok(b.ids
+        .iter()
+        .copied()
+        .filter(|id| in_trash.contains(id))
+        .collect())
 }
 
 async fn trash_restore(
@@ -795,7 +1024,9 @@ async fn trash_restore(
             Err(e) => failed.push(serde_json::json!({ "id": id, "error": e.to_string() })),
         }
     }
-    Ok(Json(serde_json::json!({ "restored": restored, "failed": failed })))
+    Ok(Json(
+        serde_json::json!({ "restored": restored, "failed": failed }),
+    ))
 }
 
 async fn trash_purge(
@@ -828,11 +1059,20 @@ async fn shares_create(
     Json(b): Json<ShareCreateBody>,
 ) -> AppResult<Json<serde_json::Value>> {
     let node = state.vfs.resolve(&b.path).await?;
-    let pwd = b.password.as_deref().map(str::trim).filter(|p| !p.is_empty());
-    let exp = b.expires_hours.filter(|h| *h > 0).map(|h| crate::db::now_ts() + h * 3600);
+    let pwd = b
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let exp = b
+        .expires_hours
+        .filter(|h| *h > 0)
+        .map(|h| crate::db::now_ts() + h * 3600);
     let maxd = b.max_downloads.filter(|n| *n > 0);
     let share = state.vfs.db.share_create(node.id, pwd, exp, maxd).await?;
-    Ok(Json(serde_json::json!({ "share": share, "name": node.name, "is_dir": node.is_dir })))
+    Ok(Json(
+        serde_json::json!({ "share": share, "name": node.name, "is_dir": node.is_dir }),
+    ))
 }
 
 async fn shares_index(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
@@ -876,18 +1116,27 @@ struct ShareQuery {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
-    pwd: Option<String>,
-    #[serde(default)]
     inline: Option<u8>,
+}
+
+#[derive(Deserialize, Default)]
+struct ShareAuthorizeBody {
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// token → (share, 分享根节点);过期/已删除在此统一拦下
 async fn share_access(state: &AppState, token: &str) -> AppResult<(crate::db::Share, Node)> {
-    let s = state.vfs.db.share_by_token(token).await?.ok_or(AppError::NotFound)?;
-    if let Some(exp) = s.expires_at {
-        if exp < crate::db::now_ts() {
-            return Err(AppError::BadRequest("分享已过期".into()));
-        }
+    let s = state
+        .vfs
+        .db
+        .share_by_token(token)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(exp) = s.expires_at
+        && exp < crate::db::now_ts()
+    {
+        return Err(AppError::BadRequest("分享已过期".into()));
     }
     let node = state.vfs.db.node(s.node_id).await?;
     if node.status != "ready" {
@@ -897,10 +1146,10 @@ async fn share_access(state: &AppState, token: &str) -> AppResult<(crate::db::Sh
 }
 
 fn share_check_pwd(s: &crate::db::Share, pwd: Option<&str>) -> AppResult<()> {
-    if let Some(want) = &s.password {
-        if pwd != Some(want.as_str()) {
-            return Err(AppError::Forbidden("提取码错误".into()));
-        }
+    if let Some(want) = &s.password
+        && !pwd.is_some_and(|given| Auth::secrets_equal(given, want))
+    {
+        return Err(AppError::Forbidden("提取码错误".into()));
     }
     Ok(())
 }
@@ -910,7 +1159,12 @@ async fn share_resolve(state: &AppState, root: &Node, rel: &str) -> AppResult<No
     let segs = crate::vfs::normalize(rel)?;
     let mut cur = root.clone();
     for seg in &segs {
-        cur = state.vfs.db.child(cur.id, seg).await?.ok_or(AppError::NotFound)?;
+        cur = state
+            .vfs
+            .db
+            .child(cur.id, seg)
+            .await?
+            .ok_or(AppError::NotFound)?;
     }
     Ok(cur)
 }
@@ -931,19 +1185,81 @@ async fn share_meta(
     })))
 }
 
+/// 提取码只通过 POST 请求体提交；成功后签发短期、分享范围内的 HttpOnly 票据。
+async fn share_authorize(
+    State(state): State<AppState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+    peer: ConnectInfo<SocketAddr>,
+    Json(body): Json<ShareAuthorizeBody>,
+) -> AppResult<Response> {
+    const LIMIT: usize = 10;
+    const WINDOW: i64 = 10 * 60;
+
+    let (share, _) = share_access(&state, &token).await?;
+    let key = format!("share:{token}:{}", peer_key(peer));
+    if let Some(wait) = state.attempts.retry_after(&key, LIMIT, WINDOW) {
+        return Err(AppError::RateLimited(wait));
+    }
+    if let Err(error) = share_check_pwd(&share, body.password.as_deref()) {
+        state.attempts.record_failure(&key, WINDOW);
+        return Err(error);
+    }
+    state.attempts.clear(&key);
+
+    let (raw, ticket) = state.auth.issue_share_ticket(share.id);
+    let mut response = Json(serde_json::json!({
+        "expires_at": ticket.expires_at,
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        state
+            .auth
+            .share_cookie_header(&raw, &token)
+            .parse()
+            .expect("分享 cookie 头合法"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    Ok(response)
+}
+
+fn require_share_ticket(
+    state: &AppState,
+    headers: &HeaderMap,
+    share_id: i64,
+) -> AppResult<crate::auth::ShareTicket> {
+    let ticket = state
+        .auth
+        .share_ticket_from_headers(headers)
+        .ok_or_else(|| AppError::Forbidden("分享票据无效或已过期，请重新输入提取码".into()))?;
+    if ticket.share_id != share_id {
+        return Err(AppError::Forbidden("分享票据与当前链接不匹配".into()));
+    }
+    Ok(ticket)
+}
+
 async fn share_list_dir(
     State(state): State<AppState>,
     axum::extract::Path(token): axum::extract::Path<String>,
     Query(q): Query<ShareQuery>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
     let (s, root) = share_access(&state, &token).await?;
-    share_check_pwd(&s, q.pwd.as_deref())?;
+    require_share_ticket(&state, &headers, s.id)?;
     let target = share_resolve(&state, &root, q.path.as_deref().unwrap_or("")).await?;
     if !target.is_dir {
         return Err(AppError::NotDirectory);
     }
-    let entries: Vec<Entry> =
-        state.vfs.db.list_children(target.id).await?.iter().map(Entry::from).collect();
+    let entries: Vec<Entry> = state
+        .vfs
+        .db
+        .list_children(target.id)
+        .await?
+        .iter()
+        .map(Entry::from)
+        .collect();
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
@@ -954,7 +1270,7 @@ async fn share_download(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let (s, root) = share_access(&state, &token).await?;
-    share_check_pwd(&s, q.pwd.as_deref())?;
+    let ticket = require_share_ticket(&state, &headers, s.id)?;
     let target = if root.is_dir {
         share_resolve(&state, &root, q.path.as_deref().unwrap_or("")).await?
     } else {
@@ -963,12 +1279,22 @@ async fn share_download(
     if target.is_dir {
         return Err(AppError::IsDirectory);
     }
-    if let Some(max) = s.max_downloads {
-        if s.downloads >= max {
-            return Err(AppError::BadRequest("下载次数已用完".into()));
-        }
+    // 无效 Range 不应消耗一次下载额度。
+    if parse_range(&headers, target.size as u64).is_err() {
+        return Ok(Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{}", target.size))
+            .body(axum::body::Body::empty())
+            .expect("响应构造失败"));
     }
-    state.vfs.db.share_bump(s.id).await?;
+    if !state
+        .vfs
+        .db
+        .share_claim_download(s.id, &ticket.ticket_id, target.id, ticket.expires_at)
+        .await?
+    {
+        return Err(AppError::BadRequest("下载次数已用完".into()));
+    }
     stream_node(&state, &target, &headers, q.inline == Some(1)).await
 }
 
@@ -977,8 +1303,14 @@ async fn share_download(
 /// 下载数据库一致性快照(VACUUM INTO 临时文件后流式返回)
 async fn admin_backup(State(state): State<AppState>) -> AppResult<Response> {
     let ts = crate::db::now_ts();
-    let tmp = state.rt.current().tmp_dir.join(format!("tgdrive-backup-{ts}.db"));
-    let tmp_str = tmp.to_str().ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
+    let cfg = state.rt.current();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("tgdrive-download-")
+        .tempdir_in(&cfg.tmp_dir)?;
+    let tmp = temp_dir.path().join("snapshot.db");
+    let tmp_str = tmp
+        .to_str()
+        .ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
     state.vfs.db.vacuum_into(tmp_str).await?;
     let file = tokio::fs::File::open(&tmp).await?;
     let len = file.metadata().await?.len();
@@ -1047,5 +1379,50 @@ mod tests {
             "image/jpeg"
         );
         assert!(detect_thumbnail_mime("image/png", b"not-an-image").is_err());
+    }
+
+    #[test]
+    fn range_parsing_covers_boundaries() {
+        fn parse(value: &str, total: u64) -> Result<Option<(u64, u64)>, ()> {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RANGE, value.parse().unwrap());
+            parse_range(&headers, total)
+        }
+
+        assert_eq!(parse_range(&HeaderMap::new(), 10), Ok(None));
+        assert_eq!(parse("bytes=2-5", 10), Ok(Some((2, 5))));
+        assert_eq!(parse("bytes=8-99", 10), Ok(Some((8, 9))));
+        assert_eq!(parse("bytes=7-", 10), Ok(Some((7, 9))));
+        assert_eq!(parse("bytes=-3", 10), Ok(Some((7, 9))));
+        assert_eq!(parse("bytes=-99", 10), Ok(Some((0, 9))));
+        assert_eq!(parse("bytes=0-1, 5-6", 10), Ok(Some((0, 1))));
+        assert_eq!(parse("items=0-1", 10), Ok(None));
+        assert!(parse("bytes=10-", 10).is_err());
+        assert!(parse("bytes=5-4", 10).is_err());
+        assert!(parse("bytes=0-0", 0).is_err());
+    }
+
+    #[test]
+    fn inline_mime_blocks_active_content() {
+        for mime in [
+            "image/jpeg",
+            "image/png",
+            "audio/mpeg",
+            "video/mp4",
+            "text/plain",
+            "application/pdf",
+        ] {
+            assert!(inline_mime_allowed(mime), "应允许内联显示 {mime}");
+        }
+        for mime in [
+            "text/html",
+            "image/svg+xml",
+            "application/xhtml+xml",
+            "application/javascript",
+            "text/css",
+            "application/octet-stream",
+        ] {
+            assert!(!inline_mime_allowed(mime), "应阻止内联显示 {mime}");
+        }
     }
 }

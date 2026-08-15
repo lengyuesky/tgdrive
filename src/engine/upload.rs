@@ -3,15 +3,15 @@
 //! 生产者(HTTP 上传 / WebDAV PUT)通过 mpsc 通道喂入字节,管线在独立任务中
 //! 攒块并发上传;生产者中途消失(未发 Eof 就断开)视为失败,自动回滚已传分块。
 
-use crate::db::{Db, Node};
+use crate::db::{Db, Node, StoredMessage};
 use crate::error::{AppError, AppResult};
-use crate::telegram::{TgApi, UploadBody};
+use crate::telegram::{TgBinding, TgRegistry, UploadBody};
 use bytes::{Bytes, BytesMut};
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::io::AsyncWriteExt as _;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 pub enum UploadMsg {
@@ -117,14 +117,25 @@ impl UploadKnobs {
 
 #[derive(Clone)]
 pub struct Uploader {
-    pub tg: Arc<dyn TgApi>,
+    pub tg: Arc<TgRegistry>,
     pub db: Db,
     pub knobs: Arc<UploadKnobs>,
     /// 分块超过该值转入临时文件(生产用 MEMORY_CHUNK_LIMIT,测试可调小)
     pub mem_limit: u64,
+    delete_running: Arc<AtomicBool>,
 }
 
 impl Uploader {
+    pub fn new(tg: Arc<TgRegistry>, db: Db, knobs: Arc<UploadKnobs>, mem_limit: u64) -> Self {
+        Uploader {
+            tg,
+            db,
+            knobs,
+            mem_limit,
+            delete_running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// 启动一次上传:先建 uploading 占位节点,返回喂数据的句柄
     pub async fn start(
         &self,
@@ -132,13 +143,18 @@ impl Uploader {
         name: &str,
         display_path: &str,
     ) -> AppResult<UploadHandle> {
+        // 一次上传固定使用同一个存储目标；后台改配置只影响之后开始的上传。
+        let target = self.tg.current()?;
         let node_id = self.db.create_uploading(parent_id, name).await?;
         let (tx, rx) = mpsc::channel::<UploadMsg>(4);
         let this = self.clone();
         let name = name.to_string();
         let display_path = display_path.to_string();
         let join = tokio::spawn(async move {
-            match this.pipeline(node_id, &name, &display_path, rx).await {
+            match this
+                .pipeline(node_id, &name, &display_path, target, rx)
+                .await
+            {
                 Ok(node) => Ok(node),
                 Err(e) => {
                     tracing::warn!("上传 {display_path} 失败,回滚: {e}");
@@ -153,18 +169,74 @@ impl Uploader {
         Ok(UploadHandle { tx, join })
     }
 
-    /// 后台尽力删除 TG 消息(引用归零的分块)
-    pub fn delete_messages_best_effort(&self, message_ids: Vec<i64>) {
-        if message_ids.is_empty() {
+    /// 删除任务已经和元数据变更在同一事务内持久化；这里负责立即唤醒处理器。
+    pub fn delete_messages_best_effort(&self, messages: Vec<StoredMessage>) {
+        if messages.is_empty() {
             return;
         }
-        let tg = self.tg.clone();
+        self.process_pending_deletes();
+    }
+
+    /// 处理到期的持久化删除任务。并发触发会合并成一个工作循环。
+    pub fn process_pending_deletes(&self) {
+        if self
+            .delete_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let this = self.clone();
         tokio::spawn(async move {
-            for mid in message_ids {
-                if let Err(e) = tg.delete_message(mid).await {
-                    tracing::warn!("删除 TG 消息 {mid} 失败(可手动清理): {e}");
+            'worker: loop {
+                let jobs = match this.db.delete_jobs_due(100).await {
+                    Ok(jobs) => jobs,
+                    Err(e) => {
+                        tracing::warn!("读取 Telegram 删除队列失败: {e}");
+                        break;
+                    }
+                };
+                if jobs.is_empty() {
+                    // 常驻轻量 worker，确保指数退避到期后能按时重试，而不是最多
+                    // 等待下一轮 30 分钟维护任务。
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    continue;
+                }
+                for job in jobs {
+                    let result = match this.tg.binding(job.storage_target_id) {
+                        Ok(binding) => binding.api.delete_message(job.tg_message_id).await,
+                        Err(e) => Err(e),
+                    };
+                    match result {
+                        Ok(()) => {
+                            if let Err(e) = this.db.delete_job_done(job.id).await {
+                                tracing::warn!("确认 Telegram 删除任务 {} 失败: {e}", job.id);
+                                // Telegram 已删但数据库未确认时不能在紧循环里反复请求；
+                                // 退出并延时重启，避免紧循环重复请求。
+                                break 'worker;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "删除存储目标 {} 的消息 {} 失败，将自动重试: {e}",
+                                job.storage_target_id,
+                                job.tg_message_id
+                            );
+                            if let Err(db_err) = this
+                                .db
+                                .delete_job_failed(job.id, job.attempts, &e.to_string())
+                                .await
+                            {
+                                tracing::error!("更新 Telegram 删除任务 {} 失败: {db_err}", job.id);
+                                break 'worker;
+                            }
+                        }
+                    }
                 }
             }
+            this.delete_running.store(false, Ordering::Release);
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            this.process_pending_deletes();
         });
     }
 
@@ -173,10 +245,13 @@ impl Uploader {
         node_id: i64,
         name: &str,
         display_path: &str,
+        target: TgBinding,
         mut rx: mpsc::Receiver<UploadMsg>,
     ) -> AppResult<Node> {
         let mut uploads: JoinSet<AppResult<()>> = JoinSet::new();
-        let result = self.pipeline_inner(&mut uploads, node_id, name, display_path, &mut rx).await;
+        let result = self
+            .pipeline_inner(&mut uploads, node_id, name, display_path, target, &mut rx)
+            .await;
         if result.is_err() {
             // 出错时不 abort 在途任务:消息可能已发到 TG,必须等它落定并记入
             // chunks 表,随后的 abort_upload 才能把它们一并清理,避免孤儿消息
@@ -195,11 +270,15 @@ impl Uploader {
         node_id: i64,
         name: &str,
         display_path: &str,
+        target: TgBinding,
         rx: &mut mpsc::Receiver<UploadMsg>,
     ) -> AppResult<Node> {
         // 整次上传用同一份分块参数快照,中途改配置不会切出大小不一的块
-        let mut buf =
-            ChunkBuf::new(self.knobs.chunk_size(), self.mem_limit, self.knobs.tmp_dir());
+        let mut buf = ChunkBuf::new(
+            self.knobs.chunk_size(),
+            self.mem_limit,
+            self.knobs.tmp_dir(),
+        );
         let mut idx: i64 = 0;
         let mut total: u64 = 0;
         let mut clean_eof = false;
@@ -212,10 +291,19 @@ impl Uploader {
                     total += data.len() as u64;
                     sha2::Digest::update(&mut hasher, &data);
                     while !data.is_empty() {
-                        if let Some(full) = buf.push(&mut data)? {
+                        if let Some(full) = buf.push(&mut data).await? {
                             // 攒满整块即被切分,该文件必然多于一块,不是视频消息候选
-                            self.spawn_chunk(uploads, node_id, name, display_path, idx, full, false)
-                                .await?;
+                            self.spawn_chunk(
+                                uploads,
+                                node_id,
+                                name,
+                                display_path,
+                                idx,
+                                full,
+                                false,
+                                target.clone(),
+                            )
+                            .await?;
                             idx += 1;
                         }
                         // 上传任务出错时尽早终止,不再收数据
@@ -238,9 +326,19 @@ impl Uploader {
         while let Some(res) = uploads.try_join_next() {
             res.map_err(|e| anyhow::anyhow!("上传任务崩溃: {e}"))??;
         }
-        if let Some(last) = buf.take_partial()? {
+        if let Some(last) = buf.take_partial().await? {
             // EOF 时的尾块若是第 0 块,说明整个文件只有这一块 → 视频消息候选
-            self.spawn_chunk(uploads, node_id, name, display_path, idx, last, idx == 0).await?;
+            self.spawn_chunk(
+                uploads,
+                node_id,
+                name,
+                display_path,
+                idx,
+                last,
+                idx == 0,
+                target,
+            )
+            .await?;
         }
         while let Some(res) = uploads.join_next().await {
             res.map_err(|e| anyhow::anyhow!("上传任务崩溃: {e}"))??;
@@ -249,8 +347,10 @@ impl Uploader {
         let sha = to_hex(&sha2::Digest::finalize(hasher));
         // 节点随 finalize 事务一并读出，提交成功后不再做可能失败的数据库操作。
         // 否则可能出现“已经提交成功，却因随后一次查询失败而被外层回滚”的假失败。
-        let (node, freed) =
-            self.db.finalize_upload_with_node(node_id, total as i64, Some(&sha)).await?;
+        let (node, freed) = self
+            .db
+            .finalize_upload_with_node(node_id, total as i64, Some(&sha))
+            .await?;
         self.delete_messages_best_effort(freed); // 覆盖写释放的旧版本
         Ok(node)
     }
@@ -267,6 +367,7 @@ impl Uploader {
         idx: i64,
         body: UploadBody,
         single_chunk: bool,
+        target: TgBinding,
     ) -> AppResult<()> {
         let permit = self
             .knobs
@@ -274,11 +375,15 @@ impl Uploader {
             .acquire_owned()
             .await
             .map_err(|_| AppError::Internal(anyhow::anyhow!("信号量已关闭")))?;
-        let tg = self.tg.clone();
+        let tg = target.api;
+        let storage_target_id = target.storage_target_id;
         let db = self.db.clone();
         // 分块 0 用原始文件名(单块文件在 TG 里保持原名),后续块加 .partN 后缀
-        let filename =
-            if idx == 0 { name.to_string() } else { format!("{name}.part{idx}") };
+        let filename = if idx == 0 {
+            name.to_string()
+        } else {
+            format!("{name}.part{idx}")
+        };
         // 完整的视频文件按「视频消息」发,Telegram 里可直接播放;开关关闭或非视频照旧走文档
         let mime = (single_chunk && self.knobs.send_video())
             .then(|| video_mime(name))
@@ -301,13 +406,14 @@ impl Uploader {
                     if meta.is_none() {
                         tracing::debug!("{filename} 未解析出视频宽高,按无元数据发送");
                     }
-                    match tg.send_video(&filename, m, meta, Some(caption.clone()), &body).await {
+                    match tg
+                        .send_video(&filename, m, meta, Some(caption.clone()), &body)
+                        .await
+                    {
                         Ok(msg) => msg,
                         // 只有 Telegram 明确拒绝视频格式时才能降级；结果不确定时再次发送会重复。
                         Err(AppError::TelegramRejected(detail)) => {
-                            tracing::warn!(
-                                "{filename} 以视频消息发送失败({detail}),回退为文档"
-                            );
+                            tracing::warn!("{filename} 以视频消息发送失败({detail}),回退为文档");
                             tg.send_document(&filename, Some(caption), &body).await?
                         }
                         Err(e) => return Err(e),
@@ -315,7 +421,16 @@ impl Uploader {
                 }
                 None => tg.send_document(&filename, Some(caption), &body).await?,
             };
-            if let Err(e) = db.add_chunk(node_id, idx, size as i64, &msg.file_id, msg.message_id).await
+            if let Err(e) = db
+                .add_chunk(
+                    node_id,
+                    idx,
+                    size as i64,
+                    &msg.file_id,
+                    msg.message_id,
+                    storage_target_id,
+                )
+                .await
             {
                 // Telegram 已成功但元数据登记失败时立即补偿删除，避免频道残留孤儿分块。
                 if let Err(cleanup) = tg.delete_message(msg.message_id).await {
@@ -338,50 +453,71 @@ struct ChunkBuf {
     mem_limit: u64,
     tmp_dir: PathBuf,
     mem: BytesMut,
-    spill: Option<(tempfile::NamedTempFile, u64)>,
+    spill: Option<SpillFile>,
+}
+
+struct SpillFile {
+    owner: tempfile::NamedTempFile,
+    writer: tokio::fs::File,
+    len: u64,
 }
 
 impl ChunkBuf {
     fn new(chunk_size: u64, mem_limit: u64, tmp_dir: PathBuf) -> Self {
-        ChunkBuf { chunk_size, mem_limit, tmp_dir, mem: BytesMut::new(), spill: None }
+        ChunkBuf {
+            chunk_size,
+            mem_limit,
+            tmp_dir,
+            mem: BytesMut::new(),
+            spill: None,
+        }
     }
 
     fn filled(&self) -> u64 {
-        self.spill.as_ref().map(|(_, n)| *n).unwrap_or(0) + self.mem.len() as u64
+        self.spill.as_ref().map(|spill| spill.len).unwrap_or(0) + self.mem.len() as u64
     }
 
     /// 从 data 消费字节;攒满一个分块时返回之(data 剩余部分留给下一块)
-    fn push(&mut self, data: &mut Bytes) -> AppResult<Option<UploadBody>> {
+    async fn push(&mut self, data: &mut Bytes) -> AppResult<Option<UploadBody>> {
         let room = (self.chunk_size - self.filled()) as usize;
         let take = room.min(data.len());
         let piece = data.split_to(take);
 
-        if self.spill.is_some() {
-            let (file, n) = self.spill.as_mut().unwrap();
-            file.write_all(&piece)?;
-            *n += piece.len() as u64;
+        if let Some(spill) = &mut self.spill {
+            spill.writer.write_all(&piece).await?;
+            spill.len += piece.len() as u64;
         } else {
             self.mem.extend_from_slice(&piece);
             // 内存超限且分块还没攒满 → 转入临时文件
             if self.mem.len() as u64 > self.mem_limit && (self.mem.len() as u64) < self.chunk_size {
-                let mut file = tempfile::NamedTempFile::new_in(&self.tmp_dir)?;
-                file.write_all(&self.mem)?;
+                let owner = tempfile::NamedTempFile::new_in(&self.tmp_dir)?;
+                let writer = tokio::fs::File::from_std(owner.reopen()?);
                 let n = self.mem.len() as u64;
+                let mut spill = SpillFile {
+                    owner,
+                    writer,
+                    len: n,
+                };
+                spill.writer.write_all(&self.mem).await?;
                 self.mem = BytesMut::new();
-                self.spill = Some((file, n));
+                self.spill = Some(spill);
             }
         }
         if self.filled() >= self.chunk_size {
-            return self.take_partial();
+            return self.take_partial().await;
         }
         Ok(None)
     }
 
     /// 取出当前已攒的(可能不满的)分块;空则返回 None
-    fn take_partial(&mut self) -> AppResult<Option<UploadBody>> {
-        if let Some((mut file, len)) = self.spill.take() {
-            file.flush()?;
-            return Ok(Some(UploadBody::TempFile { file, len }));
+    async fn take_partial(&mut self) -> AppResult<Option<UploadBody>> {
+        if let Some(mut spill) = self.spill.take() {
+            spill.writer.flush().await?;
+            drop(spill.writer);
+            return Ok(Some(UploadBody::TempFile {
+                file: spill.owner,
+                len: spill.len,
+            }));
         }
         if self.mem.is_empty() {
             return Ok(None);

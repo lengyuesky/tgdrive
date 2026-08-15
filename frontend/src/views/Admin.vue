@@ -17,6 +17,7 @@ import {
   type DetectedChat,
   type Extras,
   type InboxRouteRule,
+  type InboxFailure,
 } from '../api'
 import DirPicker from '../components/DirPicker.vue'
 
@@ -26,6 +27,9 @@ const status = ref<AdminStatus>()
 const loading = ref(true)
 const saving = ref(false)
 const testing = ref(false)
+const inboxFailureDialog = ref(false)
+const inboxFailureLoading = ref(false)
+const inboxFailures = ref<InboxFailure[]>([])
 
 /** 表单当前值(字符串化,便于比对是否改动) */
 const form = ref({
@@ -124,6 +128,48 @@ const apiMode = computed<'official' | 'local'>({
 const uptime = computed(() =>
   status.value ? fmtDuration(status.value.now - status.value.started_at) : '-',
 )
+const taskHealthy = (task: AdminStatus['tasks'][number]) =>
+  task.running && !!status.value && status.value.now - task.last_heartbeat <= 120
+
+async function openInboxFailures() {
+  inboxFailureDialog.value = true
+  inboxFailureLoading.value = true
+  try {
+    inboxFailures.value = (await api.admin.inboxFailures()).data.items
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  } finally {
+    inboxFailureLoading.value = false
+  }
+}
+
+async function removeInboxFailure(updateId: number) {
+  try {
+    await api.admin.removeInboxFailure(updateId)
+    inboxFailures.value = inboxFailures.value.filter((item) => item.update_id !== updateId)
+    if (status.value) status.value.inbox_failures = inboxFailures.value.length
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  }
+}
+
+async function clearInboxFailures() {
+  try {
+    await ElMessageBox.confirm('清空全部收件死信记录？原始 Telegram update 载荷将无法从后台找回。', '清空死信', {
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  try {
+    await api.admin.clearInboxFailures()
+    inboxFailures.value = []
+    if (status.value) status.value.inbox_failures = 0
+    ElMessage.success('死信记录已清空')
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  }
+}
 
 /** 只把真正改过的字段发给后端 */
 function buildPatch(): ConfigPatch {
@@ -145,8 +191,9 @@ function buildPatch(): ConfigPatch {
 }
 const dirty = computed(() => Object.keys(buildPatch()).length > 0)
 
-/** 重建自建 Bot API 容器的命令(改 api_id/hash 后要在宿主机执行) */
-const RESTART_CMD = 'docker compose up -d telegram-bot-api'
+/** api_id/hash 改动后，tgdrive 与自建 Bot API 都要使用宿主机的新 .env。 */
+const RESTART_CMD =
+  'docker compose --profile local-bot-api up -d --build tgdrive telegram-bot-api'
 
 async function save(force = false) {
   const patch = buildPatch()
@@ -166,12 +213,11 @@ async function save(force = false) {
       return
     }
     if (data.needs_local_api_restart) {
-      // 这两项是 compose 传给 telegram-bot-api 容器的,tgdrive 改不了别人的环境变量
       await ElMessageBox.alert(
-        `已保存。api_id / api_hash 由 telegram-bot-api 容器读取,还需要在宿主机上:\n\n` +
+        `已保存。api_id / api_hash 同时用于 tgdrive 的 MTProto 流式播放和 telegram-bot-api，还需要在宿主机上：\n\n` +
           `1. 点「导出 .env」,把内容覆盖到项目目录的 .env\n` +
           `2. 执行 ${RESTART_CMD}\n\n` +
-          `重建那个容器后新凭据才生效。`,
+          `两个服务重启后新凭据才生效。`,
         '还差一步',
         { confirmButtonText: '知道了' },
       )
@@ -539,6 +585,33 @@ function downloadBackup() {
         <el-descriptions-item label="已运行">
           {{ uptime }}(v{{ status?.version }})
         </el-descriptions-item>
+        <el-descriptions-item label="后台任务">
+          <span class="status-tags">
+            <el-tooltip
+              v-for="task in status?.tasks ?? []"
+              :key="task.name"
+              :content="task.last_error ?? `重启 ${task.restarts} 次`"
+            >
+              <el-tag size="small" :type="taskHealthy(task) ? 'success' : 'danger'">
+                {{ task.name }}
+              </el-tag>
+            </el-tooltip>
+          </span>
+        </el-descriptions-item>
+        <el-descriptions-item label="待删消息">
+          {{ status?.pending_deletes ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="收件死信">
+          <el-button
+            v-if="status?.inbox_failures"
+            link
+            type="warning"
+            @click="openInboxFailures"
+          >
+            {{ status.inbox_failures }} 条，查看
+          </el-button>
+          <span v-else>0</span>
+        </el-descriptions-item>
       </el-descriptions>
       <div class="tip">
         元数据库是文件的唯一索引 —— Bot API 读不了频道历史,库丢了文件就找不回来,记得定期备份。
@@ -666,18 +739,17 @@ function downloadBackup() {
     </el-card>
 
     <el-card shadow="never" class="card">
-      <template #header><b>自建 Bot API 服务器(可选)</b></template>
+      <template #header><b>MTProto 流式播放 / 自建 Bot API</b></template>
       <el-alert type="info" :closable="false" show-icon class="alert">
         <div>
-          官方端点单块下载上限 20MB,分块只能 ≤18MB,加上发消息限流,大文件吞吐有限。自建
-          telegram-bot-api 后分块可到 GB 级,还能直读磁盘。
+          tgdrive 使用 MTProto 把视频按 512KiB 响应浏览器 Range，关闭预览后停止后续请求；
+          不改变已有 Telegram 分块大小。自建 telegram-bot-api 仍负责 GB 级分块上传和本地缓存直读。
         </div>
         <div>
           下面两项在
           <el-link type="primary" href="https://my.telegram.org" target="_blank">my.telegram.org</el-link>
-          申请。它们由 telegram-bot-api 容器读取(compose 已默认启动),<b>tgdrive 改不了别的容器的环境变量</b>
-          —— 保存后还要导出 .env 覆盖回项目目录,再执行
-          <code>{{ RESTART_CMD }}</code> 重建那个容器。
+          申请。它们同时由 tgdrive 和 telegram-bot-api 读取。保存后还要导出 .env
+          覆盖回项目目录，再执行 <code>{{ RESTART_CMD }}</code> 重启/重建两个服务。
         </div>
       </el-alert>
 
@@ -715,9 +787,9 @@ function downloadBackup() {
       </el-form>
 
       <div class="tip">
-        切换步骤:填好上面两项并保存 → 导出 .env 覆盖回宿主机 → 执行
-        <code>{{ RESTART_CMD }}</code> 重建容器 → 回「Telegram 存储」把接口端点切到「自建 Bot
-        API」再保存。
+        流式播放启用步骤：填好上面两项并保存 → 导出 .env 覆盖回宿主机 → 执行
+        <code>{{ RESTART_CMD }}</code>。如需 GB 级分块上传，再回「Telegram 存储」把接口端点
+        切到「自建 Bot API」并保存。
       </div>
     </el-card>
 
@@ -787,6 +859,16 @@ function downloadBackup() {
 
     <el-card v-if="extras" shadow="never" class="card">
       <template #header><b>Bot 收件</b></template>
+      <el-alert
+        v-if="status?.inbox_failures"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="alert"
+      >
+        有 {{ status.inbox_failures }} 条消息连续处理失败并进入死信，后续收件未被阻塞。
+        <el-button link type="warning" @click="openInboxFailures">查看与清理</el-button>
+      </el-alert>
       <el-alert type="info" :closable="false" show-icon class="alert">
         <div>开启后:<b>直接往存储频道发媒体</b>会自动登记进网盘(零流量);白名单用户私聊发送<b>文件、视频、图片或音频</b>也会按原类型零流量转存。</div>
         <div>官方 Bot API 下载单文件上限 20MB:更大的文件也会入库,但需要自建端点才能下载。</div>
@@ -942,6 +1024,29 @@ function downloadBackup() {
       <span class="tip">保存后立即生效,不需要重启容器。</span>
     </div>
 
+    <el-dialog v-model="inboxFailureDialog" title="Bot 收件死信" width="760px">
+      <el-table :data="inboxFailures" v-loading="inboxFailureLoading" size="small">
+        <el-table-column prop="update_id" label="Update ID" width="120" />
+        <el-table-column prop="attempts" label="尝试" width="72" />
+        <el-table-column label="失败时间" width="170">
+          <template #default="{ row }">{{ fmtTime(row.failed_at) }}</template>
+        </el-table-column>
+        <el-table-column prop="last_error" label="最后错误" show-overflow-tooltip />
+        <el-table-column label="操作" width="72" align="right">
+          <template #default="{ row }">
+            <el-button link type="danger" @click="removeInboxFailure(row.update_id)">删除</el-button>
+          </template>
+        </el-table-column>
+        <template #empty><el-empty description="没有死信" :image-size="56" /></template>
+      </el-table>
+      <template #footer>
+        <el-button :disabled="!inboxFailures.length" type="danger" plain @click="clearInboxFailures">
+          清空全部
+        </el-button>
+        <el-button type="primary" @click="inboxFailureDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <DirPicker ref="inboxDirPicker" />
 
     <el-dialog v-model="detectDialog" title="检测频道 / 用户 ID" width="680px">
@@ -976,10 +1081,20 @@ function downloadBackup() {
         </el-table-column>
         <el-table-column label="操作" width="130">
           <template #default="{ row }">
-            <el-button v-if="!isUserKind(row.kind)" link type="primary" @click="useChatId(row)">
+            <el-button
+              v-if="!isUserKind(row.kind)"
+              link
+              type="primary"
+              @click="useChatId(row as DetectedChat)"
+            >
               填入存储频道
             </el-button>
-            <el-button v-else-if="extras" link type="primary" @click="addWhitelist(row)">
+            <el-button
+              v-else-if="extras"
+              link
+              type="primary"
+              @click="addWhitelist(row as DetectedChat)"
+            >
               加入白名单
             </el-button>
           </template>
@@ -1057,6 +1172,11 @@ function downloadBackup() {
 }
 .alert {
   margin-bottom: 12px;
+}
+.status-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 .route-help {
   margin-bottom: 10px;

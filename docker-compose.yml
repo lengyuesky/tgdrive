@@ -2,6 +2,8 @@ services:
   tgdrive:
     build: .
     image: tgdrive:latest
+    # 与宿主机 data 目录保持同一 UID/GID；默认桌面 Linux 用户通常是 1000。
+    user: "${TGDRIVE_UID:-1000}:${TGDRIVE_GID:-1000}"
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -14,10 +16,11 @@ services:
       # 重要:挂载路径必须与 telegram-bot-api 容器内一致(getFile 返回绝对路径)
       - ./telegram-bot-api-data:/var/lib/telegram-bot-api:ro
 
-  # 自部署 Bot API 服务器,随项目默认启动。
+  # 自部署 Bot API 服务器,仅在启用 local-bot-api profile 时启动。
   # 需要在 .env 里配置 TELEGRAM_API_ID / TELEGRAM_API_HASH(https://my.telegram.org 申请);
-  # 没配置时该容器会报错重启,但不影响 tgdrive 走官方端点,不用自建可 docker compose stop telegram-bot-api
+  # 启动命令:docker compose --profile local-bot-api up -d
   telegram-bot-api:
+    profiles: ["local-bot-api"]
     image: aiogram/telegram-bot-api:latest
     restart: unless-stopped
     environment:

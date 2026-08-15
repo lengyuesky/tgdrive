@@ -11,7 +11,10 @@ mod error;
 mod extras;
 mod housekeeping;
 mod inbox;
+mod mtproto;
+mod security;
 mod settings;
+mod tasks;
 mod telegram;
 mod vfs;
 
@@ -19,10 +22,11 @@ use crate::api::AppState;
 use crate::auth::Auth;
 use crate::config::Config;
 use crate::db::Db;
-use crate::engine::upload::{UploadKnobs, Uploader};
 use crate::engine::MEMORY_CHUNK_LIMIT;
+use crate::engine::upload::{UploadKnobs, Uploader};
+use crate::mtproto::MtprotoConfig;
 use crate::settings::{Runtime, RuntimeCfg};
-use crate::telegram::{SwitchableTg, TgApi, TgClient};
+use crate::telegram::{TgApi, TgClient, TgRegistry};
 use crate::vfs::Vfs;
 use std::sync::Arc;
 
@@ -56,62 +60,119 @@ async fn serve() -> anyhow::Result<()> {
     let env_cfg = Arc::new(Config::from_env()?);
     let db = Db::open(&env_cfg.db_path).await?;
     // 环境变量只是底层默认值,后台改过的配置(settings 表)优先
-    let cfg = RuntimeCfg::load(&db, &env_cfg).await?;
+    let mut cfg = RuntimeCfg::load(&db, &env_cfg).await?;
 
     // 包一层可切换代理:后台改 token/频道/端点后无需重建 Vfs 与 DavHandler。
     // 尚未配置 Telegram 时装占位实现,服务照常起来,登录后在网页里配。
     if !cfg.is_configured() {
         tracing::warn!("尚未配置 Telegram 存储,请登录后打开「系统设置」填写 Bot Token 与存储频道");
     }
-    let switch = Arc::new(SwitchableTg::new(cfg.make_tg()?));
-    let tg: Arc<dyn TgApi> = switch.clone();
+    if cfg.is_configured() {
+        let target = db
+            .ensure_storage_target(&cfg.api_base, &cfg.bot_token, &cfg.chat_id)
+            .await?;
+        cfg.storage_target_id = Some(target.id);
+        let migrated = db.backfill_unassigned_chunks(target.id).await?;
+        if migrated > 0 {
+            tracing::warn!(
+                "已将 {migrated} 个旧版分块关联到当前 Telegram 存储目标；如数据库曾切换过 Bot/频道，请人工核对历史文件"
+            );
+        }
+    }
+    let targets = db.storage_targets().await?;
+    let mtproto =
+        MtprotoConfig::from_values(db.clone(), &cfg.telegram_api_id, &cfg.telegram_api_hash)?;
+    if mtproto.is_none() {
+        tracing::warn!(
+            "未配置 api_id/api_hash：文档与视频下载将使用 Bot API，超大分块无法真正按 Range 流式读取"
+        );
+    }
+    let tg = Arc::new(TgRegistry::new(&targets, cfg.storage_target_id, mtproto)?);
     let knobs = Arc::new(UploadKnobs::new(
         cfg.chunk_size,
         cfg.tmp_dir.clone(),
         cfg.upload_concurrency,
         cfg.send_video,
     ));
-    let uploader = Uploader {
-        tg: tg.clone(),
-        db: db.clone(),
-        knobs: knobs.clone(),
-        mem_limit: MEMORY_CHUNK_LIMIT,
-    };
+    let uploader = Uploader::new(tg.clone(), db.clone(), knobs.clone(), MEMORY_CHUNK_LIMIT);
 
     // 崩溃残留的 uploading 节点:回滚记录并尽力删除已发出的分块消息
-    let stale = db.cleanup_stale_uploads().await?;
-    if !stale.is_empty() {
-        tracing::info!("清理上次遗留的 {} 条未完成上传消息", stale.len());
-        uploader.delete_messages_best_effort(stale);
+    if db.unassigned_chunk_count().await? == 0 {
+        let stale = db.cleanup_stale_uploads().await?;
+        if !stale.is_empty() {
+            tracing::info!("清理上次遗留的 {} 条未完成上传消息", stale.len());
+            uploader.delete_messages_best_effort(stale);
+        }
+    } else {
+        tracing::warn!("存在尚未关联存储目标的旧分块，已暂缓清理未完成上传");
     }
+    uploader.process_pending_deletes();
 
-    let vfs = Vfs { db: db.clone(), tg, uploader };
+    let vfs = Vfs {
+        db: db.clone(),
+        tg: tg.clone(),
+        uploader,
+    };
     let auth = Arc::new(
-        Auth::init(&cfg.username, &cfg.password, env_cfg.secret.as_deref(), &db).await?,
+        Auth::init(
+            &cfg.username,
+            &cfg.password,
+            env_cfg.secret.as_deref(),
+            env_cfg.cookie_secure,
+            &db,
+        )
+        .await?,
     );
     let listen = env_cfg.listen;
+    let cookie_secure = env_cfg.cookie_secure;
     let (api_base, chunk_size, official) =
         (cfg.api_base.clone(), cfg.chunk_size, cfg.is_official_api());
     let rt = Arc::new(Runtime::new(
         db.clone(),
         env_cfg,
         cfg,
-        switch,
+        tg,
         knobs,
         auth.clone(),
     ));
     let dav_handler = dav::build_handler(vfs.clone());
-    let state = AppState { vfs, auth, rt, dav: dav_handler };
+    let tasks = crate::tasks::TaskManager::new();
+    let state = AppState {
+        vfs,
+        auth,
+        rt,
+        dav: dav_handler,
+        attempts: crate::security::AttemptLimiter::default(),
+        tasks: tasks.clone(),
+    };
 
     // 后台任务:回收站超期清理 + 自动备份;Bot 收件轮询
-    tokio::spawn(housekeeping::run(state.vfs.clone(), state.rt.clone()));
-    tokio::spawn(inbox::run(state.vfs.clone(), state.rt.clone()));
+    let housekeeping_vfs = state.vfs.clone();
+    let housekeeping_rt = state.rt.clone();
+    tasks.supervise("housekeeping", move |reporter| {
+        housekeeping::run(housekeeping_vfs.clone(), housekeeping_rt.clone(), reporter)
+    });
+    let inbox_vfs = state.vfs.clone();
+    let inbox_rt = state.rt.clone();
+    tasks.supervise("inbox", move |reporter| {
+        inbox::run(inbox_vfs.clone(), inbox_rt.clone(), reporter)
+    });
 
     let mut app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .route("/dav", axum::routing::any(dav::dav_handler))
-        .route("/dav/", axum::routing::any(dav::dav_handler))
-        .route("/dav/{*rest}", axum::routing::any(dav::dav_handler))
+        .route("/readyz", axum::routing::get(api::readyz))
+        .route(
+            "/dav",
+            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/dav/",
+            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/dav/{*rest}",
+            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .with_state(state.clone())
         .nest("/api", api::router(state.clone()));
 
@@ -127,6 +188,9 @@ async fn serve() -> anyhow::Result<()> {
             let index = std::path::Path::new(&dir).join("index.html");
             let serve = tower_http::services::ServeDir::new(&dir)
                 .not_found_service(tower_http::services::ServeFile::new(index));
+            let serve = tower::ServiceBuilder::new()
+                .layer(tower_http::compression::CompressionLayer::new())
+                .service(serve);
             app = app.fallback_service(serve);
         }
         None => {
@@ -135,7 +199,12 @@ async fn serve() -> anyhow::Result<()> {
     }
 
     let app = app
-        .layer(axum::extract::DefaultBodyLimit::disable())
+        // JSON/表单默认最多 1MiB；只有文件上传与 WebDAV 写入在各自路由放开。
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            cookie_secure,
+            crate::security::response_headers,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     tracing::info!(
@@ -146,8 +215,35 @@ async fn serve() -> anyhow::Result<()> {
         "tgdrive 启动"
     );
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(tasks))
+    .await?;
     Ok(())
+}
+
+async fn shutdown_signal(tasks: crate::tasks::TaskManager) {
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate => {},
+    }
+    tracing::info!("收到退出信号，正在停止后台任务并等待连接结束");
+    tasks.cancel();
 }
 
 /// 用真实 bot 验证配置与整条链路(getMe → 上传测试文件 → 下载比对 → 删除)
@@ -167,8 +263,8 @@ async fn check() -> anyhow::Result<()> {
     );
     let tg = TgClient::new(&cfg.api_base, &cfg.bot_token, &cfg.chat_id)?;
 
-    println!("[1/4] getMe ...");
-    let me = tg.get_me().await?;
+    println!("[1/4] 验证 Bot 与存储频道权限 ...");
+    let me = tg.probe_storage().await?;
     println!("      bot = @{me}, api = {}", cfg.api_base);
 
     println!("[2/4] 上传 1MB 测试文件 ...");
@@ -176,12 +272,18 @@ async fn check() -> anyhow::Result<()> {
     let want = sha2::Sha256::digest(&data);
     let body = UploadBody::Memory(bytes::Bytes::from(data));
     let msg = tg
-        .send_document("tgdrive-selftest.bin", Some("tgdrive 自检文件,可删除".into()), &body)
+        .send_document(
+            "tgdrive-selftest.bin",
+            Some("tgdrive 自检文件,可删除".into()),
+            &body,
+        )
         .await?;
     println!("      message_id = {}", msg.message_id);
 
     println!("[3/4] 下载比对 ...");
-    let mut reader = tg.open_chunk_stream(&msg.file_id, 0).await?;
+    let mut reader = tg
+        .open_chunk_stream(&msg.file_id, msg.message_id, 1024 * 1024, 0)
+        .await?;
     let mut got = Vec::new();
     reader.read_to_end(&mut got).await?;
     let got_hash = sha2::Sha256::digest(&got);

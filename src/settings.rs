@@ -1,7 +1,7 @@
 //! 配置中心:哪些配置能在运行时改、怎么持久化、怎么热生效。
 //!
 //! 优先级 **settings 表 > 环境变量 > 内置默认**。后台保存即写表并推给各个热更句柄
-//! (`SwitchableTg` / `UploadKnobs` / `Auth`),无需重启容器。
+//! (`TgRegistry` / `UploadKnobs` / `Auth`),无需重启容器。
 //!
 //! 监听地址、数据库路径等启动期配置不在此列(见 `Runtime::readonly_items`)。
 
@@ -10,7 +10,9 @@ use crate::config::{self, Config};
 use crate::db::Db;
 use crate::engine::upload::UploadKnobs;
 use crate::error::{AppError, AppResult};
-use crate::telegram::{SwitchableTg, TgApi, TgClient};
+#[cfg(test)]
+use crate::telegram::TgApi;
+use crate::telegram::{TgClient, TgRegistry};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,12 +39,13 @@ pub const KEYS: &[(&str, &str)] = &[
     ("telegram_api_hash", "TELEGRAM_API_HASH"),
 ];
 
-/// 这两项由 compose 里的 telegram-bot-api 容器读取,tgdrive 只负责保管与导出;
-/// 改动要重建那个容器才生效(compose 的 `${VAR}` 插值取自宿主机 .env 文件)。
+/// 这两项同时供 tgdrive 的 MTProto 流式下载和 telegram-bot-api 容器使用。
+/// tgdrive 在启动时建立会话，compose 的 `${VAR}` 也只在创建容器时插值，
+/// 因此修改后需要重启/重建两个服务。
 pub const LOCAL_API_KEYS: &[&str] = &["telegram_api_id", "telegram_api_hash"];
 
 /// 当前生效的可变配置
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RuntimeCfg {
     pub api_base: String,
     pub bot_token: String,
@@ -56,12 +59,18 @@ pub struct RuntimeCfg {
     pub password: String,
     pub telegram_api_id: String,
     pub telegram_api_hash: String,
+    /// 不属于用户配置字段；指向上述 Telegram 三元组对应的不可变存储目标。
+    pub storage_target_id: Option<i64>,
 }
 
 impl RuntimeCfg {
     /// 用 settings 表里的值覆盖环境变量层
     pub async fn load(db: &Db, env: &Config) -> AppResult<Self> {
         let db_vals = db.settings_with_prefix(P).await?;
+        Self::from_overrides(&db_vals, env)
+    }
+
+    fn from_overrides(db_vals: &HashMap<String, String>, env: &Config) -> AppResult<Self> {
         let get = |k: &str| db_vals.get(k).map(String::as_str);
 
         let api_base = get("api_base")
@@ -91,23 +100,34 @@ impl RuntimeCfg {
 
         Ok(RuntimeCfg {
             api_base,
-            bot_token: get("bot_token").map(str::to_string).unwrap_or_else(|| env.bot_token.clone()),
-            chat_id: get("chat_id").map(str::to_string).unwrap_or_else(|| env.chat_id.clone()),
+            bot_token: get("bot_token")
+                .map(str::to_string)
+                .unwrap_or_else(|| env.bot_token.clone()),
+            chat_id: get("chat_id")
+                .map(str::to_string)
+                .unwrap_or_else(|| env.chat_id.clone()),
             chunk_size,
             upload_concurrency: get("upload_concurrency")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(env.upload_concurrency)
                 .clamp(1, 16),
             send_video,
-            tmp_dir: get("tmp_dir").map(PathBuf::from).unwrap_or_else(|| env.tmp_dir.clone()),
-            username: get("username").map(str::to_string).unwrap_or_else(|| env.username.clone()),
-            password: get("password").map(str::to_string).unwrap_or_else(|| env.password.clone()),
+            tmp_dir: get("tmp_dir")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| env.tmp_dir.clone()),
+            username: get("username")
+                .map(str::to_string)
+                .unwrap_or_else(|| env.username.clone()),
+            password: get("password")
+                .map(str::to_string)
+                .unwrap_or_else(|| env.password.clone()),
             telegram_api_id: get("telegram_api_id")
                 .map(str::to_string)
                 .unwrap_or_else(|| env.telegram_api_id.clone()),
             telegram_api_hash: get("telegram_api_hash")
                 .map(str::to_string)
                 .unwrap_or_else(|| env.telegram_api_hash.clone()),
+            storage_target_id: None,
         })
     }
 
@@ -117,6 +137,7 @@ impl RuntimeCfg {
     }
 
     /// 按当前配置造一个 TG 客户端;没配好就返回占位实现
+    #[cfg(test)]
     pub fn make_tg(&self) -> AppResult<Arc<dyn TgApi>> {
         if !self.is_configured() {
             return Ok(Arc::new(crate::telegram::UnconfiguredTg));
@@ -150,11 +171,13 @@ impl RuntimeCfg {
 }
 
 fn env_present(key: &str) -> bool {
-    std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false)
+    std::env::var(key)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// 前端提交的改动;`None` 表示该项不动
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default)]
 pub struct ConfigPatch {
     pub api_base: Option<String>,
     pub bot_token: Option<String>,
@@ -180,7 +203,7 @@ pub struct ApplyOutcome {
     pub changed: Vec<String>,
     /// 账号变了 → 所有会话已失效,需要重新登录
     pub account_changed: bool,
-    /// 改的项里有 telegram-bot-api 容器的凭据,需要重建那个容器才生效
+    /// api_id/api_hash 有变化，需要重启 tgdrive 并重建 telegram-bot-api 才生效。
     pub needs_local_api_restart: bool,
     /// 验证到的 bot 名(跳过验证时为 null)
     pub bot: Option<String>,
@@ -192,7 +215,7 @@ pub struct Runtime {
     /// 环境变量层,用于来源标注与「恢复」
     pub env: Arc<Config>,
     current: RwLock<Arc<RuntimeCfg>>,
-    tg: Arc<SwitchableTg>,
+    tg: Arc<TgRegistry>,
     knobs: Arc<UploadKnobs>,
     pub auth: Arc<Auth>,
     pub started_at: i64,
@@ -204,7 +227,7 @@ impl Runtime {
         db: Db,
         env: Arc<Config>,
         cfg: RuntimeCfg,
-        tg: Arc<SwitchableTg>,
+        tg: Arc<TgRegistry>,
         knobs: Arc<UploadKnobs>,
         auth: Arc<Auth>,
     ) -> Self {
@@ -253,7 +276,11 @@ impl Runtime {
         {
             return Some(n);
         }
-        match self.tg.get_me().await {
+        let binding = match self.tg.current() {
+            Ok(binding) => binding,
+            Err(_) => return None,
+        };
+        match binding.api.get_me().await {
             Ok(n) => {
                 *self.bot_name.write().unwrap() = Some((n.clone(), Instant::now()));
                 Some(n)
@@ -269,7 +296,7 @@ impl Runtime {
     pub async fn probe(api_base: &str, token: &str, chat_id: &str) -> AppResult<String> {
         let client = TgClient::new(api_base, token, chat_id)
             .map_err(|e| AppError::BadRequest(format!("客户端构造失败: {e}")))?;
-        client.get_me().await
+        client.probe_storage().await
     }
 
     /// 保存并热生效
@@ -325,16 +352,24 @@ impl Runtime {
                 Err(e) => {
                     return Err(AppError::BadRequest(format!(
                         "新配置连不上 Telegram({e});确认无误可选择强制保存"
-                    )))
+                    )));
                 }
             }
         }
 
-        let changed = self.persist(&prev, &next).await?;
-        let needs_local_api_restart =
-            changed.iter().any(|k| LOCAL_API_KEYS.contains(&k.as_str()));
-        let account_changed = self.install(&prev, next, tg_changed).await?;
-        Ok(ApplyOutcome { changed, account_changed, needs_local_api_restart, bot })
+        self.attach_storage_target(&mut next).await?;
+
+        let account_changed = next.username != prev.username || next.password != prev.password;
+        let new_secret = account_changed.then(crate::auth::random_secret);
+        let changed = self.persist(&prev, &next, new_secret.as_deref()).await?;
+        let needs_local_api_restart = changed.iter().any(|k| LOCAL_API_KEYS.contains(&k.as_str()));
+        self.install(&prev, next, tg_changed, new_secret.as_deref())?;
+        Ok(ApplyOutcome {
+            changed,
+            account_changed,
+            needs_local_api_restart,
+            bot,
+        })
     }
 
     /// 恢复指定项为环境变量/默认值
@@ -344,27 +379,48 @@ impl Runtime {
             if !KEYS.iter().any(|(name, _)| name == k) {
                 return Err(AppError::BadRequest(format!("未知配置项: {k}")));
             }
-            self.db.setting_del(&format!("{P}{k}")).await?;
         }
-        let next = RuntimeCfg::load(&self.db, &self.env).await?;
+        // 先在内存中计算删除覆盖项后的配置，全部验证通过后再一次性提交。
+        let mut overrides = self.db.settings_with_prefix(P).await?;
+        for key in keys {
+            overrides.remove(key);
+        }
+        let mut next = RuntimeCfg::from_overrides(&overrides, &self.env)?;
         // 恢复出的组合仍要合法(例如端点回落到官方而分块过大)
-        if let Err(e) = self.validate(&next) {
-            // 回滚:把刚删掉的键写回去
-            for k in keys {
-                self.db.setting_set(&format!("{P}{k}"), &prev.value_of(k)).await?;
-            }
-            return Err(e);
-        }
+        self.validate(&next)?;
+        self.attach_storage_target(&mut next).await?;
         let tg_changed = next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
             || next.chat_id != prev.chat_id;
-        let account_changed = self.install(&prev, next, tg_changed).await?;
+        let deletes: Vec<String> = keys.iter().map(|key| format!("{P}{key}")).collect();
+        let account_changed = next.username != prev.username || next.password != prev.password;
+        let new_secret = account_changed.then(crate::auth::random_secret);
+        let secret_sets: Vec<(String, String)> = new_secret
+            .as_ref()
+            .map(|secret| vec![(crate::auth::SECRET_KEY.to_string(), secret.clone())])
+            .unwrap_or_default();
+        self.db.settings_apply(&secret_sets, &deletes).await?;
+        self.install(&prev, next, tg_changed, new_secret.as_deref())?;
         Ok(ApplyOutcome {
             changed: keys.to_vec(),
             account_changed,
             needs_local_api_restart: keys.iter().any(|k| LOCAL_API_KEYS.contains(&k.as_str())),
             bot: None,
         })
+    }
+
+    async fn attach_storage_target(&self, next: &mut RuntimeCfg) -> AppResult<()> {
+        if !next.is_configured() {
+            next.storage_target_id = None;
+            return Ok(());
+        }
+        let target = self
+            .db
+            .ensure_storage_target(&next.api_base, &next.bot_token, &next.chat_id)
+            .await?;
+        self.tg.register(&target)?;
+        next.storage_target_id = Some(target.id);
+        Ok(())
     }
 
     fn validate(&self, next: &RuntimeCfg) -> AppResult<()> {
@@ -385,41 +441,52 @@ impl Runtime {
             return Err(bad("用户名与密码都不能为空".into()));
         }
         if !next.telegram_api_id.is_empty()
-            && next.telegram_api_id.parse::<u64>().is_err()
+            && !matches!(next.telegram_api_id.parse::<i32>(), Ok(id) if id > 0)
         {
-            return Err(bad("api_id 应为纯数字(在 my.telegram.org 申请)".into()));
+            return Err(bad(
+                "api_id 应为有效的正整数（在 my.telegram.org 申请）".into()
+            ));
         }
         // 临时目录必须存在且可写,否则大分块上传会在半路失败
-        std::fs::create_dir_all(&next.tmp_dir)
-            .map_err(|e| bad(format!("临时目录不可用: {e}")))?;
+        std::fs::create_dir_all(&next.tmp_dir).map_err(|e| bad(format!("临时目录不可用: {e}")))?;
         tempfile::NamedTempFile::new_in(&next.tmp_dir)
             .map_err(|e| bad(format!("临时目录不可写: {e}")))?;
         Ok(())
     }
 
     /// 把变化的项写入 settings 表,返回变化的键名
-    async fn persist(&self, prev: &RuntimeCfg, next: &RuntimeCfg) -> AppResult<Vec<String>> {
+    async fn persist(
+        &self,
+        prev: &RuntimeCfg,
+        next: &RuntimeCfg,
+        new_secret: Option<&str>,
+    ) -> AppResult<Vec<String>> {
         let mut changed = Vec::new();
+        let mut sets = Vec::new();
         for (k, _) in KEYS {
             let (a, b) = (prev.value_of(k), next.value_of(k));
             if a != b {
-                self.db.setting_set(&format!("{P}{k}"), &b).await?;
+                sets.push((format!("{P}{k}"), b));
                 changed.push(k.to_string());
             }
         }
+        if let Some(secret) = new_secret {
+            sets.push((crate::auth::SECRET_KEY.to_string(), secret.to_string()));
+        }
+        self.db.settings_apply(&sets, &[]).await?;
         Ok(changed)
     }
 
     /// 推送到各热更句柄并更新当前值;返回账号是否变化
-    async fn install(
+    fn install(
         &self,
         prev: &RuntimeCfg,
         next: RuntimeCfg,
         tg_changed: bool,
+        new_secret: Option<&str>,
     ) -> AppResult<bool> {
         if tg_changed {
-            // 没配全时装占位实现,让上传/下载给出「去设置里配」而不是 401
-            self.tg.replace(next.make_tg()?);
+            self.tg.set_current_id(next.storage_target_id)?;
             *self.bot_name.write().unwrap() = None;
         }
         if next.chunk_size != prev.chunk_size {
@@ -434,12 +501,13 @@ impl Runtime {
         if next.send_video != prev.send_video {
             self.knobs.set_send_video(next.send_video);
         }
-        let account_changed =
-            next.username != prev.username || next.password != prev.password;
+        let account_changed = next.username != prev.username || next.password != prev.password;
         if account_changed {
-            self.auth.set_account(&next.username, &next.password);
-            // 改了账号就把旧会话踢掉,否则拿着旧 cookie 仍能访问
-            self.auth.rotate_secret(&self.db).await?;
+            // 密钥已与账号配置在同一事务里写入；这里仅同步内存状态。
+            let secret = new_secret
+                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("账号变化时缺少新的会话密钥")))?;
+            self.auth
+                .set_account_and_secret(&next.username, &next.password, secret);
         }
         *self.current.write().unwrap() = Arc::new(next);
         Ok(account_changed)
@@ -451,10 +519,18 @@ impl Runtime {
             ("listen", self.env.listen.to_string()),
             ("db_path", self.env.db_path.clone()),
             (
+                "local_data_root",
+                self.env.local_data_root.display().to_string(),
+            ),
+            ("cookie_secure", self.env.cookie_secure.to_string()),
+            (
                 "static_dir",
                 std::env::var("TGDRIVE_STATIC_DIR").unwrap_or_else(|_| "(自动探测)".into()),
             ),
-            ("log_level", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())),
+            (
+                "log_level",
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+            ),
         ]
     }
 
@@ -470,12 +546,24 @@ impl Runtime {
         }
         s.push_str(&format!("TGDRIVE_LISTEN={}\n", self.env.listen));
         s.push_str(&format!("TGDRIVE_DB_PATH={}\n", self.env.db_path));
+        s.push_str(&format!(
+            "TGDRIVE_LOCAL_DATA_ROOT={}\n",
+            self.env.local_data_root.display()
+        ));
+        s.push_str(&format!(
+            "TGDRIVE_COOKIE_SECURE={}\n",
+            self.env.cookie_secure
+        ));
         s.push_str(
-            "\n# 自建 Bot API 服务器(compose 的 telegram-bot-api 服务)用,\n\
-             # 改这两项必须把本文件覆盖回宿主机再重建容器才生效\n",
+            "\n# tgdrive 的 MTProto 流式下载与自建 Bot API 服务器共同使用,\n\
+             # 改这两项后必须把本文件覆盖回宿主机，并重启/重建两个服务\n",
         );
         for k in LOCAL_API_KEYS {
-            let envk = KEYS.iter().find(|(n, _)| n == k).map(|(_, e)| *e).unwrap_or("");
+            let envk = KEYS
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, e)| *e)
+                .unwrap_or("");
             s.push_str(&format!("{envk}={}\n", c.value_of(k)));
         }
         s.push_str(
@@ -511,9 +599,11 @@ mod tests {
             upload_concurrency: 2,
             db_path: "x.db".into(),
             tmp_dir: std::env::temp_dir(),
+            local_data_root: config::DEFAULT_LOCAL_DATA_ROOT.into(),
             username: "envuser".into(),
             password: "envpass".into(),
             secret: None,
+            cookie_secure: false,
             telegram_api_id: String::new(),
             telegram_api_hash: String::new(),
             send_video: false,
@@ -522,7 +612,9 @@ mod tests {
 
     async fn test_db() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("t.db").to_str().unwrap()).await.unwrap();
+        let db = Db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
         (db, dir)
     }
 
@@ -551,7 +643,9 @@ mod tests {
         assert!(!c.send_video);
 
         // 端点改成自建(db 覆盖)→ 默认开
-        db.setting_set("cfg.api_base", "http://tg:8081").await.unwrap();
+        db.setting_set("cfg.api_base", "http://tg:8081")
+            .await
+            .unwrap();
         let c = RuntimeCfg::load(&db, &env_cfg()).await.unwrap();
         assert!(c.send_video);
 
@@ -565,7 +659,9 @@ mod tests {
     async fn oversized_chunk_falls_back_on_load() {
         let (db, _g) = test_db().await;
         // 官方端点 + 512MB 分块(自建时代的遗留)→ 启动应回落默认值而非拒绝
-        db.setting_set("cfg.chunk_size", &(512u64 * 1024 * 1024).to_string()).await.unwrap();
+        db.setting_set("cfg.chunk_size", &(512u64 * 1024 * 1024).to_string())
+            .await
+            .unwrap();
         let c = RuntimeCfg::load(&db, &env_cfg()).await.unwrap();
         assert_eq!(c.chunk_size, config::OFFICIAL_CHUNK_DEFAULT);
     }

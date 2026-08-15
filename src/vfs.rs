@@ -4,7 +4,7 @@ use crate::db::{Db, Node, ROOT_ID};
 use crate::engine::reader::ChunkedReader;
 use crate::engine::upload::{UploadHandle, Uploader};
 use crate::error::{AppError, AppResult};
-use crate::telegram::TgApi;
+use crate::telegram::TgRegistry;
 use std::sync::Arc;
 
 /// 把用户路径拆成规范段:拒绝空名、`.`、`..`、控制字符与过长名称
@@ -31,7 +31,7 @@ pub fn normalize(path: &str) -> AppResult<Vec<String>> {
 #[derive(Clone)]
 pub struct Vfs {
     pub db: Db,
-    pub tg: Arc<dyn TgApi>,
+    pub tg: Arc<TgRegistry>,
     pub uploader: Uploader,
 }
 
@@ -45,9 +45,16 @@ impl Vfs {
     /// 解析出父目录节点与最后一段名称(用于创建/移动目标)
     pub async fn resolve_parent(&self, path: &str) -> AppResult<(Node, String)> {
         let segs = normalize(path)?;
-        let name = segs.last().ok_or(AppError::InvalidPath("路径不能为根".into()))?.clone();
+        let name = segs
+            .last()
+            .ok_or(AppError::InvalidPath("路径不能为根".into()))?
+            .clone();
         let parent_refs: Vec<&str> = segs[..segs.len() - 1].iter().map(String::as_str).collect();
-        let parent = self.db.resolve(&parent_refs).await?.ok_or(AppError::NotFound)?;
+        let parent = self
+            .db
+            .resolve(&parent_refs)
+            .await?
+            .ok_or(AppError::NotFound)?;
         if !parent.is_dir {
             return Err(AppError::NotDirectory);
         }
@@ -144,7 +151,15 @@ impl Vfs {
         if !parent.is_dir {
             return Err(AppError::NotDirectory);
         }
-        let display = format!("{}/{}", if parent.id == ROOT_ID { "".into() } else { self.node_path(parent).await? }, name);
+        let display = format!(
+            "{}/{}",
+            if parent.id == ROOT_ID {
+                "".into()
+            } else {
+                self.node_path(parent).await?
+            },
+            name
+        );
         self.uploader.start(parent.id, name, &display).await
     }
 

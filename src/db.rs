@@ -4,8 +4,8 @@
 //! 覆盖写通过 uploading 影子行 + finalize 事务原子替换实现。
 
 use crate::error::{AppError, AppResult};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +38,36 @@ pub struct Chunk {
     pub size: i64,
     pub tg_file_id: String,
     pub tg_message_id: i64,
+    /// 创建该分块时使用的 Bot、端点与频道；旧库首次迁移时可能暂为空。
+    pub storage_target_id: Option<i64>,
+}
+
+/// 一个可长期读取历史分块的 Telegram 存储目标。
+#[derive(Clone, sqlx::FromRow)]
+pub struct StorageTarget {
+    pub id: i64,
+    pub api_base: String,
+    pub bot_token: String,
+    pub chat_id: String,
+    #[allow(dead_code)]
+    pub created_at: i64,
+}
+
+/// Telegram 消息的完整身份；message_id 只在同一存储目标内有意义。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct StoredMessage {
+    pub storage_target_id: i64,
+    pub message_id: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DeleteJob {
+    pub id: i64,
+    pub storage_target_id: i64,
+    pub tg_message_id: i64,
+    pub attempts: i64,
 }
 
 /// 分享链接行
@@ -54,16 +84,35 @@ pub struct Share {
     pub created_at: i64,
 }
 
+#[derive(sqlx::FromRow)]
+struct SearchRow {
+    id: i64,
+    parent_id: Option<i64>,
+    name: String,
+    is_dir: bool,
+    size: i64,
+    status: String,
+    created_at: i64,
+    modified_at: i64,
+    sha256: Option<String>,
+    path: String,
+}
+
 /// URL 安全随机 token
 fn random_token(len: usize) -> String {
     use rand::RngExt as _;
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
-    (0..len).map(|_| CHARS[rng.random_range(0..CHARS.len())] as char).collect()
+    (0..len)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 pub fn now_ts() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone)]
@@ -73,19 +122,84 @@ pub struct Db {
 
 impl Db {
     pub async fn open(db_path: &str) -> anyhow::Result<Self> {
-        if let Some(dir) = std::path::Path::new(db_path).parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
+        if let Some(dir) = std::path::Path::new(db_path).parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
         }
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{db_path}"))?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(10))
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new().max_connections(8).connect_with(opts).await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(opts)
+            .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Db { pool })
+    }
+
+    pub async fn ping(&self) -> AppResult<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ---------- 存储目标 ----------
+
+    /// 取得或创建一个不可变的存储目标。敏感字段只留在服务端，不会直接序列化到 API。
+    pub async fn ensure_storage_target(
+        &self,
+        api_base: &str,
+        bot_token: &str,
+        chat_id: &str,
+    ) -> AppResult<StorageTarget> {
+        sqlx::query(
+            "INSERT INTO storage_targets (api_base, bot_token, chat_id, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(api_base, bot_token, chat_id) DO NOTHING",
+        )
+        .bind(api_base.trim_end_matches('/'))
+        .bind(bot_token)
+        .bind(chat_id)
+        .bind(now_ts())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query_as::<_, StorageTarget>(
+            "SELECT * FROM storage_targets
+             WHERE api_base = ? AND bot_token = ? AND chat_id = ?",
+        )
+        .bind(api_base.trim_end_matches('/'))
+        .bind(bot_token)
+        .bind(chat_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn storage_targets(&self) -> AppResult<Vec<StorageTarget>> {
+        Ok(sqlx::query_as("SELECT * FROM storage_targets ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// v3 及更早版本的分块没有存储目标。迁移时只能采用当前生效配置，且只执行一次。
+    pub async fn backfill_unassigned_chunks(&self, storage_target_id: i64) -> AppResult<u64> {
+        Ok(
+            sqlx::query("UPDATE chunks SET storage_target_id = ? WHERE storage_target_id IS NULL")
+                .bind(storage_target_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    pub async fn unassigned_chunk_count(&self) -> AppResult<i64> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM chunks WHERE storage_target_id IS NULL")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
     }
 
     // ---------- 查询 ----------
@@ -145,10 +259,12 @@ impl Db {
     }
 
     pub async fn chunks_of(&self, node_id: i64) -> AppResult<Vec<Chunk>> {
-        Ok(sqlx::query_as::<_, Chunk>("SELECT * FROM chunks WHERE node_id = ? ORDER BY idx")
-            .bind(node_id)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, Chunk>("SELECT * FROM chunks WHERE node_id = ? ORDER BY idx")
+                .bind(node_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     /// 全局统计:文件数、目录数、逻辑总大小
@@ -215,10 +331,10 @@ impl Db {
         if node.is_dir && self.is_ancestor(id, new_parent).await? {
             return Err(AppError::BadRequest("不能把目录移动到自己内部".into()));
         }
-        if let Some(existing) = self.child(new_parent, new_name).await? {
-            if existing.id != id {
-                return Err(AppError::AlreadyExists);
-            }
+        if let Some(existing) = self.child(new_parent, new_name).await?
+            && existing.id != id
+        {
+            return Err(AppError::AlreadyExists);
         }
         sqlx::query("UPDATE nodes SET parent_id = ?, name = ?, modified_at = ? WHERE id = ?")
             .bind(new_parent)
@@ -238,10 +354,10 @@ impl Db {
         if !parent.is_dir {
             return Err(AppError::NotDirectory);
         }
-        if let Some(existing) = self.child(parent_id, name).await? {
-            if existing.is_dir {
-                return Err(AppError::IsDirectory); // 不允许文件覆盖目录
-            }
+        if let Some(existing) = self.child(parent_id, name).await?
+            && existing.is_dir
+        {
+            return Err(AppError::IsDirectory); // 不允许文件覆盖目录
         }
         let ts = now_ts();
         // 条件插入在 SQLite 的单条写语句内完成，防止两个请求同时为同一路径建上传影子。
@@ -274,16 +390,19 @@ impl Db {
         size: i64,
         tg_file_id: &str,
         tg_message_id: i64,
+        storage_target_id: i64,
     ) -> AppResult<()> {
         sqlx::query(
-            "INSERT INTO chunks (node_id, idx, size, tg_file_id, tg_message_id)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO chunks
+                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(node_id)
         .bind(idx)
         .bind(size)
         .bind(tg_file_id)
         .bind(tg_message_id)
+        .bind(storage_target_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -295,8 +414,10 @@ impl Db {
         node_id: i64,
         size: i64,
         sha256: Option<&str>,
-    ) -> AppResult<Vec<i64>> {
-        let (_, freed) = self.finalize_upload_with_node(node_id, size, sha256).await?;
+    ) -> AppResult<Vec<StoredMessage>> {
+        let (_, freed) = self
+            .finalize_upload_with_node(node_id, size, sha256)
+            .await?;
         Ok(freed)
     }
 
@@ -306,7 +427,7 @@ impl Db {
         node_id: i64,
         size: i64,
         sha256: Option<&str>,
-    ) -> AppResult<(Node, Vec<i64>)> {
+    ) -> AppResult<(Node, Vec<StoredMessage>)> {
         let node = self.node(node_id).await?;
         let parent_id = node.parent_id.ok_or(AppError::NotFound)?;
 
@@ -322,15 +443,26 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let mut candidates: Vec<i64> = Vec::new();
+        let mut candidates: Vec<StoredMessage> = Vec::new();
         if let Some((old_id,)) = old {
-            let rows: Vec<(i64,)> =
-                sqlx::query_as("SELECT tg_message_id FROM chunks WHERE node_id = ?")
-                    .bind(old_id)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            candidates = rows.into_iter().map(|r| r.0).collect();
-            sqlx::query("DELETE FROM nodes WHERE id = ?").bind(old_id).execute(&mut *tx).await?;
+            let rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT storage_target_id, tg_message_id FROM chunks
+                 WHERE node_id = ? AND storage_target_id IS NOT NULL",
+            )
+            .bind(old_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            candidates = rows
+                .into_iter()
+                .map(|(storage_target_id, message_id)| StoredMessage {
+                    storage_target_id,
+                    message_id,
+                })
+                .collect();
+            sqlx::query("DELETE FROM nodes WHERE id = ?")
+                .bind(old_id)
+                .execute(&mut *tx)
+                .await?;
         }
         sqlx::query(
             "UPDATE nodes SET status = 'ready', size = ?, sha256 = ?, modified_at = ? WHERE id = ?",
@@ -351,25 +483,53 @@ impl Db {
     }
 
     /// 放弃上传(失败/断开/启动清理):删节点行,返回已上传且未被共享的 message_id
-    pub async fn abort_upload(&self, node_id: i64) -> AppResult<Vec<i64>> {
+    pub async fn abort_upload(&self, node_id: i64) -> AppResult<Vec<StoredMessage>> {
+        self.abort_upload_inner(node_id, true).await
+    }
+
+    /// 收件箱登记的是用户原始频道消息；登记失败只能回滚元数据，不能删除原消息。
+    pub async fn abort_upload_keep_messages(&self, node_id: i64) -> AppResult<()> {
+        self.abort_upload_inner(node_id, false).await.map(|_| ())
+    }
+
+    async fn abort_upload_inner(
+        &self,
+        node_id: i64,
+        enqueue_delete: bool,
+    ) -> AppResult<Vec<StoredMessage>> {
         let mut tx = self.pool.begin().await?;
-        let rows: Vec<(i64,)> = sqlx::query_as("SELECT tg_message_id FROM chunks WHERE node_id = ?")
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT storage_target_id, tg_message_id FROM chunks
+             WHERE node_id = ? AND storage_target_id IS NOT NULL",
+        )
+        .bind(node_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let candidates = rows
+            .into_iter()
+            .map(|(storage_target_id, message_id)| StoredMessage {
+                storage_target_id,
+                message_id,
+            })
+            .collect();
+        sqlx::query("DELETE FROM nodes WHERE id = ?")
             .bind(node_id)
-            .fetch_all(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-        let candidates: Vec<i64> = rows.into_iter().map(|r| r.0).collect();
-        sqlx::query("DELETE FROM nodes WHERE id = ?").bind(node_id).execute(&mut *tx).await?;
-        let freed = Self::freed_messages(&mut tx, candidates).await?;
+        let freed = if enqueue_delete {
+            Self::freed_messages(&mut tx, candidates).await?
+        } else {
+            Vec::new()
+        };
         tx.commit().await?;
         Ok(freed)
     }
 
     /// 启动时清理所有 uploading 残留,返回可删的 message_id
-    pub async fn cleanup_stale_uploads(&self) -> AppResult<Vec<i64>> {
-        let ids: Vec<(i64,)> =
-            sqlx::query_as("SELECT id FROM nodes WHERE status = 'uploading'")
-                .fetch_all(&self.pool)
-                .await?;
+    pub async fn cleanup_stale_uploads(&self) -> AppResult<Vec<StoredMessage>> {
+        let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM nodes WHERE status = 'uploading'")
+            .fetch_all(&self.pool)
+            .await?;
         let mut freed = Vec::new();
         for (id,) in ids {
             freed.extend(self.abort_upload(id).await?);
@@ -380,7 +540,7 @@ impl Db {
     // ---------- 删除/复制 ----------
 
     /// 递归删除节点;返回引用归零、需要在 TG 删除的 message_id
-    pub async fn delete_node(&self, id: i64) -> AppResult<Vec<i64>> {
+    pub async fn delete_node(&self, id: i64) -> AppResult<Vec<StoredMessage>> {
         if id == ROOT_ID {
             return Err(AppError::BadRequest("不能删除根目录".into()));
         }
@@ -397,18 +557,28 @@ impl Db {
         .fetch_all(&mut *tx)
         .await?;
 
-        let mut candidates: Vec<i64> = Vec::new();
+        let mut candidates: Vec<StoredMessage> = Vec::new();
         for (nid,) in &node_ids {
-            let rows: Vec<(i64,)> =
-                sqlx::query_as("SELECT tg_message_id FROM chunks WHERE node_id = ?")
-                    .bind(nid)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            candidates.extend(rows.into_iter().map(|r| r.0));
+            let rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT storage_target_id, tg_message_id FROM chunks
+                 WHERE node_id = ? AND storage_target_id IS NOT NULL",
+            )
+            .bind(nid)
+            .fetch_all(&mut *tx)
+            .await?;
+            candidates.extend(rows.into_iter().map(|(storage_target_id, message_id)| {
+                StoredMessage {
+                    storage_target_id,
+                    message_id,
+                }
+            }));
         }
         // 子节点行由 ON DELETE CASCADE 级联;显式删整棵树避免依赖外键深度
         for (nid,) in node_ids.iter().rev() {
-            sqlx::query("DELETE FROM nodes WHERE id = ?").bind(nid).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM nodes WHERE id = ?")
+                .bind(nid)
+                .execute(&mut *tx)
+                .await?;
         }
         let freed = Self::freed_messages(&mut tx, candidates).await?;
         tx.commit().await?;
@@ -416,12 +586,7 @@ impl Db {
     }
 
     /// 复制文件:仅复制元数据行,共享 Telegram 消息(零流量)
-    pub async fn copy_file(
-        &self,
-        src_id: i64,
-        dst_parent: i64,
-        dst_name: &str,
-    ) -> AppResult<i64> {
+    pub async fn copy_file(&self, src_id: i64, dst_parent: i64, dst_name: &str) -> AppResult<i64> {
         let src = self.node(src_id).await?;
         if src.is_dir {
             return Err(AppError::IsDirectory);
@@ -445,8 +610,10 @@ impl Db {
         .await?
         .last_insert_rowid();
         sqlx::query(
-            "INSERT INTO chunks (node_id, idx, size, tg_file_id, tg_message_id)
-             SELECT ?, idx, size, tg_file_id, tg_message_id FROM chunks WHERE node_id = ?",
+            "INSERT INTO chunks
+                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id)
+             SELECT ?, idx, size, tg_file_id, tg_message_id, storage_target_id
+             FROM chunks WHERE node_id = ?",
         )
         .bind(new_id)
         .bind(src_id)
@@ -561,20 +728,25 @@ impl Db {
         .bind(node_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM trash WHERE node_id = ?").bind(node_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM trash WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
 
-        Ok(self.full_path_if_visible(node_id).await?.unwrap_or_else(|| format!("/{name}")))
+        Ok(self
+            .full_path_if_visible(node_id)
+            .await?
+            .unwrap_or_else(|| format!("/{name}")))
     }
 
     /// 彻底删除回收站中超期的项,返回引用归零的 message_id
-    pub async fn trash_purge_expired(&self, retention_days: i64) -> AppResult<Vec<i64>> {
+    pub async fn trash_purge_expired(&self, retention_days: i64) -> AppResult<Vec<StoredMessage>> {
         let cutoff = now_ts() - retention_days * 86400;
-        let ids: Vec<(i64,)> =
-            sqlx::query_as("SELECT node_id FROM trash WHERE trashed_at <= ?")
-                .bind(cutoff)
-                .fetch_all(&self.pool)
-                .await?;
+        let ids: Vec<(i64,)> = sqlx::query_as("SELECT node_id FROM trash WHERE trashed_at <= ?")
+            .bind(cutoff)
+            .fetch_all(&self.pool)
+            .await?;
         let mut freed = Vec::new();
         for (id,) in ids {
             freed.extend(self.delete_node(id).await?);
@@ -637,7 +809,7 @@ impl Db {
                     return self
                         .share_by_token(&token)
                         .await?
-                        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("分享刚创建即丢失")))
+                        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("分享刚创建即丢失")));
                 }
                 Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
                 Err(e) => return Err(e.into()),
@@ -647,73 +819,146 @@ impl Db {
     }
 
     pub async fn share_by_token(&self, token: &str) -> AppResult<Option<Share>> {
-        Ok(sqlx::query_as::<_, Share>("SELECT * FROM shares WHERE token = ?")
-            .bind(token)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, Share>("SELECT * FROM shares WHERE token = ?")
+                .bind(token)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn shares_list(&self) -> AppResult<Vec<Share>> {
-        Ok(sqlx::query_as::<_, Share>("SELECT * FROM shares ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, Share>("SELECT * FROM shares ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn share_delete(&self, id: i64) -> AppResult<()> {
-        sqlx::query("DELETE FROM shares WHERE id = ?").bind(id).execute(&self.pool).await?;
-        Ok(())
-    }
-
-    /// 下载计数 +1
-    pub async fn share_bump(&self, id: i64) -> AppResult<()> {
-        sqlx::query("UPDATE shares SET downloads = downloads + 1 WHERE id = ?")
+        sqlx::query("DELETE FROM shares WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
+    /// 为一张短期票据原子领取某个文件的下载额度。
+    ///
+    /// 返回 `true` 表示可以下载。相同票据重复读取同一文件（包括 Range 请求）
+    /// 不会再次计数；不同票据或目录分享中的不同文件仍会分别领取额度。
+    pub async fn share_claim_download(
+        &self,
+        share_id: i64,
+        ticket_id: &str,
+        node_id: i64,
+        ticket_expires_at: i64,
+    ) -> AppResult<bool> {
+        let now = now_ts();
+        let mut tx = self.pool.begin().await?;
+
+        // 顺手控制短期领取记录的体积；计数已经写入 shares，不随记录清理回退。
+        sqlx::query("DELETE FROM share_download_claims WHERE expires_at < ?")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+        let inserted = sqlx::query(
+            "INSERT INTO share_download_claims
+                (share_id, ticket_id, node_id, expires_at, claimed_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(share_id, ticket_id, node_id) DO NOTHING",
+        )
+        .bind(share_id)
+        .bind(ticket_id)
+        .bind(node_id)
+        .bind(ticket_expires_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+
+        if !inserted {
+            tx.commit().await?;
+            return Ok(true);
+        }
+
+        let claimed = sqlx::query(
+            "UPDATE shares
+             SET downloads = downloads + 1
+             WHERE id = ?
+               AND (max_downloads IS NULL OR downloads < max_downloads)",
+        )
+        .bind(share_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+
+        if claimed {
+            tx.commit().await?;
+        } else {
+            // 领取记录与计数必须同成同败，不能留下一个未计数却可复用的票据。
+            tx.rollback().await?;
+        }
+        Ok(claimed)
+    }
+
     // ---------- 搜索 / 秒传 ----------
 
     /// 全库按名称搜索(不区分大小写),排除回收站与上传中的子树;返回 (节点, 完整路径)
     pub async fn search(&self, query: &str, limit: usize) -> AppResult<Vec<(Node, String)>> {
-        // 个人网盘节点量级有限,全表进内存过滤,顺带拼路径
-        let all: Vec<Node> = sqlx::query_as("SELECT * FROM nodes").fetch_all(&self.pool).await?;
-        let by_id: HashMap<i64, &Node> = all.iter().map(|n| (n.id, n)).collect();
-        let q = query.to_lowercase();
-        let mut out = Vec::new();
-        for n in &all {
-            if n.id == ROOT_ID || n.status != "ready" || !n.name.to_lowercase().contains(&q) {
-                continue;
-            }
-            let mut parts = vec![n.name.clone()];
-            let mut cur = n.parent_id;
-            let mut visible = true;
-            while let Some(pid) = cur {
-                if pid == ROOT_ID {
-                    break;
-                }
-                match by_id.get(&pid) {
-                    Some(p) if p.status == "ready" => {
-                        parts.push(p.name.clone());
-                        cur = p.parent_id;
-                    }
-                    _ => {
-                        visible = false;
-                        break;
-                    }
-                }
-            }
-            if !visible {
-                continue;
-            }
-            parts.reverse();
-            out.push((n.clone(), format!("/{}", parts.join("/"))));
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        // 只让 SQLite 遍历从 ready 根可达的节点并在库内拼路径，避免节点量大时
+        // 每次搜索把整张 nodes 表及所有字符串复制进应用内存。
+        let rows: Vec<SearchRow> = sqlx::query_as(
+            "WITH RECURSIVE visible(
+                id, parent_id, name, is_dir, size, status,
+                created_at, modified_at, sha256, path
+             ) AS (
+                SELECT id, parent_id, name, is_dir, size, status,
+                       created_at, modified_at, sha256, ''
+                FROM nodes WHERE id = ? AND status = 'ready'
+                UNION ALL
+                SELECT n.id, n.parent_id, n.name, n.is_dir, n.size, n.status,
+                       n.created_at, n.modified_at, n.sha256,
+                       visible.path || '/' || n.name
+                FROM nodes n JOIN visible ON n.parent_id = visible.id
+                WHERE n.status = 'ready'
+             )
+             SELECT id, parent_id, name, is_dir, size, status,
+                    created_at, modified_at, sha256, path
+             FROM visible
+             WHERE id != ? AND instr(lower(name), lower(?)) > 0
+             ORDER BY name COLLATE NOCASE, id
+             LIMIT ?",
+        )
+        .bind(ROOT_ID)
+        .bind(ROOT_ID)
+        .bind(query)
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let path = row.path;
+                (
+                    Node {
+                        id: row.id,
+                        parent_id: row.parent_id,
+                        name: row.name,
+                        is_dir: row.is_dir,
+                        size: row.size,
+                        status: row.status,
+                        created_at: row.created_at,
+                        modified_at: row.modified_at,
+                        sha256: row.sha256,
+                    },
+                    path,
+                )
+            })
+            .collect())
     }
 
     /// 秒传:找到内容相同(sha256+size)的既有文件则零流量链接到目标位置,
@@ -724,7 +969,7 @@ impl Db {
         size: i64,
         dst_parent: i64,
         dst_name: &str,
-    ) -> AppResult<Option<(i64, Vec<i64>)>> {
+    ) -> AppResult<Option<(i64, Vec<StoredMessage>)>> {
         // 目标本身已经是同一内容时直接成功。除了让接口具备幂等性，也避免把源节点
         // 自己删掉后再从已删除节点复制 chunks，生成“有大小但无分块”的损坏文件。
         if let Some(existing) = self.child(dst_parent, dst_name).await? {
@@ -744,12 +989,14 @@ impl Db {
         .bind(size)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((src_id,)) = src else { return Ok(None) };
+        let Some((src_id,)) = src else {
+            return Ok(None);
+        };
 
-        if let Some(existing) = self.child(dst_parent, dst_name).await? {
-            if existing.is_dir {
-                return Err(AppError::IsDirectory);
-            }
+        if let Some(existing) = self.child(dst_parent, dst_name).await?
+            && existing.is_dir
+        {
+            return Err(AppError::IsDirectory);
         }
         let ts = now_ts();
         let mut tx = self.pool.begin().await?;
@@ -763,13 +1010,24 @@ impl Db {
         .await?;
         let mut candidates = Vec::new();
         if let Some((old_id,)) = old {
-            let rows: Vec<(i64,)> =
-                sqlx::query_as("SELECT tg_message_id FROM chunks WHERE node_id = ?")
-                    .bind(old_id)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            candidates = rows.into_iter().map(|r| r.0).collect();
-            sqlx::query("DELETE FROM nodes WHERE id = ?").bind(old_id).execute(&mut *tx).await?;
+            let rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT storage_target_id, tg_message_id FROM chunks
+                 WHERE node_id = ? AND storage_target_id IS NOT NULL",
+            )
+            .bind(old_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            candidates = rows
+                .into_iter()
+                .map(|(storage_target_id, message_id)| StoredMessage {
+                    storage_target_id,
+                    message_id,
+                })
+                .collect();
+            sqlx::query("DELETE FROM nodes WHERE id = ?")
+                .bind(old_id)
+                .execute(&mut *tx)
+                .await?;
         }
         let new_id = sqlx::query(
             "INSERT INTO nodes (parent_id, name, is_dir, size, status, created_at, modified_at, sha256)
@@ -785,8 +1043,10 @@ impl Db {
         .await?
         .last_insert_rowid();
         sqlx::query(
-            "INSERT INTO chunks (node_id, idx, size, tg_file_id, tg_message_id)
-             SELECT ?, idx, size, tg_file_id, tg_message_id FROM chunks WHERE node_id = ?",
+            "INSERT INTO chunks
+                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id)
+             SELECT ?, idx, size, tg_file_id, tg_message_id, storage_target_id
+             FROM chunks WHERE node_id = ?",
         )
         .bind(new_id)
         .bind(src_id)
@@ -819,10 +1079,12 @@ impl Db {
     }
 
     pub async fn thumbnail_get(&self, sha256: &str) -> AppResult<Option<(String, Vec<u8>)>> {
-        Ok(sqlx::query_as("SELECT mime, data FROM thumbnails WHERE sha256 = ?")
-            .bind(sha256)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as("SELECT mime, data FROM thumbnails WHERE sha256 = ?")
+                .bind(sha256)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     /// 清理已经没有任何文件引用的缩略图缓存，返回删除数量。
@@ -845,7 +1107,9 @@ impl Db {
     /// 目标路径由服务端自行生成,不接受用户输入。
     pub async fn vacuum_into(&self, dest: &str) -> AppResult<()> {
         let sql = format!("VACUUM INTO '{}'", dest.replace('\'', "''"));
-        sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&self.pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -858,16 +1122,48 @@ impl Db {
     }
 
     pub async fn setting_set(&self, k: &str, v: &str) -> AppResult<()> {
-        sqlx::query("INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v")
+        sqlx::query(
+            "INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        )
+        .bind(k)
+        .bind(v)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn setting_del(&self, k: &str) -> AppResult<()> {
+        sqlx::query("DELETE FROM settings WHERE k = ?")
             .bind(k)
-            .bind(v)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn setting_del(&self, k: &str) -> AppResult<()> {
-        sqlx::query("DELETE FROM settings WHERE k = ?").bind(k).execute(&self.pool).await?;
+    /// 原子批量更新设置，避免运行时仍是旧值而数据库只写入了一半新配置。
+    pub async fn settings_apply(
+        &self,
+        sets: &[(String, String)],
+        deletes: &[String],
+    ) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+        for key in deletes {
+            sqlx::query("DELETE FROM settings WHERE k = ?")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for (key, value) in sets {
+            sqlx::query(
+                "INSERT INTO settings (k, v) VALUES (?, ?)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -884,21 +1180,112 @@ impl Db {
             .collect())
     }
 
-    /// 候选 message_id 中,删除操作后已无任何 chunks 行引用的那些
+    // ---------- 持久化删除队列 ----------
+
+    pub async fn enqueue_delete_message(&self, message: StoredMessage) -> AppResult<()> {
+        sqlx::query(
+            "INSERT INTO delete_jobs
+                (storage_target_id, tg_message_id, attempts, next_retry_at, created_at)
+             VALUES (?, ?, 0, 0, ?)
+             ON CONFLICT(storage_target_id, tg_message_id) DO NOTHING",
+        )
+        .bind(message.storage_target_id)
+        .bind(message.message_id)
+        .bind(now_ts())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_jobs_due(&self, limit: i64) -> AppResult<Vec<DeleteJob>> {
+        // 极端情况下同一消息在入队后又被引用，安全起见取消对应删除任务。
+        sqlx::query(
+            "DELETE FROM delete_jobs
+             WHERE EXISTS (
+                 SELECT 1 FROM chunks
+                 WHERE chunks.storage_target_id = delete_jobs.storage_target_id
+                   AND chunks.tg_message_id = delete_jobs.tg_message_id
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(sqlx::query_as(
+            "SELECT id, storage_target_id, tg_message_id, attempts
+             FROM delete_jobs
+             WHERE next_retry_at <= ?
+             ORDER BY next_retry_at, id
+             LIMIT ?",
+        )
+        .bind(now_ts())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn delete_job_done(&self, id: i64) -> AppResult<()> {
+        sqlx::query("DELETE FROM delete_jobs WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_job_failed(&self, id: i64, attempts: i64, error: &str) -> AppResult<()> {
+        let exponent = attempts.clamp(0, 10) as u32;
+        let delay = 5_i64
+            .saturating_mul(2_i64.saturating_pow(exponent))
+            .min(3600);
+        let detail: String = error.chars().take(500).collect();
+        sqlx::query(
+            "UPDATE delete_jobs
+             SET attempts = ?, next_retry_at = ?, last_error = ?
+             WHERE id = ?",
+        )
+        .bind(attempts + 1)
+        .bind(now_ts() + delay)
+        .bind(detail)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_delete_count(&self) -> AppResult<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM delete_jobs")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// 候选消息中，删除元数据后已无任何分块引用的消息；在同一事务内先写入删除队列。
     async fn freed_messages(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        candidates: Vec<i64>,
-    ) -> AppResult<Vec<i64>> {
-        let uniq: HashSet<i64> = candidates.into_iter().collect();
+        candidates: Vec<StoredMessage>,
+    ) -> AppResult<Vec<StoredMessage>> {
+        let uniq: HashSet<StoredMessage> = candidates.into_iter().collect();
         let mut freed = Vec::new();
-        for mid in uniq {
-            let still: Option<(i64,)> =
-                sqlx::query_as("SELECT 1 FROM chunks WHERE tg_message_id = ? LIMIT 1")
-                    .bind(mid)
-                    .fetch_optional(&mut **tx)
-                    .await?;
+        for message in uniq {
+            let still: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM chunks
+                 WHERE storage_target_id = ? AND tg_message_id = ? LIMIT 1",
+            )
+            .bind(message.storage_target_id)
+            .bind(message.message_id)
+            .fetch_optional(&mut **tx)
+            .await?;
             if still.is_none() {
-                freed.push(mid);
+                sqlx::query(
+                    "INSERT INTO delete_jobs
+                        (storage_target_id, tg_message_id, attempts, next_retry_at, created_at)
+                     VALUES (?, ?, 0, 0, ?)
+                     ON CONFLICT(storage_target_id, tg_message_id) DO NOTHING",
+                )
+                .bind(message.storage_target_id)
+                .bind(message.message_id)
+                .bind(now_ts())
+                .execute(&mut **tx)
+                .await?;
+                freed.push(message);
             }
         }
         Ok(freed)
@@ -909,10 +1296,24 @@ impl Db {
 mod tests {
     use super::*;
 
+    const TEST_TARGET: i64 = 1;
+
+    fn stored(message_id: i64) -> StoredMessage {
+        StoredMessage {
+            storage_target_id: TEST_TARGET,
+            message_id,
+        }
+    }
+
     async fn test_db() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         let db = Db::open(path.to_str().unwrap()).await.unwrap();
+        let target = db
+            .ensure_storage_target("http://mock", "mock-token", "-1001")
+            .await
+            .unwrap();
+        assert_eq!(target.id, TEST_TARGET);
         (db, dir)
     }
 
@@ -938,8 +1339,12 @@ mod tests {
         // 上传 2 块的文件
         let up = db.create_uploading(ROOT_ID, "a.bin").await.unwrap();
         assert!(db.uploading_child_exists(ROOT_ID, "a.bin").await.unwrap());
-        db.add_chunk(up, 0, 10, "f0", 100).await.unwrap();
-        db.add_chunk(up, 1, 5, "f1", 101).await.unwrap();
+        db.add_chunk(up, 0, 10, "f0", 100, TEST_TARGET)
+            .await
+            .unwrap();
+        db.add_chunk(up, 1, 5, "f1", 101, TEST_TARGET)
+            .await
+            .unwrap();
         // uploading 期间不可见
         assert!(db.resolve(&["a.bin"]).await.unwrap().is_none());
         let freed = db.finalize_upload(up, 15, Some("aabb")).await.unwrap();
@@ -957,20 +1362,24 @@ mod tests {
         let copy = db.resolve(&["b.bin"]).await.unwrap().unwrap();
         let mut freed = db.delete_node(copy.id).await.unwrap();
         freed.sort();
-        assert_eq!(freed, vec![100, 101]);
+        assert_eq!(freed, vec![stored(100), stored(101)]);
     }
 
     #[tokio::test]
     async fn overwrite_replaces_old() {
         let (db, _g) = test_db().await;
         let v1 = db.create_uploading(ROOT_ID, "f").await.unwrap();
-        db.add_chunk(v1, 0, 3, "f0", 200).await.unwrap();
+        db.add_chunk(v1, 0, 3, "f0", 200, TEST_TARGET)
+            .await
+            .unwrap();
         db.finalize_upload(v1, 3, None).await.unwrap();
 
         let v2 = db.create_uploading(ROOT_ID, "f").await.unwrap();
-        db.add_chunk(v2, 0, 7, "f1", 201).await.unwrap();
+        db.add_chunk(v2, 0, 7, "f1", 201, TEST_TARGET)
+            .await
+            .unwrap();
         let freed = db.finalize_upload(v2, 7, None).await.unwrap();
-        assert_eq!(freed, vec![200]); // 旧版本消息被释放
+        assert_eq!(freed, vec![stored(200)]); // 旧版本消息被释放
         let node = db.resolve(&["f"]).await.unwrap().unwrap();
         assert_eq!(node.size, 7);
         assert_eq!(node.id, v2);
@@ -980,9 +1389,9 @@ mod tests {
     async fn stale_upload_cleanup() {
         let (db, _g) = test_db().await;
         let up = db.create_uploading(ROOT_ID, "x").await.unwrap();
-        db.add_chunk(up, 0, 1, "f", 300).await.unwrap();
+        db.add_chunk(up, 0, 1, "f", 300, TEST_TARGET).await.unwrap();
         let freed = db.cleanup_stale_uploads().await.unwrap();
-        assert_eq!(freed, vec![300]);
+        assert_eq!(freed, vec![stored(300)]);
         assert!(db.node(up).await.is_err());
     }
 
@@ -1001,7 +1410,9 @@ mod tests {
     /// 建一个 ready 文件的辅助
     async fn mk_file(db: &Db, parent: i64, name: &str, msg: i64, sha: &str) -> i64 {
         let up = db.create_uploading(parent, name).await.unwrap();
-        db.add_chunk(up, 0, 4, &format!("f{msg}"), msg).await.unwrap();
+        db.add_chunk(up, 0, 4, &format!("f{msg}"), msg, TEST_TARGET)
+            .await
+            .unwrap();
         db.finalize_upload(up, 4, Some(sha)).await.unwrap();
         up
     }
@@ -1027,14 +1438,22 @@ mod tests {
         assert_eq!(list[0].1, "/docs");
         let back = db.trash_restore(list[0].0.id).await.unwrap();
         assert_eq!(back, "/docs (恢复)");
-        assert!(db.resolve(&["docs (恢复)", "a.txt"]).await.unwrap().is_some());
+        assert!(
+            db.resolve(&["docs (恢复)", "a.txt"])
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // 再删一次后超期清理:消息引用归零被释放
-        db.trash_node(db.resolve(&["docs (恢复)"]).await.unwrap().unwrap().id, "/docs (恢复)")
-            .await
-            .unwrap();
+        db.trash_node(
+            db.resolve(&["docs (恢复)"]).await.unwrap().unwrap().id,
+            "/docs (恢复)",
+        )
+        .await
+        .unwrap();
         let freed = db.trash_purge_expired(0).await.unwrap();
-        assert_eq!(freed, vec![500]);
+        assert_eq!(freed, vec![stored(500)]);
         assert!(db.trash_list().await.unwrap().is_empty());
     }
 
@@ -1044,17 +1463,28 @@ mod tests {
         let src_id = mk_file(&db, ROOT_ID, "src.bin", 600, "deadbeef").await;
 
         // 对已经成功的同一路径重复探测必须是无副作用成功，分块不能被误删。
-        let (same_id, freed) =
-            db.instant_link("deadbeef", 4, ROOT_ID, "src.bin").await.unwrap().unwrap();
+        let (same_id, freed) = db
+            .instant_link("deadbeef", 4, ROOT_ID, "src.bin")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(same_id, src_id);
         assert!(freed.is_empty());
         assert_eq!(db.chunks_of(src_id).await.unwrap().len(), 1);
 
         // 未命中
-        assert!(db.instant_link("nope", 4, ROOT_ID, "x").await.unwrap().is_none());
+        assert!(
+            db.instant_link("nope", 4, ROOT_ID, "x")
+                .await
+                .unwrap()
+                .is_none()
+        );
         // 命中:零流量链接,共享消息
-        let (nid, freed) =
-            db.instant_link("deadbeef", 4, ROOT_ID, "copy.bin").await.unwrap().unwrap();
+        let (nid, freed) = db
+            .instant_link("deadbeef", 4, ROOT_ID, "copy.bin")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(freed.is_empty());
         let n = db.node(nid).await.unwrap();
         assert_eq!(n.sha256.as_deref(), Some("deadbeef"));
@@ -1064,16 +1494,21 @@ mod tests {
 
         // 秒传覆盖同名文件:旧消息释放
         mk_file(&db, ROOT_ID, "old.bin", 700, "cafe").await;
-        let (_, freed) =
-            db.instant_link("deadbeef", 4, ROOT_ID, "old.bin").await.unwrap().unwrap();
-        assert_eq!(freed, vec![700]);
+        let (_, freed) = db
+            .instant_link("deadbeef", 4, ROOT_ID, "old.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(freed, vec![stored(700)]);
     }
 
     #[tokio::test]
     async fn thumbnail_cache_follows_content_hash() {
         let (db, _g) = test_db().await;
         let data = b"RIFFxxxxWEBPthumbnail";
-        db.thumbnail_put("thumb-sha", "image/webp", data).await.unwrap();
+        db.thumbnail_put("thumb-sha", "image/webp", data)
+            .await
+            .unwrap();
         let got = db.thumbnail_get("thumb-sha").await.unwrap().unwrap();
         assert_eq!(got.0, "image/webp");
         assert_eq!(got.1, data);
@@ -1107,12 +1542,52 @@ mod tests {
     async fn share_roundtrip() {
         let (db, _g) = test_db().await;
         let fid = mk_file(&db, ROOT_ID, "a.txt", 900, "sh").await;
-        let s = db.share_create(fid, Some("1234"), Some(now_ts() + 100), Some(5)).await.unwrap();
+        let s = db
+            .share_create(fid, Some("1234"), Some(now_ts() + 100), Some(5))
+            .await
+            .unwrap();
         assert_eq!(s.token.len(), 12);
         let got = db.share_by_token(&s.token).await.unwrap().unwrap();
         assert_eq!(got.password.as_deref(), Some("1234"));
-        db.share_bump(got.id).await.unwrap();
-        assert_eq!(db.share_by_token(&s.token).await.unwrap().unwrap().downloads, 1);
+        assert!(
+            db.share_claim_download(got.id, "ticket-a", fid, now_ts() + 100)
+                .await
+                .unwrap()
+        );
+        // 同一票据读取同一文件（例如多个 Range）不重复计数。
+        assert!(
+            db.share_claim_download(got.id, "ticket-a", fid, now_ts() + 100)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.share_by_token(&s.token)
+                .await
+                .unwrap()
+                .unwrap()
+                .downloads,
+            1
+        );
+
+        // 并发票据也不能冲破下载上限。
+        let limited = db.share_create(fid, None, None, Some(1)).await.unwrap();
+        let (a, b) = tokio::join!(
+            db.share_claim_download(limited.id, "ticket-1", fid, now_ts() + 100),
+            db.share_claim_download(limited.id, "ticket-2", fid, now_ts() + 100),
+        );
+        let accepted = [a.unwrap(), b.unwrap()]
+            .into_iter()
+            .filter(|accepted| *accepted)
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(
+            db.share_by_token(&limited.token)
+                .await
+                .unwrap()
+                .unwrap()
+                .downloads,
+            1
+        );
         // 彻底删除节点 → 分享级联消失
         db.delete_node(fid).await.unwrap();
         assert!(db.share_by_token(&s.token).await.unwrap().is_none());

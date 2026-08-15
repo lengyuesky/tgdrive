@@ -21,6 +21,7 @@ WebDAV 客户端─┘   ├ /api/*  REST            └─> Telegram Bot API
 - **全局搜索**:按文件名全库搜索,结果直达所在目录
 - **Bot 收件**:往存储频道直发或白名单用户私聊文件/视频/图片自动零流量转存;可把视频、图片、书籍分别存到指定目录,并自定义「文件后缀 → 目录」规则
 - **数据库备份**:一键下载一致性快照;可开启每日自动备份到存储频道(滚动保留 7 份)
+- **可靠后台任务**:Telegram 删除失败进入持久化重试队列;Bot 收件连续失败会进入死信,避免卡住后续消息
 - **WebDAV**:支持 rclone、Windows 资源管理器、macOS Finder(Class 2 LOCK)
 - **零成本复制**:复制文件/目录只复制元数据,共享底层 Telegram 消息(引用计数,删除安全)
 - **流式传输**:上传下载全程流式,内存占用与文件大小无关;>32MB 的分块经临时文件中转
@@ -41,10 +42,13 @@ WebDAV 客户端─┘   ├ /api/*  REST            └─> Telegram Bot API
 `.env` 里**只有账号密码是必填的**,其余留空即可 —— 服务照常启动,登录后在网页里配置:
 
 ```bash
+mkdir -p data
 cp .env.example .env
 # 编辑 .env:只需填 TGDRIVE_USERNAME / TGDRIVE_PASSWORD
 docker compose up -d --build
 ```
+
+镜像默认以非 root 用户 `1000:1000` 运行。`data` 目录必须对该用户可写;如果宿主机当前用户不是 `1000:1000`,请把 `.env` 中的 `TGDRIVE_UID` / `TGDRIVE_GID` 改为 `id -u` / `id -g` 的输出。先由当前用户创建 `data` 目录,可避免 Docker 自动创建出 root 所有的目录。
 
 打开 <http://localhost:8080> 登录,页面会提示「还没配置 Telegram 存储」,点「去配置」填好 **Bot Token** 与**存储频道**,保存即生效(不用重启容器)。
 
@@ -54,21 +58,25 @@ docker compose up -d --build
 
 官方端点下载单块上限 20MB,所以分块只能 ≤18MB,而 bot 发消息到同一频道约有 20 条/分钟 的限流,大文件吞吐约 6MB/s。自建 `telegram-bot-api` 后分块可到 GB 级,轻松跑满带宽。
 
-在 <https://my.telegram.org> 申请 `api_id` / `api_hash` 后,有两种配法:
+在 <https://my.telegram.org> 申请 `api_id` / `api_hash` 后，有两种配法。这两项也供
+tgdrive 的 MTProto Range 下载使用：浏览器播放视频时每次只向 Telegram 请求最多
+512KiB，关闭预览后停止后续请求，不需要改变已有的 GB 级 Telegram 分块。
+
+自建服务位于 Compose 的 `local-bot-api` profile 中,不会随普通的 `docker compose up` 启动。
 
 **A. 网页里配**(推荐):后台「自建 Bot API 服务器」填好 api_id / api_hash 并保存,点「导出 .env」把内容覆盖回项目目录的 `.env`,执行:
 
 ```bash
-docker compose up -d telegram-bot-api
+docker compose --profile local-bot-api up -d
 ```
 
 重建容器后,回「Telegram 存储」把「接口端点」切到**自建 Bot API** 再保存即可。
 
-**B. 直接改 .env**:填 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` 与 `TGDRIVE_API_BASE=http://telegram-bot-api:8081`,再执行 `docker compose up -d`。
+**B. 直接改 .env**:填 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` 与 `TGDRIVE_API_BASE=http://telegram-bot-api:8081`,再执行 `docker compose --profile local-bot-api up -d --build`。
 
-> telegram-bot-api 容器随 `docker compose up -d` 默认启动;没配 api_id / api_hash 时它会报错重启,不影响 tgdrive 走官方端点,不需要自建可 `docker compose stop telegram-bot-api`。
-
-> api_id / api_hash 由 telegram-bot-api 容器读取(compose 的 `${VAR}` 插值取自宿主机 `.env`),tgdrive 改不了别的容器的环境变量 —— 所以这两项无论在哪改,都必须重建那个容器才生效。
+> api_id / api_hash 会在 tgdrive 启动时用于 MTProto 会话，也由 telegram-bot-api 容器读取
+> （compose 的 `${VAR}` 插值取自宿主机 `.env`）。所以这两项无论在哪改，都要先导出并
+> 覆盖宿主机 `.env`，再重启/重建 tgdrive 与 telegram-bot-api。
 
 compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相同路径只读挂到 tgdrive 容器(local 模式下 `getFile` 返回容器内绝对路径,tgdrive 自动探测并直读磁盘,失败才回退 HTTP)。
 
@@ -88,10 +96,13 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_UPLOAD_CONCURRENCY` | | `2` | ✔ | 分块并发上传数,调大易触发 429 限流 |
 | `TGDRIVE_SEND_VIDEO` | | 官方 `false` / 自建 `true` | ✔ | 视频消息模式:不超过分块大小的 mp4/mov/m4v 以「视频消息」发送(自动带宽高时长),Telegram 里可直接播放,文件内容不变;mkv/webm 仍走文档(Telegram 播放器不支持其常见编码);超过分块大小的视频仍按文档分块存储 |
 | `TGDRIVE_TMP_DIR` | | 系统临时目录 | ✔ | 大分块暂存目录,需 ≥ 分块大小×(并发+1) 的空间 |
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | | — | ✔* | 自建 Bot API 服务器的凭据,在 <https://my.telegram.org> 申请;\*后台可编辑并导出,但由 telegram-bot-api 容器读取,**必须重建那个容器才生效** |
+| `TGDRIVE_LOCAL_DATA_ROOT` | | `/var/lib/telegram-bot-api` | | 自建 Bot API local 模式允许读取的根目录;必须与 Compose 共享卷的容器内路径一致,修改需重启 |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | | — | ✔* | 在 <https://my.telegram.org> 申请；tgdrive 用于 MTProto Range 流式下载，自建 Bot API 也使用；\*后台可编辑并导出，修改后必须重启/重建两个服务 |
+| `TGDRIVE_UID` / `TGDRIVE_GID` | | `1000` / `1000` | | Compose 中 tgdrive 进程的 UID/GID;应对 `./data` 有写权限 |
 | `TGDRIVE_LISTEN` | | `0.0.0.0:8080` | | 监听地址(端口由 compose 映射,改需重启) |
 | `TGDRIVE_DB_PATH` | | `/data/tgdrive.db`(镜像内) | | SQLite 路径(设置本身存在这个库里) |
 | `TGDRIVE_SECRET` | | 自动生成并存库 | | cookie 签名密钥,**仅首次启动时作为初始值**,之后以库中值为准 |
+| `TGDRIVE_COOKIE_SECURE` | | `false` | | 通过 HTTPS(含反向代理)访问时设为 `true`,为 Cookie 启用 Secure 并发送 HSTS 响应头;修改需重启 |
 | `TGDRIVE_STATIC_DIR` | | `/app/static`(镜像内) | | 前端静态文件目录 |
 | `RUST_LOG` | | `info` | | 日志级别 |
 
@@ -99,15 +110,15 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 右上角用户名菜单 → **系统设置**(`/admin`)。
 
-- **系统状态**:bot、端点、分块、文件数与占用、元数据库体积、运行时长
+- **系统状态**:bot、端点、分块、文件数与占用、元数据库体积、运行时长、待删除任务、收件死信与后台任务健康度
 - **Telegram 存储**:bot token、存储频道、接口端点、分块大小、上传并发、视频消息模式
-- **自建 Bot API 服务器**:api_id / api_hash,以及切换到自建端点的操作步骤
+- **MTProto 流式播放 / 自建 Bot API**：api_id / api_hash，以及切换到自建端点的操作步骤
 - **账号**、**高级**(临时目录)、需重启才能改的项(监听地址、数据库路径等)
 - **Bot 收件**:设置默认、视频、图片、书籍目录;自定义类型名称、一个或多个文件后缀及目标目录。自定义规则优先,多段后缀按更具体的规则匹配
 
 上表中标了「可在后台改」的项都能在这里改,**保存后立即生效,不需要重启容器**(api_id / api_hash 除外,见下)。改动写进 SQLite,优先级高于 `.env`;每项都标了来源(`来自 .env` / `后台已改` / `默认值`),点「恢复」即可退回 `.env` 或默认值。
 
-- **安全网**:改 Telegram 相关配置时先自动跑一次 `getMe`,连不上就拒绝保存(可选择强制保存,给自建端点还没启动的场景用);分块大小与端点的组合会一并校验,例如切回官方端点时不允许保留 512MB 的分块
+- **安全网**:改 Telegram 相关配置时会验证 Bot 身份、目标会话以及频道/群组的管理员、发消息和删消息权限;验证失败就拒绝保存(可选择强制保存,给自建端点还没启动的场景用)。分块大小与端点的组合也会一并校验,例如切回官方端点时不允许保留 512MB 的分块
 - **导出 .env**:把当前生效配置生成 `.env` 文本,方便同步回宿主机文件
 - **维护**:清理上传中断留下的残留;登出所有会话(轮换签名密钥)
 
@@ -115,9 +126,17 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 **改配置前请注意:**
 
-- **换存储频道**只影响之后上传的文件。已存文件的分块仍在原频道,删除它们时消息可能无法自动清理(需要手动去原频道删)。
-- **从自建端点切回官方端点**前,确认历史分块都不超过 20MB —— 官方 `getFile` 下载上限 20MB,更大的分块将读不出来。
-- **api_id / api_hash 改完不会立刻生效**:它们是 compose 传给 telegram-bot-api 容器的环境变量,tgdrive 改不了别的容器的环境。保存后要导出 `.env` 覆盖回项目目录,再执行 `docker compose up -d telegram-bot-api` 重建那个容器。
+- **换 Bot、端点或存储频道**只影响之后开始的上传。每个分块会记录原 Bot/API/频道,历史文件仍按原目标读取和删除;请保留原 Bot Token、端点和频道权限,否则对应历史文件会不可用。
+- **旧数据库首次升级**无法凭 Telegram 消息反推出每个历史分块的原目标,程序会把尚未关联目标的旧分块一次性绑定到升级时的当前配置。如果旧库曾经换过 Bot、端点或频道,请先备份数据库并人工核对。
+- **api_id / api_hash 改完不会立刻生效**：tgdrive 在启动时读取它们建立 MTProto 会话，Compose 也把它们传给 telegram-bot-api。保存后要导出 `.env` 覆盖回项目目录，再执行 `docker compose --profile local-bot-api up -d --build tgdrive telegram-bot-api`。
+
+### Range 流式播放
+
+下载接口支持标准单段 HTTP Range。配置 api_id/api_hash 后，文档、音频和视频会直接通过
+MTProto 按 512KiB 读取；任意偏移最多只会额外读取前方不足 512KiB 的对齐数据。播放器关闭
+或请求取消后，服务会停止发出后续 MTProto 请求。若自建 Bot API 的文件已在共享卷缓存中，
+仍优先本地直读，完全不产生 Telegram 下载流量。照片等不支持的 file_id 以及未配置 MTProto
+时才保留原 Bot API 下载路径。
 
 ## WebDAV 使用
 
@@ -150,24 +169,35 @@ docker compose run --rm tgdrive check
 tgdrive healthcheck
 ```
 
+HTTP 探针:
+
+- `GET /healthz`:存活探针,HTTP 服务能响应即返回 `200`
+- `GET /readyz`:就绪探针,检查 SQLite、当前存储目标和关键后台任务心跳;异常时返回 `503` 及各项 JSON 状态
+
 ## 本地开发
 
 ```bash
 # 后端(读取 .env)
 cargo run -- serve
 # 前端(代理 /api、/dav 到 127.0.0.1:8080)
-cd frontend && npm install && npm run dev
-# 测试
-cargo test
+npm --prefix frontend install
+npm --prefix frontend run dev
+# 提交前检查
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+npm --prefix frontend run check
 ```
+
+仓库内置 GitHub Actions CI,会在 push 和 pull request 时执行同一套 Rust 格式、Clippy、测试以及前端类型检查和生产构建。
 
 ## 重要注意事项
 
 - **务必备份 `./data/tgdrive.db`(SQLite,项目目录下的 `data/` 映射进容器 `/data`)**。Bot API 无法读取频道历史消息,元数据库一旦丢失,频道里的分块将无法自动找回(每条消息的 caption 里记有 `{"p":路径,"i":分块序号}`,可作最后的人工恢复线索)。库里同时存着后台改过的配置(含 bot token 与密码,明文),请一并妥善保管。
 - **限流**:Telegram 对 bot 发消息到同一频道限流约 20 条/分钟。触发 429 时程序会按 `retry_after` 自动重试;官方端点大文件多的场景建议自建 Bot API 并调大分块。
-- **删除**:删除文件会尽力删除对应频道消息(bot 需要是频道管理员);删除失败仅记日志,不阻塞操作。
+- **删除**:删除文件不会等待 Telegram 消息删除完成;失败任务会持久化到 SQLite,后台按指数退避持续重试。可在后台系统状态查看队列。
 - **不加密**:分块原样存储,频道成员可直接查看文件;需要保密请勿把他人拉进存储频道。
-- 未实现(欢迎扩展):断点续传、回收站、多用户、端到端加密、元数据库自动备份到频道、`chunks` 表记录 `chat_id`(支持换频道后仍能清理旧频道消息)。
+- 未实现(欢迎扩展):断点续传、多用户、端到端加密。
 
 ## 技术栈
 
