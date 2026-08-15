@@ -7,6 +7,7 @@ export interface Entry {
   size: number
   created_at: number
   modified_at: number
+  sha256: string | null
 }
 
 export interface ServerInfo {
@@ -202,7 +203,7 @@ export const api = {
   upload: (dir: string, file: File, onProgress: (pct: number) => void, signal?: AbortSignal) => {
     const form = new FormData()
     form.append('file', file, file.name)
-    return http.post('/fs/upload', form, {
+    return http.post<{ saved: Entry[] }>('/fs/upload', form, {
       params: { path: dir },
       signal,
       onUploadProgress: (ev) => {
@@ -212,6 +213,16 @@ export const api = {
   },
   downloadUrl: (path: string, inline = false) =>
     `/api/fs/download?path=${encodeURIComponent(path)}${inline ? '&inline=1' : ''}`,
+  /** 视频缩略图是独立小图，不会触发原视频下载。 */
+  thumbnailUrl: (sha256: string) =>
+    `/api/fs/thumbnail?sha256=${encodeURIComponent(sha256)}`,
+  saveThumbnail: (path: string, sha256: string, image: Blob) =>
+    http.post('/fs/thumbnail', image, {
+      params: { path, sha256 },
+      headers: { 'Content-Type': image.type },
+      // 主文件已经上传成功，缩略图请求不能无限阻塞上传队列。
+      timeout: 15_000,
+    }),
   /** 上传前批量查重:返回目录下已存在的名字 */
   exists: (dir: string, names: string[]) =>
     http.post<{ existing: string[] }>('/fs/exists', { dir, names }),
@@ -219,7 +230,12 @@ export const api = {
   search: (q: string) => http.get<{ results: SearchHit[] }>('/fs/search', { params: { q } }),
   /** 秒传探测:库里有同内容文件则零流量落位 */
   instant: (dir: string, name: string, sha256: string, size: number) =>
-    http.post<{ linked: boolean; entry?: Entry }>('/fs/instant', { dir, name, sha256, size }),
+    http.post<{ linked: boolean; pending: boolean; entry?: Entry }>('/fs/instant', {
+      dir,
+      name,
+      sha256,
+      size,
+    }),
 
   trash: {
     list: () => http.get<{ items: TrashItem[] }>('/trash'),

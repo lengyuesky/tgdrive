@@ -1,17 +1,15 @@
 <template>
   <div ref="root" class="vthumb">
-    <!-- 进入视口才挂 video,靠 Range 请求只拉元数据与首帧,不下载整个文件 -->
-    <video
-      v-if="active && !failed"
-      class="vthumb-video"
-      :src="src + '#t=0.1'"
-      preload="metadata"
-      muted
-      playsinline
-      disablepictureinpicture
-      @loadeddata="ready = true"
+    <!-- 这里只加载上传时生成的小图，绝不把原视频挂进列表。 -->
+    <img
+      v-if="active && src && !failed"
+      class="vthumb-image"
+      :src="src"
+      loading="lazy"
+      decoding="async"
+      @load="ready = true"
       @error="failed = true"
-    />
+    >
     <div v-if="!ready || failed" class="vthumb-fallback">
       <el-icon color="#8b5cf6"><Film /></el-icon>
     </div>
@@ -22,16 +20,24 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { Film, VideoPlay } from '@element-plus/icons-vue'
 
-defineProps<{ src: string }>()
+const props = defineProps<{ src: string }>()
 
 const root = ref<HTMLElement>()
 const active = ref(false)
 const ready = ref(false)
 const failed = ref(false)
 let ob: IntersectionObserver | undefined
+
+watch(
+  () => props.src,
+  () => {
+    ready.value = false
+    failed.value = false
+  },
+)
 
 onMounted(() => {
   ob = new IntersectionObserver(
@@ -55,7 +61,7 @@ onUnmounted(() => ob?.disconnect())
   overflow: hidden;
   /* 尺寸由宿主决定:列表里是 36px 小图,网格里由 .tile-media 撑满 */
 }
-.vthumb-video {
+.vthumb-image {
   width: 100%;
   height: 100%;
   object-fit: cover;

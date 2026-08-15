@@ -302,7 +302,7 @@
                 <VideoThumb
                   v-else-if="isVideo(row.name)"
                   class="thumb"
-                  :src="fileUrl(row)"
+                  :src="thumbnailUrl(row)"
                 />
                 <el-icon v-else class="fico" :color="iconOf(row.name).color">
                   <component :is="iconOf(row.name).icon" />
@@ -395,7 +395,7 @@
                 </el-image>
                 <VideoThumb
                   v-else-if="!cell.is_dir && isVideo(cell.name)"
-                  :src="fileUrl(cell)"
+                  :src="thumbnailUrl(cell)"
                 />
                 <el-icon v-else-if="cell.is_dir" color="#f6a821"><Folder /></el-icon>
                 <el-icon v-else :color="iconOf(cell.name).color">
@@ -523,6 +523,10 @@ function iconOf(name: string) {
 
 function fileUrl(row: Entry) {
   return api.downloadUrl(joinPath(cur.value, row.name), true)
+}
+
+function thumbnailUrl(row: Entry) {
+  return row.sha256 ? api.thumbnailUrl(row.sha256) : ''
 }
 
 // ---- 布局:列表 / 网格 / 大图 / 时间线,记住选择 ----

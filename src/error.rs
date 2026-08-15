@@ -24,6 +24,10 @@ pub enum AppError {
     BadRequest(String),
     #[error("Telegram API 错误: {0}")]
     Telegram(String),
+    #[error("Telegram API 明确拒绝: {0}")]
+    TelegramRejected(String),
+    #[error("Telegram 上传结果不确定（为避免重复未自动重试）: {0}")]
+    TelegramUncertain(String),
     #[error("数据库错误: {0}")]
     Db(#[from] sqlx::Error),
     #[error("IO 错误: {0}")]
@@ -41,7 +45,9 @@ impl AppError {
             AppError::IsDirectory | AppError::NotDirectory => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
-            AppError::Telegram(_) => StatusCode::BAD_GATEWAY,
+            AppError::Telegram(_)
+            | AppError::TelegramRejected(_)
+            | AppError::TelegramUncertain(_) => StatusCode::BAD_GATEWAY,
             AppError::Db(_) | AppError::Io(_) | AppError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }

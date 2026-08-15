@@ -33,6 +33,8 @@ mod tests {
         video_meta: Mutex<Vec<Option<VideoMeta>>>,
         /// 注入 sendVideo 失败,验证回退文档路径
         fail_video: AtomicBool,
+        /// 注入结果不确定的视频发送错误，验证不会再次按文档发送
+        uncertain_video: AtomicBool,
     }
 
     impl MockTg {
@@ -45,6 +47,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 video_meta: Mutex::new(Vec::new()),
                 fail_video: AtomicBool::new(false),
+                uncertain_video: AtomicBool::new(false),
             })
         }
 
@@ -93,7 +96,10 @@ mod tests {
             body: &UploadBody,
         ) -> AppResult<TgMessage> {
             if self.fail_video.load(Ordering::SeqCst) {
-                return Err(AppError::Telegram("mock: sendVideo 不可用".into()));
+                return Err(AppError::TelegramRejected("mock: sendVideo 不可用".into()));
+            }
+            if self.uncertain_video.load(Ordering::SeqCst) {
+                return Err(AppError::TelegramUncertain("mock: 响应丢失".into()));
             }
             self.video_meta.lock().unwrap().push(meta);
             self.store_body(filename, body, true)
@@ -314,6 +320,16 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn uncertain_video_send_does_not_fall_back() {
+        let (up, tg, db, _g) = fixture(100, 1024, None).await;
+        tg.uncertain_video.store(true, Ordering::SeqCst);
+        let err = feed_all(&up, "movie.mp4", &[9, 8, 7], 3).await.unwrap_err();
+        assert!(matches!(err, AppError::TelegramUncertain(_)));
+        assert!(tg.sent.lock().unwrap().is_empty(), "结果不确定时不得再按文档发送");
+        assert!(db.resolve(&["movie.mp4"]).await.unwrap().is_none());
     }
 
     #[tokio::test]

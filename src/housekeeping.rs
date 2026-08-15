@@ -25,6 +25,11 @@ pub async fn run(vfs: Vfs, rt: Arc<Runtime>) {
 async fn tick(vfs: &Vfs, rt: &Runtime) -> AppResult<()> {
     let ex = crate::extras::load(&vfs.db).await?;
 
+    let removed_thumbnails = vfs.db.cleanup_orphan_thumbnails().await?;
+    if removed_thumbnails > 0 {
+        tracing::info!("清理 {removed_thumbnails} 个无文件引用的视频缩略图");
+    }
+
     if ex.trash_retention_days > 0 {
         let freed = vfs.db.trash_purge_expired(ex.trash_retention_days).await?;
         if !freed.is_empty() {

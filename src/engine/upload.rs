@@ -247,9 +247,12 @@ impl Uploader {
         }
 
         let sha = to_hex(&sha2::Digest::finalize(hasher));
-        let freed = self.db.finalize_upload(node_id, total as i64, Some(&sha)).await?;
+        // 节点随 finalize 事务一并读出，提交成功后不再做可能失败的数据库操作。
+        // 否则可能出现“已经提交成功，却因随后一次查询失败而被外层回滚”的假失败。
+        let (node, freed) =
+            self.db.finalize_upload_with_node(node_id, total as i64, Some(&sha)).await?;
         self.delete_messages_best_effort(freed); // 覆盖写释放的旧版本
-        self.db.node(node_id).await
+        Ok(node)
     }
 
     /// 信号量内并发上传一个分块;插 chunks 行在任务内完成。
@@ -280,9 +283,14 @@ impl Uploader {
         let mime = (single_chunk && self.knobs.send_video())
             .then(|| video_mime(name))
             .flatten();
-        // caption 记录路径与序号,供元数据库丢失时人工恢复(截断避免超限)
+        // caption 记录路径、分块序号与上传节点号，供异常核对或元数据库丢失时人工恢复。
         let cap_path: String = display_path.chars().take(700).collect();
-        let caption = format!("tgdrive {{\"p\":\"{}\",\"i\":{}}}", cap_path.replace('"', "'"), idx);
+        let caption = format!(
+            "tgdrive {{\"p\":\"{}\",\"i\":{},\"u\":{}}}",
+            cap_path.replace('"', "'"),
+            idx,
+            node_id
+        );
         uploads.spawn(async move {
             let _permit = permit;
             let size = body.len();
@@ -295,16 +303,29 @@ impl Uploader {
                     }
                     match tg.send_video(&filename, m, meta, Some(caption.clone()), &body).await {
                         Ok(msg) => msg,
-                        // 端点/内容不被 sendVideo 接受时退回文档,别让整次上传失败
-                        Err(e) => {
-                            tracing::warn!("{filename} 以视频消息发送失败({e}),回退为文档");
+                        // 只有 Telegram 明确拒绝视频格式时才能降级；结果不确定时再次发送会重复。
+                        Err(AppError::TelegramRejected(detail)) => {
+                            tracing::warn!(
+                                "{filename} 以视频消息发送失败({detail}),回退为文档"
+                            );
                             tg.send_document(&filename, Some(caption), &body).await?
                         }
+                        Err(e) => return Err(e),
                     }
                 }
                 None => tg.send_document(&filename, Some(caption), &body).await?,
             };
-            db.add_chunk(node_id, idx, size as i64, &msg.file_id, msg.message_id).await?;
+            if let Err(e) = db.add_chunk(node_id, idx, size as i64, &msg.file_id, msg.message_id).await
+            {
+                // Telegram 已成功但元数据登记失败时立即补偿删除，避免频道残留孤儿分块。
+                if let Err(cleanup) = tg.delete_message(msg.message_id).await {
+                    tracing::error!(
+                        "分块 {idx} 落库失败({e})，且清理 TG 消息 {} 失败: {cleanup}",
+                        msg.message_id
+                    );
+                }
+                return Err(e);
+            }
             Ok(())
         });
         Ok(())

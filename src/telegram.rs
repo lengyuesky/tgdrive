@@ -17,6 +17,52 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 const FILE_PATH_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_RETRIES: u32 = 5;
 
+/// 普通查询/删除可放心重试；发送媒体必须避免在结果不确定时再次发送。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallMode {
+    Idempotent,
+    SendMedia,
+}
+
+fn classify_api_failure(
+    mode: CallMode,
+    retry: Option<Duration>,
+    detail: String,
+) -> (Option<Duration>, AppError) {
+    let err = if mode == CallMode::SendMedia && retry.is_none() {
+        AppError::TelegramRejected(detail)
+    } else {
+        AppError::Telegram(detail)
+    };
+    (retry, err)
+}
+
+fn classify_malformed_response(
+    mode: CallMode,
+    status: http::StatusCode,
+    detail: String,
+) -> (Option<Duration>, AppError) {
+    if mode == CallMode::SendMedia {
+        if status.as_u16() == 429 {
+            (Some(Duration::from_secs(2)), AppError::Telegram(detail))
+        } else if status.is_client_error() {
+            (None, AppError::TelegramRejected(detail))
+        } else {
+            // 典型场景是反向代理在上游已处理请求后返回 502/504。
+            (
+                None,
+                AppError::TelegramUncertain(format!(
+                    "{detail}；请求可能已经送达，请检查存储频道中的对应分块"
+                )),
+            )
+        }
+    } else {
+        let retry = (status.is_server_error() || status.as_u16() == 429)
+            .then(|| Duration::from_secs(2));
+        (retry, AppError::Telegram(detail))
+    }
+}
+
 pub type ByteReader = Pin<Box<dyn AsyncRead + Send>>;
 
 #[derive(Debug, Clone)]
@@ -255,41 +301,57 @@ impl TgClient {
         format!("{}/file/bot{}/{}", self.api_base, self.token, file_path)
     }
 
-    /// 解析响应体;429/5xx 时返回需等待的秒数以便重试
+    /// 解析响应体；发送媒体时，只有 Telegram 明确返回失败才允许重试。
+    /// 响应在回程中损坏时消息可能已经写入，此时必须停止，避免产生重复消息。
     async fn parse<T: serde::de::DeserializeOwned>(
         resp: reqwest::Response,
+        mode: CallMode,
     ) -> Result<T, (Option<Duration>, AppError)> {
         let status = resp.status();
         let body = resp.bytes().await.map_err(|e| {
-            (Some(Duration::from_secs(2)), AppError::Telegram(format!("读取响应失败: {e}")))
+            if mode == CallMode::SendMedia {
+                (
+                    None,
+                    AppError::TelegramUncertain(format!(
+                        "请求已发出，但读取响应失败: {e}；请检查存储频道中的对应分块"
+                    )),
+                )
+            } else {
+                (Some(Duration::from_secs(2)), AppError::Telegram(format!("读取响应失败: {e}")))
+            }
         })?;
         let parsed: Result<ApiResponse<T>, _> = serde_json::from_slice(&body);
         match parsed {
             Ok(r) if r.ok => r.result.ok_or_else(|| {
-                (None, AppError::Telegram("响应缺少 result".into()))
+                let err = if mode == CallMode::SendMedia {
+                    AppError::TelegramUncertain(
+                        "Telegram 返回成功但响应缺少 result；请检查存储频道中的对应分块".into(),
+                    )
+                } else {
+                    AppError::Telegram("响应缺少 result".into())
+                };
+                (None, err)
             }),
             Ok(r) => {
                 let desc = r.description.unwrap_or_else(|| "未知错误".into());
+                let code = r.error_code.unwrap_or(status.as_u16() as i64);
                 let retry = r
                     .parameters
                     .and_then(|p| p.retry_after)
                     .map(Duration::from_secs)
                     .or_else(|| {
                         // 5xx 无 retry_after 时按 2s 起步退避
-                        (r.error_code.unwrap_or(0) >= 500).then(|| Duration::from_secs(2))
+                        (code >= 500).then(|| Duration::from_secs(2))
                     });
-                Err((retry, AppError::Telegram(format!(
-                    "[{}] {desc}",
-                    r.error_code.unwrap_or(status.as_u16() as i64)
-                ))))
+                let detail = format!("[{code}] {desc}");
+                Err(classify_api_failure(mode, retry, detail))
             }
             Err(_) => {
-                let retry = (status.is_server_error() || status.as_u16() == 429)
-                    .then(|| Duration::from_secs(2));
-                Err((retry, AppError::Telegram(format!(
+                let detail = format!(
                     "HTTP {status}: {}",
                     String::from_utf8_lossy(&body[..body.len().min(200)])
-                ))))
+                );
+                Err(classify_malformed_response(mode, status, detail))
             }
         }
     }
@@ -305,7 +367,7 @@ impl TgClient {
         loop {
             attempt += 1;
             let outcome = match make_req().await {
-                Ok(resp) => Self::parse::<T>(resp).await,
+                Ok(resp) => Self::parse::<T>(resp, CallMode::Idempotent).await,
                 Err(e) => Err((
                     Some(Duration::from_secs(2u64.pow(attempt.min(4)))),
                     AppError::Telegram(format!("{what} 网络错误: {e}")),
@@ -386,37 +448,71 @@ impl TgClient {
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
         let url = self.method_url(method);
-        let msg: RawMessage = self
-            .call_with_retry(method, || {
-                let mut form = reqwest::multipart::Form::new()
-                    .text("chat_id", self.chat_id.clone())
-                    .text("disable_notification", "true");
-                if field == "video" {
-                    // 让客户端不必下完整个文件就能拖动播放
-                    form = form.text("supports_streaming", "true");
+        let mut attempt = 0u32;
+        let msg: RawMessage = loop {
+            attempt += 1;
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", self.chat_id.clone())
+                .text("disable_notification", "true");
+            if field == "video" {
+                // 让客户端不必下完整个文件就能拖动播放
+                form = form.text("supports_streaming", "true");
+            }
+            if let Some(m) = meta {
+                // 不带宽高时 Telegram 不探测内容,气泡长宽比是猜的
+                form = form
+                    .text("width", m.width.to_string())
+                    .text("height", m.height.to_string());
+                if let Some(d) = m.duration_secs {
+                    form = form.text("duration", d.to_string());
                 }
-                if let Some(m) = meta {
-                    // 不带宽高时 Telegram 不探测内容,气泡长宽比是猜的
-                    form = form
-                        .text("width", m.width.to_string())
-                        .text("height", m.height.to_string());
-                    if let Some(d) = m.duration_secs {
-                        form = form.text("duration", d.to_string());
-                    }
+            }
+            if let Some(c) = &caption {
+                form = form.text("caption", c.clone());
+            }
+            // 每次安全重试都重新打开临时文件；构造失败发生在请求发出前，直接返回即可。
+            let part = self.body_to_part(filename, mime, body)?;
+            form = form.part(field, part);
+
+            let outcome = match self.http.post(&url).multipart(form).send().await {
+                Ok(resp) => Self::parse::<RawMessage>(resp, CallMode::SendMedia).await,
+                // 连接尚未建立或请求体没有发完整时，Telegram 不可能成功解析媒体，可安全重试。
+                Err(e) if e.is_connect() || e.is_body() => Err((
+                    Some(Duration::from_secs(2u64.pow(attempt.min(4)))),
+                    AppError::Telegram(format!("{method} 网络错误: {e}")),
+                )),
+                // 请求体可能已经完整送达，仅响应头丢失；此时重试会制造重复消息。
+                Err(e) => Err((
+                    None,
+                    AppError::TelegramUncertain(format!(
+                        "{method} 请求已发出但未收到可靠响应: {e}；请检查存储频道中的对应分块"
+                    )),
+                )),
+            };
+            match outcome {
+                Ok(msg) => break msg,
+                Err((Some(wait), err)) if attempt < MAX_RETRIES => {
+                    let jitter = Duration::from_millis((attempt as u64 * 137) % 500);
+                    tracing::warn!(
+                        "{method} 第 {attempt} 次失败({err}),{:?} 后安全重试",
+                        wait + jitter
+                    );
+                    tokio::time::sleep(wait + jitter).await;
                 }
-                if let Some(c) = &caption {
-                    form = form.text("caption", c.clone());
-                }
-                // Part 构造失败会在 send 时报网络错误重试后放弃,此处直接 expect 简化
-                let part = self.body_to_part(filename, mime, body).expect("构造上传体失败");
-                form = form.part(field, part);
-                self.http.post(&url).multipart(form).send()
-            })
-            .await?;
+                Err((_, err)) => return Err(err),
+            }
+        };
         let message_id = msg.message_id;
-        let file_id = msg.any_file_id().ok_or_else(|| {
-            AppError::Telegram(format!("{method} 响应缺少文件字段"))
-        })?;
+        let file_id = match msg.any_file_id() {
+            Some(file_id) => file_id,
+            None => {
+                // 已知消息号但结构异常时主动撤销，不能留下数据库无法引用的孤儿消息。
+                if let Err(e) = self.delete_message(message_id).await {
+                    tracing::warn!("{method} 响应缺少文件字段，且清理消息 {message_id} 失败: {e}");
+                }
+                return Err(AppError::Telegram(format!("{method} 响应缺少文件字段")));
+            }
+        };
         Ok(TgMessage { message_id, file_id })
     }
 
@@ -534,5 +630,37 @@ impl TgApi for TgClient {
             }
         }
         self.open_http_stream(&file_path, offset).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_retry_classification_is_safe() {
+        let (retry, err) = classify_malformed_response(
+            CallMode::SendMedia,
+            http::StatusCode::BAD_GATEWAY,
+            "HTTP 502".into(),
+        );
+        assert!(retry.is_none());
+        assert!(matches!(err, AppError::TelegramUncertain(_)));
+
+        let (retry, err) = classify_api_failure(
+            CallMode::SendMedia,
+            Some(Duration::ZERO),
+            "[429] Too Many Requests".into(),
+        );
+        assert_eq!(retry, Some(Duration::ZERO));
+        assert!(matches!(err, AppError::Telegram(_)));
+
+        let (retry, err) = classify_api_failure(
+            CallMode::SendMedia,
+            None,
+            "[400] wrong file identifier".into(),
+        );
+        assert!(retry.is_none());
+        assert!(matches!(err, AppError::TelegramRejected(_)));
     }
 }

@@ -11,6 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -42,6 +43,12 @@ pub fn router(state: AppState) -> Router {
         .route("/fs/upload", post(upload))
         .route("/fs/exists", post(exists))
         .route("/fs/download", get(download))
+        .route(
+            "/fs/thumbnail",
+            get(thumbnail_get)
+                .post(thumbnail_put)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_THUMBNAIL_SIZE)),
+        )
         .route("/fs/rename", post(rename))
         .route("/fs/copy", post(copy_entry))
         .route("/fs/delete", post(delete))
@@ -113,6 +120,7 @@ struct Entry {
     size: i64,
     created_at: i64,
     modified_at: i64,
+    sha256: Option<String>,
 }
 
 impl From<&Node> for Entry {
@@ -123,6 +131,7 @@ impl From<&Node> for Entry {
             size: n.size,
             created_at: n.created_at,
             modified_at: n.modified_at,
+            sha256: n.sha256.clone(),
         }
     }
 }
@@ -227,6 +236,104 @@ async fn upload(
         return Err(AppError::BadRequest("请求中没有文件".into()));
     }
     Ok(Json(serde_json::json!({ "saved": saved })))
+}
+
+// ---------- 视频缩略图 ----------
+
+const MAX_THUMBNAIL_SIZE: usize = 512 * 1024;
+
+#[derive(Deserialize)]
+struct ThumbnailQuery {
+    sha256: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+fn normalized_sha256(raw: &str) -> AppResult<String> {
+    if raw.len() != 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest("sha256 格式不对".into()));
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+fn detect_thumbnail_mime(declared: &str, data: &[u8]) -> AppResult<&'static str> {
+    if declared == "image/webp"
+        && data.len() >= 12
+        && &data[..4] == b"RIFF"
+        && &data[8..12] == b"WEBP"
+    {
+        Ok("image/webp")
+    } else if declared == "image/jpeg" && data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Ok("image/jpeg")
+    } else {
+        Err(AppError::BadRequest("只接受有效的 WebP 或 JPEG 缩略图".into()))
+    }
+}
+
+/// 返回已经缓存的小图，不读取原视频或 Telegram。
+async fn thumbnail_get(
+    State(state): State<AppState>,
+    Query(q): Query<ThumbnailQuery>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let sha = normalized_sha256(&q.sha256)?;
+    let Some((mime, data)) = state.vfs.db.thumbnail_get(&sha).await? else {
+        // 404 不缓存，后续为历史文件补上缩略图后可立即显示。
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(axum::body::Body::empty())
+            .expect("构造缩略图未命中响应失败"));
+    };
+    let etag = format!("\"thumbnail-{sha}\"");
+    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .body(axum::body::Body::empty())
+            .expect("构造缩略图缓存响应失败"));
+    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, data.len())
+        .header(header::CACHE_CONTROL, "private, max-age=31536000, immutable")
+        .header(header::ETAG, etag)
+        .header("x-content-type-options", "nosniff")
+        .body(axum::body::Body::from(data))
+        .expect("构造缩略图响应失败"))
+}
+
+/// 接收浏览器从本地待上传视频提取的小图，并按最终文件哈希持久化。
+async fn thumbnail_put(
+    State(state): State<AppState>,
+    Query(q): Query<ThumbnailQuery>,
+    headers: HeaderMap,
+    data: Bytes,
+) -> AppResult<Json<serde_json::Value>> {
+    let sha = normalized_sha256(&q.sha256)?;
+    let path = q.path.as_deref().ok_or_else(|| AppError::BadRequest("缺少文件路径".into()))?;
+    let node = state.vfs.resolve(path).await?;
+    if node.is_dir {
+        return Err(AppError::IsDirectory);
+    }
+    if node.sha256.as_deref() != Some(sha.as_str()) {
+        return Err(AppError::BadRequest("文件内容已经变化，拒绝写入旧缩略图".into()));
+    }
+    if data.is_empty() || data.len() > MAX_THUMBNAIL_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "缩略图大小必须在 1~{}KB 之间",
+            MAX_THUMBNAIL_SIZE / 1024
+        )));
+    }
+    let declared = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .unwrap_or("");
+    let mime = detect_thumbnail_mime(declared, &data)?;
+    state.vfs.db.thumbnail_put(&sha, mime, &data).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// 解析单个 Range;None=无 Range,Err=不可满足
@@ -614,9 +721,7 @@ async fn instant(
     Json(b): Json<InstantBody>,
 ) -> AppResult<Json<serde_json::Value>> {
     let name = clean_filename(&b.name)?;
-    if b.sha256.len() != 64 || !b.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(AppError::BadRequest("sha256 格式不对".into()));
-    }
+    let sha = normalized_sha256(&b.sha256)?;
     if b.size < 0 {
         return Err(AppError::BadRequest("大小无效".into()));
     }
@@ -624,13 +729,20 @@ async fn instant(
     if !dir.is_dir {
         return Err(AppError::NotDirectory);
     }
-    match state.vfs.db.instant_link(&b.sha256.to_lowercase(), b.size, dir.id, &name).await? {
+    match state.vfs.db.instant_link(&sha, b.size, dir.id, &name).await? {
         Some((id, freed)) => {
             state.vfs.uploader.delete_messages_best_effort(freed);
             let node = state.vfs.db.node(id).await?;
-            Ok(Json(serde_json::json!({ "linked": true, "entry": Entry::from(&node) })))
+            Ok(Json(serde_json::json!({
+                "linked": true,
+                "pending": false,
+                "entry": Entry::from(&node),
+            })))
         }
-        None => Ok(Json(serde_json::json!({ "linked": false }))),
+        None => {
+            let pending = state.vfs.db.uploading_child_exists(dir.id, &name).await?;
+            Ok(Json(serde_json::json!({ "linked": false, "pending": pending })))
+        }
     }
 }
 
@@ -914,4 +1026,26 @@ async fn extras_set(
 ) -> AppResult<Json<serde_json::Value>> {
     crate::extras::save(&state.vfs.db, &p).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumbnail_input_validation() {
+        let upper = "A".repeat(64);
+        assert_eq!(normalized_sha256(&upper).unwrap(), "a".repeat(64));
+        assert!(normalized_sha256("bad").is_err());
+
+        assert_eq!(
+            detect_thumbnail_mime("image/webp", b"RIFFxxxxWEBPdata").unwrap(),
+            "image/webp"
+        );
+        assert_eq!(
+            detect_thumbnail_mime("image/jpeg", &[0xff, 0xd8, 0xff, 0x00]).unwrap(),
+            "image/jpeg"
+        );
+        assert!(detect_thumbnail_mime("image/png", b"not-an-image").is_err());
+    }
 }

@@ -83,6 +83,8 @@ interface Item {
   pct: number
   status: 'hashing' | 'waiting' | 'uploading' | 'instant' | 'done' | 'skipped' | 'error'
   error?: string
+  /** undefined 表示尚未尝试生成，null 表示浏览器无法解码该视频。 */
+  thumbnail?: Blob | null
 }
 
 const visible = ref(false)
@@ -222,6 +224,99 @@ async function sha256File(f: File, onPct: (p: number) => void): Promise<string> 
   return hasher.digest('hex')
 }
 
+const THUMB_VIDEO_EXT = new Set(['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv'])
+
+function isVideoFile(file: File) {
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
+  return file.type.startsWith('video/') || THUMB_VIDEO_EXT.has(ext)
+}
+
+/** 从浏览器本地文件取一帧并压成小图；object URL 不会产生任何网络下载。 */
+function createVideoThumbnail(file: File): Promise<Blob | null> {
+  if (!isVideoFile(file)) return Promise.resolve(null)
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file)
+    const video = document.createElement('video')
+    let finished = false
+    let capturing = false
+    let timer = 0
+
+    const finish = (image: Blob | null) => {
+      if (finished) return
+      finished = true
+      window.clearTimeout(timer)
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
+      URL.revokeObjectURL(url)
+      resolve(image)
+    }
+
+    const capture = () => {
+      if (finished || capturing || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
+      const width = video.videoWidth
+      const height = video.videoHeight
+      if (!width || !height) return finish(null)
+      capturing = true
+      const scale = Math.min(1, 480 / width, 480 / height)
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(width * scale))
+      canvas.height = Math.max(1, Math.round(height * scale))
+      const context = canvas.getContext('2d')
+      if (!context) return finish(null)
+      try {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      } catch {
+        finish(null)
+        return
+      }
+      canvas.toBlob(
+        (webp) => {
+          if (webp?.type === 'image/webp') return finish(webp)
+          canvas.toBlob((jpeg) => finish(jpeg), 'image/jpeg', 0.82)
+        },
+        'image/webp',
+        0.78,
+      )
+    }
+
+    video.preload = 'auto'
+    video.muted = true
+    video.playsInline = true
+    video.onloadedmetadata = () => {
+      const duration = Number.isFinite(video.duration) ? video.duration : 0
+      const target = duration > 0.2 ? Math.min(1, duration * 0.05) : 0
+      if (target > 0.01) {
+        try {
+          video.currentTime = target
+        } catch {
+          capture()
+        }
+      } else {
+        capture()
+      }
+    }
+    video.onloadeddata = () => {
+      if (video.currentTime <= 0.01) capture()
+    }
+    video.onseeked = capture
+    video.onerror = () => finish(null)
+    timer = window.setTimeout(() => finish(null), 12_000)
+    video.src = url
+    video.load()
+  })
+}
+
+/** 缩略图失败不影响文件本身上传，历史或不支持的编码会继续显示视频图标。 */
+async function persistThumbnail(target: string, item: Item, sha: string) {
+  if (!item.thumbnail) return
+  try {
+    await api.saveThumbnail(joinPath(target, item.file.name), sha, item.thumbnail)
+  } catch (e) {
+    console.warn('视频缩略图保存失败', e)
+  }
+}
+
 /** 目标目录 = 基目录 + 相对子路径;文件夹上传时按需递归创建 */
 async function ensureDir(item: Item): Promise<string> {
   const target = item.rel ? joinPath(item.dir, item.rel) : item.dir
@@ -230,6 +325,29 @@ async function ensureDir(item: Item): Promise<string> {
     ensuredDirs.add(target)
   }
   return target
+}
+
+/** 上传响应丢失后等待后台任务落定；仍有同名 uploading 节点时不能立即重传。 */
+async function confirmCompleted(
+  target: string,
+  item: Item,
+  sha: string,
+): Promise<boolean | null> {
+  const deadline = Date.now() + 5 * 60 * 1000
+  while (Date.now() < deadline) {
+    let state: { linked: boolean; pending: boolean }
+    try {
+      state = (await api.instant(target, item.file.name, sha, item.file.size)).data
+    } catch {
+      // 核实请求也可能遇到同一段短暂网络故障，稍后再问，不能据此判定上传失败。
+      await new Promise((resolve) => window.setTimeout(resolve, 1000))
+      continue
+    }
+    if (state.linked) return true
+    if (!state.pending) return false
+    await new Promise((resolve) => window.setTimeout(resolve, 1000))
+  }
+  return null
 }
 
 async function pump() {
@@ -244,15 +362,28 @@ async function pump() {
 
       // 秒传:先算哈希问一嘴,库里有同内容文件就零流量落位
       live.status = 'hashing'
+      if (live.thumbnail === undefined) {
+        live.thumbnail = await createVideoThumbnail(live.file)
+      }
       let linked = false
+      let pending = false
+      let sha: string | undefined
       try {
-        const sha = await sha256File(live.file, (p) => (live.pct = p))
+        sha = await sha256File(live.file, (p) => (live.pct = p))
         const r = await api.instant(target, live.file.name, sha, live.file.size)
         linked = r.data.linked
+        pending = r.data.pending
       } catch {
         // 哈希/探测失败不阻塞,老老实实走真实上传
       }
+      if (!linked && pending && sha) {
+        // 同一路径已有上传时先等它落定，避免多设备或手动重试并发写出重复分块。
+        const confirmed = await confirmCompleted(target, live, sha)
+        if (confirmed === null) throw new Error('同名文件仍在后台上传，请稍后重试')
+        linked = confirmed
+      }
       if (linked) {
+        if (sha) await persistThumbnail(target, live, sha)
         live.status = 'instant'
         live.pct = 100
         emit('uploaded')
@@ -261,7 +392,18 @@ async function pump() {
 
       live.status = 'uploading'
       live.pct = 0
-      await api.upload(target, live.file, (pct) => (live.pct = pct))
+      let finalSha = sha
+      try {
+        const r = await api.upload(target, live.file, (pct) => (live.pct = pct))
+        finalSha = r.data.saved[0]?.sha256 ?? finalSha
+      } catch (uploadError) {
+        // 响应丢失不代表服务端失败：先按已算出的哈希核实，避免用户重试后重复上传。
+        if (!sha) throw uploadError
+        const confirmed = await confirmCompleted(target, live, sha)
+        // 核实接口自身失败时保留原始上传错误，它通常更能说明根因。
+        if (confirmed !== true) throw uploadError
+      }
+      if (finalSha) await persistThumbnail(target, live, finalSha)
       live.status = 'done'
       live.pct = 100
       emit('uploaded')
