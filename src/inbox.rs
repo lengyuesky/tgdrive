@@ -90,12 +90,25 @@ struct User {
     is_bot: Option<bool>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 struct FileRef {
     file_id: String,
     file_size: Option<i64>,
     file_name: Option<String>,
     thumbnail: Option<ThumbnailRef>,
+    /// Telegram 9.x 会把视频的其他清晰度放在这里；主 file_id 不一定是最高画质。
+    #[serde(default)]
+    qualities: Vec<VideoQualityRef>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct VideoQualityRef {
+    file_id: String,
+    file_size: Option<i64>,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -414,8 +427,48 @@ struct PickedFile {
     thumbnail_file_id: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SelectedVideoRef {
+    file_id: String,
+    size: i64,
+    width: u32,
+    height: u32,
+    is_primary: bool,
+}
+
 fn positive_size(size: Option<i64>) -> Option<i64> {
     size.filter(|n| *n > 0)
+}
+
+/// Telegram 的 `video.file_id` 可能只对应默认 360p，720p/1080p 位于
+/// `video.qualities`。只在文件大小有效时参与选择，保证登记的分块长度可用于 Range。
+fn select_best_video(video: &FileRef) -> Option<SelectedVideoRef> {
+    let primary = positive_size(video.file_size).and_then(|size| {
+        (!video.file_id.trim().is_empty()).then(|| SelectedVideoRef {
+            file_id: video.file_id.clone(),
+            size,
+            width: video.width.unwrap_or(0),
+            height: video.height.unwrap_or(0),
+            is_primary: true,
+        })
+    });
+    let alternatives = video.qualities.iter().filter_map(|quality| {
+        let size = positive_size(quality.file_size)?;
+        (!quality.file_id.trim().is_empty()).then(|| SelectedVideoRef {
+            file_id: quality.file_id.clone(),
+            size,
+            width: quality.width,
+            height: quality.height,
+            is_primary: false,
+        })
+    });
+    primary.into_iter().chain(alternatives).max_by_key(|item| {
+        (
+            u64::from(item.width).saturating_mul(u64::from(item.height)),
+            item.is_primary,
+            item.size,
+        )
+    })
 }
 
 fn has_supported_media(m: &Msg) -> bool {
@@ -457,6 +510,7 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
         });
     }
     if let Some(v) = &m.video {
+        let selected = select_best_video(v)?;
         let name = v
             .file_name
             .clone()
@@ -464,8 +518,8 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
         return Some(PickedFile {
             kind: MediaKind::Video,
             name,
-            size: positive_size(v.file_size)?,
-            file_id: v.file_id.clone(),
+            size: selected.size,
+            file_id: selected.file_id,
             thumbnail_file_id: v.thumbnail.as_ref().map(|thumb| thumb.file_id.clone()),
         });
     }
@@ -671,12 +725,13 @@ async fn resend_file(
                 f.thumbnail.map(|thumb| thumb.file_id),
             )
         }),
-        MediaKind::Video => sent.video.map(|f| {
-            (
-                f.file_id,
-                f.file_size,
+        MediaKind::Video => sent.video.and_then(|f| {
+            let selected = select_best_video(&f)?;
+            Some((
+                selected.file_id,
+                Some(selected.size),
                 f.thumbnail.map(|thumb| thumb.file_id),
-            )
+            ))
         }),
         MediaKind::Audio => sent.audio.map(|f| {
             (
@@ -948,6 +1003,7 @@ mod tests {
             thumbnail: Some(ThumbnailRef {
                 file_id: "video-thumb".into(),
             }),
+            ..Default::default()
         });
         let picked = pick_file(&video).unwrap();
         assert_eq!(picked.kind, MediaKind::Video);
@@ -978,15 +1034,85 @@ mod tests {
             file_size: Some(30),
             file_name: Some("fallback.gif".into()),
             thumbnail: None,
+            ..Default::default()
         });
         animation.animation = Some(FileRef {
             file_id: "animation-id".into(),
             file_size: Some(20),
             file_name: Some("animated.gif".into()),
             thumbnail: None,
+            ..Default::default()
         });
         let picked = pick_file(&animation).unwrap();
         assert_eq!(picked.kind, MediaKind::Animation);
         assert_eq!(picked.file_id, "animation-id");
+    }
+
+    #[test]
+    fn forwarded_video_prefers_highest_quality_with_known_size() {
+        let video: FileRef = serde_json::from_value(serde_json::json!({
+            "file_id": "default-360p",
+            "file_size": 100,
+            "file_name": "movie.mp4",
+            "width": 640,
+            "height": 360,
+            "thumbnail": { "file_id": "thumb" },
+            "qualities": [
+                {
+                    "file_id": "h264-360p",
+                    "file_size": 90,
+                    "width": 640,
+                    "height": 360,
+                    "codec": "h264"
+                },
+                {
+                    "file_id": "h264-720p",
+                    "file_size": 400,
+                    "width": 1280,
+                    "height": 720,
+                    "codec": "h264"
+                },
+                {
+                    "file_id": "unknown-size-1080p",
+                    "width": 1920,
+                    "height": 1080,
+                    "codec": "h265"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let selected = select_best_video(&video).unwrap();
+        assert_eq!(selected.file_id, "h264-720p");
+        assert_eq!(selected.size, 400);
+        assert_eq!((selected.width, selected.height), (1280, 720));
+
+        let mut message = empty_msg();
+        message.video = Some(video);
+        let picked = pick_file(&message).unwrap();
+        assert_eq!(picked.file_id, "h264-720p");
+        assert_eq!(picked.size, 400);
+        assert_eq!(picked.thumbnail_file_id.as_deref(), Some("thumb"));
+    }
+
+    #[test]
+    fn primary_video_wins_when_resolution_is_equal() {
+        let video = FileRef {
+            file_id: "primary-original".into(),
+            file_size: Some(500),
+            width: Some(1280),
+            height: Some(720),
+            qualities: vec![VideoQualityRef {
+                file_id: "transcoded-720p".into(),
+                file_size: Some(300),
+                width: 1280,
+                height: 720,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            select_best_video(&video).unwrap().file_id,
+            "primary-original"
+        );
     }
 }
