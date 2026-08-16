@@ -466,6 +466,7 @@
       v-model="propertyVisible"
       :title="`属性：${propertyDisplayName}`"
       width="600px"
+      align-center
       append-to-body
     >
       <div v-loading="propertyLoading" class="property-panel">
@@ -538,12 +539,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox, ElTree, type LoadFunction, type TableInstance } from 'element-plus'
+import { ElMessage, ElTree, type LoadFunction, type TableInstance } from 'element-plus'
 import {
-  ArrowDown, Box, Calendar, Delete, DeleteFilled, Document, Film, Finished, Folder, FolderAdd,
-  FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position, Promotion, Rank,
-  Refresh, Search, Setting, Share, Sort, Sunny, SwitchButton, Tickets, TrendCharts, Upload,
+  ArrowDown, Box, Calendar, CopyDocument, Delete, DeleteFilled, Document, EditPen, Film, Finished,
+  Folder, FolderAdd, FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position,
+  Promotion, Rank, Refresh, Search, Setting, Share, Sort, Sunny, SwitchButton, Tickets,
+  TrendCharts, Upload,
 } from '@element-plus/icons-vue'
+import { appConfirm, appPrompt } from '../dialog'
 import {
   api,
   errMsg,
@@ -1033,9 +1036,14 @@ function download(row: Entry) {
 
 async function mkdir() {
   try {
-    const { value } = await ElMessageBox.prompt('输入文件夹名称', '新建文件夹', {
-      inputPattern: /^[^/\\]+$/,
-      inputErrorMessage: '名称不能为空或包含斜杠',
+    const { value } = await appPrompt({
+      title: '新建文件夹',
+      message: cur.value === '/' ? '将创建在根目录下' : `将创建在 ${cur.value} 下`,
+      placeholder: '输入文件夹名称',
+      icon: FolderAdd,
+      confirmText: '创建',
+      pattern: /^[^/\\]+$/,
+      errorMessage: '名称不能为空,且不能包含斜杠',
     })
     await api.mkdir(joinPath(cur.value, value.trim()))
     treeKey.value++
@@ -1047,10 +1055,15 @@ async function mkdir() {
 
 async function rename(row: Entry) {
   try {
-    const { value } = await ElMessageBox.prompt('输入新名称', `重命名 ${row.name}`, {
-      inputValue: row.name,
-      inputPattern: /^[^/\\]+$/,
-      inputErrorMessage: '名称不能为空或包含斜杠',
+    const { value } = await appPrompt({
+      title: '重命名',
+      message: row.name,
+      value: row.name,
+      placeholder: '输入新名称',
+      icon: EditPen,
+      confirmText: '重命名',
+      pattern: /^[^/\\]+$/,
+      errorMessage: '名称不能为空,且不能包含斜杠',
     })
     await api.rename(joinPath(cur.value, row.name), joinPath(cur.value, value.trim()))
     if (row.is_dir) treeKey.value++
@@ -1085,10 +1098,15 @@ async function onRowCmd(cmd: string, row: Entry) {
     } else if (cmd === 'copy') {
       const target = await dirPicker.value!.open(`复制「${row.name}」到`, cur.value)
       if (target === null) return
-      const { value } = await ElMessageBox.prompt('目标文件名', '复制为', {
-        inputValue: target === cur.value ? copyName(row.name) : row.name,
-        inputPattern: /^[^/\\]+$/,
-        inputErrorMessage: '名称不能为空或包含斜杠',
+      const { value } = await appPrompt({
+        title: '复制为',
+        message: `复制到 ${target}`,
+        value: target === cur.value ? copyName(row.name) : row.name,
+        placeholder: '目标文件名',
+        icon: CopyDocument,
+        confirmText: '复制',
+        pattern: /^[^/\\]+$/,
+        errorMessage: '名称不能为空,且不能包含斜杠',
       })
       await api.copy(src, joinPath(target, value.trim()))
       ElMessage.success('复制完成(元数据级,不占额外流量)')
@@ -1126,11 +1144,14 @@ async function moveSelected() {
 }
 
 async function confirmDelete(rows: Entry[]) {
-  await ElMessageBox.confirm(
-    `把 ${rows.length} 项移入回收站?可随时恢复;超过保留期后自动彻底删除。`,
-    '删除确认',
-    { type: 'warning' },
-  )
+  const label = rows.length === 1 ? `「${rows[0].name}」` : `选中的 ${rows.length} 项`
+  await appConfirm({
+    title: '移入回收站',
+    message: `确定把${label}移入回收站吗?\n回收站里可随时恢复,超过保留期后自动彻底删除。`,
+    kind: 'danger',
+    icon: Delete,
+    confirmText: '移入回收站',
+  })
   const r = await api.del(rows.map((x) => joinPath(cur.value, x.name)))
   if (r.data.failed.length > 0) {
     ElMessage.warning(`有 ${r.data.failed.length} 项删除失败:${r.data.failed[0].error}`)

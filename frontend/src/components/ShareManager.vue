@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" title="分享管理" width="820px" append-to-body>
+  <el-dialog v-model="visible" title="分享管理" width="820px" align-center append-to-body>
     <el-table :data="items" v-loading="loading" size="small">
       <el-table-column label="内容" min-width="200">
         <template #default="{ row }">
@@ -45,9 +45,10 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { Document, Folder } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { Document, Folder, Share } from '@element-plus/icons-vue'
 import { api, errMsg, fmtTime, type ShareItem } from '../api'
+import { appConfirm } from '../dialog'
 
 const visible = ref(false)
 const loading = ref(false)
@@ -83,9 +84,13 @@ async function copy(row: ShareItem) {
 
 async function remove(row: ShareItem) {
   try {
-    await ElMessageBox.confirm(`取消「${row.name}」的分享?已发出的链接将立即失效。`, '取消分享', {
-      type: 'warning',
-      appendTo: 'body',
+    await appConfirm({
+      title: '取消分享',
+      message: `确定取消「${row.name}」的分享吗?\n已发出的链接将立即失效。`,
+      kind: 'warning',
+      icon: Share,
+      confirmText: '取消分享',
+      cancelText: '保留',
     })
   } catch {
     return

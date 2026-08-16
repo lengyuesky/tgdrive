@@ -198,8 +198,7 @@ html.dark body {
   background: transparent;
 }
 
-.el-dialog,
-.el-message-box {
+.el-dialog {
   background: var(--glass-bg-heavy);
   backdrop-filter: blur(24px) saturate(1.6);
   -webkit-backdrop-filter: blur(24px) saturate(1.6);

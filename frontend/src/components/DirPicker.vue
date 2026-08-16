@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" :title="title" width="440px" append-to-body>
+  <el-dialog v-model="visible" :title="title" width="440px" align-center append-to-body>
     <div class="picked">
       目标:<code>{{ picked }}</code>
     </div>
@@ -37,9 +37,10 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { ElMessage, ElMessageBox, type LoadFunction } from 'element-plus'
+import { ElMessage, type LoadFunction } from 'element-plus'
 import { Folder, FolderAdd } from '@element-plus/icons-vue'
 import { api, errMsg } from '../api'
+import { appPrompt } from '../dialog'
 
 const visible = ref(false)
 const title = ref('选择目录')
@@ -73,10 +74,14 @@ const loadDirs: LoadFunction = async (node, resolve) => {
 
 async function mkdirHere() {
   try {
-    const { value } = await ElMessageBox.prompt(`在 ${picked.value} 下新建文件夹`, '新建文件夹', {
-      inputPattern: /^[^/\\]+$/,
-      inputErrorMessage: '名称不能为空或包含斜杠',
-      appendTo: 'body',
+    const { value } = await appPrompt({
+      title: '新建文件夹',
+      message: `将创建在 ${picked.value} 下`,
+      placeholder: '输入文件夹名称',
+      icon: FolderAdd,
+      confirmText: '创建',
+      pattern: /^[^/\\]+$/,
+      errorMessage: '名称不能为空,且不能包含斜杠',
     })
     await api.mkdir(joinPath(picked.value, value.trim()))
     picked.value = joinPath(picked.value, value.trim())

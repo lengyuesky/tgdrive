@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Download, Moon, Refresh, Setting, Sunny } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { ArrowLeft, Brush, Delete, Download, Moon, Refresh, RefreshLeft, Setting, Sunny, SwitchButton } from '@element-plus/icons-vue'
+import { appAlert, appConfirm } from '../dialog'
 import { isDark, toggleDark } from '../theme'
 import {
   api,
@@ -155,8 +156,12 @@ async function removeInboxFailure(updateId: number) {
 
 async function clearInboxFailures() {
   try {
-    await ElMessageBox.confirm('清空全部收件死信记录？原始 Telegram update 载荷将无法从后台找回。', '清空死信', {
-      type: 'warning',
+    await appConfirm({
+      title: '清空死信',
+      message: '清空全部收件死信记录?\n原始 Telegram update 载荷将无法从后台找回。',
+      kind: 'danger',
+      icon: Delete,
+      confirmText: '清空',
     })
   } catch {
     return
@@ -206,21 +211,26 @@ async function save(force = false) {
   try {
     const { data } = await api.admin.save(patch)
     if (data.account_changed) {
-      await ElMessageBox.alert('账号已修改,所有设备的登录状态已失效,请用新账号重新登录。', '需要重新登录', {
-        confirmButtonText: '去登录',
+      await appAlert({
+        title: '需要重新登录',
+        message: '账号已修改,所有设备的登录状态已失效,请用新账号重新登录。',
+        icon: SwitchButton,
+        confirmText: '去登录',
       })
       router.push('/login')
       return
     }
     if (data.needs_local_api_restart) {
-      await ElMessageBox.alert(
-        `已保存。api_id / api_hash 同时用于 tgdrive 的 MTProto 流式播放和 telegram-bot-api，还需要在宿主机上：\n\n` +
+      await appAlert({
+        title: '还差一步',
+        message:
+          `已保存。api_id / api_hash 同时用于 tgdrive 的 MTProto 流式播放和 telegram-bot-api，还需要在宿主机上：\n\n` +
           `1. 点「导出 .env」,把内容覆盖到项目目录的 .env\n` +
           `2. 执行 ${RESTART_CMD}\n\n` +
           `两个服务重启后新凭据才生效。`,
-        '还差一步',
-        { confirmButtonText: '知道了' },
-      )
+        kind: 'warning',
+        confirmText: '知道了',
+      })
     } else {
       ElMessage.success(`已保存并立即生效:${data.changed.join('、')}`)
     }
@@ -230,10 +240,12 @@ async function save(force = false) {
     // 连不上 Telegram 时给一次强制保存的机会(例如自建端点还没启动)
     if (!force && msg.includes('强制保存')) {
       try {
-        await ElMessageBox.confirm(msg, '连接验证未通过', {
-          confirmButtonText: '仍然保存',
-          cancelButtonText: '返回修改',
-          type: 'warning',
+        await appConfirm({
+          title: '连接验证未通过',
+          message: msg,
+          kind: 'warning',
+          confirmText: '仍然保存',
+          cancelText: '返回修改',
         })
         await save(true)
       } catch {
@@ -249,14 +261,25 @@ async function save(force = false) {
 
 async function resetKey(key: CfgKey, label: string) {
   try {
-    await ElMessageBox.confirm(`把「${label}」恢复为 .env / 默认值?`, '恢复', { type: 'warning' })
+    await appConfirm({
+      title: '恢复默认',
+      message: `把「${label}」恢复为 .env / 默认值?`,
+      kind: 'warning',
+      icon: RefreshLeft,
+      confirmText: '恢复',
+    })
   } catch {
     return
   }
   try {
     const { data } = await api.admin.reset([key])
     if (data.account_changed) {
-      await ElMessageBox.alert('账号已恢复,请重新登录。', '需要重新登录', { confirmButtonText: '去登录' })
+      await appAlert({
+        title: '需要重新登录',
+        message: '账号已恢复,请重新登录。',
+        icon: SwitchButton,
+        confirmText: '去登录',
+      })
       router.push('/login')
       return
     }
@@ -336,11 +359,13 @@ function addWhitelist(c: DetectedChat) {
 
 async function cleanup() {
   try {
-    await ElMessageBox.confirm(
-      '清理上传中断留下的残留记录,并尽力删除已发到频道的分块消息。正在进行的上传不受影响。',
-      '清理残留上传',
-      { type: 'warning' },
-    )
+    await appConfirm({
+      title: '清理残留上传',
+      message: '清理上传中断留下的残留记录,并尽力删除已发到频道的分块消息。\n正在进行的上传不受影响。',
+      kind: 'warning',
+      icon: Brush,
+      confirmText: '开始清理',
+    })
   } catch {
     return
   }
@@ -355,11 +380,13 @@ async function cleanup() {
 
 async function logoutAll() {
   try {
-    await ElMessageBox.confirm(
-      '所有设备(含本机)的登录状态会立即失效,需要重新登录。WebDAV 客户端不受影响(用的是账号密码)。',
-      '登出所有会话',
-      { type: 'warning' },
-    )
+    await appConfirm({
+      title: '登出所有会话',
+      message: '所有设备(含本机)的登录状态会立即失效,需要重新登录。\nWebDAV 客户端不受影响(用的是账号密码)。',
+      kind: 'warning',
+      icon: SwitchButton,
+      confirmText: '全部登出',
+    })
   } catch {
     return
   }
@@ -1047,7 +1074,7 @@ function downloadBackup() {
       <span class="tip">保存后立即生效,不需要重启容器。</span>
     </div>
 
-    <el-dialog v-model="inboxFailureDialog" title="Bot 收件死信" width="760px">
+    <el-dialog v-model="inboxFailureDialog" title="Bot 收件死信" width="760px" align-center>
       <el-table :data="inboxFailures" v-loading="inboxFailureLoading" size="small">
         <el-table-column prop="update_id" label="Update ID" width="120" />
         <el-table-column prop="attempts" label="尝试" width="72" />
@@ -1072,7 +1099,7 @@ function downloadBackup() {
 
     <DirPicker ref="inboxDirPicker" />
 
-    <el-dialog v-model="detectDialog" title="检测频道 / 用户 ID" width="680px">
+    <el-dialog v-model="detectDialog" title="检测频道 / 用户 ID" width="680px" align-center>
       <el-alert type="info" :closable="false" show-icon class="alert">
         <div>
           找<b>频道 ID</b>:把 bot{{ detectBot ? `(@${detectBot})` : '' }}
@@ -1132,7 +1159,7 @@ function downloadBackup() {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="envDialog" title="当前生效配置(.env 格式)" width="640px">
+    <el-dialog v-model="envDialog" title="当前生效配置(.env 格式)" width="640px" align-center>
       <el-alert type="warning" :closable="false" show-icon class="alert">
         包含 Bot Token 与密码,注意不要外传。
       </el-alert>

@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" title="回收站" width="760px" append-to-body>
+  <el-dialog v-model="visible" title="回收站" width="760px" align-center append-to-body>
     <div class="bar">
       <span class="tip">
         删除的内容先进回收站,Telegram 消息在彻底删除时才释放;保留天数可在「系统设置 → 维护」调整。
@@ -54,9 +54,10 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { Document, Folder } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { DeleteFilled, Document, Folder } from '@element-plus/icons-vue'
 import { api, errMsg, fmtSize, fmtTime, type TrashItem } from '../api'
+import { appConfirm } from '../dialog'
 
 const visible = ref(false)
 const loading = ref(false)
@@ -96,11 +97,13 @@ async function restore(row: TrashItem) {
 
 async function purge(row: TrashItem) {
   try {
-    await ElMessageBox.confirm(
-      `彻底删除「${row.name}」?对应的 Telegram 消息也会删除,不可恢复。`,
-      '彻底删除',
-      { type: 'warning', appendTo: 'body' },
-    )
+    await appConfirm({
+      title: '彻底删除',
+      message: `确定彻底删除「${row.name}」吗?\n对应的 Telegram 消息会一并删除,无法再恢复。`,
+      kind: 'danger',
+      icon: DeleteFilled,
+      confirmText: '彻底删除',
+    })
   } catch {
     return
   }
@@ -115,11 +118,13 @@ async function purge(row: TrashItem) {
 
 async function purgeAll() {
   try {
-    await ElMessageBox.confirm(
-      `清空回收站(${items.value.length} 项)?全部对应的 Telegram 消息都会删除,不可恢复。`,
-      '清空回收站',
-      { type: 'warning', confirmButtonText: '全部删除', appendTo: 'body' },
-    )
+    await appConfirm({
+      title: '清空回收站',
+      message: `确定清空回收站(共 ${items.value.length} 项)吗?\n全部对应的 Telegram 消息都会删除,无法再恢复。`,
+      kind: 'danger',
+      icon: DeleteFilled,
+      confirmText: '全部删除',
+    })
   } catch {
     return
   }

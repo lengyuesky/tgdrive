@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" :title="`分享「${name}」`" width="460px" append-to-body>
+  <el-dialog v-model="visible" :title="`分享「${name}」`" width="460px" align-center append-to-body>
     <!-- 第一步:设置选项 -->
     <el-form v-if="!created" label-width="90px" label-position="left">
       <el-form-item label="提取码">
