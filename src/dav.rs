@@ -156,7 +156,7 @@ impl DavFileSystem for TgDavFs {
                 let (parent, name) = self.vfs.resolve_parent(&p).await.map_err(app_to_fs)?;
                 let handle = self
                     .vfs
-                    .start_upload(&parent, &name)
+                    .start_upload(&parent, &name, None)
                     .await
                     .map_err(app_to_fs)?;
                 Ok(Box::new(TgDavFile {

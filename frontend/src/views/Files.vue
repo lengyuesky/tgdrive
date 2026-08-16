@@ -350,6 +350,7 @@
                     <el-dropdown-item command="share">分享</el-dropdown-item>
                     <el-dropdown-item command="move">移动到 ...</el-dropdown-item>
                     <el-dropdown-item command="copy">复制到 ...</el-dropdown-item>
+                    <el-dropdown-item command="properties">属性</el-dropdown-item>
                     <el-dropdown-item command="delete" divided>删除(进回收站)</el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
@@ -394,6 +395,7 @@
                       <el-dropdown-item command="rename">重命名</el-dropdown-item>
                       <el-dropdown-item command="move">移动到 ...</el-dropdown-item>
                       <el-dropdown-item command="copy">复制到 ...</el-dropdown-item>
+                      <el-dropdown-item command="properties">属性</el-dropdown-item>
                       <el-dropdown-item command="delete" divided>删除(进回收站)</el-dropdown-item>
                     </el-dropdown-menu>
                   </template>
@@ -460,6 +462,59 @@
     <ShareManager ref="shareMgr" />
     <TrashPanel ref="trashPanel" @changed="onTrashChanged" />
 
+    <el-dialog
+      v-model="propertyVisible"
+      :title="`属性：${propertyDisplayName}`"
+      width="600px"
+      append-to-body
+    >
+      <div v-loading="propertyLoading" class="property-panel">
+        <el-skeleton v-if="propertyLoading" :rows="7" animated />
+        <template v-else-if="propertyData">
+          <div class="property-head">
+            <el-icon v-if="propertyData.is_dir" class="property-icon" color="#f6a821">
+              <Folder />
+            </el-icon>
+            <el-icon v-else class="property-icon" :color="iconOf(propertyData.name).color">
+              <component :is="iconOf(propertyData.name).icon" />
+            </el-icon>
+            <div class="property-heading">
+              <strong>{{ propertyDisplayName }}</strong>
+              <span>{{ propertyType }}</span>
+            </div>
+          </div>
+          <el-descriptions :column="1" border>
+            <el-descriptions-item label="路径">
+              <span class="property-value">{{ propertyData.path }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="大小">
+              {{ fmtSize(propertyData.size) }}（{{ fmtBytes(propertyData.size) }} 字节）
+            </el-descriptions-item>
+            <el-descriptions-item v-if="propertyData.is_dir" label="包含">
+              {{ propertyData.file_count }} 个文件，{{ propertyData.dir_count }} 个文件夹
+            </el-descriptions-item>
+            <el-descriptions-item label="存储分块">
+              {{ propertyData.chunk_count }} 个 Telegram 分块记录
+            </el-descriptions-item>
+            <el-descriptions-item label="创建时间">
+              {{ fmtTime(propertyData.created_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="修改时间">
+              {{ fmtTime(propertyData.modified_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="!propertyData.is_dir" label="SHA-256">
+              <span class="property-value property-hash">
+                {{ propertyData.sha256 || '未记录（历史文件）' }}
+              </span>
+            </el-descriptions-item>
+          </el-descriptions>
+        </template>
+      </div>
+      <template #footer>
+        <el-button type="primary" @click="propertyVisible = false">确定</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 自定义右键菜单 -->
     <teleport to="body">
       <div
@@ -489,7 +544,16 @@ import {
   FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position, Promotion, Rank,
   Refresh, Search, Setting, Share, Sort, Sunny, SwitchButton, Tickets, TrendCharts, Upload,
 } from '@element-plus/icons-vue'
-import { api, errMsg, fmtSize, fmtTime, type Entry, type SearchHit, type ServerInfo } from '../api'
+import {
+  api,
+  errMsg,
+  fmtSize,
+  fmtTime,
+  type Entry,
+  type EntryProperties,
+  type SearchHit,
+  type ServerInfo,
+} from '../api'
 import { isDark, toggleDark } from '../theme'
 import UploadDrawer, { type UploadFile } from '../components/UploadDrawer.vue'
 import PreviewDialog from '../components/PreviewDialog.vue'
@@ -514,6 +578,25 @@ const shareDlg = ref<InstanceType<typeof ShareDialog>>()
 const shareMgr = ref<InstanceType<typeof ShareManager>>()
 const trashPanel = ref<InstanceType<typeof TrashPanel>>()
 const tableRef = ref<TableInstance>()
+const propertyVisible = ref(false)
+const propertyLoading = ref(false)
+const propertyData = ref<EntryProperties | null>(null)
+const propertyFallbackName = ref('')
+
+const propertyDisplayName = computed(
+  () => propertyData.value?.name || propertyFallbackName.value || '根目录',
+)
+const propertyType = computed(() => {
+  const item = propertyData.value
+  if (!item) return ''
+  if (item.is_dir) return '文件夹'
+  const ext = extOf(item.name)
+  return ext ? `${ext.toUpperCase()} 文件` : '文件'
+})
+
+function fmtBytes(size: number) {
+  return new Intl.NumberFormat('zh-CN').format(size)
+}
 
 const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif', 'ico']
 /** 浏览器 <video> 大概率能解码的容器(mkv 在 Chrome/Edge 可播 H.264/VP9 轨) */
@@ -546,7 +629,7 @@ function fileUrl(row: Entry) {
 }
 
 function thumbnailUrl(row: Entry) {
-  return row.sha256 ? api.thumbnailUrl(row.sha256) : ''
+  return api.thumbnailUrl(joinPath(cur.value, row.name))
 }
 
 // ---- 布局:列表 / 网格 / 大图 / 时间线,记住选择 ----
@@ -750,6 +833,15 @@ const ctxItems = computed<CtxItem[]>(() => {
       { label: '新建文件夹', action: mkdir },
       { label: '刷新', action: refresh },
       { label: allSelected.value ? '取消全选' : '全选', action: toggleSelectAll, divided: true },
+      {
+        label: '当前文件夹属性',
+        action: () =>
+          void openPropertiesPath(
+            cur.value,
+            segments.value[segments.value.length - 1] || '根目录',
+          ),
+        divided: true,
+      },
     ]
   }
   const items: CtxItem[] = []
@@ -772,6 +864,7 @@ const ctxItems = computed<CtxItem[]>(() => {
   items.push({ label: '重命名', action: () => rename(row) })
   items.push({ label: '移动到 ...', action: () => onRowCmd('move', row) })
   items.push({ label: '复制到 ...', action: () => onRowCmd('copy', row) })
+  items.push({ label: '属性', action: () => void openProperties(row) })
   items.push({
     label: '删除(进回收站)',
     action: () => onRowCmd('delete', row),
@@ -831,6 +924,31 @@ const tgTip = computed(() => {
 function joinPath(dir: string, name: string) {
   return dir === '/' ? `/${name}` : `${dir}/${name}`
 }
+
+let propertyRequestSeq = 0
+async function openPropertiesPath(path: string, fallbackName: string) {
+  const request = ++propertyRequestSeq
+  propertyFallbackName.value = fallbackName
+  propertyData.value = null
+  propertyLoading.value = true
+  propertyVisible.value = true
+  try {
+    const response = await api.properties(path)
+    if (request === propertyRequestSeq) propertyData.value = response.data.properties
+  } catch (e) {
+    if (request === propertyRequestSeq) {
+      propertyVisible.value = false
+      ElMessage.error(`读取属性失败：${errMsg(e)}`)
+    }
+  } finally {
+    if (request === propertyRequestSeq) propertyLoading.value = false
+  }
+}
+
+function openProperties(row: Entry) {
+  return openPropertiesPath(joinPath(cur.value, row.name), row.name)
+}
+
 function pathOf(i: number) {
   return '/' + segments.value.slice(0, i + 1).join('/')
 }
@@ -950,6 +1068,10 @@ function copyName(n: string) {
 
 async function onRowCmd(cmd: string, row: Entry) {
   const src = joinPath(cur.value, row.name)
+  if (cmd === 'properties') {
+    await openProperties(row)
+    return
+  }
   try {
     if (cmd === 'share') {
       shareDlg.value?.open(src, row.name)
@@ -1493,6 +1615,43 @@ html.dark .tile-check {
   .hide-sm {
     display: none;
   }
+}
+
+.property-panel {
+  min-height: 260px;
+}
+.property-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 4px 2px;
+}
+.property-icon {
+  flex-shrink: 0;
+  font-size: 44px;
+}
+.property-heading {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.property-heading strong {
+  overflow-wrap: anywhere;
+  font-size: 17px;
+}
+.property-heading span {
+  color: var(--text-soft);
+  font-size: 13px;
+}
+.property-value {
+  user-select: text;
+  overflow-wrap: anywhere;
+}
+.property-hash {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
 }
 
 /* 自定义右键菜单(teleport 到 body,fixed 定位) */

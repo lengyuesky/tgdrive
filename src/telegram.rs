@@ -19,6 +19,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 const FILE_PATH_TTL: Duration = Duration::from_secs(30 * 60);
 const FILE_PATH_CACHE_CAPACITY: usize = 4096;
 const MAX_RETRIES: u32 = 5;
+/// Telegram 自定义媒体缩略图必须小于该值。
+pub const MAX_THUMBNAIL_SIZE: usize = 200 * 1024;
 
 /// reqwest 错误通常携带完整请求 URL，而 Telegram URL 中含 Bot Token。
 /// 对外只保留故障类别，绝不格式化原始错误对象。
@@ -90,6 +92,8 @@ pub type ByteReader = Pin<Box<dyn AsyncRead + Send>>;
 pub struct TgMessage {
     pub message_id: i64,
     pub file_id: String,
+    /// Telegram 实际绑定到该媒体消息的缩略图，可能是自定义图，也可能由服务端生成。
+    pub thumbnail_file_id: Option<String>,
 }
 
 /// 视频显示元数据(从文件头解析);sendVideo 不带宽高时
@@ -125,6 +129,7 @@ pub trait TgApi: Send + Sync + 'static {
         &self,
         filename: &str,
         caption: Option<String>,
+        thumbnail: Option<&Bytes>,
         body: &UploadBody,
     ) -> AppResult<TgMessage>;
     /// 以「视频消息」发送,客户端可直接流式播放;默认实现退回文档发送,
@@ -135,10 +140,11 @@ pub trait TgApi: Send + Sync + 'static {
         mime: &str,
         meta: Option<VideoMeta>,
         caption: Option<String>,
+        thumbnail: Option<&Bytes>,
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
         let _ = (mime, meta);
-        self.send_document(filename, caption, body).await
+        self.send_document(filename, caption, thumbnail, body).await
     }
     async fn delete_message(&self, message_id: i64) -> AppResult<()>;
     async fn get_me(&self) -> AppResult<String>;
@@ -151,6 +157,13 @@ pub trait TgApi: Send + Sync + 'static {
         chunk_size: u64,
         offset: u64,
     ) -> AppResult<ByteReader>;
+
+    /// 打开 Telegram 小缩略图。默认实现便于测试客户端复用普通读取逻辑；
+    /// 真实客户端会绕过 MTProto 文档解析，直接使用 Bot API 的 getFile。
+    async fn open_thumbnail_stream(&self, file_id: &str, message_id: i64) -> AppResult<ByteReader> {
+        self.open_chunk_stream(file_id, message_id, MAX_THUMBNAIL_SIZE as u64, 0)
+            .await
+    }
 }
 
 // ---------- Bot API 响应结构 ----------
@@ -179,16 +192,19 @@ struct RawMessage {
 }
 
 impl RawMessage {
-    fn any_file_id(self) -> Option<String> {
-        self.video
-            .or(self.document)
-            .or(self.animation)
-            .map(|f| f.file_id)
+    fn any_file(self) -> Option<RawFileRef> {
+        self.video.or(self.document).or(self.animation)
     }
 }
 
 #[derive(Deserialize)]
 struct RawFileRef {
+    file_id: String,
+    thumbnail: Option<RawThumbnailRef>,
+}
+
+#[derive(Deserialize)]
+struct RawThumbnailRef {
     file_id: String,
 }
 
@@ -366,6 +382,7 @@ impl TgApi for UnconfiguredTg {
         &self,
         _filename: &str,
         _caption: Option<String>,
+        _thumbnail: Option<&Bytes>,
         _body: &UploadBody,
     ) -> AppResult<TgMessage> {
         Self::err()
@@ -702,6 +719,7 @@ impl TgClient {
         mime: &str,
         meta: Option<VideoMeta>,
         caption: Option<String>,
+        thumbnail: Option<&Bytes>,
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
         let url = self.method_url(method);
@@ -726,6 +744,18 @@ impl TgClient {
             }
             if let Some(c) = &caption {
                 form = form.text("caption", c.clone());
+            }
+            if let Some(image) = thumbnail {
+                let part = reqwest::multipart::Part::stream_with_length(
+                    reqwest::Body::from(image.clone()),
+                    image.len() as u64,
+                )
+                .file_name("thumbnail.jpg")
+                .mime_str("image/jpeg")
+                .map_err(|e| AppError::Telegram(e.to_string()))?;
+                form = form
+                    .text("thumbnail", "attach://thumbnail")
+                    .part("thumbnail", part);
             }
             // 每次安全重试都重新打开临时文件；构造失败发生在请求发出前，直接返回即可。
             let part = self.body_to_part(filename, mime, body)?;
@@ -761,8 +791,8 @@ impl TgClient {
             }
         };
         let message_id = msg.message_id;
-        let file_id = match msg.any_file_id() {
-            Some(file_id) => file_id,
+        let media = match msg.any_file() {
+            Some(media) => media,
             None => {
                 // 已知消息号但结构异常时主动撤销，不能留下数据库无法引用的孤儿消息。
                 if let Err(e) = self.delete_message(message_id).await {
@@ -771,9 +801,11 @@ impl TgClient {
                 return Err(AppError::Telegram(format!("{method} 响应缺少文件字段")));
             }
         };
+        let thumbnail_file_id = media.thumbnail.map(|thumbnail| thumbnail.file_id);
         Ok(TgMessage {
             message_id,
-            file_id,
+            file_id: media.file_id,
+            thumbnail_file_id,
         })
     }
 
@@ -853,6 +885,7 @@ impl TgApi for TgClient {
         &self,
         filename: &str,
         caption: Option<String>,
+        thumbnail: Option<&Bytes>,
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
         self.send_media(
@@ -862,6 +895,7 @@ impl TgApi for TgClient {
             "application/octet-stream",
             None,
             caption,
+            thumbnail,
             body,
         )
         .await
@@ -873,10 +907,20 @@ impl TgApi for TgClient {
         mime: &str,
         meta: Option<VideoMeta>,
         caption: Option<String>,
+        thumbnail: Option<&Bytes>,
         body: &UploadBody,
     ) -> AppResult<TgMessage> {
-        self.send_media("sendVideo", "video", filename, mime, meta, caption, body)
-            .await
+        self.send_media(
+            "sendVideo",
+            "video",
+            filename,
+            mime,
+            meta,
+            caption,
+            thumbnail,
+            body,
+        )
+        .await
     }
 
     async fn delete_message(&self, message_id: i64) -> AppResult<()> {
@@ -944,6 +988,19 @@ impl TgApi for TgClient {
         );
         self.open_http_stream(&file_path, offset).await
     }
+
+    async fn open_thumbnail_stream(
+        &self,
+        file_id: &str,
+        _message_id: i64,
+    ) -> AppResult<ByteReader> {
+        // 缩略图很小且属于 PhotoSize，不交给只解析文档 file_id 的 MTProto 链路。
+        let file_path = self.get_file_path(file_id).await?;
+        if let Some(reader) = self.open_known_path(&file_path, 0).await? {
+            return Ok(reader);
+        }
+        self.open_http_stream(&file_path, 0).await
+    }
 }
 
 #[cfg(test)]
@@ -1004,5 +1061,26 @@ mod tests {
             ..member
         };
         assert!(validate_storage_member("channel", &missing_delete).is_err());
+    }
+
+    #[test]
+    fn media_response_keeps_telegram_thumbnail_file_id() {
+        let message: RawMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 42,
+            "video": {
+                "file_id": "video-file",
+                "thumbnail": { "file_id": "thumbnail-file" }
+            }
+        }))
+        .unwrap();
+        let media = message.any_file().unwrap();
+        assert_eq!(media.file_id, "video-file");
+        assert_eq!(
+            media
+                .thumbnail
+                .map(|thumbnail| thumbnail.file_id)
+                .as_deref(),
+            Some("thumbnail-file")
+        );
     }
 }

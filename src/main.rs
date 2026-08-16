@@ -275,6 +275,7 @@ async fn check() -> anyhow::Result<()> {
         .send_document(
             "tgdrive-selftest.bin",
             Some("tgdrive 自检文件,可删除".into()),
+            None,
             &body,
         )
         .await?;

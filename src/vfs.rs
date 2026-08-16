@@ -5,6 +5,7 @@ use crate::engine::reader::ChunkedReader;
 use crate::engine::upload::{UploadHandle, Uploader};
 use crate::error::{AppError, AppResult};
 use crate::telegram::TgRegistry;
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// 把用户路径拆成规范段:拒绝空名、`.`、`..`、控制字符与过长名称
@@ -147,7 +148,12 @@ impl Vfs {
     }
 
     /// 启动上传:目标为 dir_path 下的 name(自动递归建目录由调用方决定)
-    pub async fn start_upload(&self, parent: &Node, name: &str) -> AppResult<UploadHandle> {
+    pub async fn start_upload(
+        &self,
+        parent: &Node,
+        name: &str,
+        thumbnail: Option<Bytes>,
+    ) -> AppResult<UploadHandle> {
         if !parent.is_dir {
             return Err(AppError::NotDirectory);
         }
@@ -160,7 +166,9 @@ impl Vfs {
             },
             name
         );
-        self.uploader.start(parent.id, name, &display).await
+        self.uploader
+            .start(parent.id, name, &display, thumbnail)
+            .await
     }
 
     /// 由节点回溯完整路径(仅日志/caption 用)

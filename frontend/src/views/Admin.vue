@@ -397,6 +397,7 @@ const SOURCE_LABEL: Record<string, string> = {
 
 // ---- 维护类设置(回收站/备份/Bot 收件) ----
 const extras = ref<Extras>()
+const backupChunkSizeInput = ref('18MB')
 const backupLastTs = ref<number | null>(null)
 const trashCount = ref(0)
 const extrasSaving = ref(false)
@@ -482,6 +483,7 @@ async function loadExtras() {
   try {
     const { data } = await api.admin.extras()
     extras.value = data.extras
+    backupChunkSizeInput.value = sizeInput(data.extras.backup_chunk_size)
     inboxRuleExtensionDrafts.value = data.extras.inbox_rules.map(() => '')
     backupLastTs.value = data.backup_last_ts
     trashCount.value = data.trash_count
@@ -497,7 +499,10 @@ async function saveExtras() {
   extras.value.inbox_rules.forEach((rule, index) => addRuleExtensions(rule, index))
   extrasSaving.value = true
   try {
-    await api.admin.saveExtras(extras.value)
+    await api.admin.saveExtras({
+      ...extras.value,
+      backup_chunk_size: backupChunkSizeInput.value,
+    })
     ElMessage.success('维护设置已保存并生效')
     await loadExtras()
   } catch (e) {
@@ -511,7 +516,11 @@ async function backupNow() {
   backingUp.value = true
   try {
     const { data } = await api.admin.backupToChannel()
-    ElMessage.success(`已发送到存储频道:${data.name}`)
+    ElMessage.success(
+      data.parts > 1
+        ? `已发送到存储频道:${data.name}（${data.parts} 个分块）`
+        : `已发送到存储频道:${data.name}`,
+    )
     await loadExtras()
   } catch (e) {
     ElMessage.error(errMsg(e))
@@ -846,6 +855,19 @@ function downloadBackup() {
             </span>
           </div>
         </el-form-item>
+        <el-form-item label="备份分块">
+          <div class="row">
+            <el-input
+              v-model="backupChunkSizeInput"
+              placeholder="如 18MB / 512MB"
+              style="width: 180px"
+            />
+            <span class="tip">
+              默认 18MB；官方端点不得超过
+              {{ fmtSize(cfg?.official_chunk_max ?? 19_500_000) }}，自建端点最大 1900MB。
+            </span>
+          </div>
+        </el-form-item>
       </el-form>
       <div class="row">
         <el-button type="primary" :loading="extrasSaving" @click="saveExtras">保存维护设置</el-button>
@@ -853,7 +875,8 @@ function downloadBackup() {
         <el-button @click="downloadBackup">下载数据库备份</el-button>
       </div>
       <div class="tip" style="margin-top: 8px">
-        元数据库是文件的唯一索引,强烈建议开启自动备份;下载的 .db 文件可直接替换 data/tgdrive.db 完成恢复。
+        元数据库是文件的唯一索引,强烈建议开启自动备份；单块 .db 可直接恢复，多块备份需按
+        part 编号顺序二进制合并为 .db 后再替换 data/tgdrive.db。
       </div>
     </el-card>
 

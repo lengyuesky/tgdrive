@@ -225,10 +225,24 @@ async function sha256File(f: File, onPct: (p: number) => void): Promise<string> 
 }
 
 const THUMB_VIDEO_EXT = new Set(['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv'])
+const TELEGRAM_THUMB_MAX_BYTES = 200 * 1024
 
 function isVideoFile(file: File) {
   const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
   return file.type.startsWith('video/') || THUMB_VIDEO_EXT.has(ext)
+}
+
+function canvasToJpeg(canvas: HTMLCanvasElement, quality: number): Promise<Blob | null> {
+  return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality))
+}
+
+/** Telegram 只接受不超过 320×320、大小小于 200KB 的 JPEG 媒体缩略图。 */
+async function encodeTelegramThumbnail(canvas: HTMLCanvasElement): Promise<Blob | null> {
+  for (const quality of [0.82, 0.7, 0.58, 0.46, 0.34]) {
+    const image = await canvasToJpeg(canvas, quality)
+    if (image && image.size < TELEGRAM_THUMB_MAX_BYTES) return image
+  }
+  return null
 }
 
 /** 从浏览器本地文件取一帧并压成小图；object URL 不会产生任何网络下载。 */
@@ -258,7 +272,7 @@ function createVideoThumbnail(file: File): Promise<Blob | null> {
       const height = video.videoHeight
       if (!width || !height) return finish(null)
       capturing = true
-      const scale = Math.min(1, 480 / width, 480 / height)
+      const scale = Math.min(1, 320 / width, 320 / height)
       const canvas = document.createElement('canvas')
       canvas.width = Math.max(1, Math.round(width * scale))
       canvas.height = Math.max(1, Math.round(height * scale))
@@ -270,14 +284,7 @@ function createVideoThumbnail(file: File): Promise<Blob | null> {
         finish(null)
         return
       }
-      canvas.toBlob(
-        (webp) => {
-          if (webp?.type === 'image/webp') return finish(webp)
-          canvas.toBlob((jpeg) => finish(jpeg), 'image/jpeg', 0.82)
-        },
-        'image/webp',
-        0.78,
-      )
+      void encodeTelegramThumbnail(canvas).then(finish).catch(() => finish(null))
     }
 
     video.preload = 'auto'
@@ -305,16 +312,6 @@ function createVideoThumbnail(file: File): Promise<Blob | null> {
     video.src = url
     video.load()
   })
-}
-
-/** 缩略图失败不影响文件本身上传，历史或不支持的编码会继续显示视频图标。 */
-async function persistThumbnail(target: string, item: Item, sha: string) {
-  if (!item.thumbnail) return
-  try {
-    await api.saveThumbnail(joinPath(target, item.file.name), sha, item.thumbnail)
-  } catch (e) {
-    console.warn('视频缩略图保存失败', e)
-  }
 }
 
 /** 目标目录 = 基目录 + 相对子路径;文件夹上传时按需递归创建 */
@@ -383,7 +380,6 @@ async function pump() {
         linked = confirmed
       }
       if (linked) {
-        if (sha) await persistThumbnail(target, live, sha)
         live.status = 'instant'
         live.pct = 100
         emit('uploaded')
@@ -392,10 +388,8 @@ async function pump() {
 
       live.status = 'uploading'
       live.pct = 0
-      let finalSha = sha
       try {
-        const r = await api.upload(target, live.file, (pct) => (live.pct = pct))
-        finalSha = r.data.saved[0]?.sha256 ?? finalSha
+        await api.upload(target, live.file, live.thumbnail, (pct) => (live.pct = pct))
       } catch (uploadError) {
         // 响应丢失不代表服务端失败：先按已算出的哈希核实，避免用户重试后重复上传。
         if (!sha) throw uploadError
@@ -403,7 +397,6 @@ async function pump() {
         // 核实接口自身失败时保留原始上传错误，它通常更能说明根因。
         if (confirmed !== true) throw uploadError
       }
-      if (finalSha) await persistThumbnail(target, live, finalSha)
       live.status = 'done'
       live.pct = 100
       emit('uploaded')

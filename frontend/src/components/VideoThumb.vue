@@ -1,6 +1,6 @@
 <template>
   <div ref="root" class="vthumb">
-    <!-- 这里只加载上传时生成的小图，绝不把原视频挂进列表。 -->
+    <!-- 这里只加载 Telegram 媒体消息的小图，绝不把原视频挂进列表。 -->
     <img
       v-if="active && src && !failed"
       class="vthumb-image"

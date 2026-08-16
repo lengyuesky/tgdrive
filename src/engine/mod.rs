@@ -29,6 +29,8 @@ mod tests {
         fail_on_send: Option<i64>,
         /// 每次成功发送的 (文件名, 是否视频消息)
         sent: Mutex<Vec<(String, bool)>>,
+        /// 每次发送是否携带自定义缩略图。
+        sent_thumbnail: Mutex<Vec<bool>>,
         /// 每次视频发送时带的元数据(宽高/时长)
         video_meta: Mutex<Vec<Option<VideoMeta>>>,
         /// 注入 sendVideo 失败,验证回退文档路径
@@ -45,6 +47,7 @@ mod tests {
                 deleted: Mutex::new(Vec::new()),
                 fail_on_send,
                 sent: Mutex::new(Vec::new()),
+                sent_thumbnail: Mutex::new(Vec::new()),
                 video_meta: Mutex::new(Vec::new()),
                 fail_video: AtomicBool::new(false),
                 uncertain_video: AtomicBool::new(false),
@@ -56,6 +59,7 @@ mod tests {
             filename: &str,
             body: &UploadBody,
             video: bool,
+            thumbnail: Option<&Bytes>,
         ) -> AppResult<TgMessage> {
             let n = self.seq.fetch_add(1, Ordering::SeqCst);
             if self.fail_on_send == Some(n) {
@@ -70,14 +74,27 @@ mod tests {
                 }
             };
             let fid = format!("f{n}");
+            let thumbnail_file_id = thumbnail.map(|image| {
+                let file_id = format!("thumb-{n}");
+                self.store
+                    .lock()
+                    .unwrap()
+                    .insert(file_id.clone(), image.clone());
+                file_id
+            });
             self.store.lock().unwrap().insert(fid.clone(), data);
             self.sent
                 .lock()
                 .unwrap()
                 .push((filename.to_string(), video));
+            self.sent_thumbnail
+                .lock()
+                .unwrap()
+                .push(thumbnail.is_some());
             Ok(TgMessage {
                 message_id: 1000 + n,
                 file_id: fid,
+                thumbnail_file_id,
             })
         }
     }
@@ -88,9 +105,10 @@ mod tests {
             &self,
             filename: &str,
             _caption: Option<String>,
+            thumbnail: Option<&Bytes>,
             body: &UploadBody,
         ) -> AppResult<TgMessage> {
-            self.store_body(filename, body, false)
+            self.store_body(filename, body, false, thumbnail)
         }
 
         async fn send_video(
@@ -99,6 +117,7 @@ mod tests {
             _mime: &str,
             meta: Option<VideoMeta>,
             _caption: Option<String>,
+            thumbnail: Option<&Bytes>,
             body: &UploadBody,
         ) -> AppResult<TgMessage> {
             if self.fail_video.load(Ordering::SeqCst) {
@@ -108,7 +127,7 @@ mod tests {
                 return Err(AppError::TelegramUncertain("mock: 响应丢失".into()));
             }
             self.video_meta.lock().unwrap().push(meta);
-            self.store_body(filename, body, true)
+            self.store_body(filename, body, true, thumbnail)
         }
 
         async fn delete_message(&self, message_id: i64) -> AppResult<()> {
@@ -175,7 +194,23 @@ mod tests {
         data: &[u8],
         piece: usize,
     ) -> AppResult<crate::db::Node> {
-        let h = up.start(ROOT_ID, name, &format!("/{name}")).await?;
+        let h = up.start(ROOT_ID, name, &format!("/{name}"), None).await?;
+        for chunk in data.chunks(piece.max(1)) {
+            h.feed(Bytes::copy_from_slice(chunk)).await?;
+        }
+        h.finish().await
+    }
+
+    async fn feed_all_with_thumbnail(
+        up: &Uploader,
+        name: &str,
+        data: &[u8],
+        piece: usize,
+        thumbnail: Bytes,
+    ) -> AppResult<crate::db::Node> {
+        let h = up
+            .start(ROOT_ID, name, &format!("/{name}"), Some(thumbnail))
+            .await?;
         for chunk in data.chunks(piece.max(1)) {
             h.feed(Bytes::copy_from_slice(chunk)).await?;
         }
@@ -277,7 +312,10 @@ mod tests {
     #[tokio::test]
     async fn producer_drop_aborts() {
         let (up, tg, db, _g) = fixture(4, 1024, None).await;
-        let h = up.start(ROOT_ID, "drop.bin", "/drop.bin").await.unwrap();
+        let h = up
+            .start(ROOT_ID, "drop.bin", "/drop.bin", None)
+            .await
+            .unwrap();
         h.feed(Bytes::from_static(&[1, 2, 3, 4, 5])).await.unwrap(); // 分块 0 已满并上传
         let join = h.join;
         drop(h.tx); // 模拟客户端断开:未发 Eof
@@ -319,6 +357,48 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_is_sent_with_single_video_message() {
+        let (up, tg, db, _g) = fixture(100, 1024, None).await;
+        let thumbnail = Bytes::from_static(b"mock-jpeg-thumbnail");
+        let node = feed_all_with_thumbnail(&up, "movie.mp4", &[1, 2, 3], 2, thumbnail.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(*tg.sent_thumbnail.lock().unwrap(), vec![true]);
+        let chunks = db.chunks_of(node.id).await.unwrap();
+        assert_eq!(chunks[0].tg_thumbnail_file_id.as_deref(), Some("thumb-0"));
+
+        let mut reader = tg.open_thumbnail_stream("thumb-0", 1000).await.unwrap();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, thumbnail);
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_thumbnail_is_only_attached_to_first_message() {
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        let data: Vec<u8> = (0..10u8).collect();
+        let node = feed_all_with_thumbnail(
+            &up,
+            "movie.mp4",
+            &data,
+            3,
+            Bytes::from_static(b"mock-jpeg-thumbnail"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*tg.sent_thumbnail.lock().unwrap(), vec![true, false, false]);
+        let chunks = db.chunks_of(node.id).await.unwrap();
+        assert_eq!(chunks[0].tg_thumbnail_file_id.as_deref(), Some("thumb-0"));
+        assert!(
+            chunks[1..]
+                .iter()
+                .all(|chunk| chunk.tg_thumbnail_file_id.is_none())
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,16 @@ export interface Entry {
   sha256: string | null
 }
 
+export interface EntryProperties extends Entry {
+  path: string
+  /** 目录内递归文件数；普通文件为 1。 */
+  file_count: number
+  /** 目录内递归子目录数；不包含目录自身。 */
+  dir_count: number
+  /** Telegram 分块记录数；统计只读取 SQLite。 */
+  chunk_count: number
+}
+
 export interface ServerInfo {
   username: string
   api_base: string
@@ -74,6 +84,8 @@ export interface InboxRouteRule {
 export interface Extras {
   trash_retention_days: number
   backup_auto: boolean
+  /** SQLite 快照上传到 Telegram 时的单块字节数。 */
+  backup_chunk_size: number
   inbox_enabled: boolean
   inbox_allowed_chats: string
   inbox_dir: string
@@ -81,6 +93,11 @@ export interface Extras {
   inbox_image_dir: string
   inbox_book_dir: string
   inbox_rules: InboxRouteRule[]
+}
+
+export type ExtrasPatch = Omit<Partial<Extras>, 'backup_chunk_size'> & {
+  /** 字符串形式支持 18MB、1GB 等后台输入。 */
+  backup_chunk_size?: string
 }
 
 /** 可在后台修改的配置项键名 */
@@ -225,6 +242,8 @@ export const api = {
   info: () => http.get<ServerInfo>('/info'),
   list: (path: string) =>
     http.get<{ path: string; entries: Entry[] }>('/fs/list', { params: { path } }),
+  properties: (path: string) =>
+    http.get<{ properties: EntryProperties }>('/fs/properties', { params: { path } }),
   mkdir: (path: string) => http.post('/fs/mkdir', { path }),
   rename: (from: string, to: string) => http.post('/fs/rename', { from, to }),
   copy: (from: string, to: string) => http.post('/fs/copy', { from, to }),
@@ -232,8 +251,16 @@ export const api = {
     http.post<{ deleted: number; failed: { path: string; error: string }[] }>('/fs/delete', {
       paths,
     }),
-  upload: (dir: string, file: File, onProgress: (pct: number) => void, signal?: AbortSignal) => {
+  upload: (
+    dir: string,
+    file: File,
+    thumbnail: Blob | null | undefined,
+    onProgress: (pct: number) => void,
+    signal?: AbortSignal,
+  ) => {
     const form = new FormData()
+    // 缩略图必须先到达后端，才能和第一个视频分块放进同一条 Telegram 消息。
+    if (thumbnail) form.append('thumbnail', thumbnail, 'thumbnail.jpg')
     form.append('file', file, file.name)
     return http.post<{ saved: Entry[] }>('/fs/upload', form, {
       params: { path: dir },
@@ -245,16 +272,8 @@ export const api = {
   },
   downloadUrl: (path: string, inline = false) =>
     `/api/fs/download?path=${encodeURIComponent(path)}${inline ? '&inline=1' : ''}`,
-  /** 视频缩略图是独立小图，不会触发原视频下载。 */
-  thumbnailUrl: (sha256: string) =>
-    `/api/fs/thumbnail?sha256=${encodeURIComponent(sha256)}`,
-  saveThumbnail: (path: string, sha256: string, image: Blob) =>
-    http.post('/fs/thumbnail', image, {
-      params: { path, sha256 },
-      headers: { 'Content-Type': image.type },
-      // 主文件已经上传成功，缩略图请求不能无限阻塞上传队列。
-      timeout: 15_000,
-    }),
+  /** 只请求 Telegram 小图，不会读取原视频。 */
+  thumbnailUrl: (path: string) => `/api/fs/thumbnail?path=${encodeURIComponent(path)}`,
   /** 上传前批量查重:返回目录下已存在的名字 */
   exists: (dir: string, names: string[]) =>
     http.post<{ existing: string[] }>('/fs/exists', { dir, names }),
@@ -330,12 +349,12 @@ export const api = {
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
     backupUrl: '/api/admin/backup',
     backupToChannel: () =>
-      http.post<{ ok: boolean; name: string }>('/admin/backup-to-channel'),
+      http.post<{ ok: boolean; name: string; parts: number }>('/admin/backup-to-channel'),
     extras: () =>
       http.get<{ extras: Extras; backup_last_ts: number | null; trash_count: number }>(
         '/admin/extras',
       ),
-    saveExtras: (patch: Partial<Extras>) => http.post('/admin/extras', patch),
+    saveExtras: (patch: ExtrasPatch) => http.post('/admin/extras', patch),
   },
 }
 

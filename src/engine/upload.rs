@@ -142,6 +142,7 @@ impl Uploader {
         parent_id: i64,
         name: &str,
         display_path: &str,
+        thumbnail: Option<Bytes>,
     ) -> AppResult<UploadHandle> {
         // 一次上传固定使用同一个存储目标；后台改配置只影响之后开始的上传。
         let target = self.tg.current()?;
@@ -152,7 +153,7 @@ impl Uploader {
         let display_path = display_path.to_string();
         let join = tokio::spawn(async move {
             match this
-                .pipeline(node_id, &name, &display_path, target, rx)
+                .pipeline(node_id, &name, &display_path, thumbnail, target, rx)
                 .await
             {
                 Ok(node) => Ok(node),
@@ -245,12 +246,21 @@ impl Uploader {
         node_id: i64,
         name: &str,
         display_path: &str,
+        thumbnail: Option<Bytes>,
         target: TgBinding,
         mut rx: mpsc::Receiver<UploadMsg>,
     ) -> AppResult<Node> {
         let mut uploads: JoinSet<AppResult<()>> = JoinSet::new();
         let result = self
-            .pipeline_inner(&mut uploads, node_id, name, display_path, target, &mut rx)
+            .pipeline_inner(
+                &mut uploads,
+                node_id,
+                name,
+                display_path,
+                thumbnail,
+                target,
+                &mut rx,
+            )
             .await;
         if result.is_err() {
             // 出错时不 abort 在途任务:消息可能已发到 TG,必须等它落定并记入
@@ -264,12 +274,14 @@ impl Uploader {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn pipeline_inner(
         &self,
         uploads: &mut JoinSet<AppResult<()>>,
         node_id: i64,
         name: &str,
         display_path: &str,
+        thumbnail: Option<Bytes>,
         target: TgBinding,
         rx: &mut mpsc::Receiver<UploadMsg>,
     ) -> AppResult<Node> {
@@ -301,6 +313,7 @@ impl Uploader {
                                 idx,
                                 full,
                                 false,
+                                if idx == 0 { thumbnail.clone() } else { None },
                                 target.clone(),
                             )
                             .await?;
@@ -336,6 +349,7 @@ impl Uploader {
                 idx,
                 last,
                 idx == 0,
+                if idx == 0 { thumbnail } else { None },
                 target,
             )
             .await?;
@@ -367,6 +381,7 @@ impl Uploader {
         idx: i64,
         body: UploadBody,
         single_chunk: bool,
+        thumbnail: Option<Bytes>,
         target: TgBinding,
     ) -> AppResult<()> {
         let permit = self
@@ -407,19 +422,30 @@ impl Uploader {
                         tracing::debug!("{filename} 未解析出视频宽高,按无元数据发送");
                     }
                     match tg
-                        .send_video(&filename, m, meta, Some(caption.clone()), &body)
+                        .send_video(
+                            &filename,
+                            m,
+                            meta,
+                            Some(caption.clone()),
+                            thumbnail.as_ref(),
+                            &body,
+                        )
                         .await
                     {
                         Ok(msg) => msg,
                         // 只有 Telegram 明确拒绝视频格式时才能降级；结果不确定时再次发送会重复。
                         Err(AppError::TelegramRejected(detail)) => {
                             tracing::warn!("{filename} 以视频消息发送失败({detail}),回退为文档");
-                            tg.send_document(&filename, Some(caption), &body).await?
+                            tg.send_document(&filename, Some(caption), thumbnail.as_ref(), &body)
+                                .await?
                         }
                         Err(e) => return Err(e),
                     }
                 }
-                None => tg.send_document(&filename, Some(caption), &body).await?,
+                None => {
+                    tg.send_document(&filename, Some(caption), thumbnail.as_ref(), &body)
+                        .await?
+                }
             };
             if let Err(e) = db
                 .add_chunk(
@@ -429,6 +455,7 @@ impl Uploader {
                     &msg.file_id,
                     msg.message_id,
                     storage_target_id,
+                    msg.thumbnail_file_id.as_deref(),
                 )
                 .await
             {

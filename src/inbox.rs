@@ -95,6 +95,12 @@ struct FileRef {
     file_id: String,
     file_size: Option<i64>,
     file_name: Option<String>,
+    thumbnail: Option<ThumbnailRef>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ThumbnailRef {
+    file_id: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -286,6 +292,7 @@ async fn handle_update(
                     &file.name,
                     file.size,
                     &file.file_id,
+                    file.thumbnail_file_id.as_deref(),
                     post.message_id,
                     cfg.storage_target_id.ok_or_else(|| {
                         AppError::BadRequest("当前 Telegram 配置缺少存储目标".into())
@@ -317,18 +324,30 @@ async fn handle_update(
     }
 
     if let Some(file) = pick_file(msg) {
-        let (mid, fid, size) = match resend_file(http, cfg, file.kind, &file.file_id).await {
-            Ok(sent) => sent,
-            Err(e) => {
-                reply(http, cfg, msg, "❌ 转存失败，请稍后重新发送").await;
-                return Err(e);
-            }
-        };
+        let (mid, fid, size, thumbnail_file_id) =
+            match resend_file(http, cfg, file.kind, &file.file_id).await {
+                Ok(sent) => sent,
+                Err(e) => {
+                    reply(http, cfg, msg, "❌ 转存失败，请稍后重新发送").await;
+                    return Err(e);
+                }
+            };
         let size = size.filter(|n| *n > 0).unwrap_or(file.size);
         let storage_target_id = cfg
             .storage_target_id
             .ok_or_else(|| AppError::BadRequest("当前 Telegram 配置缺少存储目标".into()))?;
-        let path = match ingest(vfs, ex, &file.name, size, &fid, mid, storage_target_id).await {
+        let path = match ingest(
+            vfs,
+            ex,
+            &file.name,
+            size,
+            &fid,
+            thumbnail_file_id.as_deref(),
+            mid,
+            storage_target_id,
+        )
+        .await
+        {
             Ok(path) => path,
             Err(e) => {
                 // 私聊文件已经转发成功但落库失败时补偿删除，不能在频道留下孤儿消息。
@@ -392,6 +411,7 @@ struct PickedFile {
     name: String,
     size: i64,
     file_id: String,
+    thumbnail_file_id: Option<String>,
 }
 
 fn positive_size(size: Option<i64>) -> Option<i64> {
@@ -420,6 +440,7 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
             name,
             size: positive_size(a.file_size)?,
             file_id: a.file_id.clone(),
+            thumbnail_file_id: a.thumbnail.as_ref().map(|thumb| thumb.file_id.clone()),
         });
     }
     if let Some(d) = &m.document {
@@ -432,6 +453,7 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
             name,
             size: positive_size(d.file_size)?,
             file_id: d.file_id.clone(),
+            thumbnail_file_id: d.thumbnail.as_ref().map(|thumb| thumb.file_id.clone()),
         });
     }
     if let Some(v) = &m.video {
@@ -444,6 +466,7 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
             name,
             size: positive_size(v.file_size)?,
             file_id: v.file_id.clone(),
+            thumbnail_file_id: v.thumbnail.as_ref().map(|thumb| thumb.file_id.clone()),
         });
     }
     if let Some(a) = &m.audio {
@@ -456,6 +479,7 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
             name,
             size: positive_size(a.file_size)?,
             file_id: a.file_id.clone(),
+            thumbnail_file_id: a.thumbnail.as_ref().map(|thumb| thumb.file_id.clone()),
         });
     }
     if let Some(sizes) = &m.photo {
@@ -466,6 +490,7 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
             name: format!("photo_{}.jpg", m.message_id),
             size: positive_size(best.file_size)?,
             file_id: best.file_id.clone(),
+            thumbnail_file_id: None,
         });
     }
     None
@@ -531,12 +556,14 @@ fn inbox_dir_for<'a>(ex: &'a crate::extras::Extras, name: &str) -> &'a str {
 }
 
 /// 把频道里的一条文件消息登记为网盘单块文件(同名覆盖,与上传语义一致)
+#[allow(clippy::too_many_arguments)]
 async fn ingest(
     vfs: &Vfs,
     ex: &crate::extras::Extras,
     raw_name: &str,
     size: i64,
     file_id: &str,
+    thumbnail_file_id: Option<&str>,
     message_id: i64,
     storage_target_id: i64,
 ) -> AppResult<String> {
@@ -562,7 +589,15 @@ async fn ingest(
     let node_id = vfs.db.create_uploading(dir.id, &name).await?;
     let result = async {
         vfs.db
-            .add_chunk(node_id, 0, size, file_id, message_id, storage_target_id)
+            .add_chunk(
+                node_id,
+                0,
+                size,
+                file_id,
+                message_id,
+                storage_target_id,
+                thumbnail_file_id,
+            )
             .await?;
         vfs.db.finalize_upload(node_id, size, None).await
     }
@@ -583,13 +618,13 @@ async fn ingest(
 }
 
 /// 按原媒体类型用 file_id 重发到存储频道(Telegram 侧复制,零流量)，
-/// 返回 (message_id, 新 file_id, file_size)。
+/// 返回 (message_id, 新 file_id, file_size, thumbnail_file_id)。
 async fn resend_file(
     http: &reqwest::Client,
     cfg: &RuntimeCfg,
     kind: MediaKind,
     file_id: &str,
-) -> AppResult<(i64, String, Option<i64>)> {
+) -> AppResult<(i64, String, Option<i64>, Option<String>)> {
     #[derive(Deserialize)]
     struct Sent {
         message_id: i64,
@@ -629,17 +664,41 @@ async fn resend_file(
         }
     };
     let media = match kind {
-        MediaKind::Document => sent.document.map(|f| (f.file_id, f.file_size)),
-        MediaKind::Video => sent.video.map(|f| (f.file_id, f.file_size)),
-        MediaKind::Audio => sent.audio.map(|f| (f.file_id, f.file_size)),
-        MediaKind::Animation => sent.animation.map(|f| (f.file_id, f.file_size)),
+        MediaKind::Document => sent.document.map(|f| {
+            (
+                f.file_id,
+                f.file_size,
+                f.thumbnail.map(|thumb| thumb.file_id),
+            )
+        }),
+        MediaKind::Video => sent.video.map(|f| {
+            (
+                f.file_id,
+                f.file_size,
+                f.thumbnail.map(|thumb| thumb.file_id),
+            )
+        }),
+        MediaKind::Audio => sent.audio.map(|f| {
+            (
+                f.file_id,
+                f.file_size,
+                f.thumbnail.map(|thumb| thumb.file_id),
+            )
+        }),
+        MediaKind::Animation => sent.animation.map(|f| {
+            (
+                f.file_id,
+                f.file_size,
+                f.thumbnail.map(|thumb| thumb.file_id),
+            )
+        }),
         MediaKind::Photo => sent
             .photo
             .and_then(|sizes| sizes.into_iter().last())
-            .map(|f| (f.file_id, f.file_size)),
+            .map(|f| (f.file_id, f.file_size, None)),
     }
     .ok_or_else(|| AppError::Telegram(format!("转存响应缺少 {}", kind.field())))?;
-    Ok((sent.message_id, media.0, media.1))
+    Ok((sent.message_id, media.0, media.1, media.2))
 }
 
 /// 尽力回复私聊,失败只记日志
@@ -818,6 +877,7 @@ mod tests {
         Extras {
             trash_retention_days: 30,
             backup_auto: false,
+            backup_chunk_size: crate::extras::DEFAULT_BACKUP_CHUNK_SIZE,
             inbox_enabled: true,
             inbox_allowed_chats: String::new(),
             inbox_dir: "/收件箱".into(),
@@ -885,11 +945,15 @@ mod tests {
             file_id: "video-id".into(),
             file_size: Some(123),
             file_name: Some("clip.MP4".into()),
+            thumbnail: Some(ThumbnailRef {
+                file_id: "video-thumb".into(),
+            }),
         });
         let picked = pick_file(&video).unwrap();
         assert_eq!(picked.kind, MediaKind::Video);
         assert_eq!(picked.name, "clip.MP4");
         assert_eq!(picked.size, 123);
+        assert_eq!(picked.thumbnail_file_id.as_deref(), Some("video-thumb"));
 
         let mut photo = empty_msg();
         photo.photo = Some(vec![
@@ -913,11 +977,13 @@ mod tests {
             file_id: "document-id".into(),
             file_size: Some(30),
             file_name: Some("fallback.gif".into()),
+            thumbnail: None,
         });
         animation.animation = Some(FileRef {
             file_id: "animation-id".into(),
             file_size: Some(20),
             file_name: Some("animated.gif".into()),
+            thumbnail: None,
         });
         let picked = pick_file(&animation).unwrap();
         assert_eq!(picked.kind, MediaKind::Animation);

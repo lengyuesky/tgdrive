@@ -40,6 +40,17 @@ pub struct Chunk {
     pub tg_message_id: i64,
     /// 创建该分块时使用的 Bot、端点与频道；旧库首次迁移时可能暂为空。
     pub storage_target_id: Option<i64>,
+    /// Telegram 在同一媒体消息中返回的缩略图；只在第 0 块保存。
+    pub tg_thumbnail_file_id: Option<String>,
+}
+
+/// 文件或目录属性中的递归逻辑用量；不读取 Telegram 内容。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NodeUsage {
+    pub file_count: i64,
+    pub dir_count: i64,
+    pub total_size: i64,
+    pub chunk_count: i64,
 }
 
 /// 一个可长期读取历史分块的 Telegram 存储目标。
@@ -281,6 +292,33 @@ impl Db {
         Ok(row)
     }
 
+    /// 统计一个可见节点。目录递归计算，目录本身不计入 dir_count。
+    pub async fn node_usage(&self, node_id: i64) -> AppResult<NodeUsage> {
+        sqlx::query_as::<_, NodeUsage>(
+            "WITH RECURSIVE sub(id, is_dir, size) AS (
+                 SELECT id, is_dir, size FROM nodes
+                 WHERE id = ? AND status = 'ready'
+                 UNION ALL
+                 SELECT n.id, n.is_dir, n.size
+                 FROM nodes n JOIN sub s ON n.parent_id = s.id
+                 WHERE n.status = 'ready'
+             )
+             SELECT
+                 COALESCE(SUM(CASE WHEN is_dir = 0 THEN 1 ELSE 0 END), 0) AS file_count,
+                 COALESCE(SUM(CASE WHEN is_dir = 1 AND id != ? THEN 1 ELSE 0 END), 0)
+                     AS dir_count,
+                 COALESCE(SUM(CASE WHEN is_dir = 0 THEN size ELSE 0 END), 0) AS total_size,
+                 (SELECT COUNT(*) FROM chunks WHERE node_id IN (SELECT id FROM sub))
+                     AS chunk_count
+             FROM sub",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     // ---------- 目录/重命名 ----------
 
     pub async fn mkdir(&self, parent_id: i64, name: &str) -> AppResult<Node> {
@@ -383,6 +421,7 @@ impl Db {
         Ok(inserted.last_insert_rowid())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_chunk(
         &self,
         node_id: i64,
@@ -391,11 +430,13 @@ impl Db {
         tg_file_id: &str,
         tg_message_id: i64,
         storage_target_id: i64,
+        tg_thumbnail_file_id: Option<&str>,
     ) -> AppResult<()> {
         sqlx::query(
             "INSERT INTO chunks
-                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id,
+                 tg_thumbnail_file_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(node_id)
         .bind(idx)
@@ -403,6 +444,7 @@ impl Db {
         .bind(tg_file_id)
         .bind(tg_message_id)
         .bind(storage_target_id)
+        .bind(tg_thumbnail_file_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -611,8 +653,10 @@ impl Db {
         .last_insert_rowid();
         sqlx::query(
             "INSERT INTO chunks
-                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id)
-             SELECT ?, idx, size, tg_file_id, tg_message_id, storage_target_id
+                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id,
+                 tg_thumbnail_file_id)
+             SELECT ?, idx, size, tg_file_id, tg_message_id, storage_target_id,
+                    tg_thumbnail_file_id
              FROM chunks WHERE node_id = ?",
         )
         .bind(new_id)
@@ -1044,8 +1088,10 @@ impl Db {
         .last_insert_rowid();
         sqlx::query(
             "INSERT INTO chunks
-                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id)
-             SELECT ?, idx, size, tg_file_id, tg_message_id, storage_target_id
+                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id,
+                 tg_thumbnail_file_id)
+             SELECT ?, idx, size, tg_file_id, tg_message_id, storage_target_id,
+                    tg_thumbnail_file_id
              FROM chunks WHERE node_id = ?",
         )
         .bind(new_id)
@@ -1055,50 +1101,6 @@ impl Db {
         let freed = Self::freed_messages(&mut tx, candidates).await?;
         tx.commit().await?;
         Ok(Some((new_id, freed)))
-    }
-
-    // ---------- 视频缩略图 ----------
-
-    /// 按文件内容哈希写入缩略图；相同内容的复制与秒传共享同一份缓存。
-    pub async fn thumbnail_put(&self, sha256: &str, mime: &str, data: &[u8]) -> AppResult<()> {
-        sqlx::query(
-            "INSERT INTO thumbnails (sha256, mime, data, created_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(sha256) DO UPDATE SET
-                 mime = excluded.mime,
-                 data = excluded.data,
-                 created_at = excluded.created_at",
-        )
-        .bind(sha256)
-        .bind(mime)
-        .bind(data)
-        .bind(now_ts())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn thumbnail_get(&self, sha256: &str) -> AppResult<Option<(String, Vec<u8>)>> {
-        Ok(
-            sqlx::query_as("SELECT mime, data FROM thumbnails WHERE sha256 = ?")
-                .bind(sha256)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
-    }
-
-    /// 清理已经没有任何文件引用的缩略图缓存，返回删除数量。
-    pub async fn cleanup_orphan_thumbnails(&self) -> AppResult<u64> {
-        Ok(sqlx::query(
-            "DELETE FROM thumbnails
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM nodes
-                 WHERE nodes.sha256 = thumbnails.sha256
-             )",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected())
     }
 
     // ---------- settings ----------
@@ -1334,15 +1336,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_removes_blob_thumbnail_cache() {
+        let (db, _g) = test_db().await;
+        let (tables,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'thumbnails'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, 0);
+
+        let (columns,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name = 'tg_thumbnail_file_id'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(columns, 1);
+    }
+
+    #[tokio::test]
     async fn upload_lifecycle_and_refcount() {
         let (db, _g) = test_db().await;
         // 上传 2 块的文件
         let up = db.create_uploading(ROOT_ID, "a.bin").await.unwrap();
         assert!(db.uploading_child_exists(ROOT_ID, "a.bin").await.unwrap());
-        db.add_chunk(up, 0, 10, "f0", 100, TEST_TARGET)
+        db.add_chunk(up, 0, 10, "f0", 100, TEST_TARGET, Some("thumb-0"))
             .await
             .unwrap();
-        db.add_chunk(up, 1, 5, "f1", 101, TEST_TARGET)
+        db.add_chunk(up, 1, 5, "f1", 101, TEST_TARGET, None)
             .await
             .unwrap();
         // uploading 期间不可见
@@ -1356,6 +1378,13 @@ mod tests {
 
         // 复制共享消息 → 删除原文件不释放消息
         db.copy_file(node.id, ROOT_ID, "b.bin").await.unwrap();
+        let copied = db.resolve(&["b.bin"]).await.unwrap().unwrap();
+        assert_eq!(
+            db.chunks_of(copied.id).await.unwrap()[0]
+                .tg_thumbnail_file_id
+                .as_deref(),
+            Some("thumb-0")
+        );
         let freed = db.delete_node(node.id).await.unwrap();
         assert!(freed.is_empty());
         // 删除副本后消息释放
@@ -1369,13 +1398,13 @@ mod tests {
     async fn overwrite_replaces_old() {
         let (db, _g) = test_db().await;
         let v1 = db.create_uploading(ROOT_ID, "f").await.unwrap();
-        db.add_chunk(v1, 0, 3, "f0", 200, TEST_TARGET)
+        db.add_chunk(v1, 0, 3, "f0", 200, TEST_TARGET, None)
             .await
             .unwrap();
         db.finalize_upload(v1, 3, None).await.unwrap();
 
         let v2 = db.create_uploading(ROOT_ID, "f").await.unwrap();
-        db.add_chunk(v2, 0, 7, "f1", 201, TEST_TARGET)
+        db.add_chunk(v2, 0, 7, "f1", 201, TEST_TARGET, None)
             .await
             .unwrap();
         let freed = db.finalize_upload(v2, 7, None).await.unwrap();
@@ -1389,7 +1418,9 @@ mod tests {
     async fn stale_upload_cleanup() {
         let (db, _g) = test_db().await;
         let up = db.create_uploading(ROOT_ID, "x").await.unwrap();
-        db.add_chunk(up, 0, 1, "f", 300, TEST_TARGET).await.unwrap();
+        db.add_chunk(up, 0, 1, "f", 300, TEST_TARGET, None)
+            .await
+            .unwrap();
         let freed = db.cleanup_stale_uploads().await.unwrap();
         assert_eq!(freed, vec![stored(300)]);
         assert!(db.node(up).await.is_err());
@@ -1410,11 +1441,32 @@ mod tests {
     /// 建一个 ready 文件的辅助
     async fn mk_file(db: &Db, parent: i64, name: &str, msg: i64, sha: &str) -> i64 {
         let up = db.create_uploading(parent, name).await.unwrap();
-        db.add_chunk(up, 0, 4, &format!("f{msg}"), msg, TEST_TARGET)
+        db.add_chunk(up, 0, 4, &format!("f{msg}"), msg, TEST_TARGET, None)
             .await
             .unwrap();
         db.finalize_upload(up, 4, Some(sha)).await.unwrap();
         up
+    }
+
+    #[tokio::test]
+    async fn node_usage_counts_directory_tree_without_downloading() {
+        let (db, _g) = test_db().await;
+        let docs = db.mkdir(ROOT_ID, "docs").await.unwrap();
+        let sub = db.mkdir(docs.id, "sub").await.unwrap();
+        let first = mk_file(&db, docs.id, "a.bin", 450, "a").await;
+        mk_file(&db, sub.id, "b.bin", 451, "b").await;
+
+        let usage = db.node_usage(docs.id).await.unwrap();
+        assert_eq!(usage.file_count, 2);
+        assert_eq!(usage.dir_count, 1);
+        assert_eq!(usage.total_size, 8);
+        assert_eq!(usage.chunk_count, 2);
+
+        let file_usage = db.node_usage(first).await.unwrap();
+        assert_eq!(file_usage.file_count, 1);
+        assert_eq!(file_usage.dir_count, 0);
+        assert_eq!(file_usage.total_size, 4);
+        assert_eq!(file_usage.chunk_count, 1);
     }
 
     #[tokio::test]
@@ -1461,6 +1513,11 @@ mod tests {
     async fn instant_link_hits_and_overwrites() {
         let (db, _g) = test_db().await;
         let src_id = mk_file(&db, ROOT_ID, "src.bin", 600, "deadbeef").await;
+        sqlx::query("UPDATE chunks SET tg_thumbnail_file_id = 'instant-thumb' WHERE node_id = ?")
+            .bind(src_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         // 对已经成功的同一路径重复探测必须是无副作用成功，分块不能被误删。
         let (same_id, freed) = db
@@ -1488,6 +1545,12 @@ mod tests {
         assert!(freed.is_empty());
         let n = db.node(nid).await.unwrap();
         assert_eq!(n.sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            db.chunks_of(nid).await.unwrap()[0]
+                .tg_thumbnail_file_id
+                .as_deref(),
+            Some("instant-thumb")
+        );
         // 删源文件不释放消息(副本还引用着)
         let src = db.resolve(&["src.bin"]).await.unwrap().unwrap();
         assert!(db.delete_node(src.id).await.unwrap().is_empty());
@@ -1500,24 +1563,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(freed, vec![stored(700)]);
-    }
-
-    #[tokio::test]
-    async fn thumbnail_cache_follows_content_hash() {
-        let (db, _g) = test_db().await;
-        let data = b"RIFFxxxxWEBPthumbnail";
-        db.thumbnail_put("thumb-sha", "image/webp", data)
-            .await
-            .unwrap();
-        let got = db.thumbnail_get("thumb-sha").await.unwrap().unwrap();
-        assert_eq!(got.0, "image/webp");
-        assert_eq!(got.1, data);
-
-        let node = mk_file(&db, ROOT_ID, "video.mp4", 750, "thumb-sha").await;
-        assert_eq!(db.cleanup_orphan_thumbnails().await.unwrap(), 0);
-        db.delete_node(node).await.unwrap();
-        assert_eq!(db.cleanup_orphan_thumbnails().await.unwrap(), 1);
-        assert!(db.thumbnail_get("thumb-sha").await.unwrap().is_none());
     }
 
     #[tokio::test]

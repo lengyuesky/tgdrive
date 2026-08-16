@@ -4,6 +4,9 @@ services:
     image: tgdrive:latest
     # 与宿主机 data 目录保持同一 UID/GID；默认桌面 Linux 用户通常是 1000。
     user: "${TGDRIVE_UID:-1000}:${TGDRIVE_GID:-1000}"
+    # Bot API 的 local 文件默认属于 101:101 且目录权限为 750；补充该组才能只读缩略图。
+    group_add:
+      - "${TGDRIVE_BOT_API_GID:-101}"
     restart: unless-stopped
     ports:
       - "8080:8080"

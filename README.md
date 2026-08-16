@@ -20,7 +20,7 @@ WebDAV 客户端─┘   ├ /api/*  REST            └─> Telegram Bot API
 - **回收站**:删除先软删可恢复(WebDAV 删除同样进回收站),超过保留天数自动彻底清理
 - **全局搜索**:按文件名全库搜索,结果直达所在目录
 - **Bot 收件**:往存储频道直发或白名单用户私聊文件/视频/图片自动零流量转存;可把视频、图片、书籍分别存到指定目录,并自定义「文件后缀 → 目录」规则
-- **数据库备份**:一键下载一致性快照;可开启每日自动备份到存储频道(滚动保留 7 份)
+- **数据库备份**:一键下载一致性快照;可开启每日自动分块备份到存储频道(默认 18MB,滚动保留 7 组)
 - **可靠后台任务**:Telegram 删除失败进入持久化重试队列;Bot 收件连续失败会进入死信,避免卡住后续消息
 - **WebDAV**:支持 rclone、Windows 资源管理器、macOS Finder(Class 2 LOCK)
 - **零成本复制**:复制文件/目录只复制元数据,共享底层 Telegram 消息(引用计数,删除安全)
@@ -78,7 +78,7 @@ docker compose --profile local-bot-api up -d
 > （compose 的 `${VAR}` 插值取自宿主机 `.env`）。所以这两项无论在哪改，都要先导出并
 > 覆盖宿主机 `.env`，再重启/重建 tgdrive 与 telegram-bot-api。
 
-compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相同路径只读挂到 tgdrive 容器(local 模式下 `getFile` 返回容器内绝对路径,tgdrive 自动探测并直读磁盘,失败才回退 HTTP)。
+compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相同路径只读挂到 tgdrive 容器(local 模式下 `getFile` 返回容器内绝对路径,tgdrive 自动探测并直读磁盘,失败才回退 HTTP)。默认还会把 Bot API 的文件组 `101` 作为 tgdrive 的补充组；若换用 UID/GID 不同的镜像，请把 `TGDRIVE_BOT_API_GID` 改为该镜像中文件所属的组 ID。
 
 > 注意:bot 在官方与自建服务器之间迁移时,Telegram 要求先对旧端点调用 `logOut`,详见 telegram-bot-api 文档。
 
@@ -99,6 +99,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_LOCAL_DATA_ROOT` | | `/var/lib/telegram-bot-api` | | 自建 Bot API local 模式允许读取的根目录;必须与 Compose 共享卷的容器内路径一致,修改需重启 |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | | — | ✔* | 在 <https://my.telegram.org> 申请；tgdrive 用于 MTProto Range 流式下载，自建 Bot API 也使用；\*后台可编辑并导出，修改后必须重启/重建两个服务 |
 | `TGDRIVE_UID` / `TGDRIVE_GID` | | `1000` / `1000` | | Compose 中 tgdrive 进程的 UID/GID;应对 `./data` 有写权限 |
+| `TGDRIVE_BOT_API_GID` | | `101` | | 自建 Bot API 数据文件的组 ID;tgdrive 以补充组身份只读 local 文件和缩略图 |
 | `TGDRIVE_LISTEN` | | `0.0.0.0:8080` | | 监听地址(端口由 compose 映射,改需重启) |
 | `TGDRIVE_DB_PATH` | | `/data/tgdrive.db`(镜像内) | | SQLite 路径(设置本身存在这个库里) |
 | `TGDRIVE_SECRET` | | 自动生成并存库 | | cookie 签名密钥,**仅首次启动时作为初始值**,之后以库中值为准 |
@@ -120,7 +121,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 - **安全网**:改 Telegram 相关配置时会验证 Bot 身份、目标会话以及频道/群组的管理员、发消息和删消息权限;验证失败就拒绝保存(可选择强制保存,给自建端点还没启动的场景用)。分块大小与端点的组合也会一并校验,例如切回官方端点时不允许保留 512MB 的分块
 - **导出 .env**:把当前生效配置生成 `.env` 文本,方便同步回宿主机文件
-- **维护**:清理上传中断留下的残留;登出所有会话(轮换签名密钥)
+- **维护**:设置数据库备份分块大小(默认采用官方 Bot API 安全值 18MB)、清理上传中断留下的残留、登出所有会话(轮换签名密钥)
 
 > 改账号后所有设备的登录状态立即失效,WebDAV 客户端也要同步改密码。
 
@@ -129,6 +130,19 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 - **换 Bot、端点或存储频道**只影响之后开始的上传。每个分块会记录原 Bot/API/频道,历史文件仍按原目标读取和删除;请保留原 Bot Token、端点和频道权限,否则对应历史文件会不可用。
 - **旧数据库首次升级**无法凭 Telegram 消息反推出每个历史分块的原目标,程序会把尚未关联目标的旧分块一次性绑定到升级时的当前配置。如果旧库曾经换过 Bot、端点或频道,请先备份数据库并人工核对。
 - **api_id / api_hash 改完不会立刻生效**：tgdrive 在启动时读取它们建立 MTProto 会话，Compose 也把它们传给 telegram-bot-api。保存后要导出 `.env` 覆盖回项目目录，再执行 `docker compose --profile local-bot-api up -d --build tgdrive telegram-bot-api`。
+
+### 数据库备份恢复
+
+发到存储频道的 SQLite 快照使用独立的备份分块设置，默认每块 18MB，确保官方 Bot API
+也能下载。未超过分块大小时只有一个 `.db` 文件，可直接替换 `data/tgdrive.db`；多块备份的
+文件名以 `.part0001-of-000N` 结尾。把同一时间戳的全部分块下载到单独目录后，按编号顺序合并：
+
+```bash
+cat tgdrive-backup-YYYYMMDD-HHMM.db.part*-of-* > tgdrive.db
+```
+
+停止 tgdrive 后再用合并出的 `tgdrive.db` 替换原数据库。滚动保留按整组计算，超过 7 组时会
+清理最旧备份的全部分块，不会只留下半组。
 
 ### Range 流式播放
 

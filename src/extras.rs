@@ -8,6 +8,8 @@ use std::collections::HashSet;
 
 pub const DEFAULT_TRASH_DAYS: i64 = 30;
 pub const DEFAULT_INBOX_DIR: &str = "/收件箱";
+/// 数据库备份默认按官方 Bot API 可安全下载的大小分块。
+pub const DEFAULT_BACKUP_CHUNK_SIZE: u64 = crate::config::OFFICIAL_CHUNK_DEFAULT;
 const MAX_INBOX_RULES: usize = 50;
 const MAX_RULE_EXTENSIONS: usize = 100;
 
@@ -25,6 +27,8 @@ pub struct Extras {
     pub trash_retention_days: i64,
     /// 每日自动把数据库快照发到存储频道
     pub backup_auto: bool,
+    /// 数据库快照上传到 Telegram 时的单块大小
+    pub backup_chunk_size: u64,
     /// Bot 收件(频道直发 + 私聊白名单转存)
     pub inbox_enabled: bool,
     /// 允许私聊收件的 chat id,逗号分隔;空 = 只收存储频道内直发
@@ -68,12 +72,25 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
         },
         None => Vec::new(),
     };
+    let backup_chunk_size = match get(db, "backup_chunk_size").await? {
+        Some(raw) => match parse_backup_chunk_size(&raw) {
+            Ok(size) => size,
+            Err(error) => {
+                tracing::warn!(
+                    "忽略无效的数据库备份分块大小（{error}），改用默认值 {DEFAULT_BACKUP_CHUNK_SIZE}"
+                );
+                DEFAULT_BACKUP_CHUNK_SIZE
+            }
+        },
+        None => DEFAULT_BACKUP_CHUNK_SIZE,
+    };
     Ok(Extras {
         trash_retention_days: get(db, "trash_retention_days")
             .await?
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TRASH_DAYS),
         backup_auto: get(db, "backup_auto").await?.as_deref() == Some("1"),
+        backup_chunk_size,
         inbox_enabled: get(db, "inbox_enabled").await?.as_deref() == Some("1"),
         inbox_allowed_chats: get(db, "inbox_allowed_chats").await?.unwrap_or_default(),
         inbox_video_dir: get(db, "inbox_video_dir")
@@ -97,6 +114,8 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
 pub struct ExtrasPatch {
     pub trash_retention_days: Option<i64>,
     pub backup_auto: Option<bool>,
+    /// 字符串形式便于后台使用 `18MB`、`1GB` 等写法。
+    pub backup_chunk_size: Option<String>,
     pub inbox_enabled: Option<bool>,
     pub inbox_allowed_chats: Option<String>,
     pub inbox_dir: Option<String>,
@@ -104,6 +123,29 @@ pub struct ExtrasPatch {
     pub inbox_image_dir: Option<String>,
     pub inbox_book_dir: Option<String>,
     pub inbox_rules: Option<Vec<InboxRouteRule>>,
+}
+
+/// 解析并校验数据库备份分块大小的全局范围。
+pub fn parse_backup_chunk_size(raw: &str) -> AppResult<u64> {
+    let size = crate::config::parse_size(raw)
+        .map_err(|error| AppError::BadRequest(format!("数据库备份分块大小无效：{error}")))?;
+    if size < crate::config::MIN_CHUNK {
+        return Err(AppError::BadRequest(
+            "数据库备份分块大小不得小于 1MB".into(),
+        ));
+    }
+    if size > crate::config::SELF_HOSTED_CHUNK_MAX {
+        return Err(AppError::BadRequest(
+            "数据库备份分块大小不得超过 1900MB".into(),
+        ));
+    }
+    Ok(size)
+}
+
+/// 校验备份分块能否由当前 Bot API 端点上传并重新下载。
+pub fn validate_backup_chunk_size(api_base: &str, size: u64) -> AppResult<()> {
+    crate::config::validate_chunk_size(api_base, size)
+        .map_err(|error| AppError::BadRequest(format!("数据库备份分块大小无效：{error}")))
 }
 
 fn normalize_dir(raw: &str, label: &str) -> AppResult<String> {
@@ -233,12 +275,20 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
         .map(|v| normalize_dir(v, "书籍目录"))
         .transpose()?;
     let inbox_rules = p.inbox_rules.as_deref().map(normalize_rules).transpose()?;
+    let backup_chunk_size = p
+        .backup_chunk_size
+        .as_deref()
+        .map(parse_backup_chunk_size)
+        .transpose()?;
 
     if let Some(d) = p.trash_retention_days {
         set(db, "trash_retention_days", &d.to_string()).await?;
     }
     if let Some(b) = p.backup_auto {
         set(db, "backup_auto", if b { "1" } else { "0" }).await?;
+    }
+    if let Some(size) = backup_chunk_size {
+        set(db, "backup_chunk_size", &size.to_string()).await?;
     }
     if let Some(b) = p.inbox_enabled {
         set(db, "inbox_enabled", if b { "1" } else { "0" }).await?;
@@ -297,6 +347,19 @@ mod tests {
         assert!(conflict.is_err());
     }
 
+    #[test]
+    fn backup_chunk_size_uses_official_default_and_validates_range() {
+        assert_eq!(DEFAULT_BACKUP_CHUNK_SIZE, 18 * 1024 * 1024);
+        assert_eq!(parse_backup_chunk_size("8MB").unwrap(), 8 * 1024 * 1024);
+        assert!(parse_backup_chunk_size("512KB").is_err());
+        assert!(
+            validate_backup_chunk_size(crate::config::OFFICIAL_API_BASE, 25 * 1024 * 1024).is_err()
+        );
+        assert!(
+            validate_backup_chunk_size("http://telegram-bot-api:8081", 512 * 1024 * 1024).is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn inbox_routing_settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -315,6 +378,7 @@ mod tests {
         .await
         .unwrap();
         let defaults = load(&db).await.unwrap();
+        assert_eq!(defaults.backup_chunk_size, DEFAULT_BACKUP_CHUNK_SIZE);
         assert_eq!(defaults.inbox_video_dir, "/所有/视频");
         assert_eq!(defaults.inbox_image_dir, "/所有/图片");
         assert_eq!(defaults.inbox_book_dir, "/所有/书籍");
@@ -323,6 +387,7 @@ mod tests {
             &db,
             &ExtrasPatch {
                 inbox_dir: Some("/所有".into()),
+                backup_chunk_size: Some("8MB".into()),
                 inbox_video_dir: Some("/分类/视频".into()),
                 inbox_image_dir: Some("/分类/图片".into()),
                 inbox_book_dir: Some("/分类/书籍".into()),
@@ -338,6 +403,7 @@ mod tests {
         .unwrap();
 
         let got = load(&db).await.unwrap();
+        assert_eq!(got.backup_chunk_size, 8 * 1024 * 1024);
         assert_eq!(got.inbox_dir, "/所有");
         assert_eq!(got.inbox_video_dir, "/分类/视频");
         assert_eq!(got.inbox_image_dir, "/分类/图片");

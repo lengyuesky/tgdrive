@@ -67,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/fs/list", get(list))
+        .route("/fs/properties", get(properties_get))
         .route("/fs/mkdir", post(mkdir))
         .route(
             "/fs/upload",
@@ -74,12 +75,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/fs/exists", post(exists))
         .route("/fs/download", get(download))
-        .route(
-            "/fs/thumbnail",
-            get(thumbnail_get)
-                .post(thumbnail_put)
-                .layer(axum::extract::DefaultBodyLimit::max(MAX_THUMBNAIL_SIZE)),
-        )
+        .route("/fs/thumbnail", get(thumbnail_get))
         .route("/fs/rename", post(rename))
         .route("/fs/copy", post(copy_entry))
         .route("/fs/delete", post(delete))
@@ -223,6 +219,35 @@ async fn list(
     ))
 }
 
+/// 返回文件或目录属性。目录统计只查询 SQLite 元数据，不读取 Telegram 内容。
+async fn properties_get(
+    State(state): State<AppState>,
+    Query(q): Query<PathQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let node = state.vfs.resolve(&q.path).await?;
+    let usage = state.vfs.db.node_usage(node.id).await?;
+    let segments = crate::vfs::normalize(&q.path)?;
+    let path = if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    };
+    Ok(Json(serde_json::json!({
+        "properties": {
+            "name": node.name,
+            "path": path,
+            "is_dir": node.is_dir,
+            "size": usage.total_size,
+            "created_at": node.created_at,
+            "modified_at": node.modified_at,
+            "sha256": node.sha256,
+            "file_count": usage.file_count,
+            "dir_count": usage.dir_count,
+            "chunk_count": usage.chunk_count,
+        }
+    })))
+}
+
 #[derive(Deserialize)]
 struct PathBody {
     path: String,
@@ -284,16 +309,47 @@ async fn upload(
 ) -> AppResult<Json<serde_json::Value>> {
     let dir = state.vfs.resolve(&q.path).await?;
     let mut saved = Vec::new();
+    let mut pending_thumbnail: Option<Bytes> = None;
     while let Some(mut field) = mp
         .next_field()
         .await
         .map_err(|e| AppError::BadRequest(format!("multipart 解析失败: {e}")))?
     {
+        if field.name() == Some("thumbnail") {
+            if pending_thumbnail.is_some() {
+                return Err(AppError::BadRequest("同一文件收到多个缩略图".into()));
+            }
+            let declared = field.content_type().unwrap_or("").to_string();
+            let mut data = Vec::new();
+            loop {
+                match field.chunk().await {
+                    Ok(Some(bytes)) => {
+                        if data.len() + bytes.len() >= crate::telegram::MAX_THUMBNAIL_SIZE {
+                            return Err(AppError::BadRequest(format!(
+                                "缩略图必须小于 {}KB",
+                                crate::telegram::MAX_THUMBNAIL_SIZE / 1024
+                            )));
+                        }
+                        data.extend_from_slice(&bytes);
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(AppError::BadRequest(format!("读取缩略图失败: {e}")));
+                    }
+                }
+            }
+            validate_thumbnail_upload(&declared, &data)?;
+            pending_thumbnail = Some(Bytes::from(data));
+            continue;
+        }
         let Some(fname) = field.file_name().map(str::to_string) else {
             continue;
         };
         let name = clean_filename(&fname)?;
-        let handle = state.vfs.start_upload(&dir, &name).await?;
+        let handle = state
+            .vfs
+            .start_upload(&dir, &name, pending_thumbnail.take())
+            .await?;
         loop {
             match field.chunk().await {
                 Ok(Some(bytes)) => handle.feed(bytes).await?,
@@ -310,59 +366,139 @@ async fn upload(
     if saved.is_empty() {
         return Err(AppError::BadRequest("请求中没有文件".into()));
     }
+    if pending_thumbnail.is_some() {
+        return Err(AppError::BadRequest("缩略图后缺少对应文件".into()));
+    }
     Ok(Json(serde_json::json!({ "saved": saved })))
 }
 
 // ---------- 视频缩略图 ----------
 
-const MAX_THUMBNAIL_SIZE: usize = 512 * 1024;
+/// 防止上游异常响应占用过多内存；Telegram 自定义缩略图本身限制为 200KB。
+const MAX_DOWNLOADED_THUMBNAIL_SIZE: usize = 512 * 1024;
 
 #[derive(Deserialize)]
 struct ThumbnailQuery {
-    sha256: String,
-    #[serde(default)]
-    path: Option<String>,
-}
-
-fn normalized_sha256(raw: &str) -> AppResult<String> {
-    if raw.len() != 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(AppError::BadRequest("sha256 格式不对".into()));
-    }
-    Ok(raw.to_ascii_lowercase())
+    path: String,
 }
 
 fn detect_thumbnail_mime(declared: &str, data: &[u8]) -> AppResult<&'static str> {
-    if declared == "image/webp"
-        && data.len() >= 12
-        && &data[..4] == b"RIFF"
-        && &data[8..12] == b"WEBP"
-    {
-        Ok("image/webp")
-    } else if declared == "image/jpeg" && data.starts_with(&[0xff, 0xd8, 0xff]) {
+    if declared == "image/jpeg" && data.starts_with(&[0xff, 0xd8, 0xff]) {
         Ok("image/jpeg")
     } else {
-        Err(AppError::BadRequest(
-            "只接受有效的 WebP 或 JPEG 缩略图".into(),
-        ))
+        Err(AppError::BadRequest("只接受有效的 JPEG 缩略图".into()))
     }
 }
 
-/// 返回已经缓存的小图，不读取原视频或 Telegram。
+/// 从 JPEG 的 SOF 段读取尺寸，不解码像素。
+fn jpeg_dimensions(data: &[u8]) -> Option<(u16, u16)> {
+    if !data.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut pos = 2usize;
+    while pos + 3 < data.len() {
+        if data[pos] != 0xff {
+            pos += 1;
+            continue;
+        }
+        while pos < data.len() && data[pos] == 0xff {
+            pos += 1;
+        }
+        let marker = *data.get(pos)?;
+        pos += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        if marker == 0x01 || (0xd0..=0xd8).contains(&marker) {
+            continue;
+        }
+        let segment_len = u16::from_be_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
+        if segment_len < 2 || pos + segment_len > data.len() {
+            return None;
+        }
+        let is_sof = matches!(
+            marker,
+            0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+        );
+        if is_sof {
+            if segment_len < 7 {
+                return None;
+            }
+            let height = u16::from_be_bytes([data[pos + 3], data[pos + 4]]);
+            let width = u16::from_be_bytes([data[pos + 5], data[pos + 6]]);
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        pos += segment_len;
+    }
+    None
+}
+
+fn validate_thumbnail_upload(declared: &str, data: &[u8]) -> AppResult<()> {
+    if data.is_empty() || data.len() >= crate::telegram::MAX_THUMBNAIL_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "缩略图大小必须在 1~{}KB 之间（不含上限）",
+            crate::telegram::MAX_THUMBNAIL_SIZE / 1024
+        )));
+    }
+    detect_thumbnail_mime(declared, data)?;
+    let (width, height) = jpeg_dimensions(data)
+        .ok_or_else(|| AppError::BadRequest("JPEG 缩略图缺少有效尺寸".into()))?;
+    if width > 320 || height > 320 {
+        return Err(AppError::BadRequest(
+            "Telegram 缩略图的宽高都不能超过 320 像素".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn downloaded_thumbnail_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn thumbnail_not_found() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::empty())
+        .expect("构造缩略图未命中响应失败")
+}
+
+fn thumbnail_etag(file_id: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(file_id.as_bytes());
+    format!(
+        "\"telegram-thumbnail-{}\"",
+        crate::engine::upload::to_hex(&digest)
+    )
+}
+
+/// 根据第 0 块记录的 Telegram thumbnail file_id 请求小图；不会读取原视频。
 async fn thumbnail_get(
     State(state): State<AppState>,
     Query(q): Query<ThumbnailQuery>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let sha = normalized_sha256(&q.sha256)?;
-    let Some((mime, data)) = state.vfs.db.thumbnail_get(&sha).await? else {
-        // 404 不缓存，后续为历史文件补上缩略图后可立即显示。
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(axum::body::Body::empty())
-            .expect("构造缩略图未命中响应失败"));
+    let node = state.vfs.resolve(&q.path).await?;
+    if node.is_dir {
+        return Err(AppError::IsDirectory);
+    }
+    let chunks = state.vfs.db.chunks_of(node.id).await?;
+    let Some(first) = chunks.first().filter(|chunk| chunk.idx == 0) else {
+        return Ok(thumbnail_not_found());
     };
-    let etag = format!("\"thumbnail-{sha}\"");
+    let Some(file_id) = first.tg_thumbnail_file_id.as_deref() else {
+        // 404 不缓存，历史消息重新登记或替换后可立即显示。
+        return Ok(thumbnail_not_found());
+    };
+    let etag = thumbnail_etag(file_id);
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -374,55 +510,31 @@ async fn thumbnail_get(
             .body(axum::body::Body::empty())
             .expect("构造缩略图缓存响应失败"));
     }
+    let storage_target_id = first
+        .storage_target_id
+        .ok_or_else(|| AppError::BadRequest("该历史文件没有可用的 Telegram 存储目标".into()))?;
+    let binding = state.vfs.tg.binding(storage_target_id)?;
+    let reader = binding
+        .api
+        .open_thumbnail_stream(file_id, first.tg_message_id)
+        .await?;
+    let mut limited = reader.take((MAX_DOWNLOADED_THUMBNAIL_SIZE + 1) as u64);
+    let mut data = Vec::new();
+    limited.read_to_end(&mut data).await?;
+    if data.len() > MAX_DOWNLOADED_THUMBNAIL_SIZE {
+        return Err(AppError::Telegram("Telegram 缩略图大小异常".into()));
+    }
+    let mime = downloaded_thumbnail_mime(&data)
+        .ok_or_else(|| AppError::Telegram("Telegram 返回的缩略图格式无效".into()))?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
         .header(header::CONTENT_LENGTH, data.len())
-        .header(
-            header::CACHE_CONTROL,
-            "private, max-age=31536000, immutable",
-        )
+        .header(header::CACHE_CONTROL, "private, no-cache")
         .header(header::ETAG, etag)
         .header("x-content-type-options", "nosniff")
         .body(axum::body::Body::from(data))
         .expect("构造缩略图响应失败"))
-}
-
-/// 接收浏览器从本地待上传视频提取的小图，并按最终文件哈希持久化。
-async fn thumbnail_put(
-    State(state): State<AppState>,
-    Query(q): Query<ThumbnailQuery>,
-    headers: HeaderMap,
-    data: Bytes,
-) -> AppResult<Json<serde_json::Value>> {
-    let sha = normalized_sha256(&q.sha256)?;
-    let path = q
-        .path
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("缺少文件路径".into()))?;
-    let node = state.vfs.resolve(path).await?;
-    if node.is_dir {
-        return Err(AppError::IsDirectory);
-    }
-    if node.sha256.as_deref() != Some(sha.as_str()) {
-        return Err(AppError::BadRequest(
-            "文件内容已经变化，拒绝写入旧缩略图".into(),
-        ));
-    }
-    if data.is_empty() || data.len() > MAX_THUMBNAIL_SIZE {
-        return Err(AppError::BadRequest(format!(
-            "缩略图大小必须在 1~{}KB 之间",
-            MAX_THUMBNAIL_SIZE / 1024
-        )));
-    }
-    let declared = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .unwrap_or("");
-    let mime = detect_thumbnail_mime(declared, &data)?;
-    state.vfs.db.thumbnail_put(&sha, mime, &data).await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// 解析单个 Range;None=无 Range,Err=不可满足
@@ -926,6 +1038,13 @@ struct InstantBody {
     size: i64,
 }
 
+fn normalized_sha256(raw: &str) -> AppResult<String> {
+    if raw.len() != 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest("sha256 格式不对".into()));
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
 /// 秒传探测:库里已有同内容文件则零流量落位,否则让前端走真实上传
 async fn instant(
     State(state): State<AppState>,
@@ -1332,8 +1451,12 @@ async fn admin_backup(State(state): State<AppState>) -> AppResult<Response> {
 async fn admin_backup_to_channel(
     State(state): State<AppState>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let name = crate::housekeeping::backup_to_channel(&state.vfs, &state.rt).await?;
-    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+    let backup = crate::housekeeping::backup_to_channel(&state.vfs, &state.rt).await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "name": backup.name,
+        "parts": backup.parts,
+    })))
 }
 
 async fn extras_get(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
@@ -1356,6 +1479,10 @@ async fn extras_set(
     State(state): State<AppState>,
     Json(p): Json<crate::extras::ExtrasPatch>,
 ) -> AppResult<Json<serde_json::Value>> {
+    if let Some(raw) = p.backup_chunk_size.as_deref() {
+        let size = crate::extras::parse_backup_chunk_size(raw)?;
+        crate::extras::validate_backup_chunk_size(&state.rt.current().api_base, size)?;
+    }
     crate::extras::save(&state.vfs.db, &p).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1366,19 +1493,27 @@ mod tests {
 
     #[test]
     fn thumbnail_input_validation() {
+        let jpeg_320x200 = [
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0xc8, 0x01, 0x40, 0x01, 0x01, 0x11,
+            0x00, 0xff, 0xd9,
+        ];
+        assert_eq!(jpeg_dimensions(&jpeg_320x200), Some((320, 200)));
+        assert!(validate_thumbnail_upload("image/jpeg", &jpeg_320x200).is_ok());
+        assert!(validate_thumbnail_upload("image/webp", &jpeg_320x200).is_err());
+
+        let mut too_wide = jpeg_320x200;
+        too_wide[9] = 0x01;
+        too_wide[10] = 0x41;
+        assert!(validate_thumbnail_upload("image/jpeg", &too_wide).is_err());
+        assert!(detect_thumbnail_mime("image/png", b"not-an-image").is_err());
+        assert_eq!(downloaded_thumbnail_mime(&jpeg_320x200), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn sha256_input_validation() {
         let upper = "A".repeat(64);
         assert_eq!(normalized_sha256(&upper).unwrap(), "a".repeat(64));
         assert!(normalized_sha256("bad").is_err());
-
-        assert_eq!(
-            detect_thumbnail_mime("image/webp", b"RIFFxxxxWEBPdata").unwrap(),
-            "image/webp"
-        );
-        assert_eq!(
-            detect_thumbnail_mime("image/jpeg", &[0xff, 0xd8, 0xff, 0x00]).unwrap(),
-            "image/jpeg"
-        );
-        assert!(detect_thumbnail_mime("image/png", b"not-an-image").is_err());
     }
 
     #[test]
