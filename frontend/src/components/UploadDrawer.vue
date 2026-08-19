@@ -18,6 +18,7 @@
       <div class="upload-name" :title="displayName(it)">
         <el-tag v-if="it.status === 'instant'" size="small" type="success" class="badge">秒传</el-tag>
         <el-tag v-else-if="it.status === 'skipped'" size="small" type="info" class="badge">跳过</el-tag>
+        <el-tag v-else-if="it.session" size="small" type="warning" class="badge">可续传</el-tag>
         {{ displayName(it) }}
       </div>
       <el-progress
@@ -28,15 +29,39 @@
       <div class="upload-sub">
         <span v-if="it.status === 'hashing'" class="state">校验中(秒传检测)…</span>
         <span v-else-if="it.status === 'waiting'" class="state">排队中</span>
-        <span v-else-if="it.status === 'uploading'" class="state">上传中</span>
+        <span v-else-if="it.status === 'uploading'" class="state">上传中，可随时暂停</span>
+        <span v-else-if="it.status === 'paused'" class="state">已暂停，分块已保留</span>
+        <span v-else-if="it.status === 'needs_file'" class="state">请选择原文件继续</span>
+        <span v-else-if="it.status === 'cancelling'" class="state">正在清理已上传分块…</span>
         <span v-else-if="it.status === 'skipped'" class="state">已跳过(目录里有同名文件)</span>
         <span v-if="it.error" class="upload-err">{{ it.error }}</span>
         <div class="spacer" />
-        <el-button v-if="it.status === 'error'" text size="small" type="primary" @click="retry(it)">
+        <el-button v-if="it.status === 'uploading'" text size="small" @click="pause(it)">
+          暂停
+        </el-button>
+        <el-button
+          v-else-if="it.status === 'needs_file'"
+          text
+          size="small"
+          type="primary"
+          @click="chooseFile(it)"
+        >
+          选择文件
+        </el-button>
+        <el-button v-else-if="it.status === 'paused'" text size="small" type="primary" @click="resume(it)">
+          继续
+        </el-button>
+        <el-button v-else-if="it.status === 'error'" text size="small" type="primary" @click="retry(it)">
           重试
         </el-button>
-        <el-button v-if="it.status === 'waiting'" text size="small" @click="removeWaiting(it)">
-          移除
+        <el-button
+          v-if="!isDone(it) && it.status !== 'cancelling'"
+          text
+          size="small"
+          type="danger"
+          @click="cancelItem(it)"
+        >
+          取消任务
         </el-button>
       </div>
     </div>
@@ -71,18 +96,38 @@ export interface UploadFile {
 </script>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { createSHA256 } from 'hash-wasm'
-import { api, errMsg } from '../api'
+import { api, errMsg, type UploadSession } from '../api'
+
+type UploadStatus =
+  | 'hashing'
+  | 'waiting'
+  | 'uploading'
+  | 'paused'
+  | 'needs_file'
+  | 'cancelling'
+  | 'instant'
+  | 'done'
+  | 'skipped'
+  | 'error'
 
 interface Item {
   id: number
   dir: string
   rel: string
-  file: File
+  name: string
+  size: number
+  file?: File
   pct: number
-  status: 'hashing' | 'waiting' | 'uploading' | 'instant' | 'done' | 'skipped' | 'error'
+  status: UploadStatus
   error?: string
+  sha256?: string
+  session?: UploadSession
+  concurrency: number
+  controllers: Set<AbortController>
+  pauseRequested: boolean
+  cancelled: boolean
   /** undefined 表示尚未尝试生成，null 表示浏览器无法解码该视频。 */
   thumbnail?: Blob | null
 }
@@ -93,22 +138,52 @@ const emit = defineEmits<{ uploaded: [] }>()
 
 const totalCount = computed(() => items.value.length)
 const doneCount = computed(() => items.value.filter(isDone).length)
-const finishedExists = computed(() => items.value.some((i) => isDone(i) || i.status === 'error'))
-function isDone(it: Item) {
-  return it.status === 'done' || it.status === 'instant' || it.status === 'skipped'
+const finishedExists = computed(() => items.value.some((item) => isDone(item)))
+function isDone(item: Item) {
+  return item.status === 'done' || item.status === 'instant' || item.status === 'skipped'
 }
-function displayName(it: Item) {
-  return it.rel ? `${it.rel}/${it.file.name}` : it.file.name
+function displayName(item: Item) {
+  if (item.session) return item.session.path.replace(/^\//, '')
+  return item.rel ? `${item.rel}/${item.name}` : item.name
 }
 
 let seq = 0
 let busy = false
+let defaultConcurrency = 1
 const queue: Item[] = []
-/** 本次会话已确保存在的目录,避免每个文件都调一次 mkdir */
+/** 本次页面会话已确保存在的目录，避免每个文件都重复调用 mkdir。 */
 const ensuredDirs = new Set<string>()
 
 function joinPath(dir: string, name: string) {
   return dir === '/' ? `/${name}` : `${dir}/${name}`
+}
+
+function parentOf(path: string) {
+  const index = path.lastIndexOf('/')
+  return index <= 0 ? '/' : path.slice(0, index)
+}
+
+function sessionPct(session: UploadSession) {
+  return session.size === 0 ? 0 : Math.round((session.uploaded_bytes / session.size) * 100)
+}
+
+function fromSession(session: UploadSession, concurrency: number): Item {
+  return {
+    id: ++seq,
+    dir: parentOf(session.path),
+    rel: '',
+    name: session.name,
+    size: session.size,
+    pct: sessionPct(session),
+    status: 'needs_file',
+    error: '页面刷新后需要重新选择原文件，已完成分块不会重复上传',
+    sha256: session.sha256,
+    session,
+    concurrency,
+    controllers: new Set(),
+    pauseRequested: true,
+    cancelled: false,
+  }
 }
 
 // ---------- 重名冲突询问 ----------
@@ -116,111 +191,166 @@ function joinPath(dir: string, name: string) {
 type ConflictAction = 'overwrite' | 'skip' | 'cancel'
 const conflictVisible = ref(false)
 const conflictNames = ref<string[]>([])
-let conflictResolve: ((a: ConflictAction) => void) | null = null
+let conflictResolve: ((action: ConflictAction) => void) | null = null
 
 function askConflict(names: string[]): Promise<ConflictAction> {
   conflictNames.value = names
   conflictVisible.value = true
-  return new Promise((res) => (conflictResolve = res))
+  return new Promise((resolve) => (conflictResolve = resolve))
 }
 
-function resolveConflict(a: ConflictAction) {
-  const r = conflictResolve
+function resolveConflict(action: ConflictAction) {
+  const resolve = conflictResolve
   conflictResolve = null
   conflictVisible.value = false
-  r?.(a)
+  resolve?.(action)
 }
 
-/** 点 X / 按 ESC 关闭对话框视为取消上传 */
+/** 点 X 或按 ESC 关闭对话框视为取消上传。 */
 function onConflictClose() {
   if (conflictResolve) resolveConflict('cancel')
 }
 
-/** 入队一批文件并打开抽屉,逐个串行处理(后端再按分块并发)。
- *  入队前按目标目录批量查重,有同名文件时让用户选覆盖/跳过/取消 */
+/** 入队前按目标目录批量查重，有同名文件时让用户选择覆盖、跳过或取消。 */
 async function enqueue(dir: string, files: UploadFile[]) {
-  const relOf = (f: UploadFile) => (f.rel ?? '').replace(/^\/+|\/+$/g, '')
-  // 按目标目录分组查一次重;查重失败不阻塞上传(与秒传探测同样宽容)
+  const relOf = (upload: UploadFile) => (upload.rel ?? '').replace(/^\/+|\/+$/g, '')
   const groups = new Map<string, UploadFile[]>()
-  for (const f of files) {
-    const rel = relOf(f)
+  for (const upload of files) {
+    const rel = relOf(upload)
     const target = rel ? joinPath(dir, rel) : dir
-    const g = groups.get(target)
-    if (g) g.push(f)
-    else groups.set(target, [f])
+    const group = groups.get(target)
+    if (group) group.push(upload)
+    else groups.set(target, [upload])
   }
-  const dupes = new Set<UploadFile>()
-  for (const [target, fs] of groups) {
+  const duplicates = new Set<UploadFile>()
+  for (const [target, group] of groups) {
     try {
-      const r = await api.exists(target, fs.map((f) => f.file.name))
-      const hit = new Set(r.data.existing)
-      for (const f of fs) if (hit.has(f.file.name)) dupes.add(f)
+      const response = await api.exists(target, group.map((upload) => upload.file.name))
+      const existing = new Set(response.data.existing)
+      for (const upload of group) if (existing.has(upload.file.name)) duplicates.add(upload)
     } catch {
-      // 查重接口不可用就当没有重名,行为退回旧版(直接覆盖)
+      // 查重只是交互增强，短暂失败时仍允许后续上传接口处理。
     }
   }
 
   let action: ConflictAction = 'overwrite'
-  if (dupes.size > 0) {
-    const names = files
-      .filter((f) => dupes.has(f))
-      .map((f) => (relOf(f) ? `${relOf(f)}/${f.file.name}` : f.file.name))
-    action = await askConflict(names)
+  if (duplicates.size > 0) {
+    action = await askConflict(
+      files
+        .filter((upload) => duplicates.has(upload))
+        .map((upload) =>
+          relOf(upload) ? `${relOf(upload)}/${upload.file.name}` : upload.file.name,
+        ),
+    )
     if (action === 'cancel') return
   }
 
-  for (const f of files) {
+  for (const upload of files) {
     const item: Item = {
       id: ++seq,
       dir,
-      rel: relOf(f),
-      file: f.file,
+      rel: relOf(upload),
+      name: upload.file.name,
+      size: upload.file.size,
+      file: upload.file,
       pct: 0,
       status: 'waiting',
+      concurrency: defaultConcurrency,
+      controllers: new Set(),
+      pauseRequested: false,
+      cancelled: false,
     }
-    if (action === 'skip' && dupes.has(f)) {
+    if (action === 'skip' && duplicates.has(upload)) {
       item.status = 'skipped'
       item.pct = 100
       items.value.unshift(item)
-      continue // 不进处理队列,不发任何请求
+      continue
     }
     items.value.unshift(item)
-    queue.push(item)
+    schedule(item)
   }
   visible.value = true
+}
+
+function schedule(item: Item) {
+  if (!queue.includes(item)) queue.push(item)
   void pump()
 }
 
-function retry(it: Item) {
-  const live = items.value.find((i) => i.id === it.id)
-  if (!live || live.status !== 'error') return
-  live.status = 'waiting'
-  live.pct = 0
-  live.error = undefined
-  queue.push(live)
-  void pump()
+function pause(item: Item) {
+  item.pauseRequested = true
+  for (const controller of item.controllers) controller.abort()
+  item.controllers.clear()
+  if (!item.cancelled) item.status = 'paused'
 }
 
-function removeWaiting(it: Item) {
-  const qi = queue.findIndex((q) => q.id === it.id)
-  if (qi >= 0) queue.splice(qi, 1)
-  items.value = items.value.filter((i) => i.id !== it.id)
+function resume(item: Item) {
+  if (!item.file) {
+    chooseFile(item)
+    return
+  }
+  item.pauseRequested = false
+  item.error = undefined
+  item.status = 'waiting'
+  schedule(item)
+}
+
+function retry(item: Item) {
+  if (item.session && item.session.uploaded_parts.length === item.session.part_count) {
+    item.pauseRequested = false
+    item.error = undefined
+    item.status = 'waiting'
+    schedule(item)
+    return
+  }
+  if (!item.file) {
+    chooseFile(item)
+    return
+  }
+  resume(item)
+}
+
+async function cancelItem(item: Item) {
+  item.cancelled = true
+  pause(item)
+  item.status = 'cancelling'
+  const queueIndex = queue.indexOf(item)
+  if (queueIndex >= 0) queue.splice(queueIndex, 1)
+  try {
+    if (item.session) await api.uploads.cancel(item.session.id)
+    items.value = items.value.filter((candidate) => candidate.id !== item.id)
+  } catch (error) {
+    const status = (error as { response?: { status?: number } }).response?.status
+    if (status === 404) {
+      items.value = items.value.filter((candidate) => candidate.id !== item.id)
+      return
+    }
+    item.cancelled = false
+    item.status = 'error'
+    item.error = `取消失败：${errMsg(error)}`
+  }
 }
 
 function clearFinished() {
-  items.value = items.value.filter((i) => !isDone(i) && i.status !== 'error')
+  items.value = items.value.filter((item) => !isDone(item))
 }
 
-/** 流式 sha256(32MB 一片),大文件不占内存 */
-async function sha256File(f: File, onPct: (p: number) => void): Promise<string> {
+/** 流式计算 SHA-256（32MB 一片），大文件不会一次读入内存。 */
+async function sha256File(
+  file: File,
+  onPct: (percentage: number) => void,
+  stopped: () => boolean = () => false,
+): Promise<string> {
   const hasher = await createSHA256()
   hasher.init()
-  const CHUNK = 32 * 1024 * 1024
-  for (let off = 0; off < f.size; off += CHUNK) {
-    const buf = await f.slice(off, Math.min(off + CHUNK, f.size)).arrayBuffer()
-    hasher.update(new Uint8Array(buf))
-    onPct(Math.round((Math.min(off + CHUNK, f.size) / f.size) * 100))
+  const chunkSize = 32 * 1024 * 1024
+  for (let offset = 0; offset < file.size; offset += chunkSize) {
+    if (stopped()) throw new Error('任务已取消')
+    const buffer = await file.slice(offset, Math.min(offset + chunkSize, file.size)).arrayBuffer()
+    hasher.update(new Uint8Array(buffer))
+    onPct(Math.round((Math.min(offset + chunkSize, file.size) / file.size) * 100))
   }
+  onPct(100)
   return hasher.digest('hex')
 }
 
@@ -314,17 +444,17 @@ function createVideoThumbnail(file: File): Promise<Blob | null> {
   })
 }
 
-/** 目标目录 = 基目录 + 相对子路径;文件夹上传时按需递归创建 */
+/** 目标目录 = 基目录 + 相对子路径；上传文件夹时按需递归创建。 */
 async function ensureDir(item: Item): Promise<string> {
   const target = item.rel ? joinPath(item.dir, item.rel) : item.dir
   if (item.rel && !ensuredDirs.has(target)) {
-    await api.mkdir(target) // 后端 mkdir 是递归语义(mkdir -p)
+    await api.mkdir(target)
     ensuredDirs.add(target)
   }
   return target
 }
 
-/** 上传响应丢失后等待后台任务落定；仍有同名 uploading 节点时不能立即重传。 */
+/** 完成响应丢失后核实文件是否已经原子落位，避免重复上传。 */
 async function confirmCompleted(
   target: string,
   item: Item,
@@ -334,7 +464,7 @@ async function confirmCompleted(
   while (Date.now() < deadline) {
     let state: { linked: boolean; pending: boolean }
     try {
-      state = (await api.instant(target, item.file.name, sha, item.file.size)).data
+      state = (await api.instant(target, item.name, sha, item.size)).data
     } catch {
       // 核实请求也可能遇到同一段短暂网络故障，稍后再问，不能据此判定上传失败。
       await new Promise((resolve) => window.setTimeout(resolve, 1000))
@@ -347,66 +477,247 @@ async function confirmCompleted(
   return null
 }
 
+function partSize(session: UploadSession, index: number) {
+  const start = index * session.chunk_size
+  return Math.min(session.chunk_size, session.size - start)
+}
+
+async function syncSession(item: Item) {
+  if (!item.session) return
+  const response = await api.uploads.status(item.session.id)
+  item.session = response.data.session
+  item.concurrency = response.data.concurrency
+  item.pct = sessionPct(item.session)
+}
+
+async function finalizeItem(item: Item, session: UploadSession) {
+  try {
+    await api.uploads.complete(session.id)
+  } catch (completeError) {
+    const confirmed = await confirmCompleted(item.dir, item, item.sha256 ?? session.sha256)
+    if (confirmed !== true) throw completeError
+  }
+  item.status = 'done'
+  item.pct = 100
+  item.session = undefined
+  emit('uploaded')
+}
+
+async function uploadMissingParts(item: Item) {
+  if (!item.session || !item.file) return
+  await syncSession(item)
+  const session = item.session
+  const uploaded = new Set(session.uploaded_parts)
+  const missing = Array.from({ length: session.part_count }, (_, index) => index).filter(
+    (index) => !uploaded.has(index),
+  )
+  let completedBytes = session.uploaded_bytes
+  const activeBytes = new Map<number, number>()
+  let cursor = 0
+  let stopped = false
+  let failure: unknown
+
+  const updateProgress = () => {
+    if (!item.session || item.session.size === 0) return
+    const active = [...activeBytes.values()].reduce((sum, value) => sum + value, 0)
+    item.pct = Math.min(99, Math.round(((completedBytes + active) / item.session.size) * 100))
+  }
+
+  item.status = 'uploading'
+  const worker = async () => {
+    while (!stopped && !item.pauseRequested && !item.cancelled) {
+      const index = missing[cursor++]
+      if (index === undefined) return
+      const start = index * session.chunk_size
+      const data = item.file!.slice(start, start + partSize(session, index))
+      const controller = new AbortController()
+      item.controllers.add(controller)
+      activeBytes.set(index, 0)
+      try {
+        await api.uploads.part(
+          session.id,
+          index,
+          data,
+          (loaded) => {
+            activeBytes.set(index, Math.min(loaded, data.size))
+            updateProgress()
+          },
+          controller.signal,
+        )
+        completedBytes += data.size
+        activeBytes.delete(index)
+        updateProgress()
+      } catch (error) {
+        activeBytes.delete(index)
+        if (!item.pauseRequested && !item.cancelled) {
+          failure = error
+          stopped = true
+          for (const active of item.controllers) active.abort()
+        }
+      } finally {
+        item.controllers.delete(controller)
+      }
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(item.concurrency, missing.length || 1))
+  await Promise.all(Array.from({ length: workerCount }, worker))
+  if (item.cancelled) return
+  try {
+    await syncSession(item)
+  } catch {
+    // 会话可能恰好在完成请求中消失，后面的秒传核实会给出最终状态。
+  }
+  if (item.pauseRequested) {
+    item.status = 'paused'
+    return
+  }
+  if (failure) throw failure
+
+  await finalizeItem(item, session)
+}
+
+async function processItem(item: Item) {
+  if (item.cancelled) return
+  if (
+    item.session &&
+    item.session.uploaded_parts.length === item.session.part_count
+  ) {
+    await finalizeItem(item, item.session)
+    return
+  }
+  if (!item.file) {
+    item.status = 'needs_file'
+    return
+  }
+  const target = item.session ? item.dir : await ensureDir(item)
+
+  if (!item.session) {
+    item.status = 'hashing'
+    const thumbnailPromise =
+      item.thumbnail === undefined ? createVideoThumbnail(item.file) : Promise.resolve(item.thumbnail)
+    item.sha256 = await sha256File(item.file, (percentage) => (item.pct = percentage), () => item.cancelled)
+    item.thumbnail = await thumbnailPromise
+    if (item.cancelled) return
+
+    try {
+      const instant = await api.instant(target, item.name, item.sha256, item.size)
+      if (item.cancelled) return
+      if (instant.data.linked) {
+        item.status = 'instant'
+        item.pct = 100
+        emit('uploaded')
+        return
+      }
+    } catch {
+      // 秒传探测失败时继续创建普通上传会话。
+    }
+    if (item.cancelled) return
+
+    const created = await api.uploads.create(target, item.name, item.size, item.sha256)
+    item.session = created.data.session
+    item.concurrency = created.data.concurrency
+    item.dir = parentOf(item.session.path)
+    item.pct = sessionPct(item.session)
+    if (item.cancelled) {
+      await api.uploads.cancel(item.session.id).catch(() => {})
+      return
+    }
+  }
+  if (item.thumbnail && item.session && !item.session.uploaded_parts.includes(0)) {
+    await api.uploads.thumbnail(item.session.id, item.thumbnail).catch(() => {
+      // 缩略图失败不应阻塞文件本体上传。
+    })
+  }
+  await uploadMissingParts(item)
+}
+
 async function pump() {
   if (busy) return
   busy = true
   while (queue.length > 0) {
     const item = queue.shift()!
-    const live = items.value.find((i) => i.id === item.id)
-    if (!live) continue
+    if (!items.value.includes(item) || item.cancelled) continue
     try {
-      const target = await ensureDir(live)
-
-      // 秒传:先算哈希问一嘴,库里有同内容文件就零流量落位
-      live.status = 'hashing'
-      if (live.thumbnail === undefined) {
-        live.thumbnail = await createVideoThumbnail(live.file)
+      await processItem(item)
+    } catch (error) {
+      if (!item.cancelled && !item.pauseRequested) {
+        item.status = 'error'
+        item.error = errMsg(error)
       }
-      let linked = false
-      let pending = false
-      let sha: string | undefined
-      try {
-        sha = await sha256File(live.file, (p) => (live.pct = p))
-        const r = await api.instant(target, live.file.name, sha, live.file.size)
-        linked = r.data.linked
-        pending = r.data.pending
-      } catch {
-        // 哈希/探测失败不阻塞,老老实实走真实上传
-      }
-      if (!linked && pending && sha) {
-        // 同一路径已有上传时先等它落定，避免多设备或手动重试并发写出重复分块。
-        const confirmed = await confirmCompleted(target, live, sha)
-        if (confirmed === null) throw new Error('同名文件仍在后台上传，请稍后重试')
-        linked = confirmed
-      }
-      if (linked) {
-        live.status = 'instant'
-        live.pct = 100
-        emit('uploaded')
-        continue
-      }
-
-      live.status = 'uploading'
-      live.pct = 0
-      try {
-        await api.upload(target, live.file, live.thumbnail, (pct) => (live.pct = pct))
-      } catch (uploadError) {
-        // 响应丢失不代表服务端失败：先按已算出的哈希核实，避免用户重试后重复上传。
-        if (!sha) throw uploadError
-        const confirmed = await confirmCompleted(target, live, sha)
-        // 核实接口自身失败时保留原始上传错误，它通常更能说明根因。
-        if (confirmed !== true) throw uploadError
-      }
-      live.status = 'done'
-      live.pct = 100
-      emit('uploaded')
-    } catch (e) {
-      live.status = 'error'
-      live.error = errMsg(e)
     }
   }
   busy = false
 }
+
+function chooseFile(item: Item) {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.onchange = () => {
+    const file = input.files?.[0]
+    if (file) void attachFile(item, file)
+  }
+  input.click()
+}
+
+async function attachFile(item: Item, file: File) {
+  if (!item.session) return
+  if (file.size !== item.session.size) {
+    item.status = 'needs_file'
+    item.error = `文件大小不一致，应为 ${item.session.size} 字节`
+    return
+  }
+  item.file = file
+  item.status = 'hashing'
+  item.error = undefined
+  item.cancelled = false
+  try {
+    const digest = await sha256File(file, (percentage) => (item.pct = percentage))
+    if (digest !== item.session.sha256) {
+      item.file = undefined
+      item.status = 'needs_file'
+      item.pct = sessionPct(item.session)
+      item.error = '所选文件内容与原任务不一致，请选择原文件'
+      return
+    }
+    item.sha256 = digest
+    item.thumbnail = await createVideoThumbnail(file)
+    resume(item)
+  } catch (error) {
+    item.file = undefined
+    item.status = 'needs_file'
+    item.error = errMsg(error)
+  }
+}
+
+onMounted(async () => {
+  try {
+    const response = await api.uploads.list()
+    defaultConcurrency = response.data.concurrency
+    if (response.data.sessions.length) {
+      for (const session of response.data.sessions) {
+        const item = fromSession(session, response.data.concurrency)
+        if (session.uploaded_parts.length === session.part_count) {
+          item.status = 'waiting'
+          item.error = undefined
+          item.pauseRequested = false
+        }
+        items.value.push(item)
+        if (item.status === 'waiting') schedule(item)
+      }
+      visible.value = true
+    }
+  } catch {
+    // 文件页仍可使用；用户开始上传时会再次得到明确错误。
+  }
+})
+
+onBeforeUnmount(() => {
+  for (const item of items.value) {
+    item.pauseRequested = true
+    for (const controller of item.controllers) controller.abort()
+  }
+})
 
 defineExpose({ enqueue })
 </script>

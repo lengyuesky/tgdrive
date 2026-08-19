@@ -1,17 +1,18 @@
 //! REST API:认证 + 文件操作端点,供 Vue 前端调用
 
 use crate::auth::{Auth, LoginReq};
-use crate::db::Node;
+use crate::db::{Node, SearchFilter, SearchSort, UploadSessionInfo};
 use crate::error::{AppError, AppResult};
 use crate::settings::{self, ApplyOutcome, ConfigPatch, Runtime};
 use crate::vfs::Vfs;
-use axum::extract::{ConnectInfo, Multipart, Query, Request, State};
+use axum::extract::{ConnectInfo, Multipart, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
+use futures_util::StreamExt as _;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -80,7 +81,16 @@ pub fn router(state: AppState) -> Router {
         .route("/fs/copy", post(copy_entry))
         .route("/fs/delete", post(delete))
         .route("/fs/search", get(search))
+        .route("/fs/favorite", post(favorite_set))
         .route("/fs/instant", post(instant))
+        .route("/uploads", get(uploads_index).post(uploads_create))
+        .route("/uploads/{id}", get(upload_status).delete(upload_cancel))
+        .route("/uploads/{id}/thumbnail", post(upload_thumbnail))
+        .route(
+            "/uploads/{id}/parts/{idx}",
+            put(upload_part).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/uploads/{id}/complete", post(upload_complete))
         .route("/trash", get(trash_index))
         .route("/trash/restore", post(trash_restore))
         .route("/trash/purge", post(trash_purge))
@@ -186,6 +196,7 @@ struct Entry {
     created_at: i64,
     modified_at: i64,
     sha256: Option<String>,
+    favorite: bool,
 }
 
 impl From<&Node> for Entry {
@@ -197,6 +208,7 @@ impl From<&Node> for Entry {
             created_at: n.created_at,
             modified_at: n.modified_at,
             sha256: n.sha256.clone(),
+            favorite: n.favorite,
         }
     }
 }
@@ -241,6 +253,7 @@ async fn properties_get(
             "created_at": node.created_at,
             "modified_at": node.modified_at,
             "sha256": node.sha256,
+            "favorite": node.favorite,
             "file_count": usage.file_count,
             "dir_count": usage.dir_count,
             "chunk_count": usage.chunk_count,
@@ -370,6 +383,161 @@ async fn upload(
         return Err(AppError::BadRequest("缩略图后缺少对应文件".into()));
     }
     Ok(Json(serde_json::json!({ "saved": saved })))
+}
+
+// ---------- 可恢复上传 ----------
+
+#[derive(Deserialize)]
+struct UploadCreateBody {
+    dir: String,
+    name: String,
+    size: i64,
+    sha256: String,
+}
+
+fn upload_session_json(info: &UploadSessionInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": info.session.id,
+        "path": info.session.display_path,
+        "name": info.node.name,
+        "size": info.session.expected_size,
+        "sha256": info.session.sha256,
+        "chunk_size": info.session.chunk_size,
+        "part_count": info.part_count(),
+        "uploaded_parts": info.uploaded_parts,
+        "uploaded_bytes": info.uploaded_bytes,
+        "created_at": info.session.created_at,
+        "updated_at": info.session.updated_at,
+    })
+}
+
+fn normalized_display_path(dir: &str, name: &str) -> AppResult<String> {
+    let mut segments = crate::vfs::normalize(dir)?;
+    segments.push(name.to_string());
+    Ok(format!("/{}", segments.join("/")))
+}
+
+async fn uploads_index(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+    let sessions = state.vfs.db.upload_sessions().await?;
+    let values: Vec<_> = sessions.iter().map(upload_session_json).collect();
+    Ok(Json(serde_json::json!({
+        "sessions": values,
+        "concurrency": state.rt.current().upload_concurrency,
+    })))
+}
+
+async fn upload_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let info = state.vfs.db.upload_session_info(&id).await?;
+    Ok(Json(serde_json::json!({
+        "session": upload_session_json(&info),
+        "concurrency": state.rt.current().upload_concurrency,
+    })))
+}
+
+async fn uploads_create(
+    State(state): State<AppState>,
+    Json(body): Json<UploadCreateBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let name = clean_filename(&body.name)?;
+    let parent = state.vfs.resolve(&body.dir).await?;
+    if !parent.is_dir {
+        return Err(AppError::NotDirectory);
+    }
+    let target = state.vfs.tg.current()?;
+    let cfg = state.rt.current();
+    let display_path = normalized_display_path(&body.dir, &name)?;
+    let info = state
+        .vfs
+        .db
+        .create_upload_session(
+            parent.id,
+            &name,
+            &display_path,
+            body.size,
+            &body.sha256,
+            cfg.chunk_size as i64,
+            target.storage_target_id,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({
+        "session": upload_session_json(&info),
+        "concurrency": cfg.upload_concurrency,
+    })))
+}
+
+async fn upload_thumbnail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    data: Bytes,
+) -> AppResult<Json<serde_json::Value>> {
+    let declared = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    validate_thumbnail_upload(declared, &data)?;
+    state.vfs.db.set_upload_thumbnail(&id, &data).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn upload_part(
+    State(state): State<AppState>,
+    Path((id, idx)): Path<(String, i64)>,
+    request: Request,
+) -> AppResult<Json<serde_json::Value>> {
+    use crate::engine::upload::ResumablePartStart;
+
+    let handle = match state.vfs.uploader.start_resumable_part(&id, idx).await? {
+        ResumablePartStart::Complete => {
+            let info = state.vfs.db.upload_session_info(&id).await?;
+            return Ok(Json(serde_json::json!({
+                "already_uploaded": true,
+                "session": upload_session_json(&info),
+            })));
+        }
+        ResumablePartStart::Upload(handle) => handle,
+    };
+    let mut stream = request.into_body().into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes =
+            chunk.map_err(|error| AppError::BadRequest(format!("读取上传分块失败: {error}")))?;
+        handle.feed(bytes).await?;
+    }
+    handle.finish().await?;
+    let info = state.vfs.db.upload_session_info(&id).await?;
+    Ok(Json(serde_json::json!({
+        "already_uploaded": false,
+        "session": upload_session_json(&info),
+    })))
+}
+
+async fn upload_complete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let node = state.vfs.db.complete_upload_session(&id).await?;
+    // 覆盖旧文件时，删除任务已在事务内持久化；立即唤醒处理器。
+    state.vfs.uploader.process_pending_deletes();
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "entry": Entry::from(&node),
+    })))
+}
+
+async fn upload_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let freed = state.vfs.db.cancel_upload_session(&id).await?;
+    state.vfs.uploader.delete_messages_best_effort(freed);
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ---------- 视频缩略图 ----------
@@ -1001,20 +1169,102 @@ async fn admin_env_export(State(state): State<AppState>) -> Response {
 
 // ---------- 搜索 / 秒传 ----------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SearchQuery {
-    q: String,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    extensions: Option<String>,
+    min_size: Option<i64>,
+    max_size: Option<i64>,
+    modified_after: Option<i64>,
+    modified_before: Option<i64>,
+    #[serde(default)]
+    favorite: bool,
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    order: Option<String>,
+    limit: Option<usize>,
 }
 
 async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let needle = q.q.trim();
-    if needle.is_empty() {
-        return Err(AppError::BadRequest("搜索词不能为空".into()));
+    if q.min_size.is_some_and(|size| size < 0) || q.max_size.is_some_and(|size| size < 0) {
+        return Err(AppError::BadRequest("文件大小不能为负数".into()));
     }
-    let hits = state.vfs.db.search(needle, 200).await?;
+    if let (Some(min), Some(max)) = (q.min_size, q.max_size)
+        && min > max
+    {
+        return Err(AppError::BadRequest(
+            "最小文件大小不能大于最大文件大小".into(),
+        ));
+    }
+    if let (Some(after), Some(before)) = (q.modified_after, q.modified_before)
+        && after > before
+    {
+        return Err(AppError::BadRequest("开始时间不能晚于结束时间".into()));
+    }
+    let is_dir = match q.kind.as_deref().unwrap_or("all") {
+        "all" | "" => None,
+        "file" => Some(false),
+        "dir" => Some(true),
+        _ => return Err(AppError::BadRequest("搜索类型无效".into())),
+    };
+    let extensions: Vec<String> = q
+        .extensions
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .collect();
+    if extensions.len() > 20
+        || extensions.iter().any(|ext| {
+            ext.len() > 40
+                || !ext
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+        })
+    {
+        return Err(AppError::BadRequest("文件后缀筛选格式无效".into()));
+    }
+    let sort = match q.sort.as_deref().unwrap_or("name") {
+        "name" | "" => SearchSort::Name,
+        "size" => SearchSort::Size,
+        "modified" => SearchSort::Modified,
+        "created" => SearchSort::Created,
+        _ => return Err(AppError::BadRequest("搜索排序字段无效".into())),
+    };
+    let descending = match q.order.as_deref().unwrap_or("asc") {
+        "asc" | "" => false,
+        "desc" => true,
+        _ => return Err(AppError::BadRequest("搜索排序方向无效".into())),
+    };
+    let filter = SearchFilter {
+        query: q
+            .q
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        is_dir,
+        extensions,
+        min_size: q.min_size,
+        max_size: q.max_size,
+        modified_after: q.modified_after,
+        modified_before: q.modified_before,
+        favorite_only: q.favorite,
+        sort,
+        descending,
+    };
+    let hits = state
+        .vfs
+        .db
+        .search_filtered(&filter, q.limit.unwrap_or(500).clamp(1, 500))
+        .await?;
     let results: Vec<serde_json::Value> = hits
         .iter()
         .map(|(n, path)| {
@@ -1023,11 +1273,34 @@ async fn search(
                 "name": n.name,
                 "is_dir": n.is_dir,
                 "size": n.size,
+                "created_at": n.created_at,
                 "modified_at": n.modified_at,
+                "favorite": n.favorite,
             })
         })
         .collect();
     Ok(Json(serde_json::json!({ "results": results })))
+}
+
+#[derive(Deserialize)]
+struct FavoriteBody {
+    path: String,
+    favorite: bool,
+}
+
+async fn favorite_set(
+    State(state): State<AppState>,
+    Json(body): Json<FavoriteBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let node = state.vfs.resolve(&body.path).await?;
+    if node.id == crate::db::ROOT_ID {
+        return Err(AppError::BadRequest("不能收藏根目录".into()));
+    }
+    let updated = state.vfs.db.set_favorite(node.id, body.favorite).await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "favorite": updated.favorite,
+    })))
 }
 
 #[derive(Deserialize)]

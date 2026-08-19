@@ -8,11 +8,14 @@
       <el-input
         v-model="query"
         class="search"
-        placeholder="过滤当前目录,回车全局搜索"
+        placeholder="过滤当前目录，回车全局搜索"
         :prefix-icon="Search"
         clearable
         @keyup.enter="doGlobalSearch"
       />
+      <el-tooltip content="高级搜索">
+        <el-button class="icon-btn" :icon="Filter" @click="advancedVisible = true" />
+      </el-tooltip>
 
       <div v-if="info" class="stat-badge hide-sm">
         <el-icon><TrendCharts /></el-icon>
@@ -221,6 +224,10 @@
           </template>
         </el-tree>
         <div class="side-sep" />
+        <div class="side-root" :class="{ on: searchMode && searchView === 'favorites' }" @click="showFavorites">
+          <el-icon color="#f59e0b"><StarFilled /></el-icon>
+          <span>我的收藏</span>
+        </div>
         <div class="side-root" @click="trashPanel?.open()">
           <el-icon color="#94a3b8"><DeleteFilled /></el-icon>
           <span>回收站</span>
@@ -237,8 +244,8 @@
         <div v-if="searchMode">
           <div class="search-head">
             <span>
-              全局搜索「<b>{{ lastQuery }}</b>」:{{ searchHits.length }} 个结果
-              <template v-if="searchHits.length >= 200">(仅显示前 200 条)</template>
+              {{ searchTitle }}：{{ searchHits.length }} 个结果
+              <template v-if="searchHits.length >= searchLimit">（仅显示前 {{ searchLimit }} 条）</template>
             </span>
             <el-button text size="small" @click="exitSearch">退出搜索</el-button>
           </div>
@@ -266,6 +273,17 @@
             </el-table-column>
             <el-table-column label="修改时间" width="170">
               <template #default="{ row }">{{ fmtTime(row.modified_at) }}</template>
+            </el-table-column>
+            <el-table-column label="收藏" width="70" align="center">
+              <template #default="{ row }">
+                <el-button
+                  text
+                  circle
+                  :icon="row.favorite ? StarFilled : Star"
+                  :class="{ 'favorite-on': row.favorite }"
+                  @click="toggleSearchFavorite(row as SearchHit)"
+                />
+              </template>
             </el-table-column>
             <template #empty><el-empty description="没有找到匹配的内容" /></template>
           </el-table>
@@ -307,7 +325,8 @@
                 <el-icon v-else class="fico" :color="iconOf(row.name).color">
                   <component :is="iconOf(row.name).icon" />
                 </el-icon>
-                {{ row.name }}
+                  {{ row.name }}
+                  <el-icon v-if="row.favorite" class="favorite-mark"><StarFilled /></el-icon>
               </span>
             </template>
           </el-table-column>
@@ -327,8 +346,16 @@
           >
             <template #default="{ row }">{{ fmtTime(row.modified_at) }}</template>
           </el-table-column>
-          <el-table-column label="操作" width="230" align="right">
+          <el-table-column label="操作" width="265" align="right">
             <template #default="{ row }">
+              <el-button
+                text
+                size="small"
+                :class="{ 'favorite-on': row.favorite }"
+                @click="toggleEntryFavorite(row as Entry)"
+              >
+                {{ row.favorite ? '已收藏' : '收藏' }}
+              </el-button>
               <el-button
                 v-if="!row.is_dir"
                 text
@@ -391,6 +418,7 @@
                   <template #dropdown>
                     <el-dropdown-menu>
                       <el-dropdown-item v-if="!cell.is_dir" command="download">下载</el-dropdown-item>
+                      <el-dropdown-item command="favorite">{{ cell.favorite ? '取消收藏' : '收藏' }}</el-dropdown-item>
                       <el-dropdown-item command="share">分享</el-dropdown-item>
                       <el-dropdown-item command="rename">重命名</el-dropdown-item>
                       <el-dropdown-item command="move">移动到 ...</el-dropdown-item>
@@ -400,6 +428,13 @@
                     </el-dropdown-menu>
                   </template>
                 </el-dropdown>
+              </span>
+              <span
+                class="tile-favorite"
+                :class="{ on: cell.favorite }"
+                @click.stop="toggleEntryFavorite(cell)"
+              >
+                <el-icon><component :is="cell.favorite ? StarFilled : Star" /></el-icon>
               </span>
               <div class="tile-media">
                 <el-image
@@ -461,6 +496,102 @@
     <ShareDialog ref="shareDlg" />
     <ShareManager ref="shareMgr" />
     <TrashPanel ref="trashPanel" @changed="onTrashChanged" />
+
+    <el-dialog
+      v-model="advancedVisible"
+      title="高级搜索"
+      width="640px"
+      align-center
+      append-to-body
+    >
+      <el-form label-width="92px" class="advanced-search-form">
+        <el-form-item label="名称包含">
+          <el-input v-model="advanced.keyword" clearable placeholder="可留空，只按下面条件筛选" />
+        </el-form-item>
+        <el-form-item label="对象类型">
+          <el-segmented
+            v-model="advanced.kind"
+            :options="[
+              { label: '全部', value: 'all' },
+              { label: '文件', value: 'file' },
+              { label: '文件夹', value: 'dir' },
+            ]"
+          />
+        </el-form-item>
+        <el-form-item v-if="advanced.kind !== 'dir'" label="文件类别">
+          <el-select v-model="advanced.category" style="width: 100%">
+            <el-option label="全部类别" value="all" />
+            <el-option label="图片" value="image" />
+            <el-option label="视频" value="video" />
+            <el-option label="音频" value="audio" />
+            <el-option label="文档" value="document" />
+            <el-option label="压缩包" value="archive" />
+            <el-option label="自定义后缀" value="custom" />
+          </el-select>
+        </el-form-item>
+        <el-form-item
+          v-if="advanced.kind !== 'dir' && advanced.category === 'custom'"
+          label="文件后缀"
+        >
+          <el-input v-model="advanced.extensions" clearable placeholder="例如 pdf,docx,tar.gz" />
+        </el-form-item>
+        <el-form-item v-if="advanced.kind !== 'dir'" label="文件大小">
+          <div class="size-range">
+            <el-input-number
+              v-model="advanced.minMb"
+              :min="0"
+              :precision="1"
+              :step="10"
+              controls-position="right"
+              placeholder="最小"
+            />
+            <span>至</span>
+            <el-input-number
+              v-model="advanced.maxMb"
+              :min="0"
+              :precision="1"
+              :step="10"
+              controls-position="right"
+              placeholder="最大"
+            />
+            <span>MB</span>
+          </div>
+        </el-form-item>
+        <el-form-item label="修改时间">
+          <el-date-picker
+            v-model="advanced.modifiedRange"
+            type="datetimerange"
+            start-placeholder="开始时间"
+            end-placeholder="结束时间"
+            range-separator="至"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <el-form-item label="仅看收藏">
+          <el-switch v-model="advanced.favorite" />
+        </el-form-item>
+        <el-form-item label="结果排序">
+          <div class="sort-range">
+            <el-select v-model="advanced.sort">
+              <el-option label="名称" value="name" />
+              <el-option label="大小" value="size" />
+              <el-option label="修改时间" value="modified" />
+              <el-option label="创建时间" value="created" />
+            </el-select>
+            <el-select v-model="advanced.order">
+              <el-option label="升序" value="asc" />
+              <el-option label="降序" value="desc" />
+            </el-select>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="resetAdvanced">重置</el-button>
+        <el-button type="primary" :loading="advancedLoading" @click="runAdvancedSearch">
+          搜索
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog
       v-model="propertyVisible"
@@ -537,13 +668,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElTree, type LoadFunction, type TableInstance } from 'element-plus'
 import {
   ArrowDown, Box, Calendar, CopyDocument, Delete, DeleteFilled, Document, EditPen, Film, Finished,
-  Folder, FolderAdd, FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position,
-  Promotion, Rank, Refresh, Search, Setting, Share, Sort, Sunny, SwitchButton, Tickets,
+  Filter, Folder, FolderAdd, FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position,
+  Promotion, Rank, Refresh, Search, Setting, Share, Sort, Star, StarFilled, Sunny, SwitchButton, Tickets,
   TrendCharts, Upload,
 } from '@element-plus/icons-vue'
 import { appConfirm, appPrompt } from '../dialog'
@@ -555,6 +686,7 @@ import {
   type Entry,
   type EntryProperties,
   type SearchHit,
+  type SearchParams,
   type ServerInfo,
 } from '../api'
 import { isDark, toggleDark } from '../theme'
@@ -604,6 +736,11 @@ function fmtBytes(size: number) {
 const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif', 'ico']
 /** 浏览器 <video> 大概率能解码的容器(mkv 在 Chrome/Edge 可播 H.264/VP9 轨) */
 const VIDEO_EXT = ['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv']
+const AUDIO_EXT = ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'opus']
+const DOCUMENT_EXT = [
+  'pdf', 'txt', 'md', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'epub', 'mobi',
+]
+const ARCHIVE_EXT = ['zip', 'rar', '7z', 'tar', 'tar.gz', 'gz', 'xz', 'zst', 'bz2', 'iso']
 function extOf(name: string) {
   return name.split('.').pop()?.toLowerCase() ?? ''
 }
@@ -617,9 +754,9 @@ function isVideo(name: string) {
 /** 按扩展名给非图片文件配图标与颜色 */
 const ICON_RULES: [string[], typeof Document, string][] = [
   [['mp4', 'webm', 'mov', 'm4v', 'mkv', 'avi', 'ogv', 'ts', 'flv'], Film, '#8b5cf6'],
-  [['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'opus'], Headset, '#f59e0b'],
-  [['zip', 'rar', '7z', 'tar', 'gz', 'xz', 'zst', 'bz2', 'iso'], Box, '#b45309'],
-  [['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'], Tickets, '#ef4444'],
+  [AUDIO_EXT, Headset, '#f59e0b'],
+  [ARCHIVE_EXT, Box, '#b45309'],
+  [DOCUMENT_EXT, Tickets, '#ef4444'],
 ]
 function iconOf(name: string) {
   const ext = extOf(name)
@@ -647,11 +784,43 @@ watch(viewMode, (v) => {
   selected.value = []
 })
 
-// ---- 搜索:输入即过滤当前目录,回车全局搜索 ----
+// ---- 搜索：输入即过滤当前目录，回车全局搜索，高级条件由弹窗提交 ----
 const query = ref('')
 const searchMode = ref(false)
 const searchHits = ref<SearchHit[]>([])
-const lastQuery = ref('')
+type SearchView = 'simple' | 'advanced' | 'favorites'
+const searchView = ref<SearchView>('simple')
+const searchTitle = ref('全局搜索')
+const searchLimit = ref(200)
+const advancedVisible = ref(false)
+const advancedLoading = ref(false)
+
+interface AdvancedSearchForm {
+  keyword: string
+  kind: 'all' | 'file' | 'dir'
+  category: 'all' | 'image' | 'video' | 'audio' | 'document' | 'archive' | 'custom'
+  extensions: string
+  minMb: number | undefined
+  maxMb: number | undefined
+  modifiedRange: [Date, Date] | null
+  favorite: boolean
+  sort: 'name' | 'size' | 'modified' | 'created'
+  order: 'asc' | 'desc'
+}
+
+const advanced = reactive<AdvancedSearchForm>({
+  keyword: '',
+  kind: 'all',
+  category: 'all',
+  extensions: '',
+  minMb: undefined,
+  maxMb: undefined,
+  modifiedRange: null,
+  favorite: false,
+  sort: 'modified',
+  order: 'desc',
+})
+
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase()
   return q ? entries.value.filter((e) => e.name.toLowerCase().includes(q)) : entries.value
@@ -669,7 +838,9 @@ async function doGlobalSearch() {
   try {
     const r = await api.search(q)
     searchHits.value = r.data.results
-    lastQuery.value = q
+    searchTitle.value = `全局搜索“${q}”`
+    searchLimit.value = 200
+    searchView.value = 'simple'
     searchMode.value = true
   } catch (e) {
     ElMessage.error(errMsg(e))
@@ -678,6 +849,7 @@ async function doGlobalSearch() {
 function exitSearch() {
   searchMode.value = false
   searchHits.value = []
+  searchView.value = 'simple'
 }
 watch(query, (v) => {
   if (!v.trim()) exitSearch()
@@ -689,6 +861,131 @@ function parentOf(p: string) {
 function openHit(hit: SearchHit) {
   if (hit.is_dir) goto(hit.path)
   else goto(parentOf(hit.path))
+}
+
+function resetAdvanced() {
+  Object.assign(advanced, {
+    keyword: '',
+    kind: 'all',
+    category: 'all',
+    extensions: '',
+    minMb: undefined,
+    maxMb: undefined,
+    modifiedRange: null,
+    favorite: false,
+    sort: 'modified',
+    order: 'desc',
+  } satisfies AdvancedSearchForm)
+}
+
+async function runAdvancedSearch() {
+  if (
+    advanced.minMb !== undefined &&
+    advanced.maxMb !== undefined &&
+    advanced.minMb > advanced.maxMb
+  ) {
+    ElMessage.warning('最小文件大小不能大于最大文件大小')
+    return
+  }
+  const categoryExtensions: Record<AdvancedSearchForm['category'], string[]> = {
+    all: [],
+    image: IMG_EXT,
+    video: VIDEO_EXT,
+    audio: AUDIO_EXT,
+    document: DOCUMENT_EXT,
+    archive: ARCHIVE_EXT,
+    custom: advanced.extensions
+      .split(',')
+      .map((extension) => extension.trim().replace(/^\.+/, ''))
+      .filter(Boolean),
+  }
+  const params: SearchParams = {
+    q: advanced.keyword.trim() || undefined,
+    kind: advanced.kind,
+    extensions:
+      advanced.kind === 'dir'
+        ? undefined
+        : categoryExtensions[advanced.category].join(',') || undefined,
+    min_size:
+      advanced.kind === 'dir' || advanced.minMb === undefined
+        ? undefined
+        : Math.round(advanced.minMb * 1024 * 1024),
+    max_size:
+      advanced.kind === 'dir' || advanced.maxMb === undefined
+        ? undefined
+        : Math.round(advanced.maxMb * 1024 * 1024),
+    modified_after: advanced.modifiedRange
+      ? Math.floor(advanced.modifiedRange[0].getTime() / 1000)
+      : undefined,
+    modified_before: advanced.modifiedRange
+      ? Math.floor(advanced.modifiedRange[1].getTime() / 1000)
+      : undefined,
+    favorite: advanced.favorite,
+    sort: advanced.sort,
+    order: advanced.order,
+    limit: 500,
+  }
+  advancedLoading.value = true
+  try {
+    const response = await api.search(params)
+    searchHits.value = response.data.results
+    searchTitle.value = '高级搜索结果'
+    searchLimit.value = 500
+    searchView.value = 'advanced'
+    searchMode.value = true
+    advancedVisible.value = false
+  } catch (error) {
+    ElMessage.error(errMsg(error))
+  } finally {
+    advancedLoading.value = false
+  }
+}
+
+async function showFavorites() {
+  try {
+    const response = await api.search({
+      favorite: true,
+      sort: 'modified',
+      order: 'desc',
+      limit: 500,
+    })
+    searchHits.value = response.data.results
+    searchTitle.value = '我的收藏'
+    searchLimit.value = 500
+    searchView.value = 'favorites'
+    searchMode.value = true
+  } catch (error) {
+    ElMessage.error(errMsg(error))
+  }
+}
+
+async function setFavorite(path: string, row: { favorite: boolean }) {
+  const next = !row.favorite
+  try {
+    await api.favorite(path, next)
+    row.favorite = next
+    const local = entries.value.find((entry) => joinPath(cur.value, entry.name) === path)
+    if (local) local.favorite = next
+    const hit = searchHits.value.find((candidate) => candidate.path === path)
+    if (hit) hit.favorite = next
+    if (
+      !next &&
+      (searchView.value === 'favorites' ||
+        (searchView.value === 'advanced' && advanced.favorite))
+    ) {
+      searchHits.value = searchHits.value.filter((candidate) => candidate.path !== path)
+    }
+  } catch (error) {
+    ElMessage.error(errMsg(error))
+  }
+}
+
+function toggleEntryFavorite(row: Entry) {
+  void setFavorite(joinPath(cur.value, row.name), row)
+}
+
+function toggleSearchFavorite(row: SearchHit) {
+  void setFavorite(row.path, row)
 }
 
 // ---- 排序:目录始终在前,文件按所选键排 ----
@@ -863,6 +1160,10 @@ const ctxItems = computed<CtxItem[]>(() => {
     divided: items.length > 0,
   })
   if (!row.is_dir) items.push({ label: '下载', action: () => download(row) })
+  items.push({
+    label: row.favorite ? '取消收藏' : '收藏',
+    action: () => void setFavorite(joinPath(cur.value, row.name), row),
+  })
   items.push({ label: '分享', action: () => onRowCmd('share', row) })
   items.push({ label: '重命名', action: () => rename(row) })
   items.push({ label: '移动到 ...', action: () => onRowCmd('move', row) })
@@ -1083,6 +1384,10 @@ async function onRowCmd(cmd: string, row: Entry) {
   const src = joinPath(cur.value, row.name)
   if (cmd === 'properties') {
     await openProperties(row)
+    return
+  }
+  if (cmd === 'favorite') {
+    await setFavorite(src, row)
     return
   }
   try {
@@ -1438,6 +1743,14 @@ async function logout() {
 .hit-path:hover {
   color: var(--el-color-primary);
 }
+.favorite-on,
+.favorite-mark {
+  color: #f59e0b !important;
+}
+.favorite-mark {
+  flex-shrink: 0;
+  font-size: 14px;
+}
 
 .table {
   width: 100%;
@@ -1601,7 +1914,8 @@ async function logout() {
 }
 /* 复选框在右上、更多按钮在左上(对齐 K-Vault 的角标布局) */
 .tile-check,
-.tile-more {
+.tile-more,
+.tile-favorite {
   position: absolute;
   top: 8px;
   z-index: 2;
@@ -1622,8 +1936,29 @@ html.dark .tile-check {
 .tile-more {
   left: 8px;
 }
+.tile-favorite {
+  left: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  color: #64748b;
+  cursor: pointer;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 1px 4px rgba(30, 40, 80, 0.2);
+}
+html.dark .tile-favorite {
+  background: rgba(30, 36, 54, 0.88);
+}
+.tile-favorite.on {
+  color: #f59e0b;
+  opacity: 1;
+}
 .tile:hover .tile-check,
 .tile:hover .tile-more,
+.tile:hover .tile-favorite,
 .tile.sel .tile-check {
   opacity: 1;
 }
@@ -1673,6 +2008,21 @@ html.dark .tile-check {
 .property-hash {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 12px;
+}
+
+.advanced-search-form {
+  padding: 4px 8px 0;
+}
+.size-range,
+.sort-range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.size-range .el-input-number,
+.sort-range .el-select {
+  flex: 1;
 }
 
 /* 自定义右键菜单(teleport 到 body,fixed 定位) */

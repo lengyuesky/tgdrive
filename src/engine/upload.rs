@@ -3,9 +3,9 @@
 //! 生产者(HTTP 上传 / WebDAV PUT)通过 mpsc 通道喂入字节,管线在独立任务中
 //! 攒块并发上传;生产者中途消失(未发 Eof 就断开)视为失败,自动回滚已传分块。
 
-use crate::db::{Db, Node, StoredMessage};
+use crate::db::{Db, Node, StoredMessage, UploadPartClaim, UploadSessionInfo};
 use crate::error::{AppError, AppResult};
-use crate::telegram::{TgBinding, TgRegistry, UploadBody};
+use crate::telegram::{TgApi, TgBinding, TgMessage, TgRegistry, UploadBody};
 use bytes::{Bytes, BytesMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,9 +38,71 @@ pub fn video_mime(filename: &str) -> Option<&'static str> {
     }
 }
 
+async fn send_body_to_telegram(
+    tg: Arc<dyn TgApi>,
+    filename: &str,
+    caption: String,
+    mime: Option<&str>,
+    thumbnail: Option<&Bytes>,
+    body: &UploadBody,
+) -> AppResult<TgMessage> {
+    match mime {
+        Some(mime) => {
+            // 从文件头解析宽高/时长；解析不了就让 Telegram 使用默认显示比例。
+            let meta = crate::engine::probe::probe_body(mime, body);
+            if meta.is_none() {
+                tracing::debug!("{filename} 未解析出视频宽高，按无元数据发送");
+            }
+            match tg
+                .send_video(filename, mime, meta, Some(caption.clone()), thumbnail, body)
+                .await
+            {
+                Ok(message) => Ok(message),
+                // 只有 Telegram 明确拒绝格式时才安全降级；不确定结果不能重复发送。
+                Err(AppError::TelegramRejected(detail)) => {
+                    tracing::warn!("{filename} 以视频消息发送失败({detail})，回退为文档");
+                    tg.send_document(filename, Some(caption), thumbnail, body)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        None => {
+            tg.send_document(filename, Some(caption), thumbnail, body)
+                .await
+        }
+    }
+}
+
 pub struct UploadHandle {
     pub tx: mpsc::Sender<UploadMsg>,
     pub join: tokio::task::JoinHandle<AppResult<Node>>,
+}
+
+pub struct ResumablePartHandle {
+    pub tx: mpsc::Sender<UploadMsg>,
+    pub join: tokio::task::JoinHandle<AppResult<()>>,
+}
+
+impl ResumablePartHandle {
+    pub async fn feed(&self, data: Bytes) -> AppResult<()> {
+        self.tx
+            .send(UploadMsg::Data(data))
+            .await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("分块上传管线已终止")))
+    }
+
+    pub async fn finish(self) -> AppResult<()> {
+        let _ = self.tx.send(UploadMsg::Eof).await;
+        self.join
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("分块上传任务崩溃: {e}")))?
+    }
+}
+
+pub enum ResumablePartStart {
+    Complete,
+    Upload(ResumablePartHandle),
 }
 
 impl UploadHandle {
@@ -168,6 +230,154 @@ impl Uploader {
             }
         });
         Ok(UploadHandle { tx, join })
+    }
+
+    /// 为一个可恢复会话启动独立分块请求。请求体必须恰好等于该分块的期望大小；
+    /// 输入没有完整结束时只丢弃当前临时缓冲，已经登记的其他分块不受影响。
+    pub async fn start_resumable_part(
+        &self,
+        session_id: &str,
+        idx: i64,
+    ) -> AppResult<ResumablePartStart> {
+        let info = match self.db.claim_upload_part(session_id, idx).await? {
+            UploadPartClaim::Complete => return Ok(ResumablePartStart::Complete),
+            UploadPartClaim::Claimed(info) => *info,
+        };
+        if let Err(error) = self.tg.binding(info.session.storage_target_id) {
+            let _ = self.db.release_upload_part(session_id, idx).await;
+            return Err(error);
+        }
+        let (tx, rx) = mpsc::channel::<UploadMsg>(4);
+        let this = self.clone();
+        let id = session_id.to_string();
+        let join = tokio::spawn(async move {
+            let result = this.resumable_part_pipeline(&id, idx, info, rx).await;
+            if result.is_err()
+                && let Err(release_error) = this.db.release_upload_part(&id, idx).await
+            {
+                tracing::warn!("释放上传会话 {id} 的分块 {idx} 失败: {release_error}");
+            }
+            result
+        });
+        Ok(ResumablePartStart::Upload(ResumablePartHandle { tx, join }))
+    }
+
+    async fn resumable_part_pipeline(
+        &self,
+        session_id: &str,
+        idx: i64,
+        info: UploadSessionInfo,
+        mut rx: mpsc::Receiver<UploadMsg>,
+    ) -> AppResult<()> {
+        let expected = info
+            .expected_part_size(idx)
+            .ok_or_else(|| AppError::BadRequest("分块下标超出范围".into()))?;
+        let mut buffer = ChunkBuf::new(expected as u64, self.mem_limit, self.knobs.tmp_dir());
+        let mut received = 0i64;
+        let mut complete_body: Option<UploadBody> = None;
+        let mut clean_eof = false;
+        loop {
+            match rx.recv().await {
+                Some(UploadMsg::Data(mut data)) => {
+                    received = received
+                        .checked_add(data.len() as i64)
+                        .ok_or_else(|| AppError::BadRequest("分块大小溢出".into()))?;
+                    if received > expected {
+                        return Err(AppError::BadRequest(format!(
+                            "分块大小不匹配：期望 {expected} 字节"
+                        )));
+                    }
+                    while !data.is_empty() {
+                        if let Some(body) = buffer.push(&mut data).await?
+                            && complete_body.replace(body).is_some()
+                        {
+                            return Err(AppError::BadRequest("分块包含多余数据".into()));
+                        }
+                    }
+                }
+                Some(UploadMsg::Eof) => {
+                    clean_eof = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+        if !clean_eof {
+            return Err(AppError::BadRequest("分块上传中断".into()));
+        }
+        if received != expected {
+            return Err(AppError::BadRequest(format!(
+                "分块大小不匹配：期望 {expected} 字节，实际 {received} 字节"
+            )));
+        }
+        let body = match complete_body {
+            Some(body) => body,
+            None => buffer
+                .take_partial()
+                .await?
+                .ok_or_else(|| AppError::BadRequest("分块内容为空".into()))?,
+        };
+
+        let target = self.tg.binding(info.session.storage_target_id)?;
+        let _permit = self
+            .knobs
+            .semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("信号量已关闭")))?;
+        let filename = if idx == 0 {
+            info.node.name.clone()
+        } else {
+            format!("{}.part{idx}", info.node.name)
+        };
+        let cap_path: String = info.session.display_path.chars().take(700).collect();
+        let caption = format!(
+            "tgdrive {{\"p\":\"{}\",\"i\":{},\"u\":{}}}",
+            cap_path.replace('"', "'"),
+            idx,
+            info.node.id
+        );
+        let mime = (info.part_count() == 1 && self.knobs.send_video())
+            .then(|| video_mime(&info.node.name))
+            .flatten();
+        let thumbnail = (idx == 0)
+            .then(|| info.session.thumbnail.clone().map(Bytes::from))
+            .flatten();
+        let msg = send_body_to_telegram(
+            target.api.clone(),
+            &filename,
+            caption,
+            mime,
+            thumbnail.as_ref(),
+            &body,
+        )
+        .await?;
+        let stored = StoredMessage {
+            storage_target_id: target.storage_target_id,
+            message_id: msg.message_id,
+        };
+        if let Err(error) = self
+            .db
+            .finish_upload_part(
+                session_id,
+                idx,
+                body.len() as i64,
+                &msg.file_id,
+                msg.message_id,
+                target.storage_target_id,
+                msg.thumbnail_file_id.as_deref(),
+            )
+            .await
+        {
+            // 用户可能在 Telegram 请求进行期间取消了会话；消息必须进入可靠删除队列。
+            if let Err(queue_error) = self.db.enqueue_delete_message(stored).await {
+                tracing::error!("分块 {idx} 落库失败({error})，且登记补偿删除失败: {queue_error}");
+            } else {
+                self.process_pending_deletes();
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// 删除任务已经和元数据变更在同一事务内持久化；这里负责立即唤醒处理器。
@@ -414,39 +624,15 @@ impl Uploader {
         uploads.spawn(async move {
             let _permit = permit;
             let size = body.len();
-            let msg = match mime {
-                Some(m) => {
-                    // 从文件头解析宽高/时长;解析不了就不带(Telegram 会按默认比例显示)
-                    let meta = crate::engine::probe::probe_body(m, &body);
-                    if meta.is_none() {
-                        tracing::debug!("{filename} 未解析出视频宽高,按无元数据发送");
-                    }
-                    match tg
-                        .send_video(
-                            &filename,
-                            m,
-                            meta,
-                            Some(caption.clone()),
-                            thumbnail.as_ref(),
-                            &body,
-                        )
-                        .await
-                    {
-                        Ok(msg) => msg,
-                        // 只有 Telegram 明确拒绝视频格式时才能降级；结果不确定时再次发送会重复。
-                        Err(AppError::TelegramRejected(detail)) => {
-                            tracing::warn!("{filename} 以视频消息发送失败({detail}),回退为文档");
-                            tg.send_document(&filename, Some(caption), thumbnail.as_ref(), &body)
-                                .await?
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                None => {
-                    tg.send_document(&filename, Some(caption), thumbnail.as_ref(), &body)
-                        .await?
-                }
-            };
+            let msg = send_body_to_telegram(
+                tg.clone(),
+                &filename,
+                caption,
+                mime,
+                thumbnail.as_ref(),
+                &body,
+            )
+            .await?;
             if let Err(e) = db
                 .add_chunk(
                     node_id,

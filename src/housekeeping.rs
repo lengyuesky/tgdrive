@@ -15,6 +15,7 @@ use std::time::Duration;
 const TICK: Duration = Duration::from_secs(30 * 60);
 const BACKUP_INTERVAL_SECS: i64 = 86400;
 const BACKUP_KEEP: usize = 7;
+const UPLOAD_SESSION_KEEP_SECS: i64 = 7 * 86400;
 const BACKUP_HISTORY_KEY: &str = "extra.backup_msg_groups";
 const LEGACY_BACKUP_HISTORY_KEY: &str = "extra.backup_msg_ids";
 
@@ -53,6 +54,15 @@ pub async fn run(vfs: Vfs, rt: Arc<Runtime>, task: crate::tasks::TaskReporter) {
 async fn tick(vfs: &Vfs, rt: &Runtime) -> AppResult<()> {
     vfs.uploader.process_pending_deletes();
     let ex = crate::extras::load(&vfs.db).await?;
+
+    let abandoned = vfs
+        .db
+        .cleanup_expired_upload_sessions(now_ts() - UPLOAD_SESSION_KEEP_SECS)
+        .await?;
+    if !abandoned.is_empty() {
+        tracing::info!("清理过期断点续传任务：释放 {} 条消息", abandoned.len());
+        vfs.uploader.delete_messages_best_effort(abandoned);
+    }
 
     if ex.trash_retention_days > 0 {
         let freed = vfs.db.trash_purge_expired(ex.trash_retention_days).await?;

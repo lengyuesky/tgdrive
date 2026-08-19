@@ -26,6 +26,8 @@ pub struct Node {
     pub modified_at: i64,
     /// 文件内容 sha256(hex);历史文件与目录为 None
     pub sha256: Option<String>,
+    /// 是否已收藏；目录与文件都可以收藏。
+    pub favorite: bool,
 }
 
 /// 分块行;部分字段仅由 SQL 侧使用,保留以完整映射
@@ -106,7 +108,86 @@ struct SearchRow {
     created_at: i64,
     modified_at: i64,
     sha256: Option<String>,
+    favorite: bool,
     path: String,
+}
+
+/// 高级搜索条件。`None` 表示不限制，时间均为 Unix 秒。
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilter {
+    pub query: Option<String>,
+    /// `Some(true)` 只查目录，`Some(false)` 只查文件。
+    pub is_dir: Option<bool>,
+    /// 不带前导点的小写后缀；支持 `tar.gz` 这样的多段后缀。
+    pub extensions: Vec<String>,
+    pub min_size: Option<i64>,
+    pub max_size: Option<i64>,
+    pub modified_after: Option<i64>,
+    pub modified_before: Option<i64>,
+    pub favorite_only: bool,
+    pub sort: SearchSort,
+    pub descending: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum SearchSort {
+    #[default]
+    Name,
+    Size,
+    Modified,
+    Created,
+}
+
+/// 一个可跨浏览器刷新和服务重启继续的上传会话。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UploadSession {
+    pub id: String,
+    pub node_id: i64,
+    pub display_path: String,
+    pub expected_size: i64,
+    pub sha256: String,
+    pub chunk_size: i64,
+    pub storage_target_id: i64,
+    pub thumbnail: Option<Vec<u8>>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadSessionInfo {
+    pub session: UploadSession,
+    pub node: Node,
+    pub uploaded_parts: Vec<i64>,
+    pub uploaded_bytes: i64,
+}
+
+impl UploadSessionInfo {
+    pub fn part_count(&self) -> i64 {
+        if self.session.expected_size == 0 {
+            0
+        } else {
+            self.session.expected_size / self.session.chunk_size
+                + i64::from(self.session.expected_size % self.session.chunk_size != 0)
+        }
+    }
+
+    pub fn expected_part_size(&self, idx: i64) -> Option<i64> {
+        if idx < 0 || idx >= self.part_count() {
+            return None;
+        }
+        let start = idx.checked_mul(self.session.chunk_size)?;
+        Some(
+            self.session
+                .chunk_size
+                .min(self.session.expected_size - start),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum UploadPartClaim {
+    Complete,
+    Claimed(Box<UploadSessionInfo>),
 }
 
 /// URL 安全随机 token
@@ -276,6 +357,20 @@ impl Db {
                 .fetch_all(&self.pool)
                 .await?,
         )
+    }
+
+    pub async fn set_favorite(&self, node_id: i64, favorite: bool) -> AppResult<Node> {
+        let changed =
+            sqlx::query("UPDATE nodes SET favorite = ? WHERE id = ? AND status = 'ready'")
+                .bind(favorite)
+                .bind(node_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        if changed == 0 {
+            return Err(AppError::NotFound);
+        }
+        self.node(node_id).await
     }
 
     /// 全局统计:文件数、目录数、逻辑总大小
@@ -475,8 +570,8 @@ impl Db {
 
         let mut tx = self.pool.begin().await?;
         // 旧同名 ready 文件(覆盖写场景)
-        let old: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM nodes
+        let old: Option<(i64, bool)> = sqlx::query_as(
+            "SELECT id, favorite FROM nodes
              WHERE parent_id = ? AND name = ? AND status = 'ready' AND id != ?",
         )
         .bind(parent_id)
@@ -486,7 +581,8 @@ impl Db {
         .await?;
 
         let mut candidates: Vec<StoredMessage> = Vec::new();
-        if let Some((old_id,)) = old {
+        let inherited_favorite = old.map(|(_, favorite)| favorite).unwrap_or(false);
+        if let Some((old_id, _)) = old {
             let rows: Vec<(i64, i64)> = sqlx::query_as(
                 "SELECT storage_target_id, tg_message_id FROM chunks
                  WHERE node_id = ? AND storage_target_id IS NOT NULL",
@@ -506,12 +602,21 @@ impl Db {
                 .execute(&mut *tx)
                 .await?;
         }
+        // 上传会话只在 uploading 阶段存在；和最终节点切换在同一事务内完成。
+        sqlx::query("DELETE FROM upload_sessions WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
-            "UPDATE nodes SET status = 'ready', size = ?, sha256 = ?, modified_at = ? WHERE id = ?",
+            "UPDATE nodes
+             SET status = 'ready', size = ?, sha256 = ?, modified_at = ?,
+                 favorite = CASE WHEN ? THEN 1 ELSE favorite END
+             WHERE id = ?",
         )
         .bind(size)
         .bind(sha256)
         .bind(now_ts())
+        .bind(inherited_favorite)
         .bind(node_id)
         .execute(&mut *tx)
         .await?;
@@ -567,14 +672,310 @@ impl Db {
         Ok(freed)
     }
 
-    /// 启动时清理所有 uploading 残留,返回可删的 message_id
+    /// 启动时清理旧上传管线的 uploading 残留；可恢复会话必须保留。
     pub async fn cleanup_stale_uploads(&self) -> AppResult<Vec<StoredMessage>> {
-        let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM nodes WHERE status = 'uploading'")
-            .fetch_all(&self.pool)
-            .await?;
+        let ids: Vec<(i64,)> = sqlx::query_as(
+            "SELECT n.id FROM nodes n
+             LEFT JOIN upload_sessions s ON s.node_id = n.id
+             WHERE n.status = 'uploading' AND s.id IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let mut freed = Vec::new();
         for (id,) in ids {
             freed.extend(self.abort_upload(id).await?);
+        }
+        Ok(freed)
+    }
+
+    // ---------- 可恢复上传 ----------
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_upload_session(
+        &self,
+        parent_id: i64,
+        name: &str,
+        display_path: &str,
+        expected_size: i64,
+        sha256: &str,
+        chunk_size: i64,
+        storage_target_id: i64,
+    ) -> AppResult<UploadSessionInfo> {
+        if expected_size < 0 || chunk_size <= 0 {
+            return Err(AppError::BadRequest("上传大小或分块大小无效".into()));
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AppError::BadRequest("SHA-256 格式无效".into()));
+        }
+
+        let existing: Option<(String, i64, String)> = sqlx::query_as(
+            "SELECT s.id, s.expected_size, s.sha256
+             FROM upload_sessions s JOIN nodes n ON n.id = s.node_id
+             WHERE n.parent_id = ? AND n.name = ? AND n.status = 'uploading'",
+        )
+        .bind(parent_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((id, size, existing_sha)) = existing {
+            if size == expected_size && existing_sha.eq_ignore_ascii_case(sha256) {
+                return self.upload_session_info(&id).await;
+            }
+            return Err(AppError::BadRequest(
+                "同一路径已有另一个未完成上传，请先在上传队列中取消它".into(),
+            ));
+        }
+
+        let node_id = self.create_uploading(parent_id, name).await?;
+        let id = random_token(32);
+        let ts = now_ts();
+        let inserted = sqlx::query(
+            "INSERT INTO upload_sessions
+                (id, node_id, display_path, expected_size, sha256, chunk_size,
+                 storage_target_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, lower(?), ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(node_id)
+        .bind(display_path)
+        .bind(expected_size)
+        .bind(sha256)
+        .bind(chunk_size)
+        .bind(storage_target_id)
+        .bind(ts)
+        .bind(ts)
+        .execute(&self.pool)
+        .await;
+        if let Err(error) = inserted {
+            let _ = self.abort_upload(node_id).await;
+            return Err(error.into());
+        }
+        self.upload_session_info(&id).await
+    }
+
+    async fn upload_session_row(&self, id: &str) -> AppResult<UploadSession> {
+        sqlx::query_as::<_, UploadSession>("SELECT * FROM upload_sessions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::NotFound)
+    }
+
+    pub async fn upload_session_info(&self, id: &str) -> AppResult<UploadSessionInfo> {
+        let session = self.upload_session_row(id).await?;
+        let node = self.node(session.node_id).await?;
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT idx, size FROM chunks WHERE node_id = ? ORDER BY idx")
+                .bind(session.node_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(UploadSessionInfo {
+            session,
+            node,
+            uploaded_parts: rows.iter().map(|(idx, _)| *idx).collect(),
+            uploaded_bytes: rows.iter().map(|(_, size)| *size).sum(),
+        })
+    }
+
+    pub async fn upload_sessions(&self) -> AppResult<Vec<UploadSessionInfo>> {
+        let ids: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM upload_sessions ORDER BY updated_at, id")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for (id,) in ids {
+            out.push(self.upload_session_info(&id).await?);
+        }
+        Ok(out)
+    }
+
+    pub async fn set_upload_thumbnail(&self, id: &str, thumbnail: &[u8]) -> AppResult<()> {
+        let changed = sqlx::query(
+            "UPDATE upload_sessions
+             SET thumbnail = ?, updated_at = ?
+             WHERE id = ? AND NOT EXISTS (
+                 SELECT 1 FROM chunks c
+                 WHERE c.node_id = upload_sessions.node_id AND c.idx = 0
+             )",
+        )
+        .bind(thumbnail)
+        .bind(now_ts())
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            // 已经完成第 0 块时上传缩略图是幂等无害的；不存在的会话才报错。
+            self.upload_session_row(id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn claim_upload_part(&self, id: &str, idx: i64) -> AppResult<UploadPartClaim> {
+        let info = self.upload_session_info(id).await?;
+        if info.expected_part_size(idx).is_none() {
+            return Err(AppError::BadRequest("分块下标超出范围".into()));
+        }
+        if info.uploaded_parts.contains(&idx) {
+            return Ok(UploadPartClaim::Complete);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO upload_part_claims(session_id, idx, started_at)
+             VALUES (?, ?, ?) ON CONFLICT(session_id, idx) DO NOTHING",
+        )
+        .bind(id)
+        .bind(idx)
+        .bind(now_ts())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(AppError::BadRequest("该分块正在上传，请稍后重试".into()));
+        }
+        sqlx::query("UPDATE upload_sessions SET updated_at = ? WHERE id = ?")
+            .bind(now_ts())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(UploadPartClaim::Claimed(Box::new(info)))
+    }
+
+    pub async fn release_upload_part(&self, id: &str, idx: i64) -> AppResult<()> {
+        sqlx::query("DELETE FROM upload_part_claims WHERE session_id = ? AND idx = ?")
+            .bind(id)
+            .bind(idx)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_upload_part(
+        &self,
+        id: &str,
+        idx: i64,
+        size: i64,
+        tg_file_id: &str,
+        tg_message_id: i64,
+        storage_target_id: i64,
+        tg_thumbnail_file_id: Option<&str>,
+    ) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let session: UploadSession = sqlx::query_as("SELECT * FROM upload_sessions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let part_count = if session.expected_size == 0 {
+            0
+        } else {
+            session.expected_size / session.chunk_size
+                + i64::from(session.expected_size % session.chunk_size != 0)
+        };
+        if idx < 0 || idx >= part_count {
+            return Err(AppError::BadRequest("分块下标超出范围".into()));
+        }
+        let expected = session
+            .chunk_size
+            .min(session.expected_size - idx * session.chunk_size);
+        if size != expected || storage_target_id != session.storage_target_id {
+            return Err(AppError::BadRequest("分块大小或存储目标不匹配".into()));
+        }
+        let claimed: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM upload_part_claims WHERE session_id = ? AND idx = ?")
+                .bind(id)
+                .bind(idx)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if claimed.is_none() {
+            return Err(AppError::BadRequest("分块上传声明已失效".into()));
+        }
+        sqlx::query(
+            "INSERT INTO chunks
+                (node_id, idx, size, tg_file_id, tg_message_id, storage_target_id,
+                 tg_thumbnail_file_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session.node_id)
+        .bind(idx)
+        .bind(size)
+        .bind(tg_file_id)
+        .bind(tg_message_id)
+        .bind(storage_target_id)
+        .bind(tg_thumbnail_file_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM upload_part_claims WHERE session_id = ? AND idx = ?")
+            .bind(id)
+            .bind(idx)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE upload_sessions
+             SET updated_at = ?, thumbnail = CASE WHEN ? = 0 THEN NULL ELSE thumbnail END
+             WHERE id = ?",
+        )
+        .bind(now_ts())
+        .bind(idx)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn complete_upload_session(&self, id: &str) -> AppResult<Node> {
+        let info = self.upload_session_info(id).await?;
+        let expected: Vec<i64> = (0..info.part_count()).collect();
+        if info.uploaded_parts != expected || info.uploaded_bytes != info.session.expected_size {
+            return Err(AppError::BadRequest("仍有分块尚未上传完成".into()));
+        }
+        let (claims,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM upload_part_claims WHERE session_id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        if claims != 0 {
+            return Err(AppError::BadRequest("仍有分块正在上传".into()));
+        }
+        self.finalize_upload_with_node(
+            info.session.node_id,
+            info.session.expected_size,
+            Some(&info.session.sha256),
+        )
+        .await
+        .map(|(node, _)| node)
+    }
+
+    pub async fn cancel_upload_session(&self, id: &str) -> AppResult<Vec<StoredMessage>> {
+        let session = self.upload_session_row(id).await?;
+        self.abort_upload(session.node_id).await
+    }
+
+    pub async fn reset_upload_part_claims(&self) -> AppResult<()> {
+        sqlx::query("DELETE FROM upload_part_claims")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn cleanup_expired_upload_sessions(
+        &self,
+        cutoff: i64,
+    ) -> AppResult<Vec<StoredMessage>> {
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM upload_sessions WHERE updated_at < ? ORDER BY updated_at",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut freed = Vec::new();
+        for (id,) in ids {
+            match self.cancel_upload_session(&id).await {
+                Ok(messages) => freed.extend(messages),
+                Err(AppError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(freed)
     }
@@ -951,38 +1352,105 @@ impl Db {
 
     // ---------- 搜索 / 秒传 ----------
 
-    /// 全库按名称搜索(不区分大小写),排除回收站与上传中的子树;返回 (节点, 完整路径)
+    /// 兼容原有调用的按名称搜索。
+    #[cfg(test)]
     pub async fn search(&self, query: &str, limit: usize) -> AppResult<Vec<(Node, String)>> {
+        self.search_filtered(
+            &SearchFilter {
+                query: Some(query.to_string()),
+                ..SearchFilter::default()
+            },
+            limit,
+        )
+        .await
+    }
+
+    /// 在 SQLite 内完成高级筛选、排序和路径拼接，排除回收站与上传中的子树。
+    pub async fn search_filtered(
+        &self,
+        filter: &SearchFilter,
+        limit: usize,
+    ) -> AppResult<Vec<(Node, String)>> {
         // 只让 SQLite 遍历从 ready 根可达的节点并在库内拼路径，避免节点量大时
         // 每次搜索把整张 nodes 表及所有字符串复制进应用内存。
-        let rows: Vec<SearchRow> = sqlx::query_as(
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "WITH RECURSIVE visible(
                 id, parent_id, name, is_dir, size, status,
-                created_at, modified_at, sha256, path
+                created_at, modified_at, sha256, favorite, path
              ) AS (
                 SELECT id, parent_id, name, is_dir, size, status,
-                       created_at, modified_at, sha256, ''
-                FROM nodes WHERE id = ? AND status = 'ready'
+                       created_at, modified_at, sha256, favorite, ''
+                FROM nodes WHERE id = ",
+        );
+        query.push_bind(ROOT_ID).push(
+            " AND status = 'ready'
                 UNION ALL
                 SELECT n.id, n.parent_id, n.name, n.is_dir, n.size, n.status,
-                       n.created_at, n.modified_at, n.sha256,
+                       n.created_at, n.modified_at, n.sha256, n.favorite,
                        visible.path || '/' || n.name
                 FROM nodes n JOIN visible ON n.parent_id = visible.id
                 WHERE n.status = 'ready'
              )
              SELECT id, parent_id, name, is_dir, size, status,
-                    created_at, modified_at, sha256, path
+                    created_at, modified_at, sha256, favorite, path
              FROM visible
-             WHERE id != ? AND instr(lower(name), lower(?)) > 0
-             ORDER BY name COLLATE NOCASE, id
-             LIMIT ?",
-        )
-        .bind(ROOT_ID)
-        .bind(ROOT_ID)
-        .bind(query)
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE id != ",
+        );
+        query.push_bind(ROOT_ID);
+        if let Some(needle) = filter
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        {
+            query
+                .push(" AND instr(lower(name), lower(")
+                .push_bind(needle)
+                .push(")) > 0");
+        }
+        if let Some(is_dir) = filter.is_dir {
+            query.push(" AND is_dir = ").push_bind(is_dir);
+        }
+        if !filter.extensions.is_empty() {
+            query.push(" AND is_dir = 0 AND (");
+            for (index, extension) in filter.extensions.iter().enumerate() {
+                if index > 0 {
+                    query.push(" OR ");
+                }
+                query
+                    .push("lower(name) GLOB ")
+                    .push_bind(format!("*.{}", extension.to_ascii_lowercase()));
+            }
+            query.push(")");
+        }
+        if let Some(size) = filter.min_size {
+            query.push(" AND is_dir = 0 AND size >= ").push_bind(size);
+        }
+        if let Some(size) = filter.max_size {
+            query.push(" AND is_dir = 0 AND size <= ").push_bind(size);
+        }
+        if let Some(ts) = filter.modified_after {
+            query.push(" AND modified_at >= ").push_bind(ts);
+        }
+        if let Some(ts) = filter.modified_before {
+            query.push(" AND modified_at <= ").push_bind(ts);
+        }
+        if filter.favorite_only {
+            query.push(" AND favorite = 1");
+        }
+        query.push(" ORDER BY ");
+        match filter.sort {
+            SearchSort::Name => query.push("name COLLATE NOCASE"),
+            SearchSort::Size => query.push("size"),
+            SearchSort::Modified => query.push("modified_at"),
+            SearchSort::Created => query.push("created_at"),
+        };
+        query.push(if filter.descending { " DESC" } else { " ASC" });
+        query
+            .push(", id LIMIT ")
+            .push_bind(limit.min(i64::MAX as usize) as i64);
+
+        let rows: Vec<SearchRow> = query.build_query_as().fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -998,6 +1466,7 @@ impl Db {
                         created_at: row.created_at,
                         modified_at: row.modified_at,
                         sha256: row.sha256,
+                        favorite: row.favorite,
                     },
                     path,
                 )
@@ -1045,15 +1514,17 @@ impl Db {
         let ts = now_ts();
         let mut tx = self.pool.begin().await?;
         // 覆盖写:删同名旧文件并收集其消息做引用计数
-        let old: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM nodes WHERE parent_id = ? AND name = ? AND status = 'ready'",
+        let old: Option<(i64, bool)> = sqlx::query_as(
+            "SELECT id, favorite FROM nodes
+             WHERE parent_id = ? AND name = ? AND status = 'ready'",
         )
         .bind(dst_parent)
         .bind(dst_name)
         .fetch_optional(&mut *tx)
         .await?;
         let mut candidates = Vec::new();
-        if let Some((old_id,)) = old {
+        let inherited_favorite = old.map(|(_, favorite)| favorite).unwrap_or(false);
+        if let Some((old_id, _)) = old {
             let rows: Vec<(i64, i64)> = sqlx::query_as(
                 "SELECT storage_target_id, tg_message_id FROM chunks
                  WHERE node_id = ? AND storage_target_id IS NOT NULL",
@@ -1074,8 +1545,9 @@ impl Db {
                 .await?;
         }
         let new_id = sqlx::query(
-            "INSERT INTO nodes (parent_id, name, is_dir, size, status, created_at, modified_at, sha256)
-             VALUES (?, ?, 0, ?, 'ready', ?, ?, ?)",
+            "INSERT INTO nodes
+                (parent_id, name, is_dir, size, status, created_at, modified_at, sha256, favorite)
+             VALUES (?, ?, 0, ?, 'ready', ?, ?, ?, ?)",
         )
         .bind(dst_parent)
         .bind(dst_name)
@@ -1083,6 +1555,7 @@ impl Db {
         .bind(ts)
         .bind(ts)
         .bind(sha256)
+        .bind(inherited_favorite)
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
@@ -1581,6 +2054,119 @@ mod tests {
         let hits = db.search("报告", 100).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1, "/年度报告.pdf");
+    }
+
+    #[tokio::test]
+    async fn advanced_search_filters_and_favorites() {
+        let (db, _g) = test_db().await;
+        let docs = db.mkdir(ROOT_ID, "docs").await.unwrap();
+        let report = mk_file(&db, docs.id, "季度报告.PDF", 820, "pdf").await;
+        mk_file(&db, ROOT_ID, "录音.mp3", 821, "audio").await;
+        db.set_favorite(report, true).await.unwrap();
+        db.set_favorite(docs.id, true).await.unwrap();
+        sqlx::query("UPDATE nodes SET modified_at = 2000 WHERE id = ?")
+            .bind(report)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let hits = db
+            .search_filtered(
+                &SearchFilter {
+                    query: Some("报告".into()),
+                    is_dir: Some(false),
+                    extensions: vec!["pdf".into()],
+                    min_size: Some(4),
+                    max_size: Some(4),
+                    modified_after: Some(1000),
+                    modified_before: Some(3000),
+                    favorite_only: true,
+                    sort: SearchSort::Modified,
+                    descending: true,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, "/docs/季度报告.PDF");
+        assert!(hits[0].0.favorite);
+
+        let favorites = db
+            .search_filtered(
+                &SearchFilter {
+                    favorite_only: true,
+                    ..SearchFilter::default()
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(favorites.len(), 2, "文件和目录都可以收藏");
+    }
+
+    #[tokio::test]
+    async fn resumable_upload_session_lifecycle() {
+        let (db, _g) = test_db().await;
+        let sha = "ab".repeat(32);
+        let session = db
+            .create_upload_session(ROOT_ID, "large.bin", "/large.bin", 10, &sha, 4, TEST_TARGET)
+            .await
+            .unwrap();
+        assert_eq!(session.part_count(), 3);
+        assert_eq!(session.expected_part_size(2), Some(2));
+        let same = db
+            .create_upload_session(
+                ROOT_ID,
+                "large.bin",
+                "/large.bin",
+                10,
+                &sha,
+                99,
+                TEST_TARGET,
+            )
+            .await
+            .unwrap();
+        assert_eq!(same.session.id, session.session.id, "相同内容应恢复原会话");
+
+        assert!(matches!(
+            db.claim_upload_part(&session.session.id, 0).await.unwrap(),
+            UploadPartClaim::Claimed(_)
+        ));
+        db.finish_upload_part(&session.session.id, 0, 4, "part-0", 900, TEST_TARGET, None)
+            .await
+            .unwrap();
+        assert!(
+            db.complete_upload_session(&session.session.id)
+                .await
+                .is_err()
+        );
+        assert!(db.cleanup_stale_uploads().await.unwrap().is_empty());
+
+        for (idx, size) in [(1, 4), (2, 2)] {
+            db.claim_upload_part(&session.session.id, idx)
+                .await
+                .unwrap();
+            db.finish_upload_part(
+                &session.session.id,
+                idx,
+                size,
+                &format!("part-{idx}"),
+                900 + idx,
+                TEST_TARGET,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let node = db
+            .complete_upload_session(&session.session.id)
+            .await
+            .unwrap();
+        assert_eq!(node.size, 10);
+        assert_eq!(node.sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(db.chunks_of(node.id).await.unwrap().len(), 3);
+        assert!(db.upload_session_info(&session.session.id).await.is_err());
     }
 
     #[tokio::test]

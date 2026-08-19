@@ -96,7 +96,9 @@ async fn serve() -> anyhow::Result<()> {
     ));
     let uploader = Uploader::new(tg.clone(), db.clone(), knobs.clone(), MEMORY_CHUNK_LIMIT);
 
-    // 崩溃残留的 uploading 节点:回滚记录并尽力删除已发出的分块消息
+    // 进程退出会让在途分块声明失效；已完成分块仍由可恢复会话保留。
+    db.reset_upload_part_claims().await?;
+    // 旧上传管线的崩溃残留仍需回滚；带 upload_sessions 的节点不能删除。
     if db.unassigned_chunk_count().await? == 0 {
         let stale = db.cleanup_stale_uploads().await?;
         if !stale.is_empty() {

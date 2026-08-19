@@ -10,7 +10,7 @@ pub const MEMORY_CHUNK_LIMIT: u64 = 32 * 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::reader::ChunkedReader;
-    use super::upload::Uploader;
+    use super::upload::{ResumablePartStart, Uploader};
     use crate::db::{Db, ROOT_ID};
     use crate::error::{AppError, AppResult};
     use crate::telegram::{ByteReader, TgApi, TgMessage, TgRegistry, UploadBody, VideoMeta};
@@ -254,6 +254,75 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, &data[9..]);
+    }
+
+    #[tokio::test]
+    async fn resumable_parts_survive_an_interrupted_request() {
+        let (up, _tg, db, _g) = fixture(4, 1024, None).await;
+        let data: Vec<u8> = (0..10u8).collect();
+        let target = db.storage_targets().await.unwrap()[0].id;
+        let session = db
+            .create_upload_session(
+                ROOT_ID,
+                "resume.bin",
+                "/resume.bin",
+                data.len() as i64,
+                &"00".repeat(32),
+                4,
+                target,
+            )
+            .await
+            .unwrap();
+
+        let ResumablePartStart::Upload(first) = up
+            .start_resumable_part(&session.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("第一个分块不应提前完成");
+        };
+        first
+            .feed(Bytes::copy_from_slice(&data[..4]))
+            .await
+            .unwrap();
+        first.finish().await.unwrap();
+
+        let ResumablePartStart::Upload(interrupted) = up
+            .start_resumable_part(&session.session.id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("第二个分块不应提前完成");
+        };
+        interrupted
+            .feed(Bytes::copy_from_slice(&data[4..5]))
+            .await
+            .unwrap();
+        drop(interrupted);
+        tokio::task::yield_now().await;
+        db.reset_upload_part_claims().await.unwrap();
+
+        for (idx, slice) in [(1, &data[4..8]), (2, &data[8..])] {
+            let ResumablePartStart::Upload(handle) = up
+                .start_resumable_part(&session.session.id, idx)
+                .await
+                .unwrap()
+            else {
+                panic!("缺失分块不应提前完成");
+            };
+            handle.feed(Bytes::copy_from_slice(slice)).await.unwrap();
+            handle.finish().await.unwrap();
+        }
+
+        let node = db
+            .complete_upload_session(&session.session.id)
+            .await
+            .unwrap();
+        let chunks = db.chunks_of(node.id).await.unwrap();
+        let mut reader = ChunkedReader::new(up.tg.clone(), &chunks, 0);
+        let mut restored = Vec::new();
+        reader.read_to_end(&mut restored).await.unwrap();
+        assert_eq!(restored, data);
     }
 
     #[tokio::test]

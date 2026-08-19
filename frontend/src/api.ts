@@ -8,6 +8,7 @@ export interface Entry {
   created_at: number
   modified_at: number
   sha256: string | null
+  favorite: boolean
 }
 
 export interface EntryProperties extends Entry {
@@ -37,7 +38,43 @@ export interface SearchHit {
   name: string
   is_dir: boolean
   size: number
+  created_at: number
   modified_at: number
+  favorite: boolean
+}
+
+export interface SearchParams {
+  q?: string
+  kind?: 'all' | 'file' | 'dir'
+  /** 逗号分隔且不带前导点的后缀。 */
+  extensions?: string
+  min_size?: number
+  max_size?: number
+  modified_after?: number
+  modified_before?: number
+  favorite?: boolean
+  sort?: 'name' | 'size' | 'modified' | 'created'
+  order?: 'asc' | 'desc'
+  limit?: number
+}
+
+export interface UploadSession {
+  id: string
+  path: string
+  name: string
+  size: number
+  sha256: string
+  chunk_size: number
+  part_count: number
+  uploaded_parts: number[]
+  uploaded_bytes: number
+  created_at: number
+  updated_at: number
+}
+
+export interface UploadSessionResponse {
+  session: UploadSession
+  concurrency: number
 }
 
 export interface TrashItem {
@@ -278,7 +315,12 @@ export const api = {
   exists: (dir: string, names: string[]) =>
     http.post<{ existing: string[] }>('/fs/exists', { dir, names }),
 
-  search: (q: string) => http.get<{ results: SearchHit[] }>('/fs/search', { params: { q } }),
+  search: (params: SearchParams | string) =>
+    http.get<{ results: SearchHit[] }>('/fs/search', {
+      params: typeof params === 'string' ? { q: params, limit: 200 } : params,
+    }),
+  favorite: (path: string, favorite: boolean) =>
+    http.post<{ ok: boolean; favorite: boolean }>('/fs/favorite', { path, favorite }),
   /** 秒传探测:库里有同内容文件则零流量落位 */
   instant: (dir: string, name: string, sha256: string, size: number) =>
     http.post<{ linked: boolean; pending: boolean; entry?: Entry }>('/fs/instant', {
@@ -287,6 +329,37 @@ export const api = {
       sha256,
       size,
     }),
+
+  uploads: {
+    list: () =>
+      http.get<{ sessions: UploadSession[]; concurrency: number }>('/uploads'),
+    status: (id: string) => http.get<UploadSessionResponse>(`/uploads/${id}`),
+    create: (dir: string, name: string, size: number, sha256: string) =>
+      http.post<UploadSessionResponse>('/uploads', { dir, name, size, sha256 }),
+    thumbnail: (id: string, image: Blob) =>
+      http.post<{ ok: boolean }>(`/uploads/${id}/thumbnail`, image, {
+        headers: { 'Content-Type': image.type || 'image/jpeg' },
+      }),
+    part: (
+      id: string,
+      idx: number,
+      data: Blob,
+      onProgress: (loaded: number) => void,
+      signal?: AbortSignal,
+    ) =>
+      http.put<{ already_uploaded: boolean; session: UploadSession }>(
+        `/uploads/${id}/parts/${idx}`,
+        data,
+        {
+          headers: { 'Content-Type': 'application/octet-stream' },
+          signal,
+          onUploadProgress: (event) => onProgress(event.loaded),
+        },
+      ),
+    complete: (id: string) =>
+      http.post<{ ok: boolean; entry: Entry }>(`/uploads/${id}/complete`),
+    cancel: (id: string) => http.delete<{ ok: boolean }>(`/uploads/${id}`),
+  },
 
   trash: {
     list: () => http.get<{ items: TrashItem[] }>('/trash'),
