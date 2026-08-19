@@ -1,4 +1,4 @@
-//! 维护类可调项(回收站保留天数 / 自动备份 / Bot 收件),存 settings 表 `extra.*` 键。
+//! 维护类可调项（回收站保留天数 / 多渠道自动备份 / Bot 收件），存 settings 表 `extra.*` 键。
 //! 与 `cfg.*` 配置体系分开:这些项没有环境变量层,纯后台开关。
 
 use crate::db::Db;
@@ -10,6 +10,8 @@ pub const DEFAULT_TRASH_DAYS: i64 = 30;
 pub const DEFAULT_INBOX_DIR: &str = "/收件箱";
 /// 数据库备份默认按官方 Bot API 可安全下载的大小分块。
 pub const DEFAULT_BACKUP_CHUNK_SIZE: u64 = crate::config::OFFICIAL_CHUNK_DEFAULT;
+/// 管理端展示已保存凭据时使用固定占位符，避免泄露长度与内容。
+pub const BACKUP_SECRET_PLACEHOLDER: &str = "••••••••";
 const MAX_INBOX_RULES: usize = 50;
 const MAX_RULE_EXTENSIONS: usize = 100;
 
@@ -25,10 +27,33 @@ pub struct InboxRouteRule {
 pub struct Extras {
     /// 回收站保留天数;0 = 永不自动清理
     pub trash_retention_days: i64,
-    /// 每日自动把数据库快照发到存储频道
+    /// 每日自动把数据库快照投递到所有已启用渠道
     pub backup_auto: bool,
     /// 数据库快照上传到 Telegram 时的单块大小
     pub backup_chunk_size: u64,
+    /// 是否把数据库快照备份到当前 Telegram 存储频道；旧配置默认开启。
+    pub backup_telegram_enabled: bool,
+    /// 是否把数据库快照备份到 WebDAV。
+    pub backup_webdav_enabled: bool,
+    /// WebDAV 备份目录 URL，目录需要预先存在。
+    pub backup_webdav_url: String,
+    pub backup_webdav_username: String,
+    #[serde(serialize_with = "serialize_backup_secret")]
+    pub backup_webdav_password: String,
+    /// 是否把数据库快照备份到 S3 兼容对象存储。
+    pub backup_s3_enabled: bool,
+    pub backup_s3_endpoint: String,
+    pub backup_s3_region: String,
+    pub backup_s3_bucket: String,
+    pub backup_s3_prefix: String,
+    #[serde(serialize_with = "serialize_backup_secret")]
+    pub backup_s3_access_key: String,
+    #[serde(serialize_with = "serialize_backup_secret")]
+    pub backup_s3_secret_key: String,
+    #[serde(serialize_with = "serialize_backup_secret")]
+    pub backup_s3_session_token: String,
+    /// true 使用 endpoint/bucket/key，false 使用 bucket.endpoint/key。
+    pub backup_s3_path_style: bool,
     /// Bot 收件(频道直发 + 私聊白名单转存)
     pub inbox_enabled: bool,
     /// 允许私聊收件的 chat id,逗号分隔;空 = 只收存储频道内直发
@@ -43,6 +68,17 @@ pub struct Extras {
     pub inbox_book_dir: String,
     /// 自定义类型规则；优先于内置类型，重叠时更长的后缀优先
     pub inbox_rules: Vec<InboxRouteRule>,
+}
+
+fn serialize_backup_secret<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(if value.is_empty() {
+        ""
+    } else {
+        BACKUP_SECRET_PLACEHOLDER
+    })
 }
 
 async fn get(db: &Db, k: &str) -> AppResult<Option<String>> {
@@ -91,6 +127,28 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
             .unwrap_or(DEFAULT_TRASH_DAYS),
         backup_auto: get(db, "backup_auto").await?.as_deref() == Some("1"),
         backup_chunk_size,
+        backup_telegram_enabled: get(db, "backup_telegram_enabled").await?.as_deref() != Some("0"),
+        backup_webdav_enabled: get(db, "backup_webdav_enabled").await?.as_deref() == Some("1"),
+        backup_webdav_url: get(db, "backup_webdav_url").await?.unwrap_or_default(),
+        backup_webdav_username: get(db, "backup_webdav_username").await?.unwrap_or_default(),
+        backup_webdav_password: get(db, "backup_webdav_password").await?.unwrap_or_default(),
+        backup_s3_enabled: get(db, "backup_s3_enabled").await?.as_deref() == Some("1"),
+        backup_s3_endpoint: get(db, "backup_s3_endpoint")
+            .await?
+            .unwrap_or_else(|| "https://s3.amazonaws.com".into()),
+        backup_s3_region: get(db, "backup_s3_region")
+            .await?
+            .unwrap_or_else(|| "us-east-1".into()),
+        backup_s3_bucket: get(db, "backup_s3_bucket").await?.unwrap_or_default(),
+        backup_s3_prefix: get(db, "backup_s3_prefix")
+            .await?
+            .unwrap_or_else(|| "tgdrive".into()),
+        backup_s3_access_key: get(db, "backup_s3_access_key").await?.unwrap_or_default(),
+        backup_s3_secret_key: get(db, "backup_s3_secret_key").await?.unwrap_or_default(),
+        backup_s3_session_token: get(db, "backup_s3_session_token")
+            .await?
+            .unwrap_or_default(),
+        backup_s3_path_style: get(db, "backup_s3_path_style").await?.as_deref() != Some("0"),
         inbox_enabled: get(db, "inbox_enabled").await?.as_deref() == Some("1"),
         inbox_allowed_chats: get(db, "inbox_allowed_chats").await?.unwrap_or_default(),
         inbox_video_dir: get(db, "inbox_video_dir")
@@ -116,6 +174,20 @@ pub struct ExtrasPatch {
     pub backup_auto: Option<bool>,
     /// 字符串形式便于后台使用 `18MB`、`1GB` 等写法。
     pub backup_chunk_size: Option<String>,
+    pub backup_telegram_enabled: Option<bool>,
+    pub backup_webdav_enabled: Option<bool>,
+    pub backup_webdav_url: Option<String>,
+    pub backup_webdav_username: Option<String>,
+    pub backup_webdav_password: Option<String>,
+    pub backup_s3_enabled: Option<bool>,
+    pub backup_s3_endpoint: Option<String>,
+    pub backup_s3_region: Option<String>,
+    pub backup_s3_bucket: Option<String>,
+    pub backup_s3_prefix: Option<String>,
+    pub backup_s3_access_key: Option<String>,
+    pub backup_s3_secret_key: Option<String>,
+    pub backup_s3_session_token: Option<String>,
+    pub backup_s3_path_style: Option<bool>,
     pub inbox_enabled: Option<bool>,
     pub inbox_allowed_chats: Option<String>,
     pub inbox_dir: Option<String>,
@@ -123,6 +195,106 @@ pub struct ExtrasPatch {
     pub inbox_image_dir: Option<String>,
     pub inbox_book_dir: Option<String>,
     pub inbox_rules: Option<Vec<InboxRouteRule>>,
+}
+
+fn normalize_http_url(raw: &str, label: &str) -> AppResult<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    let mut url = reqwest::Url::parse(raw)
+        .map_err(|_| AppError::BadRequest(format!("{label}不是有效 URL")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(AppError::BadRequest(format!(
+            "{label}必须是 http:// 或 https:// 地址"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::BadRequest(format!(
+            "{label}不能内嵌账号密码，请使用独立凭据字段"
+        )));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(AppError::BadRequest(format!(
+            "{label}不能包含查询参数或片段"
+        )));
+    }
+    // 保存为稳定的目录/端点形式，拼接备份文件名时再追加路径段。
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&normalized_path);
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn normalize_s3_prefix(raw: &str) -> AppResult<String> {
+    let prefix = raw.trim().trim_matches('/');
+    if prefix.chars().count() > 512
+        || prefix.chars().any(char::is_control)
+        || prefix.split('/').any(|segment| segment == "..")
+    {
+        return Err(AppError::BadRequest("S3 对象前缀无效".into()));
+    }
+    Ok(prefix.to_string())
+}
+
+fn validate_backup_destinations(extras: &Extras) -> AppResult<()> {
+    if extras.backup_auto
+        && !extras.backup_telegram_enabled
+        && !extras.backup_webdav_enabled
+        && !extras.backup_s3_enabled
+    {
+        return Err(AppError::BadRequest(
+            "开启每日自动备份时至少要启用一个备份渠道".into(),
+        ));
+    }
+    if extras.backup_webdav_enabled && extras.backup_webdav_url.is_empty() {
+        return Err(AppError::BadRequest(
+            "启用 WebDAV 备份前请填写目录 URL".into(),
+        ));
+    }
+    if extras.backup_webdav_username.is_empty() && !extras.backup_webdav_password.is_empty() {
+        return Err(AppError::BadRequest(
+            "填写 WebDAV 密码时也需要填写用户名".into(),
+        ));
+    }
+    if extras.backup_s3_enabled {
+        if extras.backup_s3_endpoint.is_empty()
+            || extras.backup_s3_region.is_empty()
+            || extras.backup_s3_bucket.is_empty()
+            || extras.backup_s3_access_key.is_empty()
+            || extras.backup_s3_secret_key.is_empty()
+        {
+            return Err(AppError::BadRequest(
+                "启用 S3 备份前请完整填写端点、区域、存储桶、Access Key 和 Secret Key".into(),
+            ));
+        }
+        if extras.backup_s3_bucket.len() > 255
+            || extras.backup_s3_bucket.contains('/')
+            || extras.backup_s3_bucket.chars().any(char::is_control)
+        {
+            return Err(AppError::BadRequest("S3 存储桶名称无效".into()));
+        }
+        if extras.backup_s3_region.len() > 128
+            || !extras
+                .backup_s3_region
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(AppError::BadRequest("S3 区域名称无效".into()));
+        }
+        if !extras.backup_s3_path_style
+            && extras
+                .backup_s3_endpoint
+                .parse::<reqwest::Url>()
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+                .is_some_and(|host| host.parse::<std::net::IpAddr>().is_ok())
+        {
+            return Err(AppError::BadRequest(
+                "IP 地址形式的 S3 端点必须开启路径样式".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 解析并校验数据库备份分块大小的全局范围。
@@ -280,6 +452,109 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
         .as_deref()
         .map(parse_backup_chunk_size)
         .transpose()?;
+    let backup_webdav_url = p
+        .backup_webdav_url
+        .as_deref()
+        .map(|value| normalize_http_url(value, "WebDAV 目录 URL"))
+        .transpose()?;
+    let backup_webdav_username = p
+        .backup_webdav_username
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_string);
+    let backup_webdav_password = p
+        .backup_webdav_password
+        .as_deref()
+        .filter(|value| *value != BACKUP_SECRET_PLACEHOLDER)
+        .map(str::to_string);
+    let backup_s3_endpoint = p
+        .backup_s3_endpoint
+        .as_deref()
+        .map(|value| normalize_http_url(value, "S3 端点"))
+        .transpose()?;
+    let backup_s3_region = p
+        .backup_s3_region
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_string);
+    let backup_s3_bucket = p
+        .backup_s3_bucket
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_string);
+    let backup_s3_prefix = p
+        .backup_s3_prefix
+        .as_deref()
+        .map(normalize_s3_prefix)
+        .transpose()?;
+    let backup_s3_access_key = p
+        .backup_s3_access_key
+        .as_deref()
+        .filter(|value| *value != BACKUP_SECRET_PLACEHOLDER)
+        .map(str::trim)
+        .map(str::to_string);
+    let backup_s3_secret_key = p
+        .backup_s3_secret_key
+        .as_deref()
+        .filter(|value| *value != BACKUP_SECRET_PLACEHOLDER)
+        .map(str::to_string);
+    let backup_s3_session_token = p
+        .backup_s3_session_token
+        .as_deref()
+        .filter(|value| *value != BACKUP_SECRET_PLACEHOLDER)
+        .map(str::to_string);
+
+    // 使用当前配置补齐未提交字段后整体校验，避免只改开关时绕过凭据完整性检查。
+    let mut next = load(db).await?;
+    if let Some(value) = p.backup_auto {
+        next.backup_auto = value;
+    }
+    if let Some(value) = backup_chunk_size {
+        next.backup_chunk_size = value;
+    }
+    if let Some(value) = p.backup_telegram_enabled {
+        next.backup_telegram_enabled = value;
+    }
+    if let Some(value) = p.backup_webdav_enabled {
+        next.backup_webdav_enabled = value;
+    }
+    if let Some(value) = &backup_webdav_url {
+        next.backup_webdav_url.clone_from(value);
+    }
+    if let Some(value) = &backup_webdav_username {
+        next.backup_webdav_username.clone_from(value);
+    }
+    if let Some(value) = &backup_webdav_password {
+        next.backup_webdav_password.clone_from(value);
+    }
+    if let Some(value) = p.backup_s3_enabled {
+        next.backup_s3_enabled = value;
+    }
+    if let Some(value) = &backup_s3_endpoint {
+        next.backup_s3_endpoint.clone_from(value);
+    }
+    if let Some(value) = &backup_s3_region {
+        next.backup_s3_region.clone_from(value);
+    }
+    if let Some(value) = &backup_s3_bucket {
+        next.backup_s3_bucket.clone_from(value);
+    }
+    if let Some(value) = &backup_s3_prefix {
+        next.backup_s3_prefix.clone_from(value);
+    }
+    if let Some(value) = &backup_s3_access_key {
+        next.backup_s3_access_key.clone_from(value);
+    }
+    if let Some(value) = &backup_s3_secret_key {
+        next.backup_s3_secret_key.clone_from(value);
+    }
+    if let Some(value) = &backup_s3_session_token {
+        next.backup_s3_session_token.clone_from(value);
+    }
+    if let Some(value) = p.backup_s3_path_style {
+        next.backup_s3_path_style = value;
+    }
+    validate_backup_destinations(&next)?;
 
     if let Some(d) = p.trash_retention_days {
         set(db, "trash_retention_days", &d.to_string()).await?;
@@ -289,6 +564,48 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     }
     if let Some(size) = backup_chunk_size {
         set(db, "backup_chunk_size", &size.to_string()).await?;
+    }
+    if let Some(value) = p.backup_telegram_enabled {
+        set(db, "backup_telegram_enabled", if value { "1" } else { "0" }).await?;
+    }
+    if let Some(value) = p.backup_webdav_enabled {
+        set(db, "backup_webdav_enabled", if value { "1" } else { "0" }).await?;
+    }
+    if let Some(value) = backup_webdav_url {
+        set(db, "backup_webdav_url", &value).await?;
+    }
+    if let Some(value) = backup_webdav_username {
+        set(db, "backup_webdav_username", &value).await?;
+    }
+    if let Some(value) = backup_webdav_password {
+        set(db, "backup_webdav_password", &value).await?;
+    }
+    if let Some(value) = p.backup_s3_enabled {
+        set(db, "backup_s3_enabled", if value { "1" } else { "0" }).await?;
+    }
+    if let Some(value) = backup_s3_endpoint {
+        set(db, "backup_s3_endpoint", &value).await?;
+    }
+    if let Some(value) = backup_s3_region {
+        set(db, "backup_s3_region", &value).await?;
+    }
+    if let Some(value) = backup_s3_bucket {
+        set(db, "backup_s3_bucket", &value).await?;
+    }
+    if let Some(value) = backup_s3_prefix {
+        set(db, "backup_s3_prefix", &value).await?;
+    }
+    if let Some(value) = backup_s3_access_key {
+        set(db, "backup_s3_access_key", &value).await?;
+    }
+    if let Some(value) = backup_s3_secret_key {
+        set(db, "backup_s3_secret_key", &value).await?;
+    }
+    if let Some(value) = backup_s3_session_token {
+        set(db, "backup_s3_session_token", &value).await?;
+    }
+    if let Some(value) = p.backup_s3_path_style {
+        set(db, "backup_s3_path_style", if value { "1" } else { "0" }).await?;
     }
     if let Some(b) = p.inbox_enabled {
         set(db, "inbox_enabled", if b { "1" } else { "0" }).await?;
@@ -449,5 +766,96 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(load(&db).await.unwrap().inbox_dir, "/原目录");
+    }
+
+    #[tokio::test]
+    async fn backup_credentials_are_masked_and_placeholders_preserve_saved_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(
+            directory
+                .path()
+                .join("backup-settings.db")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        save(
+            &db,
+            &ExtrasPatch {
+                backup_webdav_enabled: Some(true),
+                backup_webdav_url: Some("https://dav.example.com/backups/".into()),
+                backup_webdav_username: Some("alice".into()),
+                backup_webdav_password: Some("dav-secret".into()),
+                backup_s3_enabled: Some(true),
+                backup_s3_endpoint: Some("https://s3.example.com/".into()),
+                backup_s3_region: Some("auto".into()),
+                backup_s3_bucket: Some("db-backups".into()),
+                backup_s3_prefix: Some("/tgdrive/daily/".into()),
+                backup_s3_access_key: Some("ACCESS".into()),
+                backup_s3_secret_key: Some("s3-secret".into()),
+                backup_s3_session_token: Some("session-token".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let loaded = load(&db).await.unwrap();
+        assert_eq!(loaded.backup_webdav_url, "https://dav.example.com/backups");
+        assert_eq!(loaded.backup_s3_prefix, "tgdrive/daily");
+        assert_eq!(loaded.backup_webdav_password, "dav-secret");
+        let public = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(public["backup_webdav_password"], BACKUP_SECRET_PLACEHOLDER);
+        assert_eq!(public["backup_s3_secret_key"], BACKUP_SECRET_PLACEHOLDER);
+        assert_eq!(public["backup_s3_access_key"], BACKUP_SECRET_PLACEHOLDER);
+        assert_eq!(public["backup_s3_session_token"], BACKUP_SECRET_PLACEHOLDER);
+
+        save(
+            &db,
+            &ExtrasPatch {
+                backup_webdav_password: Some(BACKUP_SECRET_PLACEHOLDER.into()),
+                backup_s3_access_key: Some(BACKUP_SECRET_PLACEHOLDER.into()),
+                backup_s3_secret_key: Some(BACKUP_SECRET_PLACEHOLDER.into()),
+                backup_s3_session_token: Some(BACKUP_SECRET_PLACEHOLDER.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let preserved = load(&db).await.unwrap();
+        assert_eq!(preserved.backup_webdav_password, "dav-secret");
+        assert_eq!(preserved.backup_s3_access_key, "ACCESS");
+        assert_eq!(preserved.backup_s3_secret_key, "s3-secret");
+        assert_eq!(preserved.backup_s3_session_token, "session-token");
+    }
+
+    #[tokio::test]
+    async fn automatic_backup_requires_at_least_one_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(
+            directory
+                .path()
+                .join("backup-validation.db")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let result = save(
+            &db,
+            &ExtrasPatch {
+                backup_auto: Some(true),
+                backup_telegram_enabled: Some(false),
+                backup_webdav_enabled: Some(false),
+                backup_s3_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        let unchanged = load(&db).await.unwrap();
+        assert!(!unchanged.backup_auto);
+        assert!(unchanged.backup_telegram_enabled);
     }
 }

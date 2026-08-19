@@ -3,6 +3,7 @@
 
 mod api;
 mod auth;
+mod backup;
 mod config;
 mod dav;
 mod db;

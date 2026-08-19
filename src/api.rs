@@ -114,7 +114,9 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/logout-all", post(admin_logout_all))
         .route("/admin/env-export", get(admin_env_export))
         .route("/admin/backup", get(admin_backup))
-        .route("/admin/backup-to-channel", post(admin_backup_to_channel))
+        .route("/admin/backup-now", post(admin_backup_now))
+        // 保留旧地址，升级前已打开的管理端仍可触发新版多渠道备份。
+        .route("/admin/backup-to-channel", post(admin_backup_now))
         .route("/admin/extras", get(extras_get).post(extras_set))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1720,30 +1722,31 @@ async fn admin_backup(State(state): State<AppState>) -> AppResult<Response> {
         .expect("响应构造失败"))
 }
 
-/// 立即把数据库快照发到存储频道
-async fn admin_backup_to_channel(
+/// 立即把同一份数据库快照投递到全部已启用渠道。
+async fn admin_backup_now(
     State(state): State<AppState>,
-) -> AppResult<Json<serde_json::Value>> {
-    let backup = crate::housekeeping::backup_to_channel(&state.vfs, &state.rt).await?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "name": backup.name,
-        "parts": backup.parts,
-    })))
+) -> AppResult<Json<crate::backup::BackupOutcome>> {
+    Ok(Json(
+        crate::backup::backup_now(&state.vfs, &state.rt).await?,
+    ))
 }
 
 async fn extras_get(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let ex = crate::extras::load(&state.vfs.db).await?;
-    let last_backup = state
-        .vfs
-        .db
-        .setting_get("extra.backup_last_ts")
-        .await?
-        .and_then(|v| v.parse::<i64>().ok());
+    let last_by_target = crate::backup::last_times(&state.vfs.db).await?;
+    let last_backup = [
+        last_by_target.telegram,
+        last_by_target.webdav,
+        last_by_target.s3,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
     let trash_count = state.vfs.db.trash_list().await?.len();
     Ok(Json(serde_json::json!({
         "extras": ex,
         "backup_last_ts": last_backup,
+        "backup_last_by_target": last_by_target,
         "trash_count": trash_count,
     })))
 }
@@ -1752,9 +1755,21 @@ async fn extras_set(
     State(state): State<AppState>,
     Json(p): Json<crate::extras::ExtrasPatch>,
 ) -> AppResult<Json<serde_json::Value>> {
-    if let Some(raw) = p.backup_chunk_size.as_deref() {
+    let current = crate::extras::load(&state.vfs.db).await?;
+    let telegram_enabled = p
+        .backup_telegram_enabled
+        .unwrap_or(current.backup_telegram_enabled);
+    if telegram_enabled && let Some(raw) = p.backup_chunk_size.as_deref() {
         let size = crate::extras::parse_backup_chunk_size(raw)?;
         crate::extras::validate_backup_chunk_size(&state.rt.current().api_base, size)?;
+    }
+    if p.backup_auto.unwrap_or(current.backup_auto)
+        && telegram_enabled
+        && !state.rt.current().is_configured()
+    {
+        return Err(AppError::BadRequest(
+            "启用 Telegram 自动备份前请先配置 Bot Token 与存储频道，或关闭该备份渠道".into(),
+        ));
     }
     crate::extras::save(&state.vfs.db, &p).await?;
     Ok(Json(serde_json::json!({ "ok": true })))

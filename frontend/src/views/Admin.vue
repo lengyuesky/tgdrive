@@ -1,8 +1,37 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, onUnmounted, ref, type Component } from 'vue'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, Brush, Delete, Download, Moon, Refresh, RefreshLeft, Setting, Sunny, SwitchButton } from '@element-plus/icons-vue'
+import {
+  ArrowLeft,
+  Brush,
+  Coin,
+  Cpu,
+  Delete,
+  Document,
+  Download,
+  FolderOpened,
+  Histogram,
+  InfoFilled,
+  Link,
+  Message,
+  Money,
+  Monitor,
+  Moon,
+  Odometer,
+  Plus,
+  Promotion,
+  Refresh,
+  RefreshLeft,
+  Setting,
+  Sunny,
+  SwitchButton,
+  Tools,
+  Upload,
+  User,
+  VideoPlay,
+  WarnTriangleFilled,
+} from '@element-plus/icons-vue'
 import { appAlert, appConfirm } from '../dialog'
 import { isDark, toggleDark } from '../theme'
 import {
@@ -13,6 +42,7 @@ import {
   fmtTime,
   type AdminConfig,
   type AdminStatus,
+  type BackupLastTimes,
   type CfgKey,
   type ConfigPatch,
   type DetectedChat,
@@ -21,8 +51,10 @@ import {
   type InboxFailure,
 } from '../api'
 import DirPicker from '../components/DirPicker.vue'
+import SettingField from '../components/SettingField.vue'
 
 const router = useRouter()
+const route = useRoute()
 const cfg = ref<AdminConfig>()
 const status = ref<AdminStatus>()
 const loading = ref(true)
@@ -31,6 +63,41 @@ const testing = ref(false)
 const inboxFailureDialog = ref(false)
 const inboxFailureLoading = ref(false)
 const inboxFailures = ref<InboxFailure[]>([])
+
+// ---- 分区导航:一次只显示一块,避免整页长滚动 ----
+type SectionKey = 'overview' | 'telegram' | 'stream' | 'account' | 'backup' | 'inbox' | 'advanced'
+
+const SECTIONS: { key: SectionKey; label: string; desc: string; icon: Component }[] = [
+  { key: 'overview', label: '概览', desc: '运行状态与快捷操作', icon: Odometer },
+  { key: 'telegram', label: 'Telegram 存储', desc: 'Bot、频道与分块', icon: Promotion },
+  { key: 'stream', label: '流式播放', desc: 'MTProto / 自建 Bot API', icon: VideoPlay },
+  { key: 'account', label: '账号', desc: '登录用户名与密码', icon: User },
+  { key: 'backup', label: '备份与回收站', desc: '数据库快照与保留期', icon: FolderOpened },
+  { key: 'inbox', label: 'Bot 收件', desc: '自动入库与分类目录', icon: Message },
+  { key: 'advanced', label: '高级', desc: '临时目录、只读项与维护', icon: Tools },
+]
+
+const SECTION_STORE = 'tgdrive.adminSection'
+const isSectionKey = (k: string): k is SectionKey => SECTIONS.some((s) => s.key === k)
+
+/** 优先用地址栏里的分区(便于收藏/跳转),其次是上次停留的分区 */
+function initialSection(): SectionKey {
+  const q = String(route.query.s ?? '')
+  if (isSectionKey(q)) return q
+  const saved = localStorage.getItem(SECTION_STORE) ?? ''
+  return isSectionKey(saved) ? saved : 'overview'
+}
+const section = ref<SectionKey>(initialSection())
+const activeSection = computed(
+  () => SECTIONS.find((s) => s.key === section.value) ?? SECTIONS[0],
+)
+
+function go(key: SectionKey) {
+  section.value = key
+  localStorage.setItem(SECTION_STORE, key)
+  // 只改 query,组件不会重建,离开守卫也不会触发
+  if (route.query.s !== key) router.replace({ query: { ...route.query, s: key } })
+}
 
 /** 表单当前值(字符串化,便于比对是否改动) */
 const form = ref({
@@ -102,6 +169,10 @@ let lastLocalBase = ''
 const lastChunk: Record<'official' | 'local', string> = { official: '', local: '' }
 /** 视频消息开关同理;没动过则取端点默认(自建开、官方关) */
 const lastVideo: Record<'official' | 'local', boolean | null> = { official: null, local: null }
+const API_MODES = [
+  { label: '官方 Bot API', value: 'official' },
+  { label: '自建 Bot API', value: 'local' },
+]
 const apiMode = computed<'official' | 'local'>({
   get: () => (isOfficial.value ? 'official' : 'local'),
   set: (m) => {
@@ -194,7 +265,6 @@ function buildPatch(): ConfigPatch {
   if (f.telegram_api_hash !== o.telegram_api_hash) p.telegram_api_hash = f.telegram_api_hash
   return p
 }
-const dirty = computed(() => Object.keys(buildPatch()).length > 0)
 
 /** api_id/hash 改动后，tgdrive 与自建 Bot API 都要使用宿主机的新 .env。 */
 const RESTART_CMD =
@@ -202,15 +272,13 @@ const RESTART_CMD =
 
 async function save(force = false) {
   const patch = buildPatch()
-  if (!Object.keys(patch).length) {
-    ElMessage.info('没有改动')
-    return
-  }
+  if (!Object.keys(patch).length) return
   if (force) patch.force = true
   saving.value = true
   try {
     const { data } = await api.admin.save(patch)
     if (data.account_changed) {
+      leaving.value = true
       await appAlert({
         title: '需要重新登录',
         message: '账号已修改,所有设备的登录状态已失效,请用新账号重新登录。',
@@ -274,6 +342,7 @@ async function resetKey(key: CfgKey, label: string) {
   try {
     const { data } = await api.admin.reset([key])
     if (data.account_changed) {
+      leaving.value = true
       await appAlert({
         title: '需要重新登录',
         message: '账号已恢复,请重新登录。',
@@ -354,7 +423,7 @@ function addWhitelist(c: DetectedChat) {
   }
   ids.push(String(c.id))
   extras.value.inbox_allowed_chats = ids.join(',')
-  ElMessage.success(`已把 ${c.id} 填进白名单,记得点「保存收件设置」`)
+  ElMessage.success(`已把 ${c.id} 填进白名单,记得点「保存并生效」`)
 }
 
 async function cleanup() {
@@ -390,6 +459,7 @@ async function logoutAll() {
   } catch {
     return
   }
+  leaving.value = true
   await api.admin.logoutAll().catch(() => {})
   router.push('/login')
 }
@@ -416,16 +486,14 @@ async function copyEnv() {
   }
 }
 
-const SOURCE_LABEL: Record<string, string> = {
-  db: '后台已改',
-  env: '来自 .env',
-  default: '默认值',
-}
-
 // ---- 维护类设置(回收站/备份/Bot 收件) ----
 const extras = ref<Extras>()
+/** 加载时的深拷贝快照,用于统计维护类设置改了几项 */
+const extrasOrigin = ref<Extras>()
 const backupChunkSizeInput = ref('18MB')
+const backupChunkOrigin = ref('18MB')
 const backupLastTs = ref<number | null>(null)
+const backupLastByTarget = ref<BackupLastTimes>({ telegram: null, webdav: null, s3: null })
 const trashCount = ref(0)
 const extrasSaving = ref(false)
 const backingUp = ref(false)
@@ -433,19 +501,33 @@ const inboxDirPicker = ref<InstanceType<typeof DirPicker>>()
 const inboxRuleExtensionDrafts = ref<string[]>([])
 
 type InboxDirKey = 'inbox_dir' | 'inbox_video_dir' | 'inbox_image_dir' | 'inbox_book_dir'
-const INBOX_DIR_LABEL: Record<InboxDirKey, string> = {
-  inbox_dir: '默认收件目录',
-  inbox_video_dir: '视频目录',
-  inbox_image_dir: '图片目录',
-  inbox_book_dir: '书籍目录',
-}
+const INBOX_DIRS: { key: InboxDirKey; label: string; help: string }[] = [
+  {
+    key: 'inbox_dir',
+    label: '默认收件目录',
+    help: '没有命中任何类型规则的文件放这里,目录不存在时自动创建。',
+  },
+  {
+    key: 'inbox_video_dir',
+    label: '视频目录',
+    help: 'mp4、mkv、mov、avi、webm、flv、wmv、ts、m2ts、mpeg、3gp 等。',
+  },
+  {
+    key: 'inbox_image_dir',
+    label: '图片目录',
+    help: 'jpg、png、gif、webp、bmp、avif、heic、tiff、svg 等。',
+  },
+  {
+    key: 'inbox_book_dir',
+    label: '书籍目录',
+    help: 'pdf、epub、mobi、azw3、fb2、djvu、cbz、cbr、txt、rtf 等。',
+  },
+]
 
 async function chooseInboxDir(key: InboxDirKey) {
   if (!extras.value) return
-  const picked = await inboxDirPicker.value?.open(
-    `选择${INBOX_DIR_LABEL[key]}`,
-    extras.value[key],
-  )
+  const label = INBOX_DIRS.find((d) => d.key === key)?.label ?? '收件目录'
+  const picked = await inboxDirPicker.value?.open(`选择${label}`, extras.value[key])
   if (!picked) return
   if (picked === '/') {
     ElMessage.warning('收件目录不能是根目录，请选择或新建一个文件夹')
@@ -510,9 +592,12 @@ async function loadExtras() {
   try {
     const { data } = await api.admin.extras()
     extras.value = data.extras
+    extrasOrigin.value = JSON.parse(JSON.stringify(data.extras))
     backupChunkSizeInput.value = sizeInput(data.extras.backup_chunk_size)
+    backupChunkOrigin.value = backupChunkSizeInput.value
     inboxRuleExtensionDrafts.value = data.extras.inbox_rules.map(() => '')
     backupLastTs.value = data.backup_last_ts
+    backupLastByTarget.value = data.backup_last_by_target
     trashCount.value = data.trash_count
   } catch (e) {
     ElMessage.error(errMsg(e))
@@ -539,15 +624,184 @@ async function saveExtras() {
   }
 }
 
+// ---- 改动追踪:哪些分区有未保存的编辑,一共几项 ----
+/** 后缀输入框里还有没敲回车的内容,保存时会一并收下 */
+const hasRuleDraft = () => inboxRuleExtensionDrafts.value.some((d) => d.trim().length > 0)
+
+function extrasPatchKeys(): string[] {
+  const cur = extras.value
+  const org = extrasOrigin.value
+  if (!cur || !org) return []
+  const keys = (Object.keys(cur) as (keyof Extras)[])
+    .filter((k) => JSON.stringify(cur[k]) !== JSON.stringify(org[k]))
+    .map(String)
+  if (backupChunkSizeInput.value !== backupChunkOrigin.value) keys.push('backup_chunk_size')
+  return keys
+}
+
+const changed = computed(() => {
+  const cfgKeys = Object.keys(buildPatch())
+  const extKeys = extrasPatchKeys()
+  if (hasRuleDraft() && !extKeys.includes('inbox_rules')) extKeys.push('inbox_rules')
+  return { cfgKeys, extKeys, total: cfgKeys.length + extKeys.length }
+})
+
+/** 配置项 → 所属分区,用于在导航上标出哪块有改动 */
+const CFG_SECTION: Record<string, SectionKey> = {
+  api_base: 'telegram',
+  bot_token: 'telegram',
+  chat_id: 'telegram',
+  chunk_size: 'telegram',
+  upload_concurrency: 'telegram',
+  send_video: 'telegram',
+  telegram_api_id: 'stream',
+  telegram_api_hash: 'stream',
+  username: 'account',
+  password: 'account',
+  tmp_dir: 'advanced',
+}
+const dirtySections = computed(() => {
+  const set = new Set<SectionKey>()
+  for (const k of changed.value.cfgKeys) {
+    const sec = CFG_SECTION[k]
+    if (sec) set.add(sec)
+  }
+  for (const k of changed.value.extKeys) set.add(k.startsWith('inbox') ? 'inbox' : 'backup')
+  return set
+})
+
+/** 导航右侧的提示角标:待配置 / 死信条数 / 备份没开 */
+const badges = computed(() => {
+  const out: Partial<Record<SectionKey, { text: string; tone: 'danger' | 'warn' }>> = {}
+  if (cfg.value && !cfg.value.configured) out.telegram = { text: '待配置', tone: 'danger' }
+  if (status.value?.inbox_failures) {
+    out.inbox = { text: String(status.value.inbox_failures), tone: 'warn' }
+  }
+  const e = extras.value
+  if (e && !e.backup_telegram_enabled && !e.backup_webdav_enabled && !e.backup_s3_enabled) {
+    out.backup = { text: '未启用', tone: 'warn' }
+  }
+  return out
+})
+
+async function saveAll() {
+  if (!changed.value.total) {
+    ElMessage.info('没有改动')
+    return
+  }
+  // 先存维护设置:保存账号可能立刻跳登录页
+  if (changed.value.extKeys.length) await saveExtras()
+  if (changed.value.cfgKeys.length) await save()
+}
+
+async function discardAll() {
+  await Promise.all([load(), loadExtras()])
+  ElMessage.info('已放弃未保存的改动')
+}
+
+async function reloadAll() {
+  await Promise.all([load(), loadExtras()])
+}
+
+// ---- 离开前确认,避免切分区后忘了保存 ----
+/** 保存账号 / 登出后主动跳转,此时不该再拦截 */
+const leaving = ref(false)
+onBeforeRouteLeave(async () => {
+  if (leaving.value || !changed.value.total) return true
+  try {
+    await appConfirm({
+      title: '放弃未保存的改动?',
+      message: `还有 ${changed.value.total} 项改动没有保存,离开后会丢失。`,
+      kind: 'warning',
+      confirmText: '直接离开',
+      cancelText: '留在本页',
+    })
+    return true
+  } catch {
+    return false
+  }
+})
+
+function onBeforeUnload(e: BeforeUnloadEvent) {
+  if (changed.value.total) e.preventDefault()
+}
+onMounted(() => window.addEventListener('beforeunload', onBeforeUnload))
+onUnmounted(() => window.removeEventListener('beforeunload', onBeforeUnload))
+
+// ---- 概览 ----
+interface Tile {
+  label: string
+  value: string
+  icon: Component
+  tone?: 'warn'
+  action?: () => void
+}
+const statTiles = computed<Tile[]>(() => {
+  const s = status.value
+  return [
+    { label: '文件 / 目录', value: `${s?.files ?? 0} / ${s?.dirs ?? 0}`, icon: Document },
+    { label: '占用空间', value: s ? fmtSize(s.total_size) : '-', icon: Coin },
+    { label: '分块大小', value: s ? fmtSize(s.chunk_size) : '-', icon: Histogram },
+    { label: '上传并发', value: String(s?.upload_concurrency ?? '-'), icon: Cpu },
+    {
+      label: '元数据库',
+      value: s ? fmtSize(s.db_size) : '-',
+      icon: Monitor,
+      action: () => go('backup'),
+    },
+    { label: '回收站', value: `${trashCount.value} 项`, icon: Delete, action: () => go('backup') },
+    { label: '待删消息', value: String(s?.pending_deletes ?? 0), icon: Brush },
+    {
+      label: '收件死信',
+      value: String(s?.inbox_failures ?? 0),
+      icon: WarnTriangleFilled,
+      tone: s?.inbox_failures ? 'warn' : undefined,
+      action: s?.inbox_failures ? openInboxFailures : undefined,
+    },
+  ]
+})
+
+interface QuickAction {
+  label: string
+  desc: string
+  icon: Component
+  action: () => void
+  danger?: boolean
+}
+const quickActions = computed<QuickAction[]>(() => [
+  {
+    label: backingUp.value ? '备份中…' : '立即备份',
+    desc: '生成快照并上传到已启用渠道',
+    icon: Upload,
+    action: backupNow,
+  },
+  { label: '下载数据库', desc: '把当前元数据库存到本机', icon: Download, action: downloadBackup },
+  { label: '导出 .env', desc: '查看并复制当前生效配置', icon: Document, action: exportEnv },
+  { label: '清理残留上传', desc: '删除中断上传留下的分块', icon: Brush, action: cleanup },
+  {
+    label: '登出所有会话',
+    desc: '所有设备都要重新登录',
+    icon: SwitchButton,
+    action: logoutAll,
+    danger: true,
+  },
+])
+
 async function backupNow() {
   backingUp.value = true
   try {
-    const { data } = await api.admin.backupToChannel()
-    ElMessage.success(
-      data.parts > 1
-        ? `已发送到存储频道:${data.name}（${data.parts} 个分块）`
-        : `已发送到存储频道:${data.name}`,
-    )
+    const { data } = await api.admin.backupNow()
+    const succeeded = data.destinations.filter((item) => item.ok).map((item) => item.label)
+    const failed = data.destinations
+      .filter((item) => !item.ok)
+      .map((item) => `${item.label}：${item.error ?? '失败'}`)
+    if (data.ok) {
+      ElMessage.success(`备份完成：${data.name}（${succeeded.join('、')}）`)
+    } else if (data.succeeded > 0) {
+      ElMessage.warning(`部分完成：${succeeded.join('、')}；失败：${failed.join('；')}`)
+    } else {
+      ElMessage.error(`备份失败：${failed.join('；')}`)
+    }
     await loadExtras()
   } catch (e) {
     ElMessage.error(errMsg(e))
@@ -569,510 +823,728 @@ function downloadBackup() {
       </el-tooltip>
       <div class="logo-badge"><el-icon><Setting /></el-icon></div>
       <div class="brand brand-text">系统设置</div>
+      <el-tag v-if="status" size="small" round type="info" class="ver">v{{ status.version }}</el-tag>
       <div class="spacer" />
       <el-tooltip content="导出 .env">
         <el-button class="icon-btn" :icon="Download" @click="exportEnv" />
       </el-tooltip>
       <el-tooltip content="刷新">
-        <el-button class="icon-btn" :icon="Refresh" @click="load" />
+        <el-button class="icon-btn" :icon="Refresh" @click="reloadAll" />
       </el-tooltip>
       <el-tooltip :content="isDark ? '切换亮色' : '切换暗色'">
         <el-button class="icon-btn" :icon="isDark ? Sunny : Moon" @click="toggleDark" />
       </el-tooltip>
     </div>
 
-    <el-alert
-      v-if="cfg && !cfg.configured"
-      type="warning"
-      :closable="false"
-      show-icon
-      title="还没配置 Telegram 存储"
-      class="alert"
-    >
-      在下面的「Telegram 存储」里填好 Bot Token 与存储频道并保存,网盘才能上传下载。
-      Token 找 @BotFather 申请;存储频道建议新建一个私有频道,把 bot 拉进去设为管理员。
-    </el-alert>
-
-    <el-card shadow="never" class="card">
-      <template #header><b>系统状态</b></template>
-      <el-descriptions :column="3" size="small" border>
-        <el-descriptions-item label="Bot">
-          <span v-if="status?.bot">@{{ status.bot }}</span>
-          <el-text v-else-if="status && !status.configured" type="warning">未配置</el-text>
-          <el-text v-else type="danger">连接不上</el-text>
-        </el-descriptions-item>
-        <el-descriptions-item label="接口端点">
-          {{ status?.official_api ? '官方 Bot API' : '自建 Bot API' }}
-        </el-descriptions-item>
-        <el-descriptions-item label="分块大小">
-          {{ status ? fmtSize(status.chunk_size) : '-' }}
-        </el-descriptions-item>
-        <el-descriptions-item label="文件 / 目录">
-          {{ status?.files ?? 0 }} / {{ status?.dirs ?? 0 }}
-        </el-descriptions-item>
-        <el-descriptions-item label="占用空间">
-          {{ status ? fmtSize(status.total_size) : '-' }}
-        </el-descriptions-item>
-        <el-descriptions-item label="上传并发">{{ status?.upload_concurrency }}</el-descriptions-item>
-        <el-descriptions-item label="元数据库">
-          {{ status?.db_path }}({{ status ? fmtSize(status.db_size) : '-' }})
-        </el-descriptions-item>
-        <el-descriptions-item label="监听地址">{{ status?.listen }}</el-descriptions-item>
-        <el-descriptions-item label="已运行">
-          {{ uptime }}(v{{ status?.version }})
-        </el-descriptions-item>
-        <el-descriptions-item label="后台任务">
-          <span class="status-tags">
-            <el-tooltip
-              v-for="task in status?.tasks ?? []"
-              :key="task.name"
-              :content="task.last_error ?? `重启 ${task.restarts} 次`"
-            >
-              <el-tag size="small" :type="taskHealthy(task) ? 'success' : 'danger'">
-                {{ task.name }}
-              </el-tag>
-            </el-tooltip>
-          </span>
-        </el-descriptions-item>
-        <el-descriptions-item label="待删消息">
-          {{ status?.pending_deletes ?? 0 }}
-        </el-descriptions-item>
-        <el-descriptions-item label="收件死信">
-          <el-button
-            v-if="status?.inbox_failures"
-            link
-            type="warning"
-            @click="openInboxFailures"
-          >
-            {{ status.inbox_failures }} 条，查看
-          </el-button>
-          <span v-else>0</span>
-        </el-descriptions-item>
-      </el-descriptions>
-      <div class="tip">
-        元数据库是文件的唯一索引 —— Bot API 读不了频道历史,库丢了文件就找不回来,记得定期备份。
+    <div v-if="cfg && !cfg.configured" class="note warn setup-note">
+      <el-icon><WarnTriangleFilled /></el-icon>
+      <div>
+        <b>还没配置 Telegram 存储</b>,网盘暂时不能上传下载。Token 找 @BotFather
+        申请;存储频道建议新建一个私有频道,把 bot 拉进去设为管理员。
       </div>
-    </el-card>
-
-    <el-card shadow="never" class="card">
-      <template #header><b>Telegram 存储</b></template>
-      <el-alert type="info" :closable="false" show-icon class="alert">
-        <div>改「存储频道」只影响之后上传的文件:已存文件的分块仍在原频道,删除时可能留下无法自动清理的消息。</div>
-        <div>从自建端点切回官方端点前请确认历史分块不超过 20MB,否则那些文件将下载不了。</div>
-      </el-alert>
-
-      <el-form label-width="110px" label-position="left">
-        <el-form-item label="接口端点">
-          <div class="row">
-            <el-radio-group v-model="apiMode">
-              <el-radio-button value="official">官方 Bot API</el-radio-button>
-              <el-radio-button value="local">自建 Bot API</el-radio-button>
-            </el-radio-group>
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.api_base ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.api_base === 'db'"
-              link
-              type="primary"
-              @click="resetKey('api_base', '接口端点')"
-              >恢复</el-button
-            >
-          </div>
-          <div v-if="apiMode === 'local'" class="row sub">
-            <el-input v-model="form.api_base" placeholder="http://telegram-bot-api:8081" />
-          </div>
-          <div class="tip">
-            官方端点分块 ≤18MB、限流较紧;自建端点(compose 已随项目启动)分块可到 GB 级。切换后点下方「保存并生效」。
-          </div>
-        </el-form-item>
-
-        <el-form-item label="Bot Token">
-          <div class="row">
-            <el-input v-model="form.bot_token" placeholder="不修改就保持原样" />
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.bot_token ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.bot_token === 'db'"
-              link
-              type="primary"
-              @click="resetKey('bot_token', 'Bot Token')"
-              >恢复</el-button
-            >
-          </div>
-        </el-form-item>
-
-        <el-form-item label="存储频道">
-          <div class="row">
-            <el-input v-model="form.chat_id" placeholder="-100xxxxxxxxxx 或 @channelname" />
-            <el-button @click="openDetect">检测 ID</el-button>
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.chat_id ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.chat_id === 'db'"
-              link
-              type="primary"
-              @click="resetKey('chat_id', '存储频道')"
-              >恢复</el-button
-            >
-          </div>
-          <div class="tip">不知道频道 ID?填好 Bot Token 后点「检测 ID」,按提示操作即可。</div>
-        </el-form-item>
-
-        <el-form-item label="分块大小">
-          <div class="row">
-            <el-input v-model="form.chunk_size" placeholder="如 18MB / 512MB" />
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.chunk_size ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.chunk_size === 'db'"
-              link
-              type="primary"
-              @click="resetKey('chunk_size', '分块大小')"
-              >恢复</el-button
-            >
-          </div>
-          <div class="tip">
-            {{
-              isOfficial
-                ? `官方端点的 getFile 下载上限 20MB,分块不能超过 ${fmtSize(cfg?.official_chunk_max ?? 0)}`
-                : '自建端点单文件上限 2000MB,分块越大消息越少、速度越快'
-            }}。只影响之后上传的文件。
-          </div>
-        </el-form-item>
-
-        <el-form-item label="上传并发">
-          <div class="row">
-            <el-input-number v-model="form.upload_concurrency" :min="1" :max="16" />
-            <el-tag size="small" type="info">
-              {{ SOURCE_LABEL[cfg?.sources.upload_concurrency ?? ''] }}
-            </el-tag>
-            <el-button
-              v-if="cfg?.sources.upload_concurrency === 'db'"
-              link
-              type="primary"
-              @click="resetKey('upload_concurrency', '上传并发')"
-              >恢复</el-button
-            >
-            <span class="tip">同时发往频道的分块数;调太高容易触发限流</span>
-          </div>
-        </el-form-item>
-
-        <el-form-item label="视频消息模式">
-          <div class="row">
-            <el-switch v-model="form.send_video" />
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.send_video ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.send_video === 'db'"
-              link
-              type="primary"
-              @click="resetKey('send_video', '视频消息模式')"
-              >恢复</el-button
-            >
-          </div>
-          <div class="tip">
-            开启后,不超过分块大小的 mp4 / mov / m4v 会以「视频消息」发到频道,在
-            Telegram 里可直接播放(文件内容不变,下载不受影响)。mkv / webm 仍走文档
-            —— Telegram 播放器不支持其常见编码,发成视频消息只有声音没画面。超过分块大小的视频按文档分块存储。自建端点默认开启,官方端点默认关闭。
-          </div>
-        </el-form-item>
-      </el-form>
-    </el-card>
-
-    <el-card shadow="never" class="card">
-      <template #header><b>MTProto 流式播放 / 自建 Bot API</b></template>
-      <el-alert type="info" :closable="false" show-icon class="alert">
-        <div>
-          tgdrive 使用 MTProto 把视频按 512KiB 响应浏览器 Range，关闭预览后停止后续请求；
-          不改变已有 Telegram 分块大小。自建 telegram-bot-api 仍负责 GB 级分块上传和本地缓存直读。
-        </div>
-        <div>
-          下面两项在
-          <el-link type="primary" href="https://my.telegram.org" target="_blank">my.telegram.org</el-link>
-          申请。它们同时由 tgdrive 和 telegram-bot-api 读取。保存后还要导出 .env
-          覆盖回项目目录，再执行 <code>{{ RESTART_CMD }}</code> 重启/重建两个服务。
-        </div>
-      </el-alert>
-
-      <el-form label-width="110px" label-position="left">
-        <el-form-item label="api_id">
-          <div class="row">
-            <el-input v-model="form.telegram_api_id" placeholder="纯数字,如 21293566" />
-            <el-tag size="small" type="info">
-              {{ SOURCE_LABEL[cfg?.sources.telegram_api_id ?? ''] }}
-            </el-tag>
-            <el-button
-              v-if="cfg?.sources.telegram_api_id === 'db'"
-              link
-              type="primary"
-              @click="resetKey('telegram_api_id', 'api_id')"
-              >恢复</el-button
-            >
-          </div>
-        </el-form-item>
-        <el-form-item label="api_hash">
-          <div class="row">
-            <el-input v-model="form.telegram_api_hash" placeholder="32 位十六进制;不修改就保持原样" />
-            <el-tag size="small" type="info">
-              {{ SOURCE_LABEL[cfg?.sources.telegram_api_hash ?? ''] }}
-            </el-tag>
-            <el-button
-              v-if="cfg?.sources.telegram_api_hash === 'db'"
-              link
-              type="primary"
-              @click="resetKey('telegram_api_hash', 'api_hash')"
-              >恢复</el-button
-            >
-          </div>
-        </el-form-item>
-      </el-form>
-
-      <div class="tip">
-        流式播放启用步骤：填好上面两项并保存 → 导出 .env 覆盖回宿主机 → 执行
-        <code>{{ RESTART_CMD }}</code>。如需 GB 级分块上传，再回「Telegram 存储」把接口端点
-        切到「自建 Bot API」并保存。
-      </div>
-    </el-card>
-
-    <el-card shadow="never" class="card">
-      <template #header><b>账号</b></template>
-      <el-form label-width="110px" label-position="left">
-        <el-form-item label="用户名">
-          <div class="row">
-            <el-input v-model="form.username" />
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.username ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.username === 'db'"
-              link
-              type="primary"
-              @click="resetKey('username', '用户名')"
-              >恢复</el-button
-            >
-          </div>
-        </el-form-item>
-        <el-form-item label="密码">
-          <div class="row">
-            <el-input v-model="form.password" type="password" show-password />
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.password ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.password === 'db'"
-              link
-              type="primary"
-              @click="resetKey('password', '密码')"
-              >恢复</el-button
-            >
-          </div>
-          <div class="tip">
-            改动账号后所有设备的登录状态立即失效,需要重新登录;WebDAV 客户端也要同步改密码。
-          </div>
-        </el-form-item>
-      </el-form>
-    </el-card>
-
-    <el-card v-if="extras" shadow="never" class="card">
-      <template #header><b>备份与回收站</b></template>
-      <el-form label-width="110px" label-position="left">
-        <el-form-item label="回收站保留">
-          <div class="row">
-            <el-input-number v-model="extras.trash_retention_days" :min="0" :max="3650" />
-            <span class="tip">天;0 = 永不自动清理。当前回收站 {{ trashCount }} 项,超期自动彻底删除并释放频道消息。</span>
-          </div>
-        </el-form-item>
-        <el-form-item label="每日自动备份">
-          <div class="row">
-            <el-switch v-model="extras.backup_auto" />
-            <span class="tip">
-              每天把数据库快照发到存储频道,滚动保留最近 7 份。
-              {{ backupLastTs ? `上次备份:${fmtTime(backupLastTs)}` : '还没备份过' }}
-            </span>
-          </div>
-        </el-form-item>
-        <el-form-item label="备份分块">
-          <div class="row">
-            <el-input
-              v-model="backupChunkSizeInput"
-              placeholder="如 18MB / 512MB"
-              style="width: 180px"
-            />
-            <span class="tip">
-              默认 18MB；官方端点不得超过
-              {{ fmtSize(cfg?.official_chunk_max ?? 19_500_000) }}，自建端点最大 1900MB。
-            </span>
-          </div>
-        </el-form-item>
-      </el-form>
-      <div class="row">
-        <el-button type="primary" :loading="extrasSaving" @click="saveExtras">保存维护设置</el-button>
-        <el-button :loading="backingUp" @click="backupNow">立即备份到频道</el-button>
-        <el-button @click="downloadBackup">下载数据库备份</el-button>
-      </div>
-      <div class="tip" style="margin-top: 8px">
-        元数据库是文件的唯一索引,强烈建议开启自动备份；单块 .db 可直接恢复，多块备份需按
-        part 编号顺序二进制合并为 .db 后再替换 data/tgdrive.db。
-      </div>
-    </el-card>
-
-    <el-card v-if="extras" shadow="never" class="card">
-      <template #header><b>Bot 收件</b></template>
-      <el-alert
-        v-if="status?.inbox_failures"
-        type="warning"
-        :closable="false"
-        show-icon
-        class="alert"
-      >
-        有 {{ status.inbox_failures }} 条消息连续处理失败并进入死信，后续收件未被阻塞。
-        <el-button link type="warning" @click="openInboxFailures">查看与清理</el-button>
-      </el-alert>
-      <el-alert type="info" :closable="false" show-icon class="alert">
-        <div>开启后:<b>直接往存储频道发媒体</b>会自动登记进网盘(零流量);白名单用户私聊发送<b>文件、视频、图片或音频</b>也会按原类型零流量转存。</div>
-        <div>官方 Bot API 下载单文件上限 20MB:更大的文件也会入库,但需要自建端点才能下载。</div>
-      </el-alert>
-      <el-form label-width="110px" label-position="left">
-        <el-form-item label="启用收件">
-          <el-switch v-model="extras.inbox_enabled" />
-        </el-form-item>
-        <el-form-item label="默认目录">
-          <div class="row">
-            <el-input v-model="extras.inbox_dir" placeholder="/收件箱" style="max-width: 360px" />
-            <el-button @click="chooseInboxDir('inbox_dir')">选择目录</el-button>
-          </div>
-          <div class="tip">没有命中任何类型规则的文件放在这里，目录不存在时自动创建。</div>
-        </el-form-item>
-        <el-form-item label="视频目录">
-          <div class="row">
-            <el-input v-model="extras.inbox_video_dir" style="max-width: 360px" />
-            <el-button @click="chooseInboxDir('inbox_video_dir')">选择目录</el-button>
-          </div>
-          <div class="tip">mp4、mkv、mov、avi、webm、flv、wmv、ts、m2ts、mpeg、3gp 等。</div>
-        </el-form-item>
-        <el-form-item label="图片目录">
-          <div class="row">
-            <el-input v-model="extras.inbox_image_dir" style="max-width: 360px" />
-            <el-button @click="chooseInboxDir('inbox_image_dir')">选择目录</el-button>
-          </div>
-          <div class="tip">jpg、png、gif、webp、bmp、avif、heic、tiff、svg 等。</div>
-        </el-form-item>
-        <el-form-item label="书籍目录">
-          <div class="row">
-            <el-input v-model="extras.inbox_book_dir" style="max-width: 360px" />
-            <el-button @click="chooseInboxDir('inbox_book_dir')">选择目录</el-button>
-          </div>
-          <div class="tip">pdf、epub、mobi、azw3、fb2、djvu、cbz、cbr、txt、rtf 等。</div>
-        </el-form-item>
-        <el-form-item label="私聊白名单">
-          <div class="row">
-            <el-input
-              v-model="extras.inbox_allowed_chats"
-              placeholder="如 123456789,987654321;留空则只收频道直发"
-            />
-            <el-button @click="openDetect">检测 ID</el-button>
-          </div>
-          <div class="tip">
-            数字为 Telegram 用户 ID:用对方账号私聊 bot 发条消息,点「检测 ID」就能看到;不在名单里的私聊消息一律忽略。
-          </div>
-        </el-form-item>
-      </el-form>
-
-      <el-divider content-position="left">自定义类型路由</el-divider>
-      <el-alert type="info" :closable="false" class="route-help">
-        自定义规则优先于上面的内置类型；按文件名后缀匹配，忽略大小写，并支持
-        <code>tar.gz</code> 这类多段后缀，重叠时更长的后缀优先。同一个后缀不能出现在两条自定义规则中。
-      </el-alert>
-      <div v-if="extras.inbox_rules.length" class="route-list">
-        <div v-for="(rule, index) in extras.inbox_rules" :key="index" class="route-card">
-          <div class="route-head">
-            <b>规则 {{ index + 1 }}{{ rule.name.trim() ? ` · ${rule.name.trim()}` : '' }}</b>
-            <el-button type="danger" link @click="removeInboxRule(index)">删除</el-button>
-          </div>
-          <div class="route-grid">
-            <label class="route-field">
-              <span>类型名称</span>
-              <el-input
-                v-model="rule.name"
-                maxlength="40"
-                placeholder="例如：音乐、压缩包、项目源码"
-              />
-            </label>
-            <label class="route-field route-extensions">
-              <span>文件后缀</span>
-              <div class="extension-editor">
-                <div v-if="rule.extensions.length" class="extension-tags">
-                  <el-tag
-                    v-for="(extension, extensionIndex) in rule.extensions"
-                    :key="`${extension}-${extensionIndex}`"
-                    closable
-                    @close="removeRuleExtension(rule, extensionIndex)"
-                  >
-                    {{ extension.startsWith('.') ? extension : `.${extension}` }}
-                  </el-tag>
-                </div>
-                <div class="row">
-                  <el-input
-                    v-model="inboxRuleExtensionDrafts[index]"
-                    class="route-extension-input"
-                    placeholder="输入 mp3、flac 或 tar.gz"
-                    @keydown.enter.prevent="addRuleExtensions(rule, index)"
-                  />
-                  <el-button @click="addRuleExtensions(rule, index)">添加</el-button>
-                </div>
-                <span class="tip">可用逗号、分号或空格一次添加多个后缀。</span>
-              </div>
-            </label>
-            <label class="route-field route-target">
-              <span>存储目录</span>
-              <div class="row">
-                <el-input v-model="rule.dir" placeholder="/收件箱/自定义" />
-                <el-button @click="chooseRuleDir(rule)">选择目录</el-button>
-              </div>
-            </label>
-          </div>
-        </div>
-      </div>
-      <el-empty v-else description="还没有自定义类型，未匹配文件会使用内置类型或默认目录" :image-size="56" />
-      <div class="row route-actions">
-        <el-button plain @click="addInboxRule">添加自定义类型</el-button>
-        <el-button type="primary" :loading="extrasSaving" @click="saveExtras">保存收件设置</el-button>
-      </div>
-    </el-card>
-
-    <el-card shadow="never" class="card">
-      <template #header><b>高级</b></template>
-      <el-form label-width="110px" label-position="left">
-        <el-form-item label="临时目录">
-          <div class="row">
-            <el-input v-model="form.tmp_dir" />
-            <el-tag size="small" type="info">{{ SOURCE_LABEL[cfg?.sources.tmp_dir ?? ''] }}</el-tag>
-            <el-button
-              v-if="cfg?.sources.tmp_dir === 'db'"
-              link
-              type="primary"
-              @click="resetKey('tmp_dir', '临时目录')"
-              >恢复</el-button
-            >
-          </div>
-          <div class="tip">超过 32MB 的分块会先落到这里再上传,需要有足够剩余空间。</div>
-        </el-form-item>
-      </el-form>
-
-      <el-divider content-position="left">需重启容器才能改</el-divider>
-      <el-descriptions :column="2" size="small" border>
-        <el-descriptions-item v-for="(v, k) in cfg?.readonly ?? {}" :key="k" :label="String(k)">
-          {{ v }}
-        </el-descriptions-item>
-      </el-descriptions>
-      <div class="tip">这些项只能改 .env 后重启容器(端口在 compose 里映射,数据库路径决定设置存在哪)。</div>
-
-      <el-divider content-position="left">维护</el-divider>
-      <div class="row">
-        <el-button @click="cleanup">清理残留上传</el-button>
-        <el-button type="danger" plain @click="logoutAll">登出所有会话</el-button>
-      </div>
-    </el-card>
-
-    <div class="actions glass">
-      <el-button type="primary" :loading="saving" :disabled="!dirty" @click="save()">
-        保存并生效
-      </el-button>
-      <el-button :loading="testing" @click="test">测试连接</el-button>
-      <el-button :disabled="!dirty" @click="load">放弃改动</el-button>
-      <span class="tip">保存后立即生效,不需要重启容器。</span>
+      <el-button type="primary" size="small" @click="go('telegram')">去配置</el-button>
     </div>
+
+    <div class="layout">
+      <nav class="nav glass">
+        <button
+          v-for="s in SECTIONS"
+          :key="s.key"
+          class="nav-item"
+          :class="{ on: section === s.key }"
+          @click="go(s.key)"
+        >
+          <span class="nav-ico"><el-icon><component :is="s.icon" /></el-icon></span>
+          <span class="nav-text">
+            <span class="nav-label">{{ s.label }}</span>
+            <span class="nav-desc">{{ s.desc }}</span>
+          </span>
+          <span class="nav-tail">
+            <span v-if="dirtySections.has(s.key)" class="nav-dot" title="有未保存的改动" />
+            <span v-if="badges[s.key]" class="nav-badge" :class="badges[s.key]!.tone">
+              {{ badges[s.key]!.text }}
+            </span>
+          </span>
+        </button>
+      </nav>
+
+      <div class="pane glass">
+        <div class="pane-head">
+          <div class="pane-ico">
+            <el-icon><component :is="activeSection.icon" /></el-icon>
+          </div>
+          <div class="pane-title">
+            <h2>{{ activeSection.label }}</h2>
+            <div class="pane-desc">{{ activeSection.desc }}</div>
+          </div>
+          <div class="pane-actions">
+            <el-button v-if="section === 'telegram'" :loading="testing" @click="test">
+              测试连接
+            </el-button>
+            <el-button v-if="section === 'backup'" :loading="backingUp" @click="backupNow">
+              立即备份
+            </el-button>
+            <el-button v-if="section === 'inbox'" plain @click="addInboxRule">
+              添加自定义类型
+            </el-button>
+          </div>
+        </div>
+
+        <transition name="pane" mode="out-in">
+          <div :key="section" class="pane-body">
+            <!-- ========== 概览 ========== -->
+            <template v-if="section === 'overview'">
+              <div class="hero">
+                <span class="status-dot" :class="status?.bot ? 'ok' : 'bad'"><i /></span>
+                <div class="hero-text">
+                  <div class="hero-title">
+                    {{
+                      status?.bot
+                        ? `@${status.bot}`
+                        : status?.configured
+                          ? '连接不上 Telegram'
+                          : '尚未配置 Telegram'
+                    }}
+                  </div>
+                  <div class="hero-sub">
+                    {{ status?.official_api ? '官方 Bot API' : '自建 Bot API' }} · 已运行
+                    {{ uptime }} · 监听 {{ status?.listen }}
+                  </div>
+                </div>
+                <el-button :loading="testing" @click="test">测试连接</el-button>
+              </div>
+
+              <div class="tiles">
+                <div
+                  v-for="t in statTiles"
+                  :key="t.label"
+                  class="tile"
+                  :class="[t.tone, { clickable: !!t.action }]"
+                  @click="t.action?.()"
+                >
+                  <span class="tile-ico"><el-icon><component :is="t.icon" /></el-icon></span>
+                  <div class="tile-body">
+                    <div class="tile-val">{{ t.value }}</div>
+                    <div class="tile-label">{{ t.label }}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="block">
+                <div class="block-head">后台任务</div>
+                <div class="tag-row">
+                  <el-tooltip
+                    v-for="task in status?.tasks ?? []"
+                    :key="task.name"
+                    :content="task.last_error ?? `重启 ${task.restarts} 次`"
+                  >
+                    <el-tag size="small" round :type="taskHealthy(task) ? 'success' : 'danger'">
+                      {{ task.name }}
+                    </el-tag>
+                  </el-tooltip>
+                  <span v-if="!status?.tasks?.length" class="muted">暂无任务</span>
+                </div>
+              </div>
+
+              <div class="block">
+                <div class="block-head">快捷操作</div>
+                <div class="quick">
+                  <button
+                    v-for="q in quickActions"
+                    :key="q.desc"
+                    class="quick-item"
+                    :class="{ danger: q.danger }"
+                    @click="q.action()"
+                  >
+                    <el-icon><component :is="q.icon" /></el-icon>
+                    <span class="quick-text">
+                      <b>{{ q.label }}</b>
+                      <em>{{ q.desc }}</em>
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  元数据库是文件的唯一索引 —— Bot API 读不了频道历史,库丢了文件就找不回来,
+                  记得在「备份与回收站」里至少启用一个远端渠道。数据库
+                  {{ status?.db_path }}。
+                </div>
+              </div>
+            </template>
+
+            <!-- ========== Telegram 存储 ========== -->
+            <template v-else-if="section === 'telegram'">
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  <div>
+                    改「存储频道」只影响之后上传的文件:已存文件的分块仍在原频道,
+                    删除时可能留下无法自动清理的消息。
+                  </div>
+                  <div>从自建端点切回官方端点前请确认历史分块不超过 20MB,否则那些文件将下载不了。</div>
+                </div>
+              </div>
+
+              <div class="fields">
+                <SettingField
+                  label="接口端点"
+                  :source="cfg?.sources.api_base"
+                  wide
+                  @reset="resetKey('api_base', '接口端点')"
+                >
+                  <div class="ctl-col">
+                    <el-segmented v-model="apiMode" :options="API_MODES" />
+                    <el-input
+                      v-if="apiMode === 'local'"
+                      v-model="form.api_base"
+                      placeholder="http://telegram-bot-api:8081"
+                    />
+                  </div>
+                  <template #help>
+                    官方端点分块 ≤18MB、限流较紧;自建端点(compose 已随项目启动)分块可到 GB 级。
+                  </template>
+                </SettingField>
+
+                <SettingField
+                  label="Bot Token"
+                  :source="cfg?.sources.bot_token"
+                  help="找 @BotFather 申请;显示的是脱敏值,不修改就保持原样。"
+                  @reset="resetKey('bot_token', 'Bot Token')"
+                >
+                  <el-input v-model="form.bot_token" placeholder="不修改就保持原样" />
+                </SettingField>
+
+                <SettingField
+                  label="存储频道"
+                  :source="cfg?.sources.chat_id"
+                  help="不知道频道 ID?填好 Bot Token 后点「检测 ID」,按提示操作即可。"
+                  @reset="resetKey('chat_id', '存储频道')"
+                >
+                  <div class="ctl-row">
+                    <el-input v-model="form.chat_id" placeholder="-100xxxxxxxxxx 或 @channelname" />
+                    <el-button @click="openDetect">检测 ID</el-button>
+                  </div>
+                </SettingField>
+
+                <SettingField
+                  label="分块大小"
+                  :source="cfg?.sources.chunk_size"
+                  @reset="resetKey('chunk_size', '分块大小')"
+                >
+                  <el-input v-model="form.chunk_size" placeholder="如 18MB / 512MB" />
+                  <template #help>
+                    {{
+                      isOfficial
+                        ? `官方端点的 getFile 下载上限 20MB,分块不能超过 ${fmtSize(cfg?.official_chunk_max ?? 0)}`
+                        : '自建端点单文件上限 2000MB,分块越大消息越少、速度越快'
+                    }}。只影响之后上传的文件。
+                  </template>
+                </SettingField>
+
+                <SettingField
+                  label="上传并发"
+                  :source="cfg?.sources.upload_concurrency"
+                  inline
+                  help="同时发往频道的分块数;调太高容易触发限流。"
+                  @reset="resetKey('upload_concurrency', '上传并发')"
+                >
+                  <el-input-number
+                    v-model="form.upload_concurrency"
+                    :min="1"
+                    :max="16"
+                    size="small"
+                    controls-position="right"
+                  />
+                </SettingField>
+
+                <SettingField
+                  label="视频消息模式"
+                  :source="cfg?.sources.send_video"
+                  inline
+                  wide
+                  @reset="resetKey('send_video', '视频消息模式')"
+                >
+                  <el-switch v-model="form.send_video" />
+                  <template #help>
+                    开启后,不超过分块大小的 mp4 / mov / m4v 会以「视频消息」发到频道,在 Telegram
+                    里可直接播放(文件内容不变,下载不受影响)。mkv / webm 仍走文档 —— Telegram
+                    播放器不支持其常见编码,发成视频消息只有声音没画面。超过分块大小的视频按文档分块存储。
+                    自建端点默认开启,官方端点默认关闭。
+                  </template>
+                </SettingField>
+              </div>
+            </template>
+
+            <!-- ========== 流式播放 ========== -->
+            <template v-else-if="section === 'stream'">
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  <div>
+                    tgdrive 使用 MTProto 把视频按 512KiB 响应浏览器 Range,关闭预览后停止后续请求;
+                    不改变已有 Telegram 分块大小。自建 telegram-bot-api 仍负责 GB
+                    级分块上传和本地缓存直读。
+                  </div>
+                  <div>
+                    下面两项在
+                    <el-link type="primary" href="https://my.telegram.org" target="_blank"
+                      >my.telegram.org</el-link
+                    >
+                    申请,由 tgdrive 和 telegram-bot-api 共同读取。
+                  </div>
+                </div>
+              </div>
+
+              <div class="fields">
+                <SettingField
+                  label="api_id"
+                  :source="cfg?.sources.telegram_api_id"
+                  @reset="resetKey('telegram_api_id', 'api_id')"
+                >
+                  <el-input v-model="form.telegram_api_id" placeholder="纯数字,如 21293566" />
+                </SettingField>
+                <SettingField
+                  label="api_hash"
+                  :source="cfg?.sources.telegram_api_hash"
+                  @reset="resetKey('telegram_api_hash', 'api_hash')"
+                >
+                  <el-input
+                    v-model="form.telegram_api_hash"
+                    placeholder="32 位十六进制;不修改就保持原样"
+                  />
+                </SettingField>
+              </div>
+
+              <div class="block">
+                <div class="block-head">启用步骤</div>
+                <div class="steps">
+                  <div class="step"><span>1</span><div>填好上面两项,点右下角「保存并生效」</div></div>
+                  <div class="step">
+                    <span>2</span>
+                    <div>点顶栏的<b>导出 .env</b>,把内容覆盖到项目目录的 <code>.env</code></div>
+                  </div>
+                  <div class="step">
+                    <span>3</span>
+                    <div>在宿主机执行 <code>{{ RESTART_CMD }}</code>,重启这两个服务</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  如需 GB 级分块上传,再回「Telegram 存储」把接口端点切到「自建 Bot API」并保存。
+                </div>
+              </div>
+            </template>
+
+            <!-- ========== 账号 ========== -->
+            <template v-else-if="section === 'account'">
+              <div class="fields">
+                <SettingField
+                  label="用户名"
+                  :source="cfg?.sources.username"
+                  @reset="resetKey('username', '用户名')"
+                >
+                  <el-input v-model="form.username" autocomplete="username" />
+                </SettingField>
+                <SettingField
+                  label="密码"
+                  :source="cfg?.sources.password"
+                  @reset="resetKey('password', '密码')"
+                >
+                  <el-input
+                    v-model="form.password"
+                    type="password"
+                    show-password
+                    autocomplete="new-password"
+                  />
+                </SettingField>
+              </div>
+              <div class="note warn">
+                <el-icon><WarnTriangleFilled /></el-icon>
+                <div>
+                  改动账号后所有设备的登录状态立即失效,需要重新登录;WebDAV 客户端也要同步改密码。
+                </div>
+              </div>
+            </template>
+
+            <!-- ========== 备份与回收站 ========== -->
+            <template v-else-if="section === 'backup'">
+              <template v-if="extras">
+                <div class="note">
+                  <el-icon><InfoFilled /></el-icon>
+                  <div>
+                    一次只生成一份 SQLite 一致性快照,并同时上传到所有已启用渠道;
+                    每个渠道独立滚动保留最近 7 份。
+                  </div>
+                </div>
+
+                <div class="fields">
+                  <SettingField
+                    label="回收站保留"
+                    inline
+                    :help="`单位天,0 = 永不自动清理。当前回收站 ${trashCount} 项,超期自动彻底删除并释放频道消息。`"
+                  >
+                    <el-input-number
+                      v-model="extras.trash_retention_days"
+                      :min="0"
+                      :max="3650"
+                      size="small"
+                      controls-position="right"
+                    />
+                  </SettingField>
+                  <SettingField
+                    label="每日自动备份"
+                    inline
+                    :help="`每 24 小时备份到所有启用渠道,失败渠道每 30 分钟单独重试。${backupLastTs ? `最近成功:${fmtTime(backupLastTs)}` : '还没备份过。'}`"
+                  >
+                    <el-switch v-model="extras.backup_auto" />
+                  </SettingField>
+                </div>
+
+                <div class="block">
+                  <div class="block-head">备份渠道</div>
+                  <div class="channels">
+                    <div class="channel" :class="{ on: extras.backup_telegram_enabled }">
+                      <div class="channel-head">
+                        <span class="channel-ico"><el-icon><Promotion /></el-icon></span>
+                        <div class="channel-name">
+                          <b>Telegram 存储频道</b>
+                          <span>
+                            {{
+                              backupLastByTarget.telegram
+                                ? `上次成功 ${fmtTime(backupLastByTarget.telegram)}`
+                                : '尚未成功备份'
+                            }}
+                          </span>
+                        </div>
+                        <el-switch v-model="extras.backup_telegram_enabled" />
+                      </div>
+                      <div v-if="extras.backup_telegram_enabled" class="fields channel-fields">
+                        <SettingField label="备份分块大小" wide>
+                          <el-input v-model="backupChunkSizeInput" placeholder="如 18MB / 512MB" />
+                          <template #help>
+                            使用上方 Telegram 存储配置。官方端点不得超过
+                            {{ fmtSize(cfg?.official_chunk_max ?? 19_500_000) }},自建端点最大
+                            1900MB;多块备份按文件名顺序合并后恢复。
+                          </template>
+                        </SettingField>
+                      </div>
+                    </div>
+
+                    <div class="channel" :class="{ on: extras.backup_webdav_enabled }">
+                      <div class="channel-head">
+                        <span class="channel-ico"><el-icon><Link /></el-icon></span>
+                        <div class="channel-name">
+                          <b>WebDAV</b>
+                          <span>
+                            {{
+                              backupLastByTarget.webdav
+                                ? `上次成功 ${fmtTime(backupLastByTarget.webdav)}`
+                                : '尚未成功备份'
+                            }}
+                          </span>
+                        </div>
+                        <el-switch v-model="extras.backup_webdav_enabled" />
+                      </div>
+                      <div v-if="extras.backup_webdav_enabled" class="fields channel-fields">
+                        <SettingField
+                          label="备份目录 URL"
+                          wide
+                          help="目录需预先存在并允许 PUT、DELETE;修改 URL 后旧目录中的备份不会被自动删除。"
+                        >
+                          <el-input
+                            v-model="extras.backup_webdav_url"
+                            placeholder="https://dav.example.com/remote.php/dav/files/user/tgdrive"
+                          />
+                        </SettingField>
+                        <SettingField label="用户名(可选)">
+                          <el-input v-model="extras.backup_webdav_username" autocomplete="username" />
+                        </SettingField>
+                        <SettingField label="密码(可选)" help="已保存的密码只显示固定占位符。">
+                          <el-input
+                            v-model="extras.backup_webdav_password"
+                            type="password"
+                            show-password
+                            autocomplete="new-password"
+                            placeholder="未修改则保留原密码"
+                          />
+                        </SettingField>
+                      </div>
+                    </div>
+
+                    <div class="channel" :class="{ on: extras.backup_s3_enabled }">
+                      <div class="channel-head">
+                        <span class="channel-ico"><el-icon><Money /></el-icon></span>
+                        <div class="channel-name">
+                          <b>S3 兼容对象存储</b>
+                          <span>
+                            {{
+                              backupLastByTarget.s3
+                                ? `上次成功 ${fmtTime(backupLastByTarget.s3)}`
+                                : '尚未成功备份'
+                            }}
+                          </span>
+                        </div>
+                        <el-switch v-model="extras.backup_s3_enabled" />
+                      </div>
+                      <div v-if="extras.backup_s3_enabled" class="fields channel-fields">
+                        <SettingField label="服务端点" wide>
+                          <el-input
+                            v-model="extras.backup_s3_endpoint"
+                            placeholder="https://s3.amazonaws.com 或 http://minio:9000"
+                          />
+                        </SettingField>
+                        <SettingField label="区域">
+                          <el-input v-model="extras.backup_s3_region" placeholder="us-east-1 / auto" />
+                        </SettingField>
+                        <SettingField label="存储桶">
+                          <el-input v-model="extras.backup_s3_bucket" placeholder="my-backups" />
+                        </SettingField>
+                        <SettingField label="对象前缀(可选)" wide>
+                          <el-input v-model="extras.backup_s3_prefix" placeholder="tgdrive" />
+                        </SettingField>
+                        <SettingField label="Access Key">
+                          <el-input
+                            v-model="extras.backup_s3_access_key"
+                            type="password"
+                            show-password
+                            autocomplete="new-password"
+                            placeholder="未修改则保留原密钥"
+                          />
+                        </SettingField>
+                        <SettingField label="Secret Key">
+                          <el-input
+                            v-model="extras.backup_s3_secret_key"
+                            type="password"
+                            show-password
+                            autocomplete="new-password"
+                            placeholder="未修改则保留原密钥"
+                          />
+                        </SettingField>
+                        <SettingField label="Session Token(临时凭据可选)" wide>
+                          <el-input
+                            v-model="extras.backup_s3_session_token"
+                            type="password"
+                            show-password
+                            autocomplete="new-password"
+                          />
+                        </SettingField>
+                        <SettingField
+                          label="路径样式"
+                          inline
+                          wide
+                          help="endpoint/bucket/key 形式,MinIO、IP 端点通常需要开启。使用 AWS Signature V4;修改端点、桶、前缀或 Access Key 后,旧目标中的备份不会被自动删除。"
+                        >
+                          <el-switch v-model="extras.backup_s3_path_style" />
+                        </SettingField>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="row">
+                  <el-button :loading="backingUp" :icon="Upload" @click="backupNow">
+                    立即备份到已启用渠道
+                  </el-button>
+                  <el-button :icon="Download" @click="downloadBackup">下载数据库备份</el-button>
+                </div>
+                <div class="note">
+                  <el-icon><InfoFilled /></el-icon>
+                  <div>
+                    WebDAV 与 S3 保存完整 .db;Telegram 单块 .db 可直接恢复,多块需按 part
+                    编号顺序二进制合并后再替换 data/tgdrive.db。
+                  </div>
+                </div>
+              </template>
+            </template>
+
+            <!-- ========== Bot 收件 ========== -->
+            <template v-else-if="section === 'inbox'">
+              <template v-if="extras">
+                <div v-if="status?.inbox_failures" class="note warn">
+                  <el-icon><WarnTriangleFilled /></el-icon>
+                  <div>
+                    有 {{ status.inbox_failures }} 条消息连续处理失败并进入死信,后续收件未被阻塞。
+                  </div>
+                  <el-button size="small" @click="openInboxFailures">查看与清理</el-button>
+                </div>
+                <div class="note">
+                  <el-icon><InfoFilled /></el-icon>
+                  <div>
+                    <div>
+                      开启后:<b>直接往存储频道发媒体</b>会自动登记进网盘(零流量);
+                      白名单用户私聊发送<b>文件、视频、图片或音频</b>也会按原类型零流量转存。
+                    </div>
+                    <div>官方 Bot API 下载单文件上限 20MB:更大的文件也会入库,但需要自建端点才能下载。</div>
+                  </div>
+                </div>
+
+                <div class="fields">
+                  <SettingField label="启用收件" inline wide>
+                    <el-switch v-model="extras.inbox_enabled" />
+                  </SettingField>
+
+                  <SettingField
+                    v-for="d in INBOX_DIRS"
+                    :key="d.key"
+                    :label="d.label"
+                    :help="d.help"
+                  >
+                    <div class="ctl-row">
+                      <el-input v-model="extras[d.key]" placeholder="/收件箱" />
+                      <el-button @click="chooseInboxDir(d.key)">选择</el-button>
+                    </div>
+                  </SettingField>
+
+                  <SettingField
+                    label="私聊白名单"
+                    wide
+                    help="数字为 Telegram 用户 ID:用对方账号私聊 bot 发条消息,点「检测 ID」就能看到;不在名单里的私聊消息一律忽略。"
+                  >
+                    <div class="ctl-row">
+                      <el-input
+                        v-model="extras.inbox_allowed_chats"
+                        placeholder="如 123456789,987654321;留空则只收频道直发"
+                      />
+                      <el-button @click="openDetect">检测 ID</el-button>
+                    </div>
+                  </SettingField>
+                </div>
+
+                <div class="block">
+                  <div class="block-head">
+                    自定义类型路由
+                    <el-button link type="primary" @click="addInboxRule">添加</el-button>
+                  </div>
+                  <div class="note">
+                    <el-icon><InfoFilled /></el-icon>
+                    <div>
+                      自定义规则优先于内置类型;按文件名后缀匹配,忽略大小写,并支持
+                      <code>tar.gz</code> 这类多段后缀,重叠时更长的后缀优先。
+                      同一个后缀不能出现在两条自定义规则中。
+                    </div>
+                  </div>
+                  <div v-if="extras.inbox_rules.length" class="rules">
+                    <div v-for="(rule, index) in extras.inbox_rules" :key="index" class="rule">
+                      <div class="rule-head">
+                        <b>规则 {{ index + 1 }}{{ rule.name.trim() ? ` · ${rule.name.trim()}` : '' }}</b>
+                        <el-button type="danger" link @click="removeInboxRule(index)">删除</el-button>
+                      </div>
+                      <div class="fields channel-fields">
+                        <SettingField label="类型名称">
+                          <el-input
+                            v-model="rule.name"
+                            maxlength="40"
+                            placeholder="例如：音乐、压缩包、项目源码"
+                          />
+                        </SettingField>
+                        <SettingField label="存储目录">
+                          <div class="ctl-row">
+                            <el-input v-model="rule.dir" placeholder="/收件箱/自定义" />
+                            <el-button @click="chooseRuleDir(rule)">选择</el-button>
+                          </div>
+                        </SettingField>
+                        <SettingField
+                          label="文件后缀"
+                          wide
+                          help="可用逗号、分号或空格一次添加多个后缀,回车即添加。"
+                        >
+                          <div class="ext-editor">
+                            <div v-if="rule.extensions.length" class="tag-row">
+                              <el-tag
+                                v-for="(extension, extensionIndex) in rule.extensions"
+                                :key="`${extension}-${extensionIndex}`"
+                                closable
+                                round
+                                @close="removeRuleExtension(rule, extensionIndex)"
+                              >
+                                {{ extension.startsWith('.') ? extension : `.${extension}` }}
+                              </el-tag>
+                            </div>
+                            <div class="ctl-row">
+                              <el-input
+                                v-model="inboxRuleExtensionDrafts[index]"
+                                placeholder="输入 mp3、flac 或 tar.gz"
+                                @keydown.enter.prevent="addRuleExtensions(rule, index)"
+                              />
+                              <el-button @click="addRuleExtensions(rule, index)">添加</el-button>
+                            </div>
+                          </div>
+                        </SettingField>
+                      </div>
+                    </div>
+                  </div>
+                  <button v-else class="rule-empty" @click="addInboxRule">
+                    <el-icon><Plus /></el-icon>
+                    <span class="quick-text">
+                      <b>添加自定义类型</b>
+                      <em>未匹配的文件会使用内置类型或默认目录</em>
+                    </span>
+                  </button>
+                </div>
+              </template>
+            </template>
+
+            <!-- ========== 高级 ========== -->
+            <template v-else>
+              <div class="fields">
+                <SettingField
+                  label="临时目录"
+                  :source="cfg?.sources.tmp_dir"
+                  wide
+                  help="超过 32MB 的分块会先落到这里再上传,需要有足够剩余空间。"
+                  @reset="resetKey('tmp_dir', '临时目录')"
+                >
+                  <el-input v-model="form.tmp_dir" />
+                </SettingField>
+              </div>
+
+              <div class="block">
+                <div class="block-head">
+                  只读项 <span class="muted">改 .env 后重启容器才生效</span>
+                </div>
+                <div class="ro-grid">
+                  <div v-for="(v, k) in cfg?.readonly ?? {}" :key="k" class="ro-item">
+                    <span class="ro-key">{{ k }}</span>
+                    <span class="ro-val">{{ v }}</span>
+                  </div>
+                </div>
+                <div class="note">
+                  <el-icon><InfoFilled /></el-icon>
+                  <div>端口在 compose 里映射,数据库路径决定后台设置存在哪。</div>
+                </div>
+              </div>
+
+              <div class="block">
+                <div class="block-head">维护</div>
+                <div class="row">
+                  <el-button :icon="Brush" @click="cleanup">清理残留上传</el-button>
+                  <el-button type="danger" plain :icon="SwitchButton" @click="logoutAll">
+                    登出所有会话
+                  </el-button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </transition>
+      </div>
+    </div>
+
+    <transition name="savebar">
+      <div v-if="changed.total" class="savebar glass">
+        <span class="savebar-dot" />
+        <span class="savebar-text">{{ changed.total }} 项改动待保存</span>
+        <el-button text @click="discardAll">放弃</el-button>
+        <el-button type="primary" :loading="saving || extrasSaving" @click="saveAll">
+          保存并生效
+        </el-button>
+      </div>
+    </transition>
 
     <el-dialog v-model="inboxFailureDialog" title="Bot 收件死信" width="760px" align-center>
       <el-table :data="inboxFailures" v-loading="inboxFailureLoading" size="small">
@@ -1100,13 +1572,16 @@ function downloadBackup() {
     <DirPicker ref="inboxDirPicker" />
 
     <el-dialog v-model="detectDialog" title="检测频道 / 用户 ID" width="680px" align-center>
-      <el-alert type="info" :closable="false" show-icon class="alert">
+      <div class="note">
+        <el-icon><InfoFilled /></el-icon>
         <div>
-          找<b>频道 ID</b>:把 bot{{ detectBot ? `(@${detectBot})` : '' }}
-          拉进目标频道并设为<b>管理员</b>,在频道里随便发一条消息,再点「重新检测」。
+          <div>
+            找<b>频道 ID</b>:把 bot{{ detectBot ? `(@${detectBot})` : '' }}
+            拉进目标频道并设为<b>管理员</b>,在频道里随便发一条消息,再点「重新检测」。
+          </div>
+          <div>找<b>用户 ID</b>(收件白名单用):用该账号<b>私聊 bot</b> 随便发一条消息,再点「重新检测」。</div>
         </div>
-        <div>找<b>用户 ID</b>(收件白名单用):用该账号<b>私聊 bot</b> 随便发一条消息,再点「重新检测」。</div>
-      </el-alert>
+      </div>
       <el-table
         :data="detectedChats"
         size="small"
@@ -1115,14 +1590,14 @@ function downloadBackup() {
       >
         <el-table-column label="类型" width="76">
           <template #default="{ row }">
-            <el-tag size="small" :type="row.kind === 'channel' ? 'primary' : 'info'">
+            <el-tag size="small" round :type="row.kind === 'channel' ? 'primary' : 'info'">
               {{ KIND_LABEL[row.kind] ?? row.kind }}
             </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="名称" show-overflow-tooltip>
           <template #default="{ row }">
-            {{ row.name }}<span v-if="row.username" class="tip"> @{{ row.username }}</span>
+            {{ row.name }}<span v-if="row.username" class="muted"> @{{ row.username }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="id" label="ID" width="150" />
@@ -1150,7 +1625,7 @@ function downloadBackup() {
           </template>
         </el-table-column>
       </el-table>
-      <div class="tip" style="margin-top: 8px">
+      <div class="muted detect-foot">
         列表来自 bot 最近收到的消息(开启收件后也会持续记录),不会保存任何配置改动。
       </div>
       <template #footer>
@@ -1160,9 +1635,10 @@ function downloadBackup() {
     </el-dialog>
 
     <el-dialog v-model="envDialog" title="当前生效配置(.env 格式)" width="640px" align-center>
-      <el-alert type="warning" :closable="false" show-icon class="alert">
-        包含 Bot Token 与密码,注意不要外传。
-      </el-alert>
+      <div class="note warn">
+        <el-icon><WarnTriangleFilled /></el-icon>
+        <div>包含 Bot Token 与密码,注意不要外传。</div>
+      </div>
       <el-input v-model="envText" type="textarea" :rows="16" readonly />
       <template #footer>
         <el-button @click="envDialog = false">关闭</el-button>
@@ -1174,9 +1650,9 @@ function downloadBackup() {
 
 <style scoped>
 .page {
-  max-width: 1000px;
+  max-width: 1180px;
   margin: 0 auto;
-  padding: 16px 20px 40px;
+  padding: 16px 20px 96px;
   min-height: 100vh;
   box-sizing: border-box;
 }
@@ -1188,7 +1664,7 @@ function downloadBackup() {
   align-items: center;
   gap: 12px;
   padding: 10px 16px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
   border-radius: 16px;
 }
 .brand {
@@ -1196,106 +1672,603 @@ function downloadBackup() {
   font-weight: 800;
   letter-spacing: 0.5px;
 }
+.ver {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
 .spacer {
   flex: 1;
 }
-.card {
+.muted {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+/* ---- 分区导航 ---- */
+.layout {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.nav {
+  width: 236px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  padding: 8px;
+  border-radius: 16px;
+  position: sticky;
+  top: 76px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+.nav-item:hover {
+  background: var(--tile-bg-hover);
+}
+.nav-item.on {
+  background: linear-gradient(120deg, rgba(99, 102, 241, 0.18), rgba(14, 165, 233, 0.14));
+  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.3);
+}
+.nav-ico {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  font-size: 15px;
+  color: var(--text-soft);
+  background: var(--tile-bg);
+  border: 1px solid var(--glass-border);
+}
+.nav-item.on .nav-ico {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+  box-shadow: 0 4px 10px rgba(99, 102, 241, 0.35);
+}
+.nav-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.nav-label {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.nav-desc {
+  font-size: 11px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nav-tail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.nav-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--el-color-primary);
+  box-shadow: 0 0 6px rgba(64, 158, 255, 0.85);
+}
+.nav-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.nav-badge.danger {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.16);
+}
+.nav-badge.warn {
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.18);
+}
+
+/* ---- 内容面板 ---- */
+.pane {
+  flex: 1;
+  min-width: 0;
+  border-radius: 16px;
+  padding: 16px 18px 20px;
+}
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 14px;
   margin-bottom: 16px;
-  border-radius: 8px;
+  border-bottom: 1px solid var(--glass-border);
+}
+.pane-ico {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  font-size: 19px;
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+  box-shadow: 0 6px 16px rgba(99, 102, 241, 0.32);
+}
+.pane-title h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+}
+.pane-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+.pane-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+.pane-enter-active,
+.pane-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+.pane-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.pane-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+/* ---- 通用块 ---- */
+.fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.ctl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.ctl-row :deep(.el-input) {
+  flex: 1;
+  min-width: 0;
+}
+.ctl-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 .row {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
-}
-.row .el-input {
-  max-width: 420px;
-}
-.row.sub {
-  margin-top: 8px;
-}
-.tip {
-  color: var(--text-soft);
-  font-size: 12px;
-  line-height: 1.7;
-}
-.alert {
-  margin-bottom: 12px;
-}
-.status-tags {
-  display: flex;
   flex-wrap: wrap;
-  gap: 4px;
 }
-.route-help {
-  margin-bottom: 10px;
+.block {
+  margin-top: 18px;
 }
-.route-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.route-card {
-  padding: 12px;
-  border: 1px solid var(--glass-border);
-  border-radius: 10px;
-  background: var(--tile-bg);
-}
-.route-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-.route-grid {
-  display: grid;
-  grid-template-columns: minmax(150px, 0.7fr) minmax(260px, 1.3fr);
-  gap: 10px;
-}
-.route-field {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  min-width: 0;
-  color: var(--text-soft);
-  font-size: 12px;
-}
-.route-field .el-input {
-  width: 100%;
-  max-width: none;
-}
-.extension-editor {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.extension-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.route-target {
-  grid-column: 1 / -1;
-}
-.route-actions {
-  margin-top: 12px;
-}
-.actions {
-  position: sticky;
-  bottom: 12px;
+.block-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px;
-  border-radius: 16px;
+  margin-bottom: 10px;
+  font-size: 13.5px;
+  font-weight: 700;
 }
-@media (max-width: 700px) {
-  .route-grid {
+.tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 14px;
+  margin-bottom: 14px;
+  border: 1px solid var(--glass-border);
+  border-left: 3px solid var(--el-color-primary);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--text-soft);
+}
+.note > .el-icon {
+  flex-shrink: 0;
+  margin-top: 3px;
+  font-size: 15px;
+  color: var(--el-color-primary);
+}
+.note > .el-button {
+  flex-shrink: 0;
+  align-self: center;
+  margin-left: auto;
+}
+.note.warn {
+  border-left-color: #f59e0b;
+}
+.note.warn > .el-icon {
+  color: #f59e0b;
+}
+.note :deep(code),
+.block :deep(code) {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--tile-media-bg);
+  word-break: break-all;
+}
+.setup-note {
+  align-items: center;
+}
+
+/* ---- 概览 ---- */
+.hero {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  border-radius: 14px;
+  border: 1px solid var(--glass-border);
+  background: linear-gradient(120deg, rgba(99, 102, 241, 0.14), rgba(14, 165, 233, 0.1));
+}
+.hero-text {
+  min-width: 0;
+}
+.hero-title {
+  font-size: 16px;
+  font-weight: 700;
+}
+.hero-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+.hero .el-button {
+  margin-left: auto;
+}
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 10px;
+}
+.tile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  transition: background 0.16s ease, transform 0.16s ease;
+}
+.tile.clickable:hover {
+  background: var(--tile-bg-hover);
+  transform: translateY(-1px);
+}
+.tile-ico {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  font-size: 16px;
+  color: var(--el-color-primary);
+  background: rgba(99, 102, 241, 0.13);
+}
+.tile.warn .tile-ico {
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.18);
+}
+.tile-body {
+  min-width: 0;
+}
+.tile-val {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.tile-label {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+.quick {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
+  gap: 10px;
+}
+.quick-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+.quick-item:hover {
+  background: var(--tile-bg-hover);
+}
+.quick-item > .el-icon {
+  flex-shrink: 0;
+  font-size: 17px;
+  color: var(--el-color-primary);
+}
+.quick-item.danger > .el-icon {
+  color: var(--el-color-danger);
+}
+.quick-text {
+  min-width: 0;
+}
+.quick-text b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+}
+.quick-text em {
+  display: block;
+  margin-top: 1px;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+
+/* ---- 步骤条 ---- */
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  font-size: 13px;
+}
+.step > span {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--el-color-primary);
+}
+
+/* ---- 备份渠道 / 收件规则:内嵌的设置项去掉外框,避免套娃 ---- */
+.channels,
+.rules {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.channel,
+.rule {
+  padding: 14px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+}
+.channel.on {
+  border-color: rgba(99, 102, 241, 0.32);
+}
+.channel-head,
+.rule-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.channel-ico {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  font-size: 16px;
+  color: var(--text-soft);
+  background: var(--tile-media-bg);
+}
+.channel.on .channel-ico {
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+}
+.channel-name {
+  min-width: 0;
+}
+.channel-name b {
+  display: block;
+  font-size: 13.5px;
+}
+.channel-name span {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+.channel-head > .el-switch,
+.rule-head > .el-button {
+  margin-left: auto;
+}
+.channel-fields {
+  padding-top: 12px;
+  margin-top: 12px;
+  border-top: 1px solid var(--glass-border);
+  gap: 10px 14px;
+}
+.channel-fields :deep(.field) {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+.ext-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rule-empty {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 14px;
+  border: 1px dashed var(--glass-border);
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+.rule-empty:hover {
+  border-color: var(--el-color-primary);
+  background: var(--tile-bg);
+}
+.rule-empty > .el-icon {
+  flex-shrink: 0;
+  font-size: 17px;
+  color: var(--el-color-primary);
+}
+
+/* ---- 只读项 ---- */
+.ro-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.ro-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 11px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: var(--tile-bg);
+  font-size: 12.5px;
+}
+.ro-key {
+  color: var(--text-soft);
+}
+.ro-val {
+  font-weight: 600;
+  text-align: right;
+  word-break: break-all;
+}
+
+/* ---- 浮动保存条 ---- */
+.savebar {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  z-index: 40;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 9px 10px 9px 16px;
+  border-radius: 999px;
+}
+.savebar-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--el-color-primary);
+  box-shadow: 0 0 8px rgba(64, 158, 255, 0.9);
+}
+.savebar-text {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.savebar-enter-active,
+.savebar-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.savebar-enter-from,
+.savebar-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 18px);
+}
+.detect-foot {
+  margin-top: 8px;
+}
+
+@media (max-width: 1020px) {
+  .fields {
     grid-template-columns: 1fr;
   }
-  .route-target {
-    grid-column: auto;
+}
+@media (max-width: 900px) {
+  .layout {
+    flex-direction: column;
+  }
+  .nav {
+    position: static;
+    width: 100%;
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 6px;
+  }
+  .nav-item {
+    width: auto;
+    flex-shrink: 0;
+  }
+  .nav-desc {
+    display: none;
+  }
+  .pane {
+    width: 100%;
+    box-sizing: border-box;
   }
 }
 </style>

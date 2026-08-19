@@ -123,6 +123,24 @@ export interface Extras {
   backup_auto: boolean
   /** SQLite 快照上传到 Telegram 时的单块字节数。 */
   backup_chunk_size: number
+  backup_telegram_enabled: boolean
+  backup_webdav_enabled: boolean
+  backup_webdav_url: string
+  backup_webdav_username: string
+  /** 已保存时为固定脱敏占位符。 */
+  backup_webdav_password: string
+  backup_s3_enabled: boolean
+  backup_s3_endpoint: string
+  backup_s3_region: string
+  backup_s3_bucket: string
+  backup_s3_prefix: string
+  /** 已保存时为固定脱敏占位符。 */
+  backup_s3_access_key: string
+  /** 已保存时为固定脱敏占位符。 */
+  backup_s3_secret_key: string
+  /** 可选临时凭据；已保存时为固定脱敏占位符。 */
+  backup_s3_session_token: string
+  backup_s3_path_style: boolean
   inbox_enabled: boolean
   inbox_allowed_chats: string
   inbox_dir: string
@@ -135,6 +153,29 @@ export interface Extras {
 export type ExtrasPatch = Omit<Partial<Extras>, 'backup_chunk_size'> & {
   /** 字符串形式支持 18MB、1GB 等后台输入。 */
   backup_chunk_size?: string
+}
+
+export interface BackupLastTimes {
+  telegram: number | null
+  webdav: number | null
+  s3: number | null
+}
+
+export interface BackupDestinationOutcome {
+  kind: 'telegram' | 'webdav' | 's3'
+  label: string
+  ok: boolean
+  parts?: number
+  error?: string
+}
+
+export interface BackupOutcome {
+  ok: boolean
+  name: string
+  parts: number
+  succeeded: number
+  failed: number
+  destinations: BackupDestinationOutcome[]
 }
 
 /** 可在后台修改的配置项键名 */
@@ -421,12 +462,14 @@ export const api = {
     logoutAll: () => http.post('/admin/logout-all'),
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
     backupUrl: '/api/admin/backup',
-    backupToChannel: () =>
-      http.post<{ ok: boolean; name: string; parts: number }>('/admin/backup-to-channel'),
+    backupNow: () => http.post<BackupOutcome>('/admin/backup-now'),
     extras: () =>
-      http.get<{ extras: Extras; backup_last_ts: number | null; trash_count: number }>(
-        '/admin/extras',
-      ),
+      http.get<{
+        extras: Extras
+        backup_last_ts: number | null
+        backup_last_by_target: BackupLastTimes
+        trash_count: number
+      }>('/admin/extras'),
     saveExtras: (patch: ExtrasPatch) => http.post('/admin/extras', patch),
   },
 }
