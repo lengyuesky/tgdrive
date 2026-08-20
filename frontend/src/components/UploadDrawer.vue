@@ -3,15 +3,108 @@
     <template #header>
       <div class="head">
         <b>上传队列</b>
-        <el-tag v-if="totalCount" size="small" type="info">
-          {{ doneCount }} / {{ totalCount }}
-        </el-tag>
         <div class="spacer" />
-        <el-button v-if="finishedExists" text size="small" @click="clearFinished">
+        <el-button
+          v-if="finishedExists"
+          text
+          size="small"
+          :disabled="batchBusy"
+          @click="clearFinished"
+        >
           清除已完成
         </el-button>
       </div>
     </template>
+
+    <div v-if="totalCount" class="queue-summary" aria-label="上传任务统计">
+      <div class="summary-item">
+        <strong class="summary-value">{{ totalCount }}</strong>
+        <span class="summary-label">总任务</span>
+      </div>
+      <div class="summary-item summary-success">
+        <strong class="summary-value">{{ successCount }}</strong>
+        <span class="summary-label">成功</span>
+      </div>
+      <div class="summary-item summary-skipped">
+        <strong class="summary-value">{{ skippedCount }}</strong>
+        <span class="summary-label">跳过</span>
+      </div>
+      <div class="summary-item summary-error">
+        <strong class="summary-value">{{ errorCount }}</strong>
+        <span class="summary-label">失败</span>
+      </div>
+    </div>
+
+    <div v-if="totalCount" class="queue-breakdown">
+      <el-tag v-if="uploadedCount" size="small" type="success" effect="plain" round>
+        普通上传 {{ uploadedCount }}
+      </el-tag>
+      <el-tag v-if="instantCount" size="small" type="success" effect="plain" round>
+        秒传 {{ instantCount }}
+      </el-tag>
+      <el-tag v-if="activeCount" size="small" type="warning" effect="plain" round>
+        处理中 {{ activeCount }}
+      </el-tag>
+      <el-tag v-if="pausedCount" size="small" type="info" effect="plain" round>
+        已暂停 {{ pausedCount }}
+      </el-tag>
+      <el-tag v-if="needsFileCount" size="small" type="warning" effect="plain" round>
+        待选原文件 {{ needsFileCount }}
+      </el-tag>
+      <el-tag v-if="cancellingCount" size="small" type="info" effect="plain" round>
+        取消中 {{ cancellingCount }}
+      </el-tag>
+    </div>
+
+    <div v-if="pendingCount" class="queue-actions">
+      <div v-if="needsFileCount" class="queue-status">
+        <span class="queue-hint">需逐项选择原文件后才能继续</span>
+      </div>
+      <div class="queue-buttons">
+        <el-button
+          v-if="pauseableCount"
+          size="small"
+          plain
+          :icon="VideoPause"
+          :disabled="batchBusy"
+          @click="pauseAll"
+        >
+          全部暂停
+        </el-button>
+        <el-button
+          v-if="resumableCount"
+          size="small"
+          type="primary"
+          plain
+          :icon="VideoPlay"
+          :disabled="batchBusy"
+          @click="resumeAll"
+        >
+          全部继续
+        </el-button>
+        <el-button
+          v-if="retryableCount"
+          size="small"
+          plain
+          :icon="Refresh"
+          :disabled="batchBusy"
+          @click="retryAll"
+        >
+          重试失败
+        </el-button>
+        <el-button
+          size="small"
+          type="danger"
+          plain
+          :icon="Close"
+          :loading="batchBusy"
+          :disabled="batchBusy"
+          @click="cancelAll"
+        >
+          取消全部
+        </el-button>
+      </div>
+    </div>
 
     <div v-if="items.length === 0" class="empty">暂无上传任务</div>
     <div v-for="it in items" :key="it.id" class="upload-item">
@@ -27,16 +120,24 @@
         :status="it.status === 'error' ? 'exception' : isDone(it) ? 'success' : undefined"
       />
       <div class="upload-sub">
-        <span v-if="it.status === 'hashing'" class="state">校验中(秒传检测)…</span>
+        <span v-if="it.status === 'hashing'" class="state">校验中(秒传检测)，可暂停…</span>
         <span v-else-if="it.status === 'waiting'" class="state">排队中</span>
         <span v-else-if="it.status === 'uploading'" class="state">上传中，可随时暂停</span>
-        <span v-else-if="it.status === 'paused'" class="state">已暂停，分块已保留</span>
+        <span v-else-if="it.status === 'paused'" class="state">已暂停，可继续上传</span>
         <span v-else-if="it.status === 'needs_file'" class="state">请选择原文件继续</span>
         <span v-else-if="it.status === 'cancelling'" class="state">正在清理已上传分块…</span>
+        <span v-else-if="it.status === 'done'" class="state">上传成功</span>
+        <span v-else-if="it.status === 'instant'" class="state">秒传成功</span>
         <span v-else-if="it.status === 'skipped'" class="state">已跳过(目录里有同名文件)</span>
         <span v-if="it.error" class="upload-err">{{ it.error }}</span>
         <div class="spacer" />
-        <el-button v-if="it.status === 'uploading'" text size="small" @click="pause(it)">
+        <el-button
+          v-if="isPauseable(it)"
+          text
+          size="small"
+          :disabled="batchBusy"
+          @click="pause(it)"
+        >
           暂停
         </el-button>
         <el-button
@@ -44,14 +145,29 @@
           text
           size="small"
           type="primary"
+          :disabled="batchBusy"
           @click="chooseFile(it)"
         >
           选择文件
         </el-button>
-        <el-button v-else-if="it.status === 'paused'" text size="small" type="primary" @click="resume(it)">
+        <el-button
+          v-else-if="it.status === 'paused'"
+          text
+          size="small"
+          type="primary"
+          :disabled="batchBusy"
+          @click="resume(it)"
+        >
           继续
         </el-button>
-        <el-button v-else-if="it.status === 'error'" text size="small" type="primary" @click="retry(it)">
+        <el-button
+          v-else-if="it.status === 'error'"
+          text
+          size="small"
+          type="primary"
+          :disabled="batchBusy"
+          @click="retry(it)"
+        >
           重试
         </el-button>
         <el-button
@@ -59,6 +175,7 @@
           text
           size="small"
           type="danger"
+          :disabled="batchBusy"
           @click="cancelItem(it)"
         >
           取消任务
@@ -97,8 +214,11 @@ export interface UploadFile {
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { createSHA256 } from 'hash-wasm'
+import { Close, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import { api, errMsg, type UploadSession } from '../api'
+import { appConfirm } from '../dialog'
 
 type UploadStatus =
   | 'hashing'
@@ -128,17 +248,57 @@ interface Item {
   controllers: Set<AbortController>
   pauseRequested: boolean
   cancelled: boolean
+  /** 每次暂停/继续/取消都会递增，令旧的异步上传轮次自动失效。 */
+  generation: number
   /** undefined 表示尚未尝试生成，null 表示浏览器无法解码该视频。 */
   thumbnail?: Blob | null
 }
 
+function isPauseable(item: Item) {
+  return (
+    !item.cancelled &&
+    (item.status === 'hashing' || item.status === 'waiting' || item.status === 'uploading')
+  )
+}
+
+function isPending(item: Item) {
+  return !isDone(item) && item.status !== 'cancelling'
+}
+
+function isCurrent(item: Item, generation: number) {
+  return !item.cancelled && item.generation === generation
+}
+
 const visible = ref(false)
 const items = ref<Item[]>([])
+const batchBusy = ref(false)
 const emit = defineEmits<{ uploaded: [] }>()
 
 const totalCount = computed(() => items.value.length)
-const doneCount = computed(() => items.value.filter(isDone).length)
+const uploadedCount = computed(() => items.value.filter((item) => item.status === 'done').length)
+const instantCount = computed(() => items.value.filter((item) => item.status === 'instant').length)
+const successCount = computed(() => uploadedCount.value + instantCount.value)
+const skippedCount = computed(() => items.value.filter((item) => item.status === 'skipped').length)
 const finishedExists = computed(() => items.value.some((item) => isDone(item)))
+
+const pendingCount = computed(() => items.value.filter(isPending).length)
+const activeCount = computed(() => items.value.filter(isPauseable).length)
+const pauseableCount = computed(() => items.value.filter(isPauseable).length)
+const pausedCount = computed(() => items.value.filter((item) => item.status === 'paused').length)
+const errorCount = computed(() => items.value.filter((item) => item.status === 'error').length)
+const needsFileCount = computed(
+  () => items.value.filter((item) => item.status === 'needs_file').length,
+)
+const cancellingCount = computed(
+  () => items.value.filter((item) => item.status === 'cancelling').length,
+)
+const resumableCount = computed(
+  () => items.value.filter((item) => item.status === 'paused' && Boolean(item.file)).length,
+)
+const retryableCount = computed(
+  () => items.value.filter((item) => item.status === 'error' && Boolean(item.file)).length,
+)
+
 function isDone(item: Item) {
   return item.status === 'done' || item.status === 'instant' || item.status === 'skipped'
 }
@@ -184,6 +344,7 @@ function fromSession(session: UploadSession, concurrency: number): Item {
     controllers: new Set(),
     pauseRequested: true,
     cancelled: false,
+    generation: 0,
   }
 }
 
@@ -260,6 +421,7 @@ async function enqueue(dir: string, files: UploadFile[]) {
       controllers: new Set(),
       pauseRequested: false,
       cancelled: false,
+      generation: 0,
     }
     if (action === 'skip' && duplicates.has(upload)) {
       item.status = 'skipped'
@@ -278,18 +440,34 @@ function schedule(item: Item) {
   void pump()
 }
 
-function pause(item: Item) {
+function removeQueued(id: number) {
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    if (queue[index] === id) queue.splice(index, 1)
+  }
+}
+
+/** 停止当前任务的本地工作；服务端会话保留，供稍后断点续传。 */
+function stopItem(item: Item) {
+  item.generation += 1
   item.pauseRequested = true
+  removeQueued(item.id)
   for (const controller of item.controllers) controller.abort()
   item.controllers.clear()
+}
+
+function pause(item: Item) {
+  if (!isPauseable(item)) return
+  stopItem(item)
   if (!item.cancelled) item.status = 'paused'
 }
 
 function resume(item: Item) {
+  if (item.cancelled || isDone(item) || item.status === 'cancelling') return
   if (!item.file) {
     chooseFile(item)
     return
   }
+  item.generation += 1
   item.pauseRequested = false
   item.error = undefined
   item.status = 'waiting'
@@ -297,7 +475,9 @@ function resume(item: Item) {
 }
 
 function retry(item: Item) {
+  if (item.cancelled || isDone(item) || item.status === 'cancelling') return
   if (item.session && item.session.uploaded_parts.length === item.session.part_count) {
+    item.generation += 1
     item.pauseRequested = false
     item.error = undefined
     item.status = 'waiting'
@@ -311,24 +491,85 @@ function retry(item: Item) {
   resume(item)
 }
 
-async function cancelItem(item: Item) {
+function pauseAll() {
+  if (batchBusy.value) return
+  const targets = items.value.filter(isPauseable)
+  targets.forEach(pause)
+  if (targets.length) ElMessage.info(`已暂停 ${targets.length} 个上传任务`)
+}
+
+function resumeAll() {
+  if (batchBusy.value) return
+  const targets = items.value.filter((item) => item.status === 'paused' && Boolean(item.file))
+  targets.forEach(resume)
+  if (targets.length) {
+    ElMessage.success(`已继续 ${targets.length} 个上传任务`)
+  } else if (pausedCount.value) {
+    ElMessage.info('刷新页面后暂停任务需要重新选择原文件')
+  }
+}
+
+function retryAll() {
+  if (batchBusy.value) return
+  const targets = items.value.filter((item) => item.status === 'error' && Boolean(item.file))
+  targets.forEach(retry)
+  if (targets.length) ElMessage.success(`已重新排队 ${targets.length} 个失败任务`)
+}
+
+async function cancelItem(item: Item): Promise<boolean> {
+  if (isDone(item) || item.status === 'cancelling') return true
   item.cancelled = true
-  pause(item)
+  stopItem(item)
   item.status = 'cancelling'
-  const queueIndex = queue.indexOf(item.id)
-  if (queueIndex >= 0) queue.splice(queueIndex, 1)
   try {
     if (item.session) await api.uploads.cancel(item.session.id)
     items.value = items.value.filter((candidate) => candidate.id !== item.id)
+    return true
   } catch (error) {
     const status = (error as { response?: { status?: number } }).response?.status
     if (status === 404) {
       items.value = items.value.filter((candidate) => candidate.id !== item.id)
-      return
+      return true
     }
     item.cancelled = false
     item.status = 'error'
     item.error = `取消失败：${errMsg(error)}`
+    return false
+  }
+}
+
+async function cancelAll() {
+  if (batchBusy.value) return
+  const targets = items.value.filter(isPending)
+  if (!targets.length) return
+  try {
+    await appConfirm({
+      title: '取消全部上传',
+      message: `确定取消 ${targets.length} 个未完成上传吗？已上传的 Telegram 分块会进入清理队列，任务将从队列移除。`,
+      kind: 'danger',
+      confirmText: '全部取消',
+      cancelText: '保留任务',
+    })
+  } catch {
+    return
+  }
+
+  batchBusy.value = true
+  let succeeded = 0
+  let failed = 0
+  try {
+    // 逐个请求，避免同时删除大量分块时给 SQLite/Telegram 清理队列造成突发压力。
+    for (const item of targets) {
+      if (await cancelItem(item)) succeeded += 1
+      else failed += 1
+    }
+  } finally {
+    batchBusy.value = false
+  }
+  if (failed) {
+    ElMessage.warning(`已取消 ${succeeded} 个任务，另有 ${failed} 个取消失败，请单独重试`)
+  } else if (succeeded) {
+    ElMessage.success(`已取消 ${succeeded} 个上传任务`)
   }
 }
 
@@ -351,7 +592,7 @@ async function sha256File(
   hasher.init()
   const chunkSize = 32 * 1024 * 1024
   for (let offset = 0; offset < file.size; offset += chunkSize) {
-    if (stopped()) throw new Error('任务已取消')
+    if (stopped()) throw new Error('任务已停止')
     const buffer = await file.slice(offset, Math.min(offset + chunkSize, file.size)).arrayBuffer()
     hasher.update(new Uint8Array(buffer))
     onPct(Math.round((Math.min(offset + chunkSize, file.size) / file.size) * 100))
@@ -465,9 +706,11 @@ async function confirmCompleted(
   target: string,
   item: Item,
   sha: string,
+  stopped: () => boolean = () => false,
 ): Promise<boolean | null> {
   const deadline = Date.now() + 5 * 60 * 1000
   while (Date.now() < deadline) {
+    if (stopped()) return null
     let state: { linked: boolean; pending: boolean }
     try {
       state = (await api.instant(target, item.name, sha, item.size)).data
@@ -478,6 +721,7 @@ async function confirmCompleted(
     }
     if (state.linked) return true
     if (!state.pending) return false
+    if (stopped()) return null
     await new Promise((resolve) => window.setTimeout(resolve, 1000))
   }
   return null
@@ -496,22 +740,33 @@ async function syncSession(item: Item) {
   item.pct = sessionPct(item.session)
 }
 
-async function finalizeItem(item: Item, session: UploadSession) {
+async function finalizeItem(item: Item, session: UploadSession, generation: number) {
+  if (!isCurrent(item, generation) || item.pauseRequested) return
   try {
     await api.uploads.complete(session.id)
   } catch (completeError) {
-    const confirmed = await confirmCompleted(item.dir, item, item.sha256 ?? session.sha256)
+    const confirmed = await confirmCompleted(
+      item.dir,
+      item,
+      item.sha256 ?? session.sha256,
+      () => !isCurrent(item, generation),
+    )
     if (confirmed !== true) throw completeError
   }
+  if (!isCurrent(item, generation) || item.pauseRequested) return
   item.status = 'done'
   item.pct = 100
   item.session = undefined
   emit('uploaded')
 }
 
-async function uploadMissingParts(item: Item) {
+async function uploadMissingParts(item: Item, generation: number) {
   if (!item.session || !item.file) return
   await syncSession(item)
+  if (!isCurrent(item, generation) || item.pauseRequested) {
+    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    return
+  }
   const session = item.session
   const uploaded = new Set(session.uploaded_parts)
   const missing = Array.from({ length: session.part_count }, (_, index) => index).filter(
@@ -531,7 +786,7 @@ async function uploadMissingParts(item: Item) {
 
   item.status = 'uploading'
   const worker = async () => {
-    while (!stopped && !item.pauseRequested && !item.cancelled) {
+    while (!stopped && isCurrent(item, generation) && !item.pauseRequested) {
       const index = missing[cursor++]
       if (index === undefined) return
       const start = index * session.chunk_size
@@ -545,17 +800,19 @@ async function uploadMissingParts(item: Item) {
           index,
           data,
           (loaded) => {
+            if (!isCurrent(item, generation)) return
             activeBytes.set(index, Math.min(loaded, data.size))
             updateProgress()
           },
           controller.signal,
         )
+        if (!isCurrent(item, generation)) return
         completedBytes += data.size
         activeBytes.delete(index)
         updateProgress()
       } catch (error) {
         activeBytes.delete(index)
-        if (!item.pauseRequested && !item.cancelled) {
+        if (isCurrent(item, generation) && !item.pauseRequested) {
           failure = error
           stopped = true
           for (const active of item.controllers) active.abort()
@@ -568,7 +825,7 @@ async function uploadMissingParts(item: Item) {
 
   const workerCount = Math.max(1, Math.min(item.concurrency, missing.length || 1))
   await Promise.all(Array.from({ length: workerCount }, worker))
-  if (item.cancelled) return
+  if (!isCurrent(item, generation)) return
   try {
     await syncSession(item)
   } catch {
@@ -580,16 +837,21 @@ async function uploadMissingParts(item: Item) {
   }
   if (failure) throw failure
 
-  await finalizeItem(item, session)
+  await finalizeItem(item, session, generation)
 }
 
 async function processItem(item: Item) {
-  if (item.cancelled) return
+  const generation = item.generation
+  if (!isCurrent(item, generation)) return
+  if (item.pauseRequested) {
+    item.status = 'paused'
+    return
+  }
   if (
     item.session &&
     item.session.uploaded_parts.length === item.session.part_count
   ) {
-    await finalizeItem(item, item.session)
+    await finalizeItem(item, item.session, generation)
     return
   }
   if (!item.file) {
@@ -597,18 +859,32 @@ async function processItem(item: Item) {
     return
   }
   const target = item.session ? item.dir : await ensureDir(item)
+  if (!isCurrent(item, generation) || item.pauseRequested) {
+    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    return
+  }
 
   if (!item.session) {
     item.status = 'hashing'
     const thumbnailPromise =
       item.thumbnail === undefined ? createVideoThumbnail(item.file) : Promise.resolve(item.thumbnail)
-    item.sha256 = await sha256File(item.file, (percentage) => (item.pct = percentage), () => item.cancelled)
+    item.sha256 = await sha256File(
+      item.file,
+      (percentage) => (item.pct = percentage),
+      () => !isCurrent(item, generation) || item.pauseRequested,
+    )
     item.thumbnail = await thumbnailPromise
-    if (item.cancelled) return
+    if (!isCurrent(item, generation) || item.pauseRequested) {
+      if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+      return
+    }
 
     try {
       const instant = await api.instant(target, item.name, item.sha256, item.size)
-      if (item.cancelled) return
+      if (!isCurrent(item, generation) || item.pauseRequested) {
+        if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+        return
+      }
       if (instant.data.linked) {
         item.status = 'instant'
         item.pct = 100
@@ -618,24 +894,36 @@ async function processItem(item: Item) {
     } catch {
       // 秒传探测失败时继续创建普通上传会话。
     }
-    if (item.cancelled) return
+    if (!isCurrent(item, generation) || item.pauseRequested) {
+      if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+      return
+    }
 
     const created = await api.uploads.create(target, item.name, item.size, item.sha256)
     item.session = created.data.session
     item.concurrency = created.data.concurrency
     item.dir = parentOf(item.session.path)
     item.pct = sessionPct(item.session)
-    if (item.cancelled) {
-      await api.uploads.cancel(item.session.id).catch(() => {})
+    if (!isCurrent(item, generation) || item.pauseRequested) {
+      if (item.cancelled) await api.uploads.cancel(item.session.id).catch(() => {})
+      else if (isCurrent(item, generation)) item.status = 'paused'
       return
     }
+  }
+  if (!isCurrent(item, generation) || item.pauseRequested) {
+    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    return
   }
   if (item.thumbnail && item.session && !item.session.uploaded_parts.includes(0)) {
     await api.uploads.thumbnail(item.session.id, item.thumbnail).catch(() => {
       // 缩略图失败不应阻塞文件本体上传。
     })
   }
-  await uploadMissingParts(item)
+  if (!isCurrent(item, generation) || item.pauseRequested) {
+    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    return
+  }
+  await uploadMissingParts(item, generation)
 }
 
 async function pump() {
@@ -645,10 +933,11 @@ async function pump() {
     const itemId = queue.shift()!
     const item = items.value.find((candidate) => candidate.id === itemId)
     if (!item || item.cancelled) continue
+    const generation = item.generation
     try {
       await processItem(item)
     } catch (error) {
-      if (!item.cancelled && !item.pauseRequested) {
+      if (isCurrent(item, generation) && !item.pauseRequested) {
         item.status = 'error'
         item.error = errMsg(error)
       }
@@ -677,9 +966,32 @@ async function attachFile(item: Item, file: File) {
   item.file = file
   item.status = 'hashing'
   item.error = undefined
+  item.generation += 1
+  const generation = item.generation
+  item.pauseRequested = false
   item.cancelled = false
   try {
-    const digest = await sha256File(file, (percentage) => (item.pct = percentage))
+    const digest = await sha256File(
+      file,
+      (percentage) => (item.pct = percentage),
+      () => !isCurrent(item, generation) || item.pauseRequested,
+    )
+    if (!isCurrent(item, generation)) {
+      if (item.cancelled) return
+      if (item.pauseRequested) {
+        item.file = undefined
+        item.status = 'needs_file'
+        item.error = '校验已暂停，请重新选择原文件继续'
+      }
+      return
+    }
+    if (item.pauseRequested) {
+      // 旧会话自带 sha256；校验尚未完成时不能把未验证的文件交给续传流程。
+      item.file = undefined
+      item.status = 'needs_file'
+      item.error = '校验已暂停，请重新选择原文件继续'
+      return
+    }
     if (digest !== item.session.sha256) {
       item.file = undefined
       item.status = 'needs_file'
@@ -689,8 +1001,20 @@ async function attachFile(item: Item, file: File) {
     }
     item.sha256 = digest
     item.thumbnail = await createVideoThumbnail(file)
+    if (!isCurrent(item, generation)) return
+    if (item.pauseRequested) {
+      item.status = 'paused'
+      return
+    }
     resume(item)
   } catch (error) {
+    if (item.cancelled) return
+    if (item.pauseRequested || item.generation !== generation) {
+      item.file = undefined
+      item.status = 'needs_file'
+      item.error = '校验已暂停，请重新选择原文件继续'
+      return
+    }
     item.file = undefined
     item.status = 'needs_file'
     item.error = errMsg(error)
@@ -738,6 +1062,71 @@ defineExpose({ enqueue, open })
 }
 .spacer {
   flex: 1;
+}
+.queue-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.summary-item {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 2px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: var(--tile-bg);
+}
+.summary-value {
+  font-size: 19px;
+  line-height: 1.15;
+}
+.summary-label {
+  margin-top: 3px;
+  color: var(--text-soft);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.summary-success .summary-value {
+  color: var(--el-color-success);
+}
+.summary-skipped .summary-value {
+  color: var(--el-color-info);
+}
+.summary-error .summary-value {
+  color: var(--el-color-danger);
+}
+.queue-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.queue-actions {
+  margin-bottom: 16px;
+  padding: 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: var(--tile-bg);
+}
+.queue-status,
+.queue-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.queue-status + .queue-buttons {
+  margin-top: 8px;
+}
+.queue-buttons .el-button {
+  margin-left: 0;
+}
+.queue-hint {
+  color: var(--text-soft);
+  font-size: 12px;
 }
 .empty {
   color: var(--text-soft);

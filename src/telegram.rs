@@ -191,11 +191,16 @@ struct RawMessage {
     /// sendVideo 成功时在此;Telegram 也可能改以 document/animation 存储
     video: Option<RawFileRef>,
     animation: Option<RawFileRef>,
+    /// 符合贴纸条件的 WebP 即使用 sendDocument，Telegram 也可能按 sticker 返回。
+    sticker: Option<RawFileRef>,
 }
 
 impl RawMessage {
     fn any_file(self) -> Option<RawFileRef> {
-        self.video.or(self.document).or(self.animation)
+        self.video
+            .or(self.document)
+            .or(self.animation)
+            .or(self.sticker)
     }
 }
 
@@ -1109,6 +1114,27 @@ mod tests {
                 .map(|thumbnail| thumbnail.file_id)
                 .as_deref(),
             Some("thumbnail-file")
+        );
+    }
+
+    #[test]
+    fn webp_sticker_response_is_accepted_as_uploaded_file() {
+        let message: RawMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 43,
+            "sticker": {
+                "file_id": "webp-sticker-file",
+                "thumbnail": { "file_id": "webp-thumbnail-file" }
+            }
+        }))
+        .unwrap();
+        let media = message.any_file().unwrap();
+        assert_eq!(media.file_id, "webp-sticker-file");
+        assert_eq!(
+            media
+                .thumbnail
+                .map(|thumbnail| thumbnail.file_id)
+                .as_deref(),
+            Some("webp-thumbnail-file")
         );
     }
 }
