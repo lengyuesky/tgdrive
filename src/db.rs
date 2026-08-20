@@ -83,6 +83,17 @@ pub struct DeleteJob {
     pub attempts: i64,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CaptionSyncJob {
+    pub id: i64,
+    pub storage_target_id: i64,
+    pub tg_message_id: i64,
+    pub node_id: i64,
+    pub chunk_idx: i64,
+    pub attempts: i64,
+    pub generation: i64,
+}
+
 /// 分享链接行
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct Share {
@@ -469,14 +480,57 @@ impl Db {
         {
             return Err(AppError::AlreadyExists);
         }
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE nodes SET parent_id = ?, name = ?, modified_at = ? WHERE id = ?")
             .bind(new_parent)
             .bind(new_name)
             .bind(now_ts())
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        Self::enqueue_caption_sync_subtree_tx(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// 为文件或目录树内的独占 Telegram 消息登记 caption 路径同步任务。
+    /// 同一消息被多个虚拟文件共享时无法表达唯一当前路径，因此安全地跳过。
+    async fn enqueue_caption_sync_subtree_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        node_id: i64,
+    ) -> AppResult<u64> {
+        Ok(sqlx::query(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM nodes WHERE id = ?
+                 UNION ALL
+                 SELECT n.id FROM nodes n JOIN sub s ON n.parent_id = s.id
+             )
+             INSERT INTO caption_sync_jobs
+                 (storage_target_id, tg_message_id, node_id, chunk_idx, attempts,
+                  next_retry_at, last_error, generation, created_at)
+             SELECT c.storage_target_id, c.tg_message_id, c.node_id, c.idx,
+                    0, 0, NULL, 1, ?
+             FROM chunks c JOIN sub s ON s.id = c.node_id
+             WHERE c.storage_target_id IS NOT NULL
+               AND (
+                   SELECT COUNT(*) FROM chunks refs
+                   WHERE refs.storage_target_id = c.storage_target_id
+                     AND refs.tg_message_id = c.tg_message_id
+               ) = 1
+             ON CONFLICT(storage_target_id, tg_message_id) DO UPDATE SET
+                 node_id = excluded.node_id,
+                 chunk_idx = excluded.chunk_idx,
+                 attempts = 0,
+                 next_retry_at = 0,
+                 last_error = NULL,
+                 generation = caption_sync_jobs.generation + 1,
+                 created_at = excluded.created_at",
+        )
+        .bind(node_id)
+        .bind(now_ts())
+        .execute(&mut **tx)
+        .await?
+        .rows_affected())
     }
 
     // ---------- 上传生命周期 ----------
@@ -1732,6 +1786,84 @@ impl Db {
         Ok(count)
     }
 
+    // ---------- Telegram caption 路径同步队列 ----------
+
+    pub async fn caption_sync_jobs_due(&self, limit: i64) -> AppResult<Vec<CaptionSyncJob>> {
+        // 节点/分块已删除，或消息后来被零流量复制为多处引用时，不再同步单一路径。
+        sqlx::query(
+            "DELETE FROM caption_sync_jobs
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM chunks c
+                 WHERE c.node_id = caption_sync_jobs.node_id
+                   AND c.idx = caption_sync_jobs.chunk_idx
+                   AND c.storage_target_id = caption_sync_jobs.storage_target_id
+                   AND c.tg_message_id = caption_sync_jobs.tg_message_id
+             )
+             OR 1 != (
+                 SELECT COUNT(*) FROM chunks refs
+                 WHERE refs.storage_target_id = caption_sync_jobs.storage_target_id
+                   AND refs.tg_message_id = caption_sync_jobs.tg_message_id
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(sqlx::query_as(
+            "SELECT id, storage_target_id, tg_message_id, node_id, chunk_idx,
+                    attempts, generation
+             FROM caption_sync_jobs
+             WHERE next_retry_at <= ?
+             ORDER BY next_retry_at, id
+             LIMIT ?",
+        )
+        .bind(now_ts())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn caption_sync_job_done(&self, id: i64, generation: i64) -> AppResult<()> {
+        sqlx::query("DELETE FROM caption_sync_jobs WHERE id = ? AND generation = ?")
+            .bind(id)
+            .bind(generation)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn caption_sync_job_failed(
+        &self,
+        id: i64,
+        generation: i64,
+        attempts: i64,
+        error: &str,
+    ) -> AppResult<()> {
+        let exponent = attempts.clamp(0, 10) as u32;
+        let delay = 5_i64
+            .saturating_mul(2_i64.saturating_pow(exponent))
+            .min(3600);
+        let detail: String = error.chars().take(500).collect();
+        sqlx::query(
+            "UPDATE caption_sync_jobs
+             SET attempts = ?, next_retry_at = ?, last_error = ?
+             WHERE id = ? AND generation = ?",
+        )
+        .bind(attempts + 1)
+        .bind(now_ts() + delay)
+        .bind(detail)
+        .bind(id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_caption_sync_count(&self) -> AppResult<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM caption_sync_jobs")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
     /// 候选消息中，删除元数据后已无任何分块引用的消息；在同一事务内先写入删除队列。
     async fn freed_messages(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -1919,6 +2051,37 @@ mod tests {
             .unwrap();
         db.finalize_upload(up, 4, Some(sha)).await.unwrap();
         up
+    }
+
+    #[tokio::test]
+    async fn moving_tree_queues_caption_sync_only_for_unshared_messages() {
+        let (db, _g) = test_db().await;
+        let folder = db.mkdir(ROOT_ID, "旧目录").await.unwrap();
+        let unique = mk_file(&db, folder.id, "独占.bin", 410, "unique").await;
+        let shared = mk_file(&db, folder.id, "共享.bin", 411, "shared").await;
+        db.copy_file(shared, ROOT_ID, "共享副本.bin").await.unwrap();
+
+        db.move_node(folder.id, ROOT_ID, "新目录").await.unwrap();
+        let first = db.caption_sync_jobs_due(10).await.unwrap();
+        assert_eq!(first.len(), 1, "共享 Telegram 消息不能绑定到单一路径");
+        assert_eq!(first[0].node_id, unique);
+        assert_eq!(
+            db.full_path_if_visible(unique).await.unwrap().as_deref(),
+            Some("/新目录/独占.bin")
+        );
+
+        // 同步过程中再次改名时会增加代次；旧 worker 不能误删新任务。
+        db.move_node(folder.id, ROOT_ID, "最终目录").await.unwrap();
+        db.caption_sync_job_done(first[0].id, first[0].generation)
+            .await
+            .unwrap();
+        let latest = db.caption_sync_jobs_due(10).await.unwrap();
+        assert_eq!(latest.len(), 1);
+        assert!(latest[0].generation > first[0].generation);
+        assert_eq!(
+            db.full_path_if_visible(unique).await.unwrap().as_deref(),
+            Some("/最终目录/独占.bin")
+        );
     }
 
     #[tokio::test]

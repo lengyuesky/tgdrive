@@ -1,6 +1,6 @@
 //! VFS 门面:路径规范化 + 汇聚 db/engine/telegram 的业务操作,REST 与 WebDAV 共用
 
-use crate::db::{Db, Node, ROOT_ID};
+use crate::db::{Db, Node, ROOT_ID, StoredMessage};
 use crate::engine::reader::ChunkedReader;
 use crate::engine::upload::{UploadHandle, Uploader};
 use crate::error::{AppError, AppResult};
@@ -98,10 +98,19 @@ impl Vfs {
         self.db.trash_node(node.id, &canon).await
     }
 
+    /// 永久删除文件或目录树；仅供用户明确选择“直接删除”时调用。
+    /// 返回引用归零且已进入持久化删除队列的 Telegram 消息。
+    pub async fn delete_permanently(&self, path: &str) -> AppResult<Vec<StoredMessage>> {
+        let node = self.resolve(path).await?;
+        self.db.delete_node(node.id).await
+    }
+
     pub async fn rename(&self, from: &str, to: &str) -> AppResult<()> {
         let node = self.resolve(from).await?;
         let (new_parent, new_name) = self.resolve_parent(to).await?;
-        self.db.move_node(node.id, new_parent.id, &new_name).await
+        self.db.move_node(node.id, new_parent.id, &new_name).await?;
+        self.uploader.process_pending_caption_syncs();
+        Ok(())
     }
 
     /// 复制文件或整棵目录(元数据级,零流量)

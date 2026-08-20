@@ -2,7 +2,7 @@
   <el-dialog v-model="visible" title="回收站" width="760px" align-center append-to-body>
     <div class="bar">
       <span class="tip">
-        删除的内容先进回收站,Telegram 消息在彻底删除时才释放;保留天数可在「系统设置 → 维护」调整。
+        回收站中的内容可以恢复;Telegram 消息在彻底删除时才释放。网页删除时也可选择直接删除,保留天数可在「系统设置 → 维护」调整。
       </span>
       <el-button
         size="small"

@@ -25,6 +25,15 @@
           <button v-if="mode !== 'alert'" type="button" class="nd-btn ghost" @click="onCancel">
             {{ cancelText }}
           </button>
+          <button
+            v-if="alternateText"
+            type="button"
+            class="nd-btn outline"
+            :class="alternateKind"
+            @click="onAlternate"
+          >
+            {{ alternateText }}
+          </button>
           <button type="button" class="nd-btn solid" :class="kind" @click="onOk">
             {{ confirmText }}
           </button>
@@ -49,6 +58,8 @@ const props = withDefaults(
     message?: string
     confirmText?: string
     cancelText?: string
+    alternateText?: string
+    alternateKind?: 'primary' | 'danger' | 'warning'
     value?: string
     placeholder?: string
     pattern?: RegExp
@@ -58,13 +69,15 @@ const props = withDefaults(
     kind: 'primary',
     confirmText: '确定',
     cancelText: '取消',
+    alternateText: '',
+    alternateKind: 'danger',
     value: '',
     placeholder: '',
     errorMessage: '输入不合法',
   },
 )
 
-const emit = defineEmits<{ resolve: [value: string]; reject: []; done: [] }>()
+const emit = defineEmits<{ resolve: [value: string]; alternate: []; reject: []; done: [] }>()
 
 const visible = ref(true)
 const text = ref(props.value)
@@ -75,11 +88,12 @@ let closing = false
 
 const fallbackIcon = computed(() => (props.kind === 'primary' ? InfoFilled : WarningFilled))
 
-function finish(ok: boolean) {
+function finish(action: 'resolve' | 'alternate' | 'reject') {
   if (closing) return
   closing = true
   visible.value = false
-  if (ok) emit('resolve', text.value)
+  if (action === 'resolve') emit('resolve', text.value)
+  else if (action === 'alternate') emit('alternate')
   else emit('reject')
 }
 
@@ -96,13 +110,17 @@ function onOk() {
     inputRef.value?.focus()
     return
   }
-  finish(true)
+  finish('resolve')
+}
+
+function onAlternate() {
+  finish('alternate')
 }
 
 function onCancel() {
   // alert 只是通知,任何关闭方式都视为已读确认
-  if (props.mode === 'alert') finish(true)
-  else finish(false)
+  if (props.mode === 'alert') finish('resolve')
+  else finish('reject')
 }
 
 function onMask() {
@@ -303,6 +321,26 @@ html.dark .nd-card {
 }
 .nd-btn.ghost:hover {
   background: var(--tile-bg-hover);
+}
+.nd-btn.outline {
+  background: transparent;
+  border: 1px solid currentColor;
+}
+.nd-btn.outline.primary {
+  color: #6366f1;
+  background: rgba(99, 102, 241, 0.08);
+}
+.nd-btn.outline.danger {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.08);
+}
+.nd-btn.outline.warning {
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.1);
+}
+.nd-btn.outline:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
 }
 .nd-btn.solid {
   color: #fff;

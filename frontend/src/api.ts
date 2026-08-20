@@ -237,6 +237,7 @@ export interface AdminStatus {
   started_at: number
   now: number
   pending_deletes: number
+  pending_caption_syncs: number
   inbox_failures: number
   tasks: TaskStatus[]
 }
@@ -325,9 +326,10 @@ export const api = {
   mkdir: (path: string) => http.post('/fs/mkdir', { path }),
   rename: (from: string, to: string) => http.post('/fs/rename', { from, to }),
   copy: (from: string, to: string) => http.post('/fs/copy', { from, to }),
-  del: (paths: string[]) =>
+  del: (paths: string[], permanent = false) =>
     http.post<{ deleted: number; failed: { path: string; error: string }[] }>('/fs/delete', {
       paths,
+      permanent,
     }),
   upload: (
     dir: string,

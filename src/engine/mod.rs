@@ -135,6 +135,10 @@ mod tests {
             Ok(())
         }
 
+        async fn edit_message_caption(&self, _message_id: i64, _caption: &str) -> AppResult<()> {
+            Ok(())
+        }
+
         async fn get_me(&self) -> AppResult<String> {
             Ok("mock".into())
         }

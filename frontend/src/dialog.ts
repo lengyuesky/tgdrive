@@ -15,6 +15,9 @@ export interface DialogOptions {
   kind?: 'primary' | 'danger' | 'warning'
   confirmText?: string
   cancelText?: string
+  /** 可选的第三操作，显示在取消与主确认按钮之间。 */
+  alternateText?: string
+  alternateKind?: 'primary' | 'danger' | 'warning'
 }
 
 export interface PromptOptions extends DialogOptions {
@@ -25,8 +28,10 @@ export interface PromptOptions extends DialogOptions {
 }
 
 type Mode = 'confirm' | 'prompt' | 'alert'
+type DialogResult = { action: 'confirm'; value: string } | { action: 'alternate' }
+export type DialogChoice = DialogResult['action']
 
-function show(mode: Mode, opts: PromptOptions): Promise<string> {
+function show(mode: Mode, opts: PromptOptions): Promise<DialogResult> {
   return new Promise((resolve, reject) => {
     const host = document.createElement('div')
     document.body.appendChild(host)
@@ -34,7 +39,8 @@ function show(mode: Mode, opts: PromptOptions): Promise<string> {
       createVNode(AppDialog, {
         mode,
         ...opts,
-        onResolve: (v: string) => resolve(v),
+        onResolve: (v: string) => resolve({ action: 'confirm', value: v }),
+        onAlternate: () => resolve({ action: 'alternate' }),
         onReject: () => reject('cancel'),
         // 离场动画结束后再卸载
         onDone: () => {
@@ -54,7 +60,16 @@ export function appConfirm(opts: DialogOptions): Promise<void> {
 
 /** 输入框:确定 resolve({ value }),取消 reject('cancel') */
 export function appPrompt(opts: PromptOptions): Promise<{ value: string }> {
-  return show('prompt', opts).then((value) => ({ value }))
+  return show('prompt', opts).then((result) => ({
+    value: result.action === 'confirm' ? result.value : '',
+  }))
+}
+
+/** 三选一确认框：主操作、备选操作或取消。 */
+export function appChoice(
+  opts: DialogOptions & { alternateText: string },
+): Promise<DialogChoice> {
+  return show('confirm', opts).then((result) => result.action)
 }
 
 /** 提示框:只有一个确认按钮,Esc / 点遮罩也算确认,永不 reject */

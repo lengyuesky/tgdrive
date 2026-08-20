@@ -751,6 +751,7 @@ const statTiles = computed<Tile[]>(() => {
     },
     { label: '回收站', value: `${trashCount.value} 项`, icon: Delete, action: () => go('backup') },
     { label: '待删消息', value: String(s?.pending_deletes ?? 0), icon: Brush },
+    { label: '待同步路径', value: String(s?.pending_caption_syncs ?? 0), icon: Refresh },
     {
       label: '收件死信',
       value: String(s?.inbox_failures ?? 0),

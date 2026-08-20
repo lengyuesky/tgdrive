@@ -37,6 +37,9 @@
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <el-tooltip content="上传队列">
+          <el-button class="icon-btn" :icon="UploadFilled" @click="drawer?.open()" />
+        </el-tooltip>
         <el-tooltip content="新建文件夹">
           <el-button class="icon-btn" :icon="FolderAdd" @click="mkdir" />
         </el-tooltip>
@@ -55,7 +58,7 @@
           <el-button class="icon-btn" :icon="Rank" @click="moveSelected" />
         </el-tooltip>
         <el-badge v-if="selected.length" :value="selected.length">
-          <el-tooltip content="删除所选(进回收站)">
+          <el-tooltip content="删除所选">
             <el-button class="icon-btn" type="danger" :icon="Delete" @click="removeSelected" />
           </el-tooltip>
         </el-badge>
@@ -378,7 +381,7 @@
                     <el-dropdown-item command="move">移动到 ...</el-dropdown-item>
                     <el-dropdown-item command="copy">复制到 ...</el-dropdown-item>
                     <el-dropdown-item command="properties">属性</el-dropdown-item>
-                    <el-dropdown-item command="delete" divided>删除(进回收站)</el-dropdown-item>
+                    <el-dropdown-item command="delete" divided>删除…</el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
@@ -424,7 +427,7 @@
                       <el-dropdown-item command="move">移动到 ...</el-dropdown-item>
                       <el-dropdown-item command="copy">复制到 ...</el-dropdown-item>
                       <el-dropdown-item command="properties">属性</el-dropdown-item>
-                      <el-dropdown-item command="delete" divided>删除(进回收站)</el-dropdown-item>
+                      <el-dropdown-item command="delete" divided>删除…</el-dropdown-item>
                     </el-dropdown-menu>
                   </template>
                 </el-dropdown>
@@ -675,9 +678,9 @@ import {
   ArrowDown, Box, Calendar, CopyDocument, Delete, DeleteFilled, Document, EditPen, Film, Finished,
   Filter, Folder, FolderAdd, FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position,
   Promotion, Rank, Refresh, Search, Setting, Share, Sort, Star, StarFilled, Sunny, SwitchButton, Tickets,
-  TrendCharts, Upload,
+  TrendCharts, Upload, UploadFilled,
 } from '@element-plus/icons-vue'
-import { appConfirm, appPrompt } from '../dialog'
+import { appChoice, appPrompt } from '../dialog'
 import {
   api,
   errMsg,
@@ -1170,7 +1173,7 @@ const ctxItems = computed<CtxItem[]>(() => {
   items.push({ label: '复制到 ...', action: () => onRowCmd('copy', row) })
   items.push({ label: '属性', action: () => void openProperties(row) })
   items.push({
-    label: '删除(进回收站)',
+    label: '删除…',
     action: () => onRowCmd('delete', row),
     danger: true,
     divided: true,
@@ -1450,18 +1453,25 @@ async function moveSelected() {
 
 async function confirmDelete(rows: Entry[]) {
   const label = rows.length === 1 ? `「${rows[0].name}」` : `选中的 ${rows.length} 项`
-  await appConfirm({
-    title: '移入回收站',
-    message: `确定把${label}移入回收站吗?\n回收站里可随时恢复,超过保留期后自动彻底删除。`,
-    kind: 'danger',
+  const choice = await appChoice({
+    title: '删除项目',
+    message: `${label}\n移入回收站后可以恢复；直接删除将立即移除且无法恢复，对应的 Telegram 消息也会进入清理队列。`,
+    kind: 'primary',
     icon: Delete,
     confirmText: '移入回收站',
+    alternateText: '直接删除',
+    alternateKind: 'danger',
   })
-  const r = await api.del(rows.map((x) => joinPath(cur.value, x.name)))
+  const permanent = choice === 'alternate'
+  const action = permanent ? '直接删除' : '移入回收站'
+  const r = await api.del(
+    rows.map((x) => joinPath(cur.value, x.name)),
+    permanent,
+  )
   if (r.data.failed.length > 0) {
-    ElMessage.warning(`有 ${r.data.failed.length} 项删除失败:${r.data.failed[0].error}`)
+    ElMessage.warning(`有 ${r.data.failed.length} 项${action}失败:${r.data.failed[0].error}`)
   } else {
-    ElMessage.success('已移入回收站')
+    ElMessage.success(permanent ? '已直接删除' : '已移入回收站')
   }
   if (rows.some((x) => x.is_dir)) treeKey.value++
   refresh()

@@ -150,7 +150,8 @@ function displayName(item: Item) {
 let seq = 0
 let busy = false
 let defaultConcurrency = 1
-const queue: Item[] = []
+/** 只保存任务 ID，消费时从响应式数组取代理，确保状态变化能触发视图更新。 */
+const queue: number[] = []
 /** 本次页面会话已确保存在的目录，避免每个文件都重复调用 mkdir。 */
 const ensuredDirs = new Set<string>()
 
@@ -273,7 +274,7 @@ async function enqueue(dir: string, files: UploadFile[]) {
 }
 
 function schedule(item: Item) {
-  if (!queue.includes(item)) queue.push(item)
+  if (!queue.includes(item.id)) queue.push(item.id)
   void pump()
 }
 
@@ -314,7 +315,7 @@ async function cancelItem(item: Item) {
   item.cancelled = true
   pause(item)
   item.status = 'cancelling'
-  const queueIndex = queue.indexOf(item)
+  const queueIndex = queue.indexOf(item.id)
   if (queueIndex >= 0) queue.splice(queueIndex, 1)
   try {
     if (item.session) await api.uploads.cancel(item.session.id)
@@ -333,6 +334,11 @@ async function cancelItem(item: Item) {
 
 function clearFinished() {
   items.value = items.value.filter((item) => !isDone(item))
+}
+
+/** 从顶栏打开上传队列；没有任务时也允许打开查看空状态。 */
+function open() {
+  visible.value = true
 }
 
 /** 流式计算 SHA-256（32MB 一片），大文件不会一次读入内存。 */
@@ -636,8 +642,9 @@ async function pump() {
   if (busy) return
   busy = true
   while (queue.length > 0) {
-    const item = queue.shift()!
-    if (!items.value.includes(item) || item.cancelled) continue
+    const itemId = queue.shift()!
+    const item = items.value.find((candidate) => candidate.id === itemId)
+    if (!item || item.cancelled) continue
     try {
       await processItem(item)
     } catch (error) {
@@ -719,7 +726,7 @@ onBeforeUnmount(() => {
   }
 })
 
-defineExpose({ enqueue })
+defineExpose({ enqueue, open })
 </script>
 
 <style scoped>

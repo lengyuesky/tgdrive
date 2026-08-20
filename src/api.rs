@@ -869,6 +869,9 @@ async fn copy_entry(
 #[derive(Deserialize)]
 struct DeleteBody {
     paths: Vec<String>,
+    /// 默认仍移入回收站，兼容旧版前端及现有 API 调用方。
+    #[serde(default)]
+    permanent: bool,
 }
 
 async fn delete(
@@ -878,7 +881,16 @@ async fn delete(
     let mut failed = Vec::new();
     let mut deleted = 0;
     for p in &b.paths {
-        match state.vfs.delete(p).await {
+        let result = if b.permanent {
+            state
+                .vfs
+                .delete_permanently(p)
+                .await
+                .map(|freed| state.vfs.uploader.delete_messages_best_effort(freed))
+        } else {
+            state.vfs.delete(p).await
+        };
+        match result {
             Ok(()) => deleted += 1,
             Err(e) => failed.push(serde_json::json!({ "path": p, "error": e.to_string() })),
         }
@@ -1058,6 +1070,7 @@ fn db_file_size(path: &str) -> u64 {
 async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let (files, dirs, total) = state.vfs.db.stats().await?;
     let pending_deletes = state.vfs.db.pending_delete_count().await?;
+    let pending_caption_syncs = state.vfs.db.pending_caption_sync_count().await?;
     let inbox_failures = state
         .vfs
         .db
@@ -1084,6 +1097,7 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "started_at": state.rt.started_at,
         "now": crate::db::now_ts(),
         "pending_deletes": pending_deletes,
+        "pending_caption_syncs": pending_caption_syncs,
         "inbox_failures": inbox_failures,
         "tasks": state.tasks.snapshots(),
     })))
@@ -1802,6 +1816,20 @@ mod tests {
         let upper = "A".repeat(64);
         assert_eq!(normalized_sha256(&upper).unwrap(), "a".repeat(64));
         assert!(normalized_sha256("bad").is_err());
+    }
+
+    #[test]
+    fn delete_body_defaults_to_recycle_bin_and_accepts_permanent_mode() {
+        let recycle: DeleteBody =
+            serde_json::from_value(serde_json::json!({ "paths": ["/a.txt"] })).unwrap();
+        assert!(!recycle.permanent);
+
+        let permanent: DeleteBody = serde_json::from_value(serde_json::json!({
+            "paths": ["/a.txt"],
+            "permanent": true
+        }))
+        .unwrap();
+        assert!(permanent.permanent);
     }
 
     #[test]

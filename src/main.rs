@@ -110,6 +110,7 @@ async fn serve() -> anyhow::Result<()> {
         tracing::warn!("存在尚未关联存储目标的旧分块，已暂缓清理未完成上传");
     }
     uploader.process_pending_deletes();
+    uploader.process_pending_caption_syncs();
 
     let vfs = Vfs {
         db: db.clone(),

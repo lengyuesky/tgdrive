@@ -147,6 +147,8 @@ pub trait TgApi: Send + Sync + 'static {
         self.send_document(filename, caption, thumbnail, body).await
     }
     async fn delete_message(&self, message_id: i64) -> AppResult<()>;
+    /// 更新媒体消息 caption；Telegram 不支持原地修改文档附件名。
+    async fn edit_message_caption(&self, message_id: i64, caption: &str) -> AppResult<()>;
     async fn get_me(&self) -> AppResult<String>;
     /// 打开某个分块的字节流，从块内 offset 开始读。
     /// message_id 用于定位日志/后续刷新引用，chunk_size 用于严格限制读取边界。
@@ -389,6 +391,10 @@ impl TgApi for UnconfiguredTg {
     }
 
     async fn delete_message(&self, _message_id: i64) -> AppResult<()> {
+        Self::err()
+    }
+
+    async fn edit_message_caption(&self, _message_id: i64, _caption: &str) -> AppResult<()> {
         Self::err()
     }
 
@@ -941,6 +947,28 @@ impl TgApi for TgClient {
             // 消息已不存在视为删除成功(幂等)
             Err(AppError::Telegram(d)) if d.contains("message to delete not found") => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    async fn edit_message_caption(&self, message_id: i64, caption: &str) -> AppResult<()> {
+        let url = self.method_url("editMessageCaption");
+        let result: AppResult<serde_json::Value> = self
+            .call_with_retry("editMessageCaption", || {
+                self.http
+                    .post(&url)
+                    .json(&serde_json::json!({
+                        "chat_id": self.chat_id,
+                        "message_id": message_id,
+                        "caption": caption,
+                    }))
+                    .send()
+            })
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            // 重试或重复入队时 caption 可能已经是目标值，视为幂等成功。
+            Err(AppError::Telegram(detail)) if detail.contains("message is not modified") => Ok(()),
+            Err(error) => Err(error),
         }
     }
 

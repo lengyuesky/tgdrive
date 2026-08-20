@@ -38,6 +38,17 @@ pub fn video_mime(filename: &str) -> Option<&'static str> {
     }
 }
 
+/// Telegram caption 中保存可人工恢复的当前路径、分块序号与节点号。
+pub(crate) fn storage_caption(display_path: &str, idx: i64, node_id: i64) -> String {
+    let cap_path: String = display_path.chars().take(700).collect();
+    format!(
+        "tgdrive {{\"p\":\"{}\",\"i\":{},\"u\":{}}}",
+        cap_path.replace('"', "'"),
+        idx,
+        node_id
+    )
+}
+
 async fn send_body_to_telegram(
     tg: Arc<dyn TgApi>,
     filename: &str,
@@ -185,6 +196,7 @@ pub struct Uploader {
     /// 分块超过该值转入临时文件(生产用 MEMORY_CHUNK_LIMIT,测试可调小)
     pub mem_limit: u64,
     delete_running: Arc<AtomicBool>,
+    caption_sync_running: Arc<AtomicBool>,
 }
 
 impl Uploader {
@@ -195,6 +207,7 @@ impl Uploader {
             knobs,
             mem_limit,
             delete_running: Arc::new(AtomicBool::new(false)),
+            caption_sync_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -330,13 +343,7 @@ impl Uploader {
         } else {
             format!("{}.part{idx}", info.node.name)
         };
-        let cap_path: String = info.session.display_path.chars().take(700).collect();
-        let caption = format!(
-            "tgdrive {{\"p\":\"{}\",\"i\":{},\"u\":{}}}",
-            cap_path.replace('"', "'"),
-            idx,
-            info.node.id
-        );
+        let caption = storage_caption(&info.session.display_path, idx, info.node.id);
         let mime = (info.part_count() == 1 && self.knobs.send_video())
             .then(|| video_mime(&info.node.name))
             .flatten();
@@ -448,6 +455,90 @@ impl Uploader {
             this.delete_running.store(false, Ordering::Release);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             this.process_pending_deletes();
+        });
+    }
+
+    /// 处理重命名/移动产生的 Telegram caption 路径同步任务。
+    /// 任务持久化在 SQLite，限流或网络失败后按指数退避自动重试。
+    pub fn process_pending_caption_syncs(&self) {
+        if self
+            .caption_sync_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            'worker: loop {
+                let jobs = match this.db.caption_sync_jobs_due(50).await {
+                    Ok(jobs) => jobs,
+                    Err(error) => {
+                        tracing::warn!("读取 Telegram caption 同步队列失败: {error}");
+                        break;
+                    }
+                };
+                if jobs.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    continue;
+                }
+                for job in jobs {
+                    let result = match this.db.full_path_if_visible(job.node_id).await {
+                        Ok(Some(path)) => match this.tg.binding(job.storage_target_id) {
+                            Ok(binding) => {
+                                let caption = storage_caption(&path, job.chunk_idx, job.node_id);
+                                binding
+                                    .api
+                                    .edit_message_caption(job.tg_message_id, &caption)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        },
+                        // 已进入回收站的节点没有需要展示的当前路径，丢弃旧任务。
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(()) => {
+                            if let Err(error) =
+                                this.db.caption_sync_job_done(job.id, job.generation).await
+                            {
+                                tracing::warn!(
+                                    "确认 Telegram caption 同步任务 {} 失败: {error}",
+                                    job.id
+                                );
+                                break 'worker;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "同步存储目标 {} 的消息 {} caption 失败，将自动重试: {error}",
+                                job.storage_target_id,
+                                job.tg_message_id
+                            );
+                            if let Err(db_error) = this
+                                .db
+                                .caption_sync_job_failed(
+                                    job.id,
+                                    job.generation,
+                                    job.attempts,
+                                    &error.to_string(),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "更新 Telegram caption 同步任务 {} 失败: {db_error}",
+                                    job.id
+                                );
+                                break 'worker;
+                            }
+                        }
+                    }
+                }
+            }
+            this.caption_sync_running.store(false, Ordering::Release);
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            this.process_pending_caption_syncs();
         });
     }
 
@@ -614,13 +705,7 @@ impl Uploader {
             .then(|| video_mime(name))
             .flatten();
         // caption 记录路径、分块序号与上传节点号，供异常核对或元数据库丢失时人工恢复。
-        let cap_path: String = display_path.chars().take(700).collect();
-        let caption = format!(
-            "tgdrive {{\"p\":\"{}\",\"i\":{},\"u\":{}}}",
-            cap_path.replace('"', "'"),
-            idx,
-            node_id
-        );
+        let caption = storage_caption(display_path, idx, node_id);
         uploads.spawn(async move {
             let _permit = permit;
             let size = body.len();
