@@ -608,6 +608,17 @@ async function chooseInboxDir(key: InboxDirKey) {
   extras.value[key] = picked
 }
 
+/** 短视频取材目录允许是根目录(整库),所以不像收件目录那样拦截 "/" */
+async function chooseShortsDir() {
+  if (!extras.value) return
+  const picked = await inboxDirPicker.value?.open(
+    '选择短视频取材文件夹(含子目录)',
+    extras.value.shorts_dir || '/',
+  )
+  if (picked === null || picked === undefined) return
+  extras.value.shorts_dir = picked === '/' ? '' : picked
+}
+
 async function chooseRuleDir(rule: InboxRouteRule) {
   const picked = await inboxDirPicker.value?.open(
     `选择「${rule.name.trim() || '自定义类型'}」的目录`,
@@ -738,7 +749,9 @@ const dirtySections = computed(() => {
     const sec = CFG_SECTION[k]
     if (sec) set.add(sec)
   }
-  for (const k of changed.value.extKeys) set.add(k.startsWith('inbox') ? 'inbox' : 'backup')
+  for (const k of changed.value.extKeys) {
+    set.add(k.startsWith('inbox') ? 'inbox' : k.startsWith('shorts') ? 'stream' : 'backup')
+  }
   return set
 })
 
@@ -1288,6 +1301,25 @@ function downloadBackup() {
                     <span>3</span>
                     <div>在宿主机执行 <code>{{ RESTART_CMD }}</code>,重启这两个服务</div>
                   </div>
+                </div>
+              </div>
+
+              <div v-if="extras" class="block">
+                <div class="block-head">短视频模式</div>
+                <div class="fields">
+                  <SettingField
+                    label="取材文件夹"
+                    wide
+                    help="文件页顶栏「短视频模式」随机播放这个文件夹(含子目录)下的所有视频。留空表示整库。"
+                  >
+                    <div class="ctl-row">
+                      <el-input v-model="extras.shorts_dir" placeholder="留空 = 整库" />
+                      <el-button @click="chooseShortsDir">选择</el-button>
+                      <el-button text :disabled="!extras.shorts_dir" @click="extras.shorts_dir = ''">
+                        整库
+                      </el-button>
+                    </div>
+                  </SettingField>
                 </div>
               </div>
 

@@ -965,6 +965,7 @@ mod tests {
                     dir: "/归档".into(),
                 },
             ],
+            shorts_dir: String::new(),
         }
     }
 

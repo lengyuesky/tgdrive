@@ -68,6 +68,8 @@ pub struct Extras {
     pub inbox_book_dir: String,
     /// 自定义类型规则；优先于内置类型，重叠时更长的后缀优先
     pub inbox_rules: Vec<InboxRouteRule>,
+    /// 短视频模式的取材目录（含子目录）；空串表示整库。
+    pub shorts_dir: String,
 }
 
 fn serialize_backup_secret<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
@@ -165,6 +167,7 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
             .unwrap_or_else(|| child_dir("书籍")),
         inbox_dir,
         inbox_rules,
+        shorts_dir: get(db, "shorts_dir").await?.unwrap_or_default(),
     })
 }
 
@@ -195,6 +198,7 @@ pub struct ExtrasPatch {
     pub inbox_image_dir: Option<String>,
     pub inbox_book_dir: Option<String>,
     pub inbox_rules: Option<Vec<InboxRouteRule>>,
+    pub shorts_dir: Option<String>,
 }
 
 fn normalize_http_url(raw: &str, label: &str) -> AppResult<String> {
@@ -447,6 +451,14 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
         .map(|v| normalize_dir(v, "书籍目录"))
         .transpose()?;
     let inbox_rules = p.inbox_rules.as_deref().map(normalize_rules).transpose()?;
+    // 短视频取材目录允许留空(整库),所以不能直接套拒绝根目录的 normalize_dir。
+    let shorts_dir = match p.shorts_dir.as_deref().map(str::trim) {
+        None => None,
+        Some(raw) => Some(match crate::vfs::normalize(raw)?.as_slice() {
+            [] => String::new(),
+            segs => format!("/{}", segs.join("/")),
+        }),
+    };
     let backup_chunk_size = p
         .backup_chunk_size
         .as_deref()
@@ -630,6 +642,9 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
             .map_err(|e| AppError::BadRequest(format!("自定义收件规则序列化失败:{e}")))?;
         set(db, "inbox_rules", &raw).await?;
     }
+    if let Some(v) = shorts_dir {
+        set(db, "shorts_dir", &v).await?;
+    }
     Ok(())
 }
 
@@ -674,6 +689,51 @@ mod tests {
         );
         assert!(
             validate_backup_chunk_size("http://telegram-bot-api:8081", 512 * 1024 * 1024).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn shorts_dir_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("extras.db").to_str().unwrap())
+            .await
+            .unwrap();
+        // 默认整库
+        assert_eq!(load(&db).await.unwrap().shorts_dir, "");
+
+        save(
+            &db,
+            &ExtrasPatch {
+                shorts_dir: Some("影视//短片/".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(load(&db).await.unwrap().shorts_dir, "/影视/短片");
+
+        // 留空表示恢复成整库
+        save(
+            &db,
+            &ExtrasPatch {
+                shorts_dir: Some("  ".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(load(&db).await.unwrap().shorts_dir, "");
+
+        assert!(
+            save(
+                &db,
+                &ExtrasPatch {
+                    shorts_dir: Some("/影视/../etc".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err()
         );
     }
 

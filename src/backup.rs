@@ -1061,6 +1061,7 @@ mod tests {
             inbox_image_dir: "/收件箱/图片".into(),
             inbox_book_dir: "/收件箱/书籍".into(),
             inbox_rules: Vec::new(),
+            shorts_dir: String::new(),
         }
     }
 

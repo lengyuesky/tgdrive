@@ -148,6 +148,8 @@ pub struct SearchFilter {
     pub modified_after: Option<i64>,
     pub modified_before: Option<i64>,
     pub favorite_only: bool,
+    /// 只在该目录子树内搜索，形如 `/影视/短片`；`None` 表示整库。
+    pub under: Option<String>,
     pub sort: SearchSort,
     pub descending: bool,
 }
@@ -1589,6 +1591,16 @@ impl Db {
         if filter.favorite_only {
             query.push(" AND favorite = 1");
         }
+        if let Some(dir) = filter.under.as_deref().filter(|d| *d != "/") {
+            // 用 substr 逐字比较而不是 LIKE/GLOB，避免目录名里的 % _ [ * 被当通配符。
+            // SQLite 的 substr 按字符计数，所以长度取 chars 而非字节。
+            let prefix = format!("{dir}/");
+            query
+                .push(" AND substr(path, 1, ")
+                .push_bind(prefix.chars().count() as i64)
+                .push(") = ")
+                .push_bind(prefix);
+        }
         query.push(" ORDER BY ");
         match filter.sort {
             SearchSort::Name => query.push("name COLLATE NOCASE"),
@@ -2341,6 +2353,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_under_limits_to_subtree() {
+        let (db, _g) = test_db().await;
+        // 目录名带 SQL/GLOB 元字符，验证前缀比较不会被当通配符
+        let a = db.mkdir(ROOT_ID, "影视_100%[新]").await.unwrap();
+        let sub = db.mkdir(a.id, "子集").await.unwrap();
+        let b = db.mkdir(ROOT_ID, "影视x100y新z").await.unwrap();
+        mk_file(&db, a.id, "x.mp4", 900, "a").await;
+        mk_file(&db, sub.id, "y.mp4", 901, "b").await;
+        mk_file(&db, b.id, "z.mp4", 902, "c").await;
+
+        let filter = SearchFilter {
+            extensions: vec!["mp4".into()],
+            under: Some("/影视_100%[新]".into()),
+            ..SearchFilter::default()
+        };
+        let mut paths: Vec<_> = db
+            .search_filtered(&filter, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/影视_100%[新]/x.mp4", "/影视_100%[新]/子集/y.mp4"]);
+
+        // 根目录等价于不限制
+        let all = SearchFilter {
+            extensions: vec!["mp4".into()],
+            under: Some("/".into()),
+            ..SearchFilter::default()
+        };
+        assert_eq!(db.search_filtered(&all, 100).await.unwrap().len(), 3);
+
+        // 不存在的目录返回空
+        let none = SearchFilter {
+            under: Some("/查无此目录".into()),
+            ..SearchFilter::default()
+        };
+        assert!(db.search_filtered(&none, 100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn advanced_search_filters_and_favorites() {
         let (db, _g) = test_db().await;
         let docs = db.mkdir(ROOT_ID, "docs").await.unwrap();
@@ -2365,6 +2419,7 @@ mod tests {
                     modified_after: Some(1000),
                     modified_before: Some(3000),
                     favorite_only: true,
+                    under: None,
                     sort: SearchSort::Modified,
                     descending: true,
                 },

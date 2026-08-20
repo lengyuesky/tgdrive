@@ -119,6 +119,10 @@
           />
         </el-tooltip>
 
+        <el-tooltip content="短视频模式(随机刷文件夹里的视频)">
+          <el-button class="icon-btn" :icon="VideoPlay" @click="openShorts" />
+        </el-tooltip>
+
         <span class="vsep" />
 
         <el-tooltip :content="isDark ? '切换亮色' : '切换暗色'">
@@ -678,7 +682,7 @@ import {
   ArrowDown, Box, Calendar, CopyDocument, Delete, DeleteFilled, Document, EditPen, Film, Finished,
   Filter, Folder, FolderAdd, FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position,
   Promotion, Rank, Refresh, Search, Setting, Share, Sort, Star, StarFilled, Sunny, SwitchButton, Tickets,
-  TrendCharts, Upload, UploadFilled,
+  TrendCharts, Upload, UploadFilled, VideoPlay,
 } from '@element-plus/icons-vue'
 import { appChoice, appPrompt } from '../dialog'
 import {
@@ -686,6 +690,8 @@ import {
   errMsg,
   fmtSize,
   fmtTime,
+  isVideo,
+  VIDEO_EXT,
   type Entry,
   type EntryProperties,
   type SearchHit,
@@ -737,8 +743,6 @@ function fmtBytes(size: number) {
 }
 
 const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif', 'ico']
-/** 浏览器 <video> 大概率能解码的容器(mkv 在 Chrome/Edge 可播 H.264/VP9 轨) */
-const VIDEO_EXT = ['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv']
 const AUDIO_EXT = ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'opus']
 const DOCUMENT_EXT = [
   'pdf', 'txt', 'md', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'epub', 'mobi',
@@ -749,9 +753,6 @@ function extOf(name: string) {
 }
 function isImage(name: string) {
   return IMG_EXT.includes(extOf(name))
-}
-function isVideo(name: string) {
-  return VIDEO_EXT.includes(extOf(name))
 }
 
 /** 按扩展名给非图片文件配图标与颜色 */
@@ -1332,6 +1333,11 @@ function openEntry(row: Entry) {
   } else {
     preview.value?.open(joinPath(cur.value, row.name))
   }
+}
+
+/** 进入短视频模式;取材范围在后台「流式播放」里设,这里只带上返回目录 */
+function openShorts() {
+  router.push({ path: '/shorts', query: { from: cur.value } })
 }
 
 function download(row: Entry) {

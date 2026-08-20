@@ -31,6 +31,8 @@ export interface ServerInfo {
   files: number
   dirs: number
   total_size: number
+  /** 后台设置的短视频取材目录;空串表示整库。 */
+  shorts_dir: string
 }
 
 export interface SearchHit {
@@ -53,6 +55,8 @@ export interface SearchParams {
   modified_after?: number
   modified_before?: number
   favorite?: boolean
+  /** 只在该目录子树内搜索(绝对路径);缺省或 '/' 表示整库。 */
+  under?: string
   sort?: 'name' | 'size' | 'modified' | 'created'
   order?: 'asc' | 'desc'
   limit?: number
@@ -148,6 +152,8 @@ export interface Extras {
   inbox_image_dir: string
   inbox_book_dir: string
   inbox_rules: InboxRouteRule[]
+  /** 短视频模式的取材目录(含子目录);空串表示整库。 */
+  shorts_dir: string
 }
 
 export type ExtrasPatch = Omit<Partial<Extras>, 'backup_chunk_size'> & {
@@ -506,4 +512,11 @@ export function fmtSize(n: number): string {
 
 export function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false })
+}
+
+/** 浏览器 <video> 大概率能解码的容器(mkv 在 Chrome/Edge 可播 H.264/VP9 轨) */
+export const VIDEO_EXT = ['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv']
+
+export function isVideo(name: string): boolean {
+  return VIDEO_EXT.includes(name.split('.').pop()?.toLowerCase() ?? '')
 }

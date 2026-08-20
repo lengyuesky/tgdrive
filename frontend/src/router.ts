@@ -5,6 +5,7 @@ const Login = () => import('./views/Login.vue')
 const Files = () => import('./views/Files.vue')
 const Admin = () => import('./views/Admin.vue')
 const Share = () => import('./views/Share.vue')
+const Shorts = () => import('./views/Shorts.vue')
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -13,6 +14,8 @@ export const router = createRouter({
     // /files 之后的部分即当前目录路径
     { path: '/files/:path(.*)*', component: Files },
     { path: '/admin', component: Admin },
+    // 短视频模式:全屏随机刷指定文件夹里的视频
+    { path: '/shorts', component: Shorts },
     // 公开分享页,免登录
     { path: '/s/:token', component: Share },
     { path: '/', redirect: '/files/' },

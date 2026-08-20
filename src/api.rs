@@ -904,6 +904,8 @@ async fn delete(
 async fn info(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let (files, dirs, total) = state.vfs.db.stats().await?;
     let c = state.rt.current();
+    // 短视频模式的取材目录由后台设置,前端每次进入都读最新值。
+    let shorts_dir = crate::extras::load(&state.vfs.db).await?.shorts_dir;
     Ok(Json(serde_json::json!({
         "username": state.auth.username(),
         "api_base": c.api_base,
@@ -913,6 +915,7 @@ async fn info(State(state): State<AppState>) -> AppResult<Json<serde_json::Value
         "files": files,
         "dirs": dirs,
         "total_size": total,
+        "shorts_dir": shorts_dir,
     })))
 }
 
@@ -1222,6 +1225,9 @@ struct SearchQuery {
     modified_before: Option<i64>,
     #[serde(default)]
     favorite: bool,
+    /// 只在该目录子树内搜索；缺省或 `/` 表示整库。
+    #[serde(default)]
+    under: Option<String>,
     #[serde(default)]
     sort: Option<String>,
     #[serde(default)]
@@ -1284,6 +1290,13 @@ async fn search(
         "desc" => true,
         _ => return Err(AppError::BadRequest("搜索排序方向无效".into())),
     };
+    let under = match q.under.as_deref() {
+        None => None,
+        Some(raw) => {
+            let segments = crate::vfs::normalize(raw)?;
+            (!segments.is_empty()).then(|| format!("/{}", segments.join("/")))
+        }
+    };
     let filter = SearchFilter {
         query: q
             .q
@@ -1296,13 +1309,14 @@ async fn search(
         modified_after: q.modified_after,
         modified_before: q.modified_before,
         favorite_only: q.favorite,
+        under,
         sort,
         descending,
     };
     let hits = state
         .vfs
         .db
-        .search_filtered(&filter, q.limit.unwrap_or(500).clamp(1, 500))
+        .search_filtered(&filter, q.limit.unwrap_or(500).clamp(1, 2000))
         .await?;
     let results: Vec<serde_json::Value> = hits
         .iter()
