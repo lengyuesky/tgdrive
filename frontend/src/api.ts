@@ -259,6 +259,14 @@ export interface InboxFailure {
   update: unknown
 }
 
+export interface BackendLog {
+  id: number
+  level: 'debug' | 'info' | 'warn' | 'error' | string
+  category: string
+  message: string
+  created_at: number
+}
+
 /** 检测到的会话(最近向 bot 发过消息的频道/用户/群) */
 export interface DetectedChat {
   id: number
@@ -454,6 +462,8 @@ export const api = {
     detectChats: (probe: { api_base?: string; bot_token?: string } = {}) =>
       http.post<{ bot: string; chats: DetectedChat[] }>('/admin/detect-chats', probe),
     status: () => http.get<AdminStatus>('/admin/status'),
+    logs: (params: { limit?: number; before?: number } = {}) =>
+      http.get<{ items: BackendLog[]; has_more: boolean }>('/admin/logs', { params }),
     inboxFailures: () =>
       http.get<{ items: InboxFailure[] }>('/admin/inbox-failures'),
     removeInboxFailure: (updateId: number) =>

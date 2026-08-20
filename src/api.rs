@@ -102,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/test", post(admin_test))
         .route("/admin/detect-chats", post(admin_detect_chats))
         .route("/admin/status", get(admin_status))
+        .route("/admin/logs", get(admin_logs))
         .route(
             "/admin/inbox-failures",
             get(admin_inbox_failures).delete(admin_inbox_failures_clear),
@@ -1101,6 +1102,28 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "inbox_failures": inbox_failures,
         "tasks": state.tasks.snapshots(),
     })))
+}
+
+#[derive(Deserialize, Default)]
+struct AdminLogsQuery {
+    /// 每页最多 100 条，默认 50。
+    limit: Option<i64>,
+    /// 上一页最后一条日志 id。
+    before: Option<i64>,
+}
+
+async fn admin_logs(
+    State(state): State<AppState>,
+    Query(query): Query<AdminLogsQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (items, has_more) = state
+        .vfs
+        .db
+        .backend_logs(query.limit.unwrap_or(50), query.before)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "items": items, "has_more": has_more }),
+    ))
 }
 
 async fn admin_inbox_failures(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {

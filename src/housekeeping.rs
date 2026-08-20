@@ -10,6 +10,12 @@ use std::time::Duration;
 const TICK: Duration = Duration::from_secs(30 * 60);
 const UPLOAD_SESSION_KEEP_SECS: i64 = 7 * 86_400;
 
+async fn record_log(vfs: &Vfs, level: &str, category: &str, message: &str) {
+    if let Err(error) = vfs.db.append_backend_log(level, category, message).await {
+        tracing::warn!("记录维护日志失败: {error}");
+    }
+}
+
 pub async fn run(vfs: Vfs, runtime: Arc<Runtime>, task: crate::tasks::TaskReporter) {
     loop {
         if task.is_cancelled() {
@@ -21,6 +27,13 @@ pub async fn run(vfs: Vfs, runtime: Arc<Runtime>, task: crate::tasks::TaskReport
             Err(error) => {
                 task.report_error(&error.to_string());
                 tracing::warn!("维护任务出错（下轮重试）：{error}");
+                record_log(
+                    &vfs,
+                    "error",
+                    "维护",
+                    &format!("维护任务失败，下轮重试：{error}"),
+                )
+                .await;
             }
         }
         if !task.sleep(TICK).await {
@@ -40,6 +53,13 @@ async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
         .await?;
     if !abandoned.is_empty() {
         tracing::info!("清理过期断点续传任务：释放 {} 条消息", abandoned.len());
+        record_log(
+            vfs,
+            "info",
+            "维护",
+            &format!("清理过期断点续传任务：释放 {} 条消息", abandoned.len()),
+        )
+        .await;
         vfs.uploader.delete_messages_best_effort(abandoned);
     }
 
@@ -50,6 +70,13 @@ async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
             .await?;
         if !freed.is_empty() {
             tracing::info!("回收站超期清理：释放 {} 条消息", freed.len());
+            record_log(
+                vfs,
+                "info",
+                "维护",
+                &format!("回收站超期清理：释放 {} 条消息", freed.len()),
+            )
+            .await;
             vfs.uploader.delete_messages_best_effort(freed);
         }
     }
@@ -60,6 +87,24 @@ async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
             destinations = outcome.succeeded,
             "数据库自动备份完成"
         );
+        let level = if outcome.failed > 0 { "warn" } else { "info" };
+        record_log(
+            vfs,
+            level,
+            "备份",
+            &format!(
+                "数据库自动备份{}：{}，成功 {} 个渠道，失败 {} 个",
+                if outcome.failed > 0 {
+                    "部分完成"
+                } else {
+                    "完成"
+                },
+                outcome.name,
+                outcome.succeeded,
+                outcome.failed
+            ),
+        )
+        .await;
     }
     Ok(())
 }

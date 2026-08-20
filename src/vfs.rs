@@ -108,7 +108,35 @@ impl Vfs {
     pub async fn rename(&self, from: &str, to: &str) -> AppResult<()> {
         let node = self.resolve(from).await?;
         let (new_parent, new_name) = self.resolve_parent(to).await?;
-        self.db.move_node(node.id, new_parent.id, &new_name).await?;
+        let old_path = self
+            .db
+            .full_path_if_visible(node.id)
+            .await?
+            .unwrap_or_else(|| from.to_string());
+        let parent_path = self
+            .db
+            .full_path_if_visible(new_parent.id)
+            .await?
+            .unwrap_or_else(|| "/".to_string());
+        let new_path = if parent_path == "/" {
+            format!("/{new_name}")
+        } else {
+            format!("{parent_path}/{new_name}")
+        };
+        let queued = self.db.move_node(node.id, new_parent.id, &new_name).await?;
+        if let Err(error) = self
+            .db
+            .append_backend_log(
+                "info",
+                "路径同步",
+                &format!(
+                    "已处理重命名/移动：{old_path} → {new_path}；加入 {queued} 条 Telegram caption 同步任务"
+                ),
+            )
+            .await
+        {
+            tracing::warn!("记录路径同步日志失败: {error}");
+        }
         self.uploader.process_pending_caption_syncs();
         Ok(())
     }

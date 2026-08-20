@@ -94,6 +94,18 @@ pub struct CaptionSyncJob {
     pub generation: i64,
 }
 
+/// 面向管理员展示的关键后台事件摘要。
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct BackendLog {
+    pub id: i64,
+    pub level: String,
+    pub category: String,
+    pub message: String,
+    pub created_at: i64,
+}
+
+const BACKEND_LOG_KEEP: i64 = 2_000;
+
 /// 分享链接行
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct Share {
@@ -463,7 +475,7 @@ impl Db {
     }
 
     /// 移动/重命名(同为改 parent_id+name)
-    pub async fn move_node(&self, id: i64, new_parent: i64, new_name: &str) -> AppResult<()> {
+    pub async fn move_node(&self, id: i64, new_parent: i64, new_name: &str) -> AppResult<u64> {
         let node = self.node(id).await?;
         if id == ROOT_ID {
             return Err(AppError::BadRequest("不能移动根目录".into()));
@@ -488,9 +500,9 @@ impl Db {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        Self::enqueue_caption_sync_subtree_tx(&mut tx, id).await?;
+        let queued = Self::enqueue_caption_sync_subtree_tx(&mut tx, id).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(queued)
     }
 
     /// 为文件或目录树内的独占 Telegram 消息登记 caption 路径同步任务。
@@ -531,6 +543,91 @@ impl Db {
         .execute(&mut **tx)
         .await?
         .rows_affected())
+    }
+
+    // ---------- 后台事件日志 ----------
+
+    /// 写入一条面向管理员的后台事件摘要。
+    /// 日志写入失败不应影响主业务，调用方通常只记录 tracing 警告后继续。
+    pub async fn append_backend_log(
+        &self,
+        level: &str,
+        category: &str,
+        message: &str,
+    ) -> AppResult<()> {
+        let level = match level {
+            "debug" | "info" | "warn" | "error" => level,
+            _ => "info",
+        };
+        let category: String = category.chars().take(80).collect();
+        let message: String = message.chars().take(1_000).collect();
+        let category = if category.trim().is_empty() {
+            "系统"
+        } else {
+            category.trim()
+        };
+        let message = if message.trim().is_empty() {
+            "后台事件"
+        } else {
+            message.trim()
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO backend_logs (level, category, message, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(level)
+        .bind(category)
+        .bind(message)
+        .bind(now_ts())
+        .execute(&mut *tx)
+        .await?;
+        // 按自增 id 保留最近固定数量，避免高频后台任务让数据库无限增长。
+        sqlx::query(
+            "DELETE FROM backend_logs
+             WHERE id <= (SELECT COALESCE(MAX(id), 0) - ? FROM backend_logs)",
+        )
+        .bind(BACKEND_LOG_KEEP)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 按 id 倒序读取后台日志；`before` 用于向前翻页。
+    pub async fn backend_logs(
+        &self,
+        limit: i64,
+        before: Option<i64>,
+    ) -> AppResult<(Vec<BackendLog>, bool)> {
+        let limit = limit.clamp(1, 100);
+        let fetch_limit = limit + 1;
+        let mut rows = if let Some(before) = before {
+            sqlx::query_as::<_, BackendLog>(
+                "SELECT id, level, category, message, created_at
+                 FROM backend_logs
+                 WHERE id < ?
+                 ORDER BY id DESC
+                 LIMIT ?",
+            )
+            .bind(before)
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, BackendLog>(
+                "SELECT id, level, category, message, created_at
+                 FROM backend_logs
+                 ORDER BY id DESC
+                 LIMIT ?",
+            )
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        Ok((rows, has_more))
     }
 
     // ---------- 上传生命周期 ----------
@@ -1821,13 +1918,13 @@ impl Db {
         .await?)
     }
 
-    pub async fn caption_sync_job_done(&self, id: i64, generation: i64) -> AppResult<()> {
-        sqlx::query("DELETE FROM caption_sync_jobs WHERE id = ? AND generation = ?")
+    pub async fn caption_sync_job_done(&self, id: i64, generation: i64) -> AppResult<bool> {
+        let removed = sqlx::query("DELETE FROM caption_sync_jobs WHERE id = ? AND generation = ?")
             .bind(id)
             .bind(generation)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(removed.rows_affected() > 0)
     }
 
     pub async fn caption_sync_job_failed(
@@ -1958,6 +2055,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(columns, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_logs_are_newest_first_and_paginated() {
+        let (db, _g) = test_db().await;
+        db.append_backend_log("info", "路径同步", "第一条")
+            .await
+            .unwrap();
+        db.append_backend_log("warn", "路径同步", "第二条")
+            .await
+            .unwrap();
+        db.append_backend_log("unknown", "", "").await.unwrap();
+
+        let (latest, has_more) = db.backend_logs(2, None).await.unwrap();
+        assert_eq!(latest.len(), 2);
+        assert!(has_more);
+        assert_eq!(latest[0].message, "后台事件");
+        assert_eq!(latest[0].level, "info");
+        assert_eq!(latest[1].message, "第二条");
+
+        let (older, has_more) = db.backend_logs(2, Some(latest[1].id)).await.unwrap();
+        assert!(!has_more);
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].message, "第一条");
     }
 
     #[tokio::test]

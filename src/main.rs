@@ -149,6 +149,17 @@ async fn serve() -> anyhow::Result<()> {
         attempts: crate::security::AttemptLimiter::default(),
         tasks: tasks.clone(),
     };
+    let pending_caption_syncs = db.pending_caption_sync_count().await.unwrap_or(0);
+    if let Err(error) = db
+        .append_backend_log(
+            "info",
+            "系统",
+            &format!("tgdrive 服务已启动；待同步路径 {pending_caption_syncs} 条"),
+        )
+        .await
+    {
+        tracing::warn!("记录启动日志失败: {error}");
+    }
 
     // 后台任务:回收站超期清理 + 自动备份;Bot 收件轮询
     let housekeeping_vfs = state.vfs.clone();

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, type Component } from 'vue'
+import { computed, onMounted, onUnmounted, ref, type Component, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
@@ -18,6 +18,7 @@ import {
   Money,
   Monitor,
   Moon,
+  Notebook,
   Odometer,
   Plus,
   Promotion,
@@ -41,6 +42,7 @@ import {
   fmtSize,
   fmtTime,
   type AdminConfig,
+  type BackendLog,
   type AdminStatus,
   type BackupLastTimes,
   type CfgKey,
@@ -63,12 +65,27 @@ const testing = ref(false)
 const inboxFailureDialog = ref(false)
 const inboxFailureLoading = ref(false)
 const inboxFailures = ref<InboxFailure[]>([])
+const backendLogs = ref<BackendLog[]>([])
+const backendLogsLoading = ref(false)
+const backendLogsHasMore = ref(false)
+const backendLogsBefore = ref<number>()
+const backendLogsAutoRefresh = ref(true)
+let backendLogsTimer: ReturnType<typeof setInterval> | undefined
 
 // ---- 分区导航:一次只显示一块,避免整页长滚动 ----
-type SectionKey = 'overview' | 'telegram' | 'stream' | 'account' | 'backup' | 'inbox' | 'advanced'
+type SectionKey =
+  | 'overview'
+  | 'logs'
+  | 'telegram'
+  | 'stream'
+  | 'account'
+  | 'backup'
+  | 'inbox'
+  | 'advanced'
 
 const SECTIONS: { key: SectionKey; label: string; desc: string; icon: Component }[] = [
   { key: 'overview', label: '概览', desc: '运行状态与快捷操作', icon: Odometer },
+  { key: 'logs', label: '后台日志', desc: '操作进度与失败重试', icon: Notebook },
   { key: 'telegram', label: 'Telegram 存储', desc: 'Bot、频道与分块', icon: Promotion },
   { key: 'stream', label: '流式播放', desc: 'MTProto / 自建 Bot API', icon: VideoPlay },
   { key: 'account', label: '账号', desc: '登录用户名与密码', icon: User },
@@ -156,6 +173,61 @@ async function load() {
   }
 }
 onMounted(load)
+
+async function loadBackendLogs(reset = true, silent = false) {
+  if (backendLogsLoading.value) return
+  if (!reset && !backendLogsHasMore.value) return
+  backendLogsLoading.value = true
+  try {
+    const params: { limit: number; before?: number } = { limit: 50 }
+    if (!reset && backendLogsBefore.value) params.before = backendLogsBefore.value
+    const [logsResult, statusResult] = await Promise.all([
+      api.admin.logs(params),
+      api.admin.status(),
+    ])
+    const items = logsResult.data.items
+    backendLogs.value = reset ? items : [...backendLogs.value, ...items]
+    backendLogsHasMore.value = logsResult.data.has_more
+    backendLogsBefore.value = backendLogs.value.at(-1)?.id
+    status.value = statusResult.data
+  } catch (e) {
+    if (!silent) ElMessage.error(errMsg(e))
+  } finally {
+    backendLogsLoading.value = false
+  }
+}
+
+async function loadMoreBackendLogs() {
+  await loadBackendLogs(false)
+}
+
+function logLevelLabel(level: string): string {
+  return { debug: '调试', info: '信息', warn: '警告', error: '错误' }[level] ?? level
+}
+
+function logLevelType(level: string): 'success' | 'warning' | 'danger' | 'info' {
+  if (level === 'error') return 'danger'
+  if (level === 'warn') return 'warning'
+  if (level === 'info') return 'success'
+  return 'info'
+}
+
+watch(section, (key) => {
+  if (key === 'logs') void loadBackendLogs()
+})
+
+onMounted(() => {
+  if (section.value === 'logs') void loadBackendLogs()
+  backendLogsTimer = setInterval(() => {
+    if (section.value === 'logs' && backendLogsAutoRefresh.value) {
+      void loadBackendLogs(true, true)
+    }
+  }, 5000)
+})
+
+onUnmounted(() => {
+  if (backendLogsTimer) clearInterval(backendLogsTimer)
+})
 
 const isOfficial = computed(
   () => form.value.api_base.replace(/\/$/, '') === cfg.value?.official_api_base,
@@ -674,6 +746,9 @@ const dirtySections = computed(() => {
 const badges = computed(() => {
   const out: Partial<Record<SectionKey, { text: string; tone: 'danger' | 'warn' }>> = {}
   if (cfg.value && !cfg.value.configured) out.telegram = { text: '待配置', tone: 'danger' }
+  if (status.value?.pending_caption_syncs) {
+    out.logs = { text: String(status.value.pending_caption_syncs), tone: 'warn' }
+  }
   if (status.value?.inbox_failures) {
     out.inbox = { text: String(status.value.inbox_failures), tone: 'warn' }
   }
@@ -751,7 +826,13 @@ const statTiles = computed<Tile[]>(() => {
     },
     { label: '回收站', value: `${trashCount.value} 项`, icon: Delete, action: () => go('backup') },
     { label: '待删消息', value: String(s?.pending_deletes ?? 0), icon: Brush },
-    { label: '待同步路径', value: String(s?.pending_caption_syncs ?? 0), icon: Refresh },
+    {
+      label: '待同步路径',
+      value: String(s?.pending_caption_syncs ?? 0),
+      icon: Refresh,
+      tone: s?.pending_caption_syncs ? 'warn' : undefined,
+      action: () => go('logs'),
+    },
     {
       label: '收件死信',
       value: String(s?.inbox_failures ?? 0),
@@ -770,6 +851,12 @@ interface QuickAction {
   danger?: boolean
 }
 const quickActions = computed<QuickAction[]>(() => [
+  {
+    label: '查看后台日志',
+    desc: '路径同步进度与失败重试',
+    icon: Notebook,
+    action: () => go('logs'),
+  },
   {
     label: backingUp.value ? '备份中…' : '立即备份',
     desc: '生成快照并上传到已启用渠道',
@@ -973,6 +1060,76 @@ function downloadBackup() {
                   记得在「备份与回收站」里至少启用一个远端渠道。数据库
                   {{ status?.db_path }}。
                 </div>
+              </div>
+            </template>
+
+            <!-- ========== 后台日志 ========== -->
+            <template v-else-if="section === 'logs'">
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  这里记录关键后台事件（例如重命名后的 Telegram caption 路径同步、失败重试和队列清空）。
+                  日志保留最近 2000 条；完整 HTTP 诊断仍请查看容器日志。
+                </div>
+              </div>
+
+              <div class="log-toolbar">
+                <div class="row">
+                  <el-button :loading="backendLogsLoading" :icon="Refresh" @click="loadBackendLogs()">
+                    刷新
+                  </el-button>
+                  <el-switch
+                    v-model="backendLogsAutoRefresh"
+                    inline-prompt
+                    active-text="自动"
+                    inactive-text="手动"
+                  />
+                </div>
+                <div class="log-summary">
+                  <el-tag
+                    :type="status?.pending_caption_syncs ? 'warning' : 'success'"
+                    size="small"
+                    round
+                  >
+                    {{
+                      status?.pending_caption_syncs
+                        ? '待同步路径 ' + status.pending_caption_syncs + ' 条'
+                        : '路径同步队列已清空'
+                    }}
+                  </el-tag>
+                  <span class="muted">每 5 秒自动刷新</span>
+                </div>
+              </div>
+
+              <el-table
+                :data="backendLogs"
+                v-loading="backendLogsLoading"
+                class="backend-log-table"
+                size="small"
+                row-key="id"
+                :max-height="560"
+              >
+                <el-table-column label="时间" width="178">
+                  <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
+                </el-table-column>
+                <el-table-column label="级别" width="76" align="center">
+                  <template #default="{ row }">
+                    <el-tag :type="logLevelType(row.level)" size="small" round>
+                      {{ logLevelLabel(row.level) }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="category" label="类别" width="100" />
+                <el-table-column prop="message" label="事件" show-overflow-tooltip />
+                <template #empty>
+                  <el-empty description="暂无后台日志" :image-size="64" />
+                </template>
+              </el-table>
+
+              <div v-if="backendLogsHasMore" class="log-more">
+                <el-button :loading="backendLogsLoading" plain @click="loadMoreBackendLogs">
+                  加载更早的日志
+                </el-button>
               </div>
             </template>
 
@@ -1890,6 +2047,29 @@ function downloadBackup() {
   gap: 6px;
   align-items: center;
 }
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.log-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.backend-log-table {
+  width: 100%;
+}
+.backend-log-table :deep(.cell) {
+  line-height: 1.55;
+}
+.log-more {
+  display: flex;
+  justify-content: center;
+  margin-top: 12px;
+}
 .note {
   display: flex;
   align-items: flex-start;
@@ -2247,6 +2427,10 @@ function downloadBackup() {
 @media (max-width: 1020px) {
   .fields {
     grid-template-columns: 1fr;
+  }
+  .log-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 @media (max-width: 900px) {

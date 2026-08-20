@@ -49,6 +49,13 @@ pub(crate) fn storage_caption(display_path: &str, idx: i64, node_id: i64) -> Str
     )
 }
 
+/// 后台日志不能影响实际任务；数据库暂时不可写时保留 tracing 诊断即可。
+async fn record_backend_log(db: &Db, level: &str, category: &str, message: &str) {
+    if let Err(error) = db.append_backend_log(level, category, message).await {
+        tracing::warn!("记录后台日志失败: {error}");
+    }
+}
+
 async fn send_body_to_telegram(
     tg: Arc<dyn TgApi>,
     filename: &str,
@@ -406,20 +413,49 @@ impl Uploader {
         }
         let this = self.clone();
         tokio::spawn(async move {
+            let mut had_work = false;
             'worker: loop {
                 let jobs = match this.db.delete_jobs_due(100).await {
                     Ok(jobs) => jobs,
                     Err(e) => {
                         tracing::warn!("读取 Telegram 删除队列失败: {e}");
+                        record_backend_log(
+                            &this.db,
+                            "error",
+                            "消息清理",
+                            &format!("读取 Telegram 删除队列失败：{e}"),
+                        )
+                        .await;
                         break;
                     }
                 };
                 if jobs.is_empty() {
+                    if had_work {
+                        let pending = this.db.pending_delete_count().await.unwrap_or(0);
+                        let (level, message) = if pending == 0 {
+                            (
+                                "info",
+                                format!("Telegram 消息清理队列已清空；剩余 {pending} 条"),
+                            )
+                        } else {
+                            (
+                                "warn",
+                                format!(
+                                    "Telegram 消息清理本轮完成；剩余 {pending} 条，等待退避重试"
+                                ),
+                            )
+                        };
+                        record_backend_log(&this.db, level, "消息清理", &message).await;
+                        had_work = false;
+                    }
                     // 常驻轻量 worker，确保指数退避到期后能按时重试，而不是最多
                     // 等待下一轮 30 分钟维护任务。
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     continue;
                 }
+                had_work = true;
+                let mut completed = 0usize;
+                let mut failed = 0usize;
                 for job in jobs {
                     let result = match this.tg.binding(job.storage_target_id) {
                         Ok(binding) => binding.api.delete_message(job.tg_message_id).await,
@@ -429,28 +465,68 @@ impl Uploader {
                         Ok(()) => {
                             if let Err(e) = this.db.delete_job_done(job.id).await {
                                 tracing::warn!("确认 Telegram 删除任务 {} 失败: {e}", job.id);
+                                record_backend_log(
+                                    &this.db,
+                                    "error",
+                                    "消息清理",
+                                    &format!("确认 Telegram 删除任务 {} 失败：{e}", job.id),
+                                )
+                                .await;
                                 // Telegram 已删但数据库未确认时不能在紧循环里反复请求；
                                 // 退出并延时重启，避免紧循环重复请求。
                                 break 'worker;
                             }
+                            completed += 1;
                         }
                         Err(e) => {
+                            failed += 1;
                             tracing::warn!(
                                 "删除存储目标 {} 的消息 {} 失败，将自动重试: {e}",
                                 job.storage_target_id,
                                 job.tg_message_id
                             );
+                            record_backend_log(
+                                &this.db,
+                                "warn",
+                                "消息清理",
+                                &format!(
+                                    "消息 {} 删除失败，将自动重试（第 {} 次）：{}",
+                                    job.tg_message_id,
+                                    job.attempts + 1,
+                                    e
+                                ),
+                            )
+                            .await;
                             if let Err(db_err) = this
                                 .db
                                 .delete_job_failed(job.id, job.attempts, &e.to_string())
                                 .await
                             {
                                 tracing::error!("更新 Telegram 删除任务 {} 失败: {db_err}", job.id);
+                                record_backend_log(
+                                    &this.db,
+                                    "error",
+                                    "消息清理",
+                                    &format!(
+                                        "更新消息清理任务 {} 的重试状态失败：{db_err}",
+                                        job.id
+                                    ),
+                                )
+                                .await;
                                 break 'worker;
                             }
                         }
                     }
                 }
+                let pending = this.db.pending_delete_count().await.unwrap_or(0);
+                let level = if failed > 0 { "warn" } else { "info" };
+                record_backend_log(
+                    &this.db,
+                    level,
+                    "消息清理",
+                    &format!("Telegram 消息清理进度：完成 {completed} 条，失败 {failed} 条，剩余 {pending} 条"),
+                )
+                .await;
             }
             this.delete_running.store(false, Ordering::Release);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -470,18 +546,56 @@ impl Uploader {
         }
         let this = self.clone();
         tokio::spawn(async move {
+            let mut had_work = false;
             'worker: loop {
                 let jobs = match this.db.caption_sync_jobs_due(50).await {
                     Ok(jobs) => jobs,
                     Err(error) => {
                         tracing::warn!("读取 Telegram caption 同步队列失败: {error}");
+                        record_backend_log(
+                            &this.db,
+                            "error",
+                            "路径同步",
+                            &format!("读取 Telegram caption 同步队列失败：{error}"),
+                        )
+                        .await;
                         break;
                     }
                 };
                 if jobs.is_empty() {
+                    if had_work {
+                        let pending = this.db.pending_caption_sync_count().await.unwrap_or(0);
+                        let (level, message) = if pending == 0 {
+                            (
+                                "info",
+                                format!("Telegram caption 路径同步队列已清空；剩余 {pending} 条"),
+                            )
+                        } else {
+                            (
+                                "warn",
+                                format!(
+                                    "Telegram caption 路径同步本轮完成；剩余 {pending} 条，等待退避重试"
+                                ),
+                            )
+                        };
+                        record_backend_log(&this.db, level, "路径同步", &message).await;
+                        had_work = false;
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     continue;
                 }
+                had_work = true;
+                let batch_size = jobs.len();
+                let mut completed = 0usize;
+                let mut superseded = 0usize;
+                let mut failed = 0usize;
+                record_backend_log(
+                    &this.db,
+                    "info",
+                    "路径同步",
+                    &format!("开始处理 Telegram caption 路径同步，本批 {batch_size} 条"),
+                )
+                .await;
                 for job in jobs {
                     let result = match this.db.full_path_if_visible(job.node_id).await {
                         Ok(Some(path)) => match this.tg.binding(job.storage_target_id) {
@@ -500,22 +614,47 @@ impl Uploader {
                     };
                     match result {
                         Ok(()) => {
-                            if let Err(error) =
-                                this.db.caption_sync_job_done(job.id, job.generation).await
-                            {
-                                tracing::warn!(
-                                    "确认 Telegram caption 同步任务 {} 失败: {error}",
-                                    job.id
-                                );
-                                break 'worker;
+                            match this.db.caption_sync_job_done(job.id, job.generation).await {
+                                Ok(true) => completed += 1,
+                                Ok(false) => superseded += 1,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "确认 Telegram caption 同步任务 {} 失败: {error}",
+                                        job.id
+                                    );
+                                    record_backend_log(
+                                        &this.db,
+                                        "error",
+                                        "路径同步",
+                                        &format!(
+                                            "确认 Telegram caption 同步任务 {} 失败：{error}",
+                                            job.id
+                                        ),
+                                    )
+                                    .await;
+                                    break 'worker;
+                                }
                             }
                         }
                         Err(error) => {
+                            failed += 1;
                             tracing::warn!(
                                 "同步存储目标 {} 的消息 {} caption 失败，将自动重试: {error}",
                                 job.storage_target_id,
                                 job.tg_message_id
                             );
+                            record_backend_log(
+                                &this.db,
+                                "warn",
+                                "路径同步",
+                                &format!(
+                                    "消息 {} 的 caption 同步失败，将自动重试（第 {} 次）：{}",
+                                    job.tg_message_id,
+                                    job.attempts + 1,
+                                    error
+                                ),
+                            )
+                            .await;
                             if let Err(db_error) = this
                                 .db
                                 .caption_sync_job_failed(
@@ -530,11 +669,33 @@ impl Uploader {
                                     "更新 Telegram caption 同步任务 {} 失败: {db_error}",
                                     job.id
                                 );
+                                record_backend_log(
+                                    &this.db,
+                                    "error",
+                                    "路径同步",
+                                    &format!(
+                                        "更新 caption 同步任务 {} 的重试状态失败：{db_error}",
+                                        job.id
+                                    ),
+                                )
+                                .await;
                                 break 'worker;
                             }
                         }
                     }
                 }
+                let pending = this.db.pending_caption_sync_count().await.unwrap_or(0);
+                let level = if failed > 0 { "warn" } else { "info" };
+                record_backend_log(
+                    &this.db,
+                    level,
+                    "路径同步",
+                    &format!(
+                        "Telegram caption 路径同步进度：完成 {completed} 条，\
+                         已被新改名覆盖 {superseded} 条，失败 {failed} 条，剩余 {pending} 条"
+                    ),
+                )
+                .await;
             }
             this.caption_sync_running.store(false, Ordering::Release);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
