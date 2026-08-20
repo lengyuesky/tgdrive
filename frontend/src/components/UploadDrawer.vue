@@ -1,5 +1,5 @@
 <template>
-  <el-drawer v-model="visible" size="400px" :close-on-click-modal="true">
+  <el-drawer v-model="visible" size="min(460px, 94vw)" :close-on-click-modal="true">
     <template #header>
       <div class="head">
         <b>上传队列</b>
@@ -107,80 +107,93 @@
     </div>
 
     <div v-if="items.length === 0" class="empty">暂无上传任务</div>
-    <div v-for="it in items" :key="it.id" class="upload-item">
-      <div class="upload-name" :title="displayName(it)">
+    <div v-for="it in items" :key="it.id" class="upload-item" :class="`tone-${tone(it)}`">
+      <div class="item-top">
         <el-tag v-if="it.status === 'instant'" size="small" type="success" class="badge">秒传</el-tag>
         <el-tag v-else-if="it.status === 'skipped'" size="small" type="info" class="badge">跳过</el-tag>
         <el-tag v-else-if="it.session" size="small" type="warning" class="badge">可续传</el-tag>
-        {{ displayName(it) }}
+        <span class="item-name" :title="displayName(it)">{{ displayName(it) }}</span>
+        <span v-if="!isDone(it) && it.status !== 'error'" class="item-pct">{{ it.pct }}%</span>
       </div>
+
       <el-progress
         v-if="it.status !== 'skipped'"
+        class="item-bar"
         :percentage="it.pct"
+        :stroke-width="6"
+        :show-text="false"
         :status="it.status === 'error' ? 'exception' : isDone(it) ? 'success' : undefined"
       />
-      <div class="upload-sub">
-        <span v-if="it.status === 'hashing'" class="state">校验中(秒传检测)，可暂停…</span>
-        <span v-else-if="it.status === 'waiting'" class="state">排队中</span>
-        <span v-else-if="it.status === 'uploading'" class="state">上传中，可随时暂停</span>
-        <span v-else-if="it.status === 'paused'" class="state">已暂停，可继续上传</span>
-        <span v-else-if="it.status === 'needs_file'" class="state">请选择原文件继续</span>
-        <span v-else-if="it.status === 'cancelling'" class="state">正在清理已上传分块…</span>
-        <span v-else-if="it.status === 'done'" class="state">上传成功</span>
-        <span v-else-if="it.status === 'instant'" class="state">秒传成功</span>
-        <span v-else-if="it.status === 'skipped'" class="state">已跳过(目录里有同名文件)</span>
-        <span v-if="it.error" class="upload-err">{{ it.error }}</span>
+
+      <div class="item-foot">
+        <span class="state">
+          <span v-if="it.status === 'hashing'">校验中(秒传检测),可暂停…</span>
+          <span v-else-if="it.status === 'waiting'">排队中</span>
+          <span v-else-if="it.status === 'uploading'">上传中,可随时暂停</span>
+          <span v-else-if="it.status === 'paused'">已暂停,可继续上传</span>
+          <span v-else-if="it.status === 'needs_file'">请选择原文件继续</span>
+          <span v-else-if="it.status === 'cancelling'">正在清理已上传分块…</span>
+          <span v-else-if="it.status === 'done'">上传成功</span>
+          <span v-else-if="it.status === 'instant'">秒传成功</span>
+          <span v-else-if="it.status === 'skipped'">已跳过(目录里有同名文件)</span>
+          <span v-else-if="it.status === 'error'">上传失败</span>
+        </span>
+        <span v-if="it.size" class="size">{{ fmtSize(it.size) }}</span>
         <div class="spacer" />
-        <el-button
-          v-if="isPauseable(it)"
-          text
-          size="small"
-          :disabled="batchBusy"
-          @click="pause(it)"
-        >
-          暂停
-        </el-button>
-        <el-button
-          v-else-if="it.status === 'needs_file'"
-          text
-          size="small"
-          type="primary"
-          :disabled="batchBusy"
-          @click="chooseFile(it)"
-        >
-          选择文件
-        </el-button>
-        <el-button
-          v-else-if="it.status === 'paused'"
-          text
-          size="small"
-          type="primary"
-          :disabled="batchBusy"
-          @click="resume(it)"
-        >
-          继续
-        </el-button>
-        <el-button
-          v-else-if="it.status === 'error'"
-          text
-          size="small"
-          type="primary"
-          :disabled="batchBusy"
-          @click="retry(it)"
-        >
-          重试
-        </el-button>
-        <el-button
-          v-if="!isDone(it) && it.status !== 'cancelling'"
-          text
-          size="small"
-          type="danger"
-          :disabled="batchBusy"
-          @click="cancelItem(it)"
-        >
-          取消任务
-        </el-button>
+        <div class="item-btns">
+          <el-button
+            v-if="isPauseable(it)"
+            text
+            size="small"
+            :disabled="batchBusy"
+            @click="pause(it)"
+          >
+            暂停
+          </el-button>
+          <el-button
+            v-else-if="it.status === 'needs_file'"
+            text
+            size="small"
+            type="primary"
+            :disabled="batchBusy"
+            @click="chooseFile(it)"
+          >
+            选择文件
+          </el-button>
+          <el-button
+            v-else-if="it.status === 'paused'"
+            text
+            size="small"
+            type="primary"
+            :disabled="batchBusy"
+            @click="resume(it)"
+          >
+            继续
+          </el-button>
+          <el-button
+            v-else-if="it.status === 'error'"
+            text
+            size="small"
+            type="primary"
+            :disabled="batchBusy"
+            @click="retry(it)"
+          >
+            重试
+          </el-button>
+          <el-button
+            v-if="!isDone(it) && it.status !== 'cancelling'"
+            text
+            size="small"
+            type="danger"
+            :disabled="batchBusy"
+            @click="cancelItem(it)"
+          >
+            取消
+          </el-button>
+        </div>
       </div>
+
+      <div v-if="it.error" class="upload-err" :title="it.error">{{ it.error }}</div>
     </div>
   </el-drawer>
 
@@ -217,7 +230,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { createSHA256 } from 'hash-wasm'
 import { Close, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
-import { api, errMsg, type UploadSession } from '../api'
+import { api, errMsg, fmtSize, type UploadSession } from '../api'
 import { appConfirm } from '../dialog'
 
 type UploadStatus =
@@ -305,6 +318,15 @@ function isDone(item: Item) {
 function displayName(item: Item) {
   if (item.session) return item.session.path.replace(/^\//, '')
   return item.rel ? `${item.rel}/${item.name}` : item.name
+}
+
+/** 卡片左侧色条:成功 / 失败 / 进行中 / 待处理 */
+function tone(item: Item): 'ok' | 'err' | 'run' | 'idle' {
+  if (item.status === 'error') return 'err'
+  if (item.status === 'done' || item.status === 'instant') return 'ok'
+  if (item.status === 'skipped') return 'idle'
+  if (item.status === 'hashing' || item.status === 'uploading') return 'run'
+  return 'idle'
 }
 
 let seq = 0
@@ -1060,31 +1082,37 @@ defineExpose({ enqueue, open })
   gap: 8px;
   width: 100%;
 }
+.head b {
+  font-size: 15px;
+}
+:deep(.el-drawer__header) {
+  margin-bottom: 14px;
+}
 .spacer {
   flex: 1;
 }
 .queue-summary {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 10px;
+  margin-bottom: 12px;
 }
 .summary-item {
   display: flex;
   min-width: 0;
   flex-direction: column;
   align-items: center;
-  padding: 8px 2px;
+  padding: 12px 4px;
   border: 1px solid var(--glass-border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--tile-bg);
 }
 .summary-value {
-  font-size: 19px;
+  font-size: 22px;
   line-height: 1.15;
 }
 .summary-label {
-  margin-top: 3px;
+  margin-top: 5px;
   color: var(--text-soft);
   font-size: 12px;
   white-space: nowrap;
@@ -1102,13 +1130,13 @@ defineExpose({ enqueue, open })
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 .queue-actions {
-  margin-bottom: 16px;
-  padding: 10px;
+  margin-bottom: 18px;
+  padding: 12px;
   border: 1px solid var(--glass-border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--tile-bg);
 }
 .queue-status,
@@ -1116,10 +1144,10 @@ defineExpose({ enqueue, open })
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 .queue-status + .queue-buttons {
-  margin-top: 8px;
+  margin-top: 10px;
 }
 .queue-buttons .el-button {
   margin-left: 0;
@@ -1131,37 +1159,104 @@ defineExpose({ enqueue, open })
 .empty {
   color: var(--text-soft);
   text-align: center;
-  margin-top: 24px;
+  margin-top: 32px;
 }
+
+/* ---- 任务卡片 ---- */
 .upload-item {
-  margin-bottom: 14px;
+  position: relative;
+  margin-bottom: 12px;
+  padding: 12px 14px 12px 16px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  overflow: hidden;
+  transition: background 0.15s, border-color 0.15s;
 }
-.upload-name {
-  font-size: 13px;
-  margin-bottom: 4px;
+.upload-item:hover {
+  background: var(--tile-bg-hover);
+}
+/* 左侧状态色条 */
+.upload-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--el-color-info);
+}
+.upload-item.tone-ok::before {
+  background: var(--el-color-success);
+}
+.upload-item.tone-err::before {
+  background: var(--el-color-danger);
+}
+.upload-item.tone-run::before {
+  background: var(--el-color-primary);
+}
+.item-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.item-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+}
+.item-pct {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-soft);
 }
 .badge {
   flex-shrink: 0;
 }
-.upload-sub {
+.item-bar {
+  margin: 10px 0 8px;
+}
+.item-foot {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 22px;
+  gap: 10px;
+  min-height: 26px;
 }
 .state {
   color: var(--text-soft);
   font-size: 12px;
 }
-.upload-err {
-  color: #f56c6c;
+.size {
+  flex-shrink: 0;
+  color: var(--text-soft);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.item-btns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.item-btns .el-button {
+  margin-left: 0;
+}
+.upload-err {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
 }
 .conflict-hint {
   margin: 0 0 8px;
