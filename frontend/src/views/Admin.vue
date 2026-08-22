@@ -24,6 +24,7 @@ import {
   Promotion,
   Refresh,
   RefreshLeft,
+  Search,
   Setting,
   Sunny,
   SwitchButton,
@@ -43,6 +44,8 @@ import {
   fmtTime,
   type AdminConfig,
   type BackendLog,
+  type BackendLogFacets,
+  type BackendLogQuery,
   type AdminStatus,
   type BackupLastTimes,
   type CfgKey,
@@ -51,6 +54,7 @@ import {
   type Extras,
   type InboxRouteRule,
   type InboxFailure,
+  type QueueRunSummary,
 } from '../api'
 import DirPicker from '../components/DirPicker.vue'
 import SettingField from '../components/SettingField.vue'
@@ -66,15 +70,23 @@ const inboxFailureDialog = ref(false)
 const inboxFailureLoading = ref(false)
 const inboxFailures = ref<InboxFailure[]>([])
 const backendLogs = ref<BackendLog[]>([])
+/** 请求进行中(含 5 秒静默轮询),只用于防重入 */
 const backendLogsLoading = ref(false)
+/** 仅手动操作时置位:轮询不该让按钮和遮罩每 5 秒闪一下 */
+const backendLogsBusy = ref(false)
 const backendLogsHasMore = ref(false)
 const backendLogsBefore = ref<number>()
 const backendLogsAutoRefresh = ref(true)
+const backendLogFacets = ref<BackendLogFacets>({ categories: [], level_counts: {} })
+const backendLogLevel = ref('')
+const backendLogCategory = ref('')
+const backendLogKeyword = ref('')
 let backendLogsTimer: ReturnType<typeof setInterval> | undefined
 
 // ---- 分区导航:一次只显示一块,避免整页长滚动 ----
 type SectionKey =
   | 'overview'
+  | 'queues'
   | 'logs'
   | 'telegram'
   | 'stream'
@@ -85,6 +97,7 @@ type SectionKey =
 
 const SECTIONS: { key: SectionKey; label: string; desc: string; icon: Component }[] = [
   { key: 'overview', label: '概览', desc: '运行状态与快捷操作', icon: Odometer },
+  { key: 'queues', label: '后台任务', desc: 'Telegram 消息删除', icon: Cpu },
   { key: 'logs', label: '后台日志', desc: '操作进度与失败重试', icon: Notebook },
   { key: 'telegram', label: 'Telegram 存储', desc: 'Bot、频道与分块', icon: Promotion },
   { key: 'stream', label: '流式播放', desc: 'MTProto / 自建 Bot API', icon: VideoPlay },
@@ -174,26 +187,74 @@ async function load() {
 }
 onMounted(load)
 
-async function loadBackendLogs(reset = true, silent = false) {
-  if (backendLogsLoading.value) return
+const LOG_LEVELS = [
+  { value: 'error', label: '错误' },
+  { value: 'warn', label: '警告' },
+  { value: 'info', label: '信息' },
+  { value: 'debug', label: '调试' },
+]
+
+/** 是否有筛选生效;决定空列表该说“没有日志”还是“没有匹配项” */
+const backendLogFiltered = computed(
+  () => !!(backendLogLevel.value || backendLogCategory.value || backendLogKeyword.value.trim()),
+)
+
+function resetBackendLogFilters() {
+  backendLogLevel.value = ''
+  backendLogCategory.value = ''
+  backendLogKeyword.value = ''
+}
+
+/** 请求代次:筛选变化后,旧条件的响应必须作废,不能拿它覆盖新列表 */
+let backendLogsSeq = 0
+
+async function loadBackendLogs(reset = true, silent = false, force = false) {
+  // force 用于筛选变化:此时哪怕轮询正在飞,也要让新条件的请求发出去
+  if (backendLogsLoading.value && !force) return
   if (!reset && !backendLogsHasMore.value) return
+  const seq = ++backendLogsSeq
   backendLogsLoading.value = true
+  if (!silent) backendLogsBusy.value = true
   try {
-    const params: { limit: number; before?: number } = { limit: 50 }
+    const params: BackendLogQuery = {
+      limit: 50,
+      level: backendLogLevel.value,
+      category: backendLogCategory.value,
+      q: backendLogKeyword.value.trim(),
+    }
     if (!reset && backendLogsBefore.value) params.before = backendLogsBefore.value
     const [logsResult, statusResult] = await Promise.all([
       api.admin.logs(params),
       api.admin.status(),
     ])
+    if (seq !== backendLogsSeq) return
     const items = logsResult.data.items
-    backendLogs.value = reset ? items : [...backendLogs.value, ...items]
-    backendLogsHasMore.value = logsResult.data.has_more
+    backendLogFacets.value = logsResult.data.facets ?? { categories: [], level_counts: {} }
+    if (reset) {
+      // 轮询若直接覆盖列表,用户点开的“更早日志”会每 5 秒被吞掉一次。
+      // 新旧两页有重叠(说明期间新增不超过一页)时只把增量补到最前面,否则才整页替换。
+      const known = new Set(backendLogs.value.map((l) => l.id))
+      const overlaps = items.some((l) => known.has(l.id))
+      if (overlaps && backendLogs.value.length > items.length) {
+        backendLogs.value = [...items.filter((l) => !known.has(l.id)), ...backendLogs.value]
+      } else {
+        backendLogs.value = items
+        backendLogsHasMore.value = logsResult.data.has_more
+      }
+    } else {
+      backendLogs.value = [...backendLogs.value, ...items]
+      backendLogsHasMore.value = logsResult.data.has_more
+    }
     backendLogsBefore.value = backendLogs.value.at(-1)?.id
     status.value = statusResult.data
   } catch (e) {
-    if (!silent) ElMessage.error(errMsg(e))
+    if (!silent && seq === backendLogsSeq) ElMessage.error(errMsg(e))
   } finally {
-    backendLogsLoading.value = false
+    // 已被更新的请求接管时不要复位状态,否则新请求的 loading 会被旧请求清掉
+    if (seq === backendLogsSeq) {
+      backendLogsLoading.value = false
+      backendLogsBusy.value = false
+    }
   }
 }
 
@@ -201,8 +262,16 @@ async function loadMoreBackendLogs() {
   await loadBackendLogs(false)
 }
 
+/** 换筛选条件等于换结果集,分页游标必须一起清掉 */
+async function reloadBackendLogs() {
+  backendLogs.value = []
+  backendLogsBefore.value = undefined
+  backendLogsHasMore.value = false
+  await loadBackendLogs(true, false, true)
+}
+
 function logLevelLabel(level: string): string {
-  return { debug: '调试', info: '信息', warn: '警告', error: '错误' }[level] ?? level
+  return LOG_LEVELS.find((l) => l.value === level)?.label ?? level
 }
 
 function logLevelType(level: string): 'success' | 'warning' | 'danger' | 'info' {
@@ -214,6 +283,13 @@ function logLevelType(level: string): 'success' | 'warning' | 'danger' | 'info' 
 
 watch(section, (key) => {
   if (key === 'logs') void loadBackendLogs()
+})
+// 下拉即时生效;关键字防抖 300ms,免得每敲一个字打一次请求
+watch([backendLogLevel, backendLogCategory], () => void reloadBackendLogs())
+let keywordTimer: ReturnType<typeof setTimeout> | undefined
+watch(backendLogKeyword, () => {
+  clearTimeout(keywordTimer)
+  keywordTimer = setTimeout(() => void reloadBackendLogs(), 300)
 })
 
 onMounted(() => {
@@ -227,7 +303,111 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (backendLogsTimer) clearInterval(backendLogsTimer)
+  clearTimeout(keywordTimer)
 })
+
+// ---- 后台任务:Telegram 消息删除队列的自动/手动与手动执行 ----
+type QueueKey = 'delete'
+
+/** 手动执行完的结果,只在页面上留着给用户看,不落库 */
+const queueLastRun = ref<Partial<Record<QueueKey, QueueRunSummary>>>({})
+const queueBusy = ref<QueueKey | ''>('')
+
+const QUEUES: {
+  key: QueueKey
+  label: string
+  desc: string
+  /** 关掉自动之后会怎样,说清楚代价 */
+  cost: string
+  icon: Component
+}[] = [
+  {
+    key: 'delete',
+    label: 'Telegram 消息清理',
+    desc: '文件彻底删除、或上传失败回滚后,删掉存储频道里对应的消息。',
+    cost: '不执行的话,这些分块会一直留在频道里占空间,且无法再从网盘找到。',
+    icon: Delete,
+  },
+]
+
+const queueOverview = (_key: QueueKey) => status.value?.delete_queue
+
+/** 开关绑在 extras 上,和页面其它设置一样走底部「保存并生效」 */
+function queueAuto(_key: QueueKey): boolean {
+  if (!extras.value) return false
+  return extras.value.auto_delete_message
+}
+
+function setQueueAuto(_key: QueueKey, value: boolean) {
+  if (!extras.value) return
+  extras.value.auto_delete_message = value
+}
+
+/** 开关改了还没保存时,「立即执行」的语义会含糊,先提示去保存 */
+const queueAutoDirty = (_key: QueueKey) => changed.value.extKeys.includes('auto_delete_message')
+
+async function runQueue(key: QueueKey) {
+  queueBusy.value = key
+  try {
+    const { data } = await api.admin.runDeleteQueue()
+    queueLastRun.value = { ...queueLastRun.value, [key]: data }
+    const label = QUEUES.find((q) => q.key === key)!.label
+    const more = data.stopped_early ? ',本轮超时收工,可再点一次' : ''
+    if (data.completed + data.failed + data.discarded === 0) {
+      // 一条都没跑完又是超时收工:队列没空,是 Telegram 迟迟不回,别说成「没有待处理」
+      if (data.stopped_early) {
+        ElMessage.warning(`${label}:20 秒内一条都没处理完,Telegram 可能不可达,队列原样保留`)
+      } else {
+        ElMessage.info(`${label}:没有待处理的任务`)
+      }
+    } else if (data.failed || data.discarded) {
+      ElMessage.warning(
+        `${label}:成功 ${data.completed} 条,永久跳过 ${data.discarded} 条,失败 ${data.failed} 条${more}`,
+      )
+    } else {
+      ElMessage.success(`${label}:成功处理 ${data.completed} 条${more}`)
+    }
+    await reloadStatus()
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  } finally {
+    queueBusy.value = ''
+  }
+}
+
+async function clearQueue(key: QueueKey) {
+  const q = QUEUES.find((item) => item.key === key)!
+  const pending = queueOverview(key)?.pending ?? 0
+  try {
+    await appConfirm({
+      title: `清空${q.label}队列?`,
+      message: `将丢弃 ${pending} 条待处理任务,且不会再重试。\n${q.cost}`,
+      kind: 'warning',
+      confirmText: '清空',
+    })
+  } catch {
+    return
+  }
+  queueBusy.value = key
+  try {
+    const { data } = await api.admin.clearDeleteQueue()
+    queueLastRun.value = { ...queueLastRun.value, [key]: undefined }
+    ElMessage.success(`已清空 ${data.cleared} 条任务`)
+    await reloadStatus()
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  } finally {
+    queueBusy.value = ''
+  }
+}
+
+async function reloadStatus() {
+  try {
+    status.value = (await api.admin.status()).data
+  } catch {
+    // 队列操作本身已经给过反馈,刷新状态失败不再打扰
+  }
+}
 
 const isOfficial = computed(
   () => form.value.api_base.replace(/\/$/, '') === cfg.value?.official_api_base,
@@ -698,7 +878,8 @@ async function saveExtras() {
       ...extras.value,
       backup_chunk_size: backupChunkSizeInput.value,
     })
-    ElMessage.success('维护设置已保存并生效')
+    // 这个保存路径被维护、备份、Bot 收件、后台任务几个分区共用,别写死某一个的名字
+    ElMessage.success('设置已保存并生效')
     await loadExtras()
   } catch (e) {
     ElMessage.error(errMsg(e))
@@ -750,7 +931,15 @@ const dirtySections = computed(() => {
     if (sec) set.add(sec)
   }
   for (const k of changed.value.extKeys) {
-    set.add(k.startsWith('inbox') ? 'inbox' : k.startsWith('shorts') ? 'stream' : 'backup')
+    set.add(
+      k.startsWith('auto_')
+        ? 'queues'
+        : k.startsWith('inbox')
+          ? 'inbox'
+          : k.startsWith('shorts')
+            ? 'stream'
+            : 'backup',
+    )
   }
   return set
 })
@@ -759,9 +948,9 @@ const dirtySections = computed(() => {
 const badges = computed(() => {
   const out: Partial<Record<SectionKey, { text: string; tone: 'danger' | 'warn' }>> = {}
   if (cfg.value && !cfg.value.configured) out.telegram = { text: '待配置', tone: 'danger' }
-  if (status.value?.pending_caption_syncs) {
-    out.logs = { text: String(status.value.pending_caption_syncs), tone: 'warn' }
-  }
+  // 队列积压挂在「后台任务」上——那里才有开关和「立即执行」
+  const queued = status.value?.delete_queue?.pending ?? 0
+  if (queued) out.queues = { text: String(queued), tone: 'warn' }
   if (status.value?.inbox_failures) {
     out.inbox = { text: String(status.value.inbox_failures), tone: 'warn' }
   }
@@ -838,13 +1027,12 @@ const statTiles = computed<Tile[]>(() => {
       action: () => go('backup'),
     },
     { label: '回收站', value: `${trashCount.value} 项`, icon: Delete, action: () => go('backup') },
-    { label: '待删消息', value: String(s?.pending_deletes ?? 0), icon: Brush },
     {
-      label: '待同步路径',
-      value: String(s?.pending_caption_syncs ?? 0),
-      icon: Refresh,
-      tone: s?.pending_caption_syncs ? 'warn' : undefined,
-      action: () => go('logs'),
+      label: '待删消息',
+      value: String(s?.pending_deletes ?? 0),
+      icon: Brush,
+      tone: s?.pending_deletes ? 'warn' : undefined,
+      action: () => go('queues'),
     },
     {
       label: '收件死信',
@@ -865,8 +1053,14 @@ interface QuickAction {
 }
 const quickActions = computed<QuickAction[]>(() => [
   {
+    label: '后台任务',
+    desc: 'Telegram 消息清理,手动执行',
+    icon: Cpu,
+    action: () => go('queues'),
+  },
+  {
     label: '查看后台日志',
-    desc: '路径同步进度与失败重试',
+    desc: '操作进度与失败原因',
     icon: Notebook,
     action: () => go('logs'),
   },
@@ -1076,19 +1270,116 @@ function downloadBackup() {
               </div>
             </template>
 
+            <!-- ========== 后台任务 ========== -->
+            <template v-else-if="section === 'queues'">
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  消息清理队列负责删除已不再被网盘引用的 Telegram 消息。
+                  默认<b>手动</b>:任务照常记账排队,但要你在这里点「立即执行」才会真的发请求。
+                </div>
+              </div>
+
+              <div class="queue-cards">
+                <div v-for="q in QUEUES" :key="q.key" class="queue-card">
+                  <div class="queue-head">
+                    <span class="queue-ico"><el-icon><component :is="q.icon" /></el-icon></span>
+                    <div class="queue-title">
+                      <b>{{ q.label }}</b>
+                      <em>{{ q.desc }}</em>
+                    </div>
+                    <el-switch
+                      :model-value="queueAuto(q.key)"
+                      inline-prompt
+                      active-text="自动"
+                      inactive-text="手动"
+                      @update:model-value="setQueueAuto(q.key, $event as boolean)"
+                    />
+                  </div>
+
+                  <div class="queue-stats">
+                    <div class="queue-stat">
+                      <b :class="{ warn: (queueOverview(q.key)?.pending ?? 0) > 0 }">
+                        {{ queueOverview(q.key)?.pending ?? 0 }}
+                      </b>
+                      <em>待处理</em>
+                    </div>
+                    <div class="queue-stat">
+                      <b :class="{ warn: (queueOverview(q.key)?.retrying ?? 0) > 0 }">
+                        {{ queueOverview(q.key)?.retrying ?? 0 }}
+                      </b>
+                      <em>失败重试过</em>
+                    </div>
+                    <div class="queue-stat">
+                      <b>{{ queueOverview(q.key)?.max_attempts ?? 0 }}</b>
+                      <em>最多试过几次</em>
+                    </div>
+                  </div>
+
+                  <!-- 卡住的根因直接摊开,不用再去日志里翻 -->
+                  <div v-if="queueOverview(q.key)?.last_error" class="queue-error">
+                    <el-icon><WarnTriangleFilled /></el-icon>
+                    <span>{{ queueOverview(q.key)?.last_error }}</span>
+                  </div>
+
+                  <div v-if="queueLastRun[q.key]" class="queue-result">
+                    本次执行:成功 {{ queueLastRun[q.key]!.completed }} 条,永久跳过
+                    {{ queueLastRun[q.key]!.discarded }} 条,失败 {{ queueLastRun[q.key]!.failed }} 条,剩余
+                    {{ queueLastRun[q.key]!.pending }} 条<template
+                      v-if="queueLastRun[q.key]!.stopped_early"
+                      >;本轮超时收工,可再点一次继续</template
+                    >
+                  </div>
+
+                  <div class="queue-actions">
+                    <el-button
+                      type="primary"
+                      plain
+                      :icon="Refresh"
+                      :loading="queueBusy === q.key"
+                      :disabled="!queueOverview(q.key)?.pending"
+                      @click="runQueue(q.key)"
+                    >
+                      立即执行
+                    </el-button>
+                    <el-button
+                      type="danger"
+                      text
+                      :disabled="!queueOverview(q.key)?.pending || queueBusy === q.key"
+                      @click="clearQueue(q.key)"
+                    >
+                      清空队列
+                    </el-button>
+                    <span v-if="queueAutoDirty(q.key)" class="queue-dirty">
+                      开关改动尚未保存
+                    </span>
+                    <span v-else class="muted queue-hint">{{ q.cost }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  单次「立即执行」最多处理 200 条,剩余数量不为 0 时可以再点一次。
+                  每条任务只尝试一次,失败原因会写进<a class="link" @click="go('logs')">后台日志</a>。
+                </div>
+              </div>
+            </template>
+
             <!-- ========== 后台日志 ========== -->
             <template v-else-if="section === 'logs'">
               <div class="note">
                 <el-icon><InfoFilled /></el-icon>
                 <div>
-                  这里记录关键后台事件（例如重命名后的 Telegram caption 路径同步、失败重试和队列清空）。
+                  这里记录关键后台事件（例如消息清理、失败重试、维护与备份）。
                   日志保留最近 2000 条；完整 HTTP 诊断仍请查看容器日志。
                 </div>
               </div>
 
               <div class="log-toolbar">
                 <div class="row">
-                  <el-button :loading="backendLogsLoading" :icon="Refresh" @click="loadBackendLogs()">
+                  <el-button :loading="backendLogsBusy" :icon="Refresh" @click="loadBackendLogs()">
                     刷新
                   </el-button>
                   <el-switch
@@ -1097,50 +1388,79 @@ function downloadBackup() {
                     active-text="自动"
                     inactive-text="手动"
                   />
-                </div>
-                <div class="log-summary">
-                  <el-tag
-                    :type="status?.pending_caption_syncs ? 'warning' : 'success'"
-                    size="small"
-                    round
-                  >
-                    {{
-                      status?.pending_caption_syncs
-                        ? '待同步路径 ' + status.pending_caption_syncs + ' 条'
-                        : '路径同步队列已清空'
-                    }}
-                  </el-tag>
-                  <span class="muted">每 5 秒自动刷新</span>
+                  <span class="muted">{{ backendLogsAutoRefresh ? '每 5 秒自动刷新' : '已暂停自动刷新' }}</span>
                 </div>
               </div>
 
-              <el-table
-                :data="backendLogs"
-                v-loading="backendLogsLoading"
-                class="backend-log-table"
-                size="small"
-                row-key="id"
-                :max-height="560"
-              >
-                <el-table-column label="时间" width="178">
-                  <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
-                </el-table-column>
-                <el-table-column label="级别" width="76" align="center">
-                  <template #default="{ row }">
-                    <el-tag :type="logLevelType(row.level)" size="small" round>
-                      {{ logLevelLabel(row.level) }}
+              <div class="log-filters">
+                <el-select
+                  v-model="backendLogLevel"
+                  placeholder="全部级别"
+                  clearable
+                  class="log-filter-sel"
+                >
+                  <el-option
+                    v-for="lv in LOG_LEVELS"
+                    :key="lv.value"
+                    :label="`${lv.label} · ${backendLogFacets.level_counts[lv.value] ?? 0}`"
+                    :value="lv.value"
+                    :disabled="!backendLogFacets.level_counts[lv.value]"
+                  />
+                </el-select>
+                <el-select
+                  v-model="backendLogCategory"
+                  placeholder="全部类别"
+                  clearable
+                  class="log-filter-sel"
+                >
+                  <el-option
+                    v-for="c in backendLogFacets.categories"
+                    :key="c"
+                    :label="c"
+                    :value="c"
+                  />
+                </el-select>
+                <el-input
+                  v-model="backendLogKeyword"
+                  placeholder="搜索类别或事件内容"
+                  clearable
+                  :prefix-icon="Search"
+                  class="log-filter-kw"
+                />
+                <el-button v-if="backendLogFiltered" text @click="resetBackendLogFilters">
+                  清除筛选
+                </el-button>
+                <span class="muted log-count">
+                  已加载 {{ backendLogs.length }} 条{{ backendLogsHasMore ? '(还有更早)' : '' }}
+                </span>
+              </div>
+
+              <div v-loading="backendLogsBusy && !backendLogs.length" class="log-list">
+                <div
+                  v-for="log in backendLogs"
+                  :key="log.id"
+                  class="log-item"
+                  :class="log.level"
+                >
+                  <div class="log-meta">
+                    <el-tag :type="logLevelType(log.level)" size="small" round>
+                      {{ logLevelLabel(log.level) }}
                     </el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="category" label="类别" width="100" />
-                <el-table-column prop="message" label="事件" show-overflow-tooltip />
-                <template #empty>
-                  <el-empty description="暂无后台日志" :image-size="64" />
-                </template>
-              </el-table>
+                    <span class="log-cat">{{ log.category }}</span>
+                    <span class="log-time">{{ fmtTime(log.created_at) }}</span>
+                  </div>
+                  <!-- 事件原文整段换行显示:这里的消息常有近百字,截断成一行等于看不到重点 -->
+                  <div class="log-msg">{{ log.message }}</div>
+                </div>
+                <el-empty
+                  v-if="!backendLogs.length && !backendLogsBusy"
+                  :description="backendLogFiltered ? '没有符合筛选条件的日志' : '暂无后台日志'"
+                  :image-size="64"
+                />
+              </div>
 
               <div v-if="backendLogsHasMore" class="log-more">
-                <el-button :loading="backendLogsLoading" plain @click="loadMoreBackendLogs">
+                <el-button :loading="backendLogsBusy" plain @click="loadMoreBackendLogs">
                   加载更早的日志
                 </el-button>
               </div>
@@ -1210,7 +1530,7 @@ function downloadBackup() {
                     {{
                       isOfficial
                         ? `官方端点的 getFile 下载上限 20MB,分块不能超过 ${fmtSize(cfg?.official_chunk_max ?? 0)}`
-                        : '自建端点单文件上限 2000MB,分块越大消息越少、速度越快'
+                        : '自建端点单文件上限 2000MB；建议使用 256MB，过大会让单次请求持续数分钟，网络中断后整块需要重传'
                     }}。只影响之后上传的文件。
                   </template>
                 </SettingField>
@@ -2086,16 +2406,185 @@ function downloadBackup() {
   gap: 12px;
   margin-bottom: 10px;
 }
+.queue-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.queue-card {
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+  background: var(--tile-bg);
+  padding: 14px 16px;
+}
+.queue-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.queue-ico {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+}
+.queue-title {
+  flex: 1;
+  min-width: 0;
+}
+.queue-title b {
+  display: block;
+  font-size: 14px;
+  font-weight: 700;
+}
+.queue-title em {
+  display: block;
+  margin-top: 2px;
+  font-style: normal;
+  font-size: 12px;
+  color: var(--text-soft);
+  line-height: 1.55;
+}
+.queue-stats {
+  display: flex;
+  gap: 10px;
+  margin: 12px 0 0;
+}
+.queue-stat {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--tile-bg-hover);
+  text-align: center;
+}
+.queue-stat b {
+  display: block;
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.queue-stat b.warn {
+  color: var(--el-color-warning);
+}
+.queue-stat em {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+.queue-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border-left: 3px solid var(--el-color-danger);
+  background: var(--tile-bg-hover);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.queue-result {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+.queue-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.queue-hint,
+.queue-dirty {
+  flex: 1;
+  min-width: 160px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.queue-dirty {
+  color: var(--el-color-warning);
+  font-weight: 600;
+}
+.link {
+  color: var(--el-color-primary);
+  cursor: pointer;
+}
 .log-summary {
   display: flex;
   align-items: center;
   gap: 10px;
 }
-.backend-log-table {
-  width: 100%;
+.log-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
 }
-.backend-log-table :deep(.cell) {
-  line-height: 1.55;
+.log-filter-sel {
+  width: 150px;
+}
+.log-filter-kw {
+  width: 240px;
+}
+.log-count {
+  margin-left: auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.log-list {
+  max-height: min(62vh, 640px);
+  overflow-y: auto;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+}
+.log-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--glass-border);
+  border-left: 3px solid transparent;
+}
+.log-item:last-child {
+  border-bottom: none;
+}
+.log-item.warn {
+  border-left-color: var(--el-color-warning);
+}
+.log-item.error {
+  border-left-color: var(--el-color-danger);
+}
+.log-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+.log-cat {
+  font-weight: 600;
+}
+.log-time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+.log-msg {
+  font-size: 13px;
+  line-height: 1.6;
+  /* 后台事件常带完整报错,必须整段折行,不能省略号截断 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .log-more {
   display: flex;
@@ -2463,6 +2952,19 @@ function downloadBackup() {
   .log-toolbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+  /* 窄屏下下拉和搜索框各占一行,免得挤成一列看不清 */
+  .log-filter-sel,
+  .log-filter-kw {
+    flex: 1 1 150px;
+    width: auto;
+  }
+  .log-count {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
+  .log-time {
+    margin-left: 0;
   }
 }
 @media (max-width: 900px) {

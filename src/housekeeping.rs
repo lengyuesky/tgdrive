@@ -44,7 +44,6 @@ pub async fn run(vfs: Vfs, runtime: Arc<Runtime>, task: crate::tasks::TaskReport
 
 async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
     vfs.uploader.process_pending_deletes();
-    vfs.uploader.process_pending_caption_syncs();
     let extras = crate::extras::load(&vfs.db).await?;
 
     let abandoned = vfs

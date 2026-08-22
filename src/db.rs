@@ -81,17 +81,8 @@ pub struct DeleteJob {
     pub storage_target_id: i64,
     pub tg_message_id: i64,
     pub attempts: i64,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct CaptionSyncJob {
-    pub id: i64,
-    pub storage_target_id: i64,
-    pub tg_message_id: i64,
-    pub node_id: i64,
-    pub chunk_idx: i64,
-    pub attempts: i64,
-    pub generation: i64,
+    /// 消息一定早于任务入队时间，可据此判断是否越过 Bot API 的 48 小时窗口。
+    pub created_at: i64,
 }
 
 /// 面向管理员展示的关键后台事件摘要。
@@ -102,6 +93,35 @@ pub struct BackendLog {
     pub category: String,
     pub message: String,
     pub created_at: i64,
+}
+
+/// 后台日志筛选条件；字段为 `None` 或空串表示该维度不限制。
+#[derive(Debug, Clone, Default)]
+pub struct BackendLogFilter {
+    /// debug | info | warn | error；其余取值按“不限制”处理
+    pub level: Option<String>,
+    pub category: Option<String>,
+    /// 在类别与事件内容里做不区分大小写的子串匹配
+    pub keyword: Option<String>,
+}
+
+/// 供管理页筛选下拉用的日志切面：全库出现过的类别，以及各级别条数。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BackendLogFacets {
+    pub categories: Vec<String>,
+    pub level_counts: HashMap<String, i64>,
+}
+
+/// 后台队列概况：待处理量与卡住的原因，供管理页「后台任务」分区展示。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct QueueOverview {
+    pub pending: i64,
+    /// 已经失败重试过（attempts > 0）的任务数
+    pub retrying: i64,
+    /// 队列里重试次数最多的那条试了几次
+    pub max_attempts: i64,
+    /// 重试次数最多那条的错误原因，通常就是卡住整个队列的根因
+    pub last_error: Option<String>,
 }
 
 const BACKEND_LOG_KEEP: i64 = 2_000;
@@ -477,7 +497,7 @@ impl Db {
     }
 
     /// 移动/重命名(同为改 parent_id+name)
-    pub async fn move_node(&self, id: i64, new_parent: i64, new_name: &str) -> AppResult<u64> {
+    pub async fn move_node(&self, id: i64, new_parent: i64, new_name: &str) -> AppResult<()> {
         let node = self.node(id).await?;
         if id == ROOT_ID {
             return Err(AppError::BadRequest("不能移动根目录".into()));
@@ -494,57 +514,14 @@ impl Db {
         {
             return Err(AppError::AlreadyExists);
         }
-        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE nodes SET parent_id = ?, name = ?, modified_at = ? WHERE id = ?")
             .bind(new_parent)
             .bind(new_name)
             .bind(now_ts())
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&self.pool)
             .await?;
-        let queued = Self::enqueue_caption_sync_subtree_tx(&mut tx, id).await?;
-        tx.commit().await?;
-        Ok(queued)
-    }
-
-    /// 为文件或目录树内的独占 Telegram 消息登记 caption 路径同步任务。
-    /// 同一消息被多个虚拟文件共享时无法表达唯一当前路径，因此安全地跳过。
-    async fn enqueue_caption_sync_subtree_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        node_id: i64,
-    ) -> AppResult<u64> {
-        Ok(sqlx::query(
-            "WITH RECURSIVE sub(id) AS (
-                 SELECT id FROM nodes WHERE id = ?
-                 UNION ALL
-                 SELECT n.id FROM nodes n JOIN sub s ON n.parent_id = s.id
-             )
-             INSERT INTO caption_sync_jobs
-                 (storage_target_id, tg_message_id, node_id, chunk_idx, attempts,
-                  next_retry_at, last_error, generation, created_at)
-             SELECT c.storage_target_id, c.tg_message_id, c.node_id, c.idx,
-                    0, 0, NULL, 1, ?
-             FROM chunks c JOIN sub s ON s.id = c.node_id
-             WHERE c.storage_target_id IS NOT NULL
-               AND (
-                   SELECT COUNT(*) FROM chunks refs
-                   WHERE refs.storage_target_id = c.storage_target_id
-                     AND refs.tg_message_id = c.tg_message_id
-               ) = 1
-             ON CONFLICT(storage_target_id, tg_message_id) DO UPDATE SET
-                 node_id = excluded.node_id,
-                 chunk_idx = excluded.chunk_idx,
-                 attempts = 0,
-                 next_retry_at = 0,
-                 last_error = NULL,
-                 generation = caption_sync_jobs.generation + 1,
-                 created_at = excluded.created_at",
-        )
-        .bind(node_id)
-        .bind(now_ts())
-        .execute(&mut **tx)
-        .await?
-        .rows_affected())
+        Ok(())
     }
 
     // ---------- 后台事件日志 ----------
@@ -596,40 +573,84 @@ impl Db {
         Ok(())
     }
 
-    /// 按 id 倒序读取后台日志；`before` 用于向前翻页。
+    /// 按 id 倒序读取后台日志；`before` 用于向前翻页，`filter` 在库内完成筛选。
+    ///
+    /// 筛选必须走 SQL：日志上限 2000 条且常被同一类事件刷屏，只在前端过滤当前页
+    /// 会出现“筛选了错误却一条都看不到”的假象。
     pub async fn backend_logs(
         &self,
         limit: i64,
         before: Option<i64>,
+        filter: &BackendLogFilter,
     ) -> AppResult<(Vec<BackendLog>, bool)> {
         let limit = limit.clamp(1, 100);
         let fetch_limit = limit + 1;
-        let mut rows = if let Some(before) = before {
-            sqlx::query_as::<_, BackendLog>(
-                "SELECT id, level, category, message, created_at
-                 FROM backend_logs
-                 WHERE id < ?
-                 ORDER BY id DESC
-                 LIMIT ?",
-            )
-            .bind(before)
-            .bind(fetch_limit)
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT id, level, category, message, created_at FROM backend_logs WHERE 1 = 1",
+        );
+        if let Some(before) = before {
+            query.push(" AND id < ").push_bind(before);
+        }
+        if let Some(level) = filter
+            .level
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| matches!(*l, "debug" | "info" | "warn" | "error"))
+        {
+            query.push(" AND level = ").push_bind(level.to_string());
+        }
+        if let Some(category) = filter
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            query
+                .push(" AND category = ")
+                .push_bind(category.to_string());
+        }
+        if let Some(needle) = filter
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            // 与文件搜索一致用 instr，免得关键字里的 % _ 被当成 LIKE 通配符
+            query
+                .push(" AND (instr(lower(message), lower(")
+                .push_bind(needle.to_string())
+                .push(")) > 0 OR instr(lower(category), lower(")
+                .push_bind(needle.to_string())
+                .push(")) > 0)");
+        }
+        query
+            .push(" ORDER BY id DESC LIMIT ")
+            .push_bind(fetch_limit);
+
+        let mut rows = query
+            .build_query_as::<BackendLog>()
             .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, BackendLog>(
-                "SELECT id, level, category, message, created_at
-                 FROM backend_logs
-                 ORDER BY id DESC
-                 LIMIT ?",
-            )
-            .bind(fetch_limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
+            .await?;
         let has_more = rows.len() > limit as usize;
         rows.truncate(limit as usize);
         Ok((rows, has_more))
+    }
+
+    /// 读取日志切面：类别取值与各级别条数，供管理页筛选下拉与角标使用。
+    /// 统计的是全库而非当前页，这样“错误 3 条”即使不在首页也能被看见。
+    pub async fn backend_log_facets(&self) -> AppResult<BackendLogFacets> {
+        let categories: Vec<(String,)> =
+            sqlx::query_as("SELECT DISTINCT category FROM backend_logs ORDER BY category")
+                .fetch_all(&self.pool)
+                .await?;
+        let counts: Vec<(String, i64)> =
+            sqlx::query_as("SELECT level, COUNT(*) FROM backend_logs GROUP BY level")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(BackendLogFacets {
+            categories: categories.into_iter().map(|(c,)| c).collect(),
+            level_counts: counts.into_iter().collect(),
+        })
     }
 
     // ---------- 上传生命周期 ----------
@@ -1835,7 +1856,13 @@ impl Db {
         Ok(())
     }
 
-    pub async fn delete_jobs_due(&self, limit: i64) -> AppResult<Vec<DeleteJob>> {
+    /// 取出到期的删除任务。`ignore_backoff` 为真时无视指数退避取出全部任务，
+    /// 供后台「立即执行」使用——否则重试多次的任务退避已拉到一小时，手动点了会像没反应。
+    pub async fn delete_jobs_due(
+        &self,
+        limit: i64,
+        ignore_backoff: bool,
+    ) -> AppResult<Vec<DeleteJob>> {
         // 极端情况下同一消息在入队后又被引用，安全起见取消对应删除任务。
         sqlx::query(
             "DELETE FROM delete_jobs
@@ -1848,13 +1875,13 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(sqlx::query_as(
-            "SELECT id, storage_target_id, tg_message_id, attempts
+            "SELECT id, storage_target_id, tg_message_id, attempts, created_at
              FROM delete_jobs
              WHERE next_retry_at <= ?
              ORDER BY next_retry_at, id
              LIMIT ?",
         )
-        .bind(now_ts())
+        .bind(if ignore_backoff { i64::MAX } else { now_ts() })
         .bind(limit)
         .fetch_all(&self.pool)
         .await?)
@@ -1895,82 +1922,33 @@ impl Db {
         Ok(count)
     }
 
-    // ---------- Telegram caption 路径同步队列 ----------
-
-    pub async fn caption_sync_jobs_due(&self, limit: i64) -> AppResult<Vec<CaptionSyncJob>> {
-        // 节点/分块已删除，或消息后来被零流量复制为多处引用时，不再同步单一路径。
-        sqlx::query(
-            "DELETE FROM caption_sync_jobs
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM chunks c
-                 WHERE c.node_id = caption_sync_jobs.node_id
-                   AND c.idx = caption_sync_jobs.chunk_idx
-                   AND c.storage_target_id = caption_sync_jobs.storage_target_id
-                   AND c.tg_message_id = caption_sync_jobs.tg_message_id
-             )
-             OR 1 != (
-                 SELECT COUNT(*) FROM chunks refs
-                 WHERE refs.storage_target_id = caption_sync_jobs.storage_target_id
-                   AND refs.tg_message_id = caption_sync_jobs.tg_message_id
-             )",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(sqlx::query_as(
-            "SELECT id, storage_target_id, tg_message_id, node_id, chunk_idx,
-                    attempts, generation
-             FROM caption_sync_jobs
-             WHERE next_retry_at <= ?
-             ORDER BY next_retry_at, id
-             LIMIT ?",
-        )
-        .bind(now_ts())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
-    pub async fn caption_sync_job_done(&self, id: i64, generation: i64) -> AppResult<bool> {
-        let removed = sqlx::query("DELETE FROM caption_sync_jobs WHERE id = ? AND generation = ?")
-            .bind(id)
-            .bind(generation)
+    /// 丢弃全部待清理消息。调用方需明白：对应 Telegram 消息会永久留在频道里。
+    pub async fn clear_delete_jobs(&self) -> AppResult<u64> {
+        Ok(sqlx::query("DELETE FROM delete_jobs")
             .execute(&self.pool)
-            .await?;
-        Ok(removed.rows_affected() > 0)
+            .await?
+            .rows_affected())
     }
 
-    pub async fn caption_sync_job_failed(
-        &self,
-        id: i64,
-        generation: i64,
-        attempts: i64,
-        error: &str,
-    ) -> AppResult<()> {
-        let exponent = attempts.clamp(0, 10) as u32;
-        let delay = 5_i64
-            .saturating_mul(2_i64.saturating_pow(exponent))
-            .min(3600);
-        let detail: String = error.chars().take(500).collect();
-        sqlx::query(
-            "UPDATE caption_sync_jobs
-             SET attempts = ?, next_retry_at = ?, last_error = ?
-             WHERE id = ? AND generation = ?",
+    /// 删除队列概况，供后台任务分区展示“卡在哪”。
+    pub async fn delete_queue_overview(&self) -> AppResult<QueueOverview> {
+        let row: (i64, i64, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(attempts > 0), 0),
+                    MAX(attempts),
+                    (SELECT last_error FROM delete_jobs
+                     WHERE last_error IS NOT NULL
+                     ORDER BY attempts DESC, id LIMIT 1)
+             FROM delete_jobs",
         )
-        .bind(attempts + 1)
-        .bind(now_ts() + delay)
-        .bind(detail)
-        .bind(id)
-        .bind(generation)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
-    }
-
-    pub async fn pending_caption_sync_count(&self) -> AppResult<i64> {
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM caption_sync_jobs")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count)
+        Ok(QueueOverview {
+            pending: row.0,
+            retrying: row.1,
+            max_attempts: row.2.unwrap_or(0),
+            last_error: row.3,
+        })
     }
 
     /// 候选消息中，删除元数据后已无任何分块引用的消息；在同一事务内先写入删除队列。
@@ -2067,30 +2045,99 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(columns, 1);
+
+        let (caption_tables,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'caption_sync_jobs'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(caption_tables, 0);
     }
 
     #[tokio::test]
     async fn backend_logs_are_newest_first_and_paginated() {
         let (db, _g) = test_db().await;
-        db.append_backend_log("info", "路径同步", "第一条")
+        db.append_backend_log("info", "维护", "第一条")
             .await
             .unwrap();
-        db.append_backend_log("warn", "路径同步", "第二条")
+        db.append_backend_log("warn", "维护", "第二条")
             .await
             .unwrap();
         db.append_backend_log("unknown", "", "").await.unwrap();
 
-        let (latest, has_more) = db.backend_logs(2, None).await.unwrap();
+        let none = BackendLogFilter::default();
+        let (latest, has_more) = db.backend_logs(2, None, &none).await.unwrap();
         assert_eq!(latest.len(), 2);
         assert!(has_more);
         assert_eq!(latest[0].message, "后台事件");
         assert_eq!(latest[0].level, "info");
         assert_eq!(latest[1].message, "第二条");
 
-        let (older, has_more) = db.backend_logs(2, Some(latest[1].id)).await.unwrap();
+        let (older, has_more) = db.backend_logs(2, Some(latest[1].id), &none).await.unwrap();
         assert!(!has_more);
         assert_eq!(older.len(), 1);
         assert_eq!(older[0].message, "第一条");
+    }
+
+    #[tokio::test]
+    async fn backend_logs_filter_by_level_category_and_keyword() {
+        let (db, _g) = test_db().await;
+        db.append_backend_log("warn", "维护", "临时文件清理失败，RETRY")
+            .await
+            .unwrap();
+        db.append_backend_log("error", "消息清理", "删除频道消息失败")
+            .await
+            .unwrap();
+        db.append_backend_log("info", "维护", "临时文件已清空")
+            .await
+            .unwrap();
+
+        let by_level = BackendLogFilter {
+            level: Some("error".into()),
+            ..Default::default()
+        };
+        let (rows, _) = db.backend_logs(50, None, &by_level).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].category, "消息清理");
+
+        let by_category = BackendLogFilter {
+            category: Some("维护".into()),
+            ..Default::default()
+        };
+        let (rows, _) = db.backend_logs(50, None, &by_category).await.unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // 关键字同时匹配类别与内容,且大小写无关
+        let by_keyword = BackendLogFilter {
+            keyword: Some("retry".into()),
+            ..Default::default()
+        };
+        let (rows, _) = db.backend_logs(50, None, &by_keyword).await.unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // 关键字里的 LIKE 通配符必须当普通字符,不能命中全部
+        let wildcard = BackendLogFilter {
+            keyword: Some("%".into()),
+            ..Default::default()
+        };
+        let (rows, _) = db.backend_logs(50, None, &wildcard).await.unwrap();
+        assert!(rows.is_empty());
+
+        // 非法级别视为不限制,避免前端传脏值时整页空白
+        let bogus = BackendLogFilter {
+            level: Some("verbose".into()),
+            ..Default::default()
+        };
+        let (rows, _) = db.backend_logs(50, None, &bogus).await.unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let facets = db.backend_log_facets().await.unwrap();
+        assert_eq!(facets.categories, vec!["消息清理", "维护"]);
+        assert_eq!(facets.level_counts.get("warn"), Some(&1));
+        assert_eq!(facets.level_counts.get("error"), Some(&1));
+        assert_eq!(facets.level_counts.get("debug"), None);
     }
 
     #[tokio::test]
@@ -2184,37 +2231,6 @@ mod tests {
             .unwrap();
         db.finalize_upload(up, 4, Some(sha)).await.unwrap();
         up
-    }
-
-    #[tokio::test]
-    async fn moving_tree_queues_caption_sync_only_for_unshared_messages() {
-        let (db, _g) = test_db().await;
-        let folder = db.mkdir(ROOT_ID, "旧目录").await.unwrap();
-        let unique = mk_file(&db, folder.id, "独占.bin", 410, "unique").await;
-        let shared = mk_file(&db, folder.id, "共享.bin", 411, "shared").await;
-        db.copy_file(shared, ROOT_ID, "共享副本.bin").await.unwrap();
-
-        db.move_node(folder.id, ROOT_ID, "新目录").await.unwrap();
-        let first = db.caption_sync_jobs_due(10).await.unwrap();
-        assert_eq!(first.len(), 1, "共享 Telegram 消息不能绑定到单一路径");
-        assert_eq!(first[0].node_id, unique);
-        assert_eq!(
-            db.full_path_if_visible(unique).await.unwrap().as_deref(),
-            Some("/新目录/独占.bin")
-        );
-
-        // 同步过程中再次改名时会增加代次；旧 worker 不能误删新任务。
-        db.move_node(folder.id, ROOT_ID, "最终目录").await.unwrap();
-        db.caption_sync_job_done(first[0].id, first[0].generation)
-            .await
-            .unwrap();
-        let latest = db.caption_sync_jobs_due(10).await.unwrap();
-        assert_eq!(latest.len(), 1);
-        assert!(latest[0].generation > first[0].generation);
-        assert_eq!(
-            db.full_path_if_visible(unique).await.unwrap().as_deref(),
-            Some("/最终目录/独占.bin")
-        );
     }
 
     #[tokio::test]
@@ -2376,7 +2392,10 @@ mod tests {
             .map(|(_, p)| p)
             .collect();
         paths.sort();
-        assert_eq!(paths, vec!["/影视_100%[新]/x.mp4", "/影视_100%[新]/子集/y.mp4"]);
+        assert_eq!(
+            paths,
+            vec!["/影视_100%[新]/x.mp4", "/影视_100%[新]/子集/y.mp4"]
+        );
 
         // 根目录等价于不限制
         let all = SearchFilter {

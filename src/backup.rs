@@ -1062,6 +1062,7 @@ mod tests {
             inbox_book_dir: "/收件箱/书籍".into(),
             inbox_rules: Vec::new(),
             shorts_dir: String::new(),
+            auto_delete_message: false,
         }
     }
 

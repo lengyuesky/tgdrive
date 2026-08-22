@@ -106,8 +106,19 @@
       </div>
     </div>
 
-    <div v-if="items.length === 0" class="empty">暂无上传任务</div>
-    <div v-for="it in items" :key="it.id" class="upload-item" :class="`tone-${tone(it)}`">
+    <div v-if="preparingFileCount" class="window-hint">
+      正在分批整理并检查 {{ preparingFileCount }} 个文件，页面仍可继续操作…
+    </div>
+    <div v-if="totalCount === 0 && !preparingFileCount" class="empty">暂无上传任务</div>
+    <div v-if="hiddenTaskCount" class="window-hint">
+      队列共 {{ totalCount }} 项；为保持页面流畅，仅展示当前及最近 {{ DISPLAY_TASK_LIMIT }} 项
+    </div>
+    <div
+      v-for="it in displayedItems"
+      :key="it.id"
+      class="upload-item"
+      :class="`tone-${tone(it)}`"
+    >
       <div class="item-top">
         <el-tag v-if="it.status === 'instant'" size="small" type="success" class="badge">秒传</el-tag>
         <el-tag v-else-if="it.status === 'skipped'" size="small" type="info" class="badge">跳过</el-tag>
@@ -205,10 +216,13 @@
     append-to-body
     @close="onConflictClose"
   >
-    <p class="conflict-hint">目标目录已有 {{ conflictNames.length }} 个同名文件,覆盖会替换原文件:</p>
+    <p class="conflict-hint">目标目录已有 {{ conflictTotal }} 个同名文件,覆盖会替换原文件:</p>
     <ul class="conflict-list">
       <li v-for="n in conflictNames" :key="n" :title="n">{{ n }}</li>
     </ul>
+    <p v-if="conflictTotal > conflictNames.length" class="conflict-hint">
+      仅列出前 {{ conflictNames.length }} 项，其余 {{ conflictTotal - conflictNames.length }} 项已折叠
+    </p>
     <template #footer>
       <el-button @click="resolveConflict('cancel')">取消上传</el-button>
       <el-button @click="resolveConflict('skip')">跳过这些</el-button>
@@ -226,9 +240,8 @@ export interface UploadFile {
 </script>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 import { ElMessage } from 'element-plus'
-import { createSHA256 } from 'hash-wasm'
 import { Close, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import { api, errMsg, fmtSize, type UploadSession } from '../api'
 import { appConfirm } from '../dialog'
@@ -283,34 +296,60 @@ function isCurrent(item: Item, generation: number) {
 }
 
 const visible = ref(false)
-const items = ref<Item[]>([])
+const items = shallowRef<Item[]>([])
 const batchBusy = ref(false)
+const preparingFileCount = ref(0)
 const emit = defineEmits<{ uploaded: [] }>()
 
-const totalCount = computed(() => items.value.length)
-const uploadedCount = computed(() => items.value.filter((item) => item.status === 'done').length)
-const instantCount = computed(() => items.value.filter((item) => item.status === 'instant').length)
-const successCount = computed(() => uploadedCount.value + instantCount.value)
-const skippedCount = computed(() => items.value.filter((item) => item.status === 'skipped').length)
-const finishedExists = computed(() => items.value.some((item) => isDone(item)))
+const DISPLAY_TASK_LIMIT = 200
+const itemById = new Map<number, Item>()
+const displayedIds = ref<number[]>([])
+const displayedItems = computed(() =>
+  displayedIds.value.flatMap((id) => {
+    const item = itemById.get(id)
+    return item ? [item] : []
+  }),
+)
+const hiddenTaskCount = computed(() => Math.max(0, totalCount.value - displayedItems.value.length))
 
-const pendingCount = computed(() => items.value.filter(isPending).length)
-const activeCount = computed(() => items.value.filter(isPauseable).length)
-const pauseableCount = computed(() => items.value.filter(isPauseable).length)
-const pausedCount = computed(() => items.value.filter((item) => item.status === 'paused').length)
-const errorCount = computed(() => items.value.filter((item) => item.status === 'error').length)
-const needsFileCount = computed(
-  () => items.value.filter((item) => item.status === 'needs_file').length,
+const statusCounts = reactive<Record<UploadStatus, number>>({
+  hashing: 0,
+  waiting: 0,
+  uploading: 0,
+  paused: 0,
+  needs_file: 0,
+  cancelling: 0,
+  instant: 0,
+  done: 0,
+  skipped: 0,
+  error: 0,
+})
+
+const totalCount = computed(() => items.value.length)
+const uploadedCount = computed(() => statusCounts.done)
+const instantCount = computed(() => statusCounts.instant)
+const successCount = computed(() => uploadedCount.value + instantCount.value)
+const skippedCount = computed(() => statusCounts.skipped)
+const finishedExists = computed(() => successCount.value + skippedCount.value > 0)
+const pendingCount = computed(
+  () =>
+    statusCounts.hashing +
+    statusCounts.waiting +
+    statusCounts.uploading +
+    statusCounts.paused +
+    statusCounts.needs_file +
+    statusCounts.error,
 )
-const cancellingCount = computed(
-  () => items.value.filter((item) => item.status === 'cancelling').length,
+const activeCount = computed(
+  () => statusCounts.hashing + statusCounts.waiting + statusCounts.uploading,
 )
-const resumableCount = computed(
-  () => items.value.filter((item) => item.status === 'paused' && Boolean(item.file)).length,
-)
-const retryableCount = computed(
-  () => items.value.filter((item) => item.status === 'error' && Boolean(item.file)).length,
-)
+const pauseableCount = activeCount
+const pausedCount = computed(() => statusCounts.paused)
+const errorCount = computed(() => statusCounts.error)
+const needsFileCount = computed(() => statusCounts.needs_file)
+const cancellingCount = computed(() => statusCounts.cancelling)
+const resumableCount = pausedCount
+const retryableCount = errorCount
 
 function isDone(item: Item) {
   return item.status === 'done' || item.status === 'instant' || item.status === 'skipped'
@@ -332,10 +371,74 @@ function tone(item: Item): 'ok' | 'err' | 'run' | 'idle' {
 let seq = 0
 let busy = false
 let defaultConcurrency = 1
-/** 只保存任务 ID，消费时从响应式数组取代理，确保状态变化能触发视图更新。 */
+/** 数组只追加、游标只前进，避免 shift/includes 在万级队列上退化为 O(n²)。 */
 const queue: number[] = []
+const queuedIds = new Set<number>()
+let queueHead = 0
 /** 本次页面会话已确保存在的目录，避免每个文件都重复调用 mkdir。 */
 const ensuredDirs = new Set<string>()
+
+function promoteDisplayed(item: Item) {
+  const next = [item.id]
+  for (const id of displayedIds.value) {
+    if (id !== item.id && itemById.has(id)) next.push(id)
+    if (next.length >= DISPLAY_TASK_LIMIT) break
+  }
+  displayedIds.value = next
+}
+
+function setItemStatus(item: Item, status: UploadStatus) {
+  if (item.status === status) return
+  statusCounts[item.status] = Math.max(0, statusCounts[item.status] - 1)
+  statusCounts[status] += 1
+  item.status = status
+  if (status !== 'waiting' || displayedIds.value.length < DISPLAY_TASK_LIMIT) {
+    promoteDisplayed(item)
+  }
+}
+
+function registerItems(rawItems: Item[], prepend = true): Item[] {
+  if (!rawItems.length) return []
+  const registered = rawItems.map((raw) => reactive(raw) as Item)
+  for (const item of registered) {
+    itemById.set(item.id, item)
+    statusCounts[item.status] += 1
+  }
+  items.value = prepend ? [...registered, ...items.value] : [...items.value, ...registered]
+  const nextIds = prepend
+    ? [...registered.map((item) => item.id), ...displayedIds.value]
+    : [...displayedIds.value, ...registered.map((item) => item.id)]
+  displayedIds.value = [...new Set(nextIds)].slice(0, DISPLAY_TASK_LIMIT)
+  return registered
+}
+
+function removeItems(targets: Item[]) {
+  if (!targets.length) return
+  const ids = new Set<number>()
+  for (const item of targets) {
+    if (!itemById.delete(item.id)) continue
+    ids.add(item.id)
+    queuedIds.delete(item.id)
+    statusCounts[item.status] = Math.max(0, statusCounts[item.status] - 1)
+    // 从响应式队列移除前释放大 File/Blob 引用，便于浏览器尽早回收内存。
+    item.file = undefined
+    item.thumbnail = undefined
+    item.controllers.clear()
+  }
+  if (!ids.size) return
+  items.value = items.value.filter((item) => !ids.has(item.id))
+  const visibleIds = displayedIds.value.filter((id) => !ids.has(id) && itemById.has(id))
+  if (visibleIds.length < DISPLAY_TASK_LIMIT) {
+    const visibleSet = new Set(visibleIds)
+    for (const item of items.value) {
+      if (visibleSet.has(item.id)) continue
+      visibleIds.push(item.id)
+      visibleSet.add(item.id)
+      if (visibleIds.length >= DISPLAY_TASK_LIMIT) break
+    }
+  }
+  displayedIds.value = visibleIds
+}
 
 function joinPath(dir: string, name: string) {
   return dir === '/' ? `/${name}` : `${dir}/${name}`
@@ -375,10 +478,12 @@ function fromSession(session: UploadSession, concurrency: number): Item {
 type ConflictAction = 'overwrite' | 'skip' | 'cancel'
 const conflictVisible = ref(false)
 const conflictNames = ref<string[]>([])
+const conflictTotal = ref(0)
 let conflictResolve: ((action: ConflictAction) => void) | null = null
 
 function askConflict(names: string[]): Promise<ConflictAction> {
-  conflictNames.value = names
+  conflictTotal.value = names.length
+  conflictNames.value = names.slice(0, DISPLAY_TASK_LIMIT)
   conflictVisible.value = true
   return new Promise((resolve) => (conflictResolve = resolve))
 }
@@ -397,25 +502,55 @@ function onConflictClose() {
 
 /** 入队前按目标目录批量查重，有同名文件时让用户选择覆盖、跳过或取消。 */
 async function enqueue(dir: string, files: UploadFile[]) {
+  visible.value = true
+  preparingFileCount.value += files.length
+  try {
+    await prepareEnqueue(dir, files)
+  } finally {
+    preparingFileCount.value = Math.max(0, preparingFileCount.value - files.length)
+  }
+}
+
+async function prepareEnqueue(dir: string, files: UploadFile[]) {
   const relOf = (upload: UploadFile) => (upload.rel ?? '').replace(/^\/+|\/+$/g, '')
   const groups = new Map<string, UploadFile[]>()
-  for (const upload of files) {
+  for (let index = 0; index < files.length; index += 1) {
+    const upload = files[index]!
     const rel = relOf(upload)
     const target = rel ? joinPath(dir, rel) : dir
     const group = groups.get(target)
     if (group) group.push(upload)
     else groups.set(target, [upload])
-  }
-  const duplicates = new Set<UploadFile>()
-  for (const [target, group] of groups) {
-    try {
-      const response = await api.exists(target, group.map((upload) => upload.file.name))
-      const existing = new Set(response.data.existing)
-      for (const upload of group) if (existing.has(upload.file.name)) duplicates.add(upload)
-    } catch {
-      // 查重只是交互增强，短暂失败时仍允许后续上传接口处理。
+    if (index > 0 && index % 500 === 0) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
     }
   }
+  const duplicates = new Set<UploadFile>()
+  const grouped = [...groups.entries()]
+  let groupCursor = 0
+  const duplicateWorker = async () => {
+    for (;;) {
+      const current = grouped[groupCursor++]
+      if (!current) return
+      const [target, group] = current
+      for (let start = 0; start < group.length; start += 500) {
+        const batch = group.slice(start, start + 500)
+        try {
+          const response = await api.exists(
+            target,
+            batch.map((upload) => upload.file.name),
+          )
+          const existing = new Set(response.data.existing)
+          for (const upload of batch) if (existing.has(upload.file.name)) duplicates.add(upload)
+        } catch {
+          // 查重只是交互增强，短暂失败时仍允许后续上传接口处理。
+        }
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(4, grouped.length) }, () => duplicateWorker()),
+  )
 
   let action: ConflictAction = 'overwrite'
   if (duplicates.size > 0) {
@@ -429,7 +564,10 @@ async function enqueue(dir: string, files: UploadFile[]) {
     if (action === 'cancel') return
   }
 
-  for (const upload of files) {
+  const rawItems: Item[] = []
+  const scheduledIds = new Set<number>()
+  for (let index = 0; index < files.length; index += 1) {
+    const upload = files[index]!
     const item: Item = {
       id: ++seq,
       dir,
@@ -448,24 +586,38 @@ async function enqueue(dir: string, files: UploadFile[]) {
     if (action === 'skip' && duplicates.has(upload)) {
       item.status = 'skipped'
       item.pct = 100
-      items.value.unshift(item)
-      continue
+    } else {
+      scheduledIds.add(item.id)
     }
-    items.value.unshift(item)
-    schedule(item)
+    rawItems.push(item)
+    if (index > 0 && index % 500 === 0) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    }
   }
-  visible.value = true
+  const registered = registerItems(rawItems)
+  scheduleMany(registered.filter((item) => scheduledIds.has(item.id)))
 }
 
 function schedule(item: Item) {
-  if (!queue.includes(item.id)) queue.push(item.id)
+  if (!queuedIds.has(item.id)) {
+    queuedIds.add(item.id)
+    queue.push(item.id)
+  }
   void pump()
 }
 
-function removeQueued(id: number) {
-  for (let index = queue.length - 1; index >= 0; index -= 1) {
-    if (queue[index] === id) queue.splice(index, 1)
+function scheduleMany(batch: Item[]) {
+  for (const item of batch) {
+    if (queuedIds.has(item.id)) continue
+    queuedIds.add(item.id)
+    queue.push(item.id)
   }
+  if (batch.length) void pump()
+}
+
+function removeQueued(id: number) {
+  // 采用惰性删除，pump 取出 ID 时会跳过；不再移动后续数万个元素。
+  queuedIds.delete(id)
 }
 
 /** 停止当前任务的本地工作；服务端会话保留，供稍后断点续传。 */
@@ -480,7 +632,7 @@ function stopItem(item: Item) {
 function pause(item: Item) {
   if (!isPauseable(item)) return
   stopItem(item)
-  if (!item.cancelled) item.status = 'paused'
+  if (!item.cancelled) setItemStatus(item, 'paused')
 }
 
 function resume(item: Item) {
@@ -492,7 +644,7 @@ function resume(item: Item) {
   item.generation += 1
   item.pauseRequested = false
   item.error = undefined
-  item.status = 'waiting'
+  setItemStatus(item, 'waiting')
   schedule(item)
 }
 
@@ -502,7 +654,7 @@ function retry(item: Item) {
     item.generation += 1
     item.pauseRequested = false
     item.error = undefined
-    item.status = 'waiting'
+    setItemStatus(item, 'waiting')
     schedule(item)
     return
   }
@@ -538,23 +690,23 @@ function retryAll() {
   if (targets.length) ElMessage.success(`已重新排队 ${targets.length} 个失败任务`)
 }
 
-async function cancelItem(item: Item): Promise<boolean> {
+async function cancelItem(item: Item, removeOnSuccess = true): Promise<boolean> {
   if (isDone(item) || item.status === 'cancelling') return true
   item.cancelled = true
   stopItem(item)
-  item.status = 'cancelling'
+  setItemStatus(item, 'cancelling')
   try {
     if (item.session) await api.uploads.cancel(item.session.id)
-    items.value = items.value.filter((candidate) => candidate.id !== item.id)
+    if (removeOnSuccess) removeItems([item])
     return true
   } catch (error) {
     const status = (error as { response?: { status?: number } }).response?.status
     if (status === 404) {
-      items.value = items.value.filter((candidate) => candidate.id !== item.id)
+      if (removeOnSuccess) removeItems([item])
       return true
     }
     item.cancelled = false
-    item.status = 'error'
+    setItemStatus(item, 'error')
     item.error = `取消失败：${errMsg(error)}`
     return false
   }
@@ -579,13 +731,19 @@ async function cancelAll() {
   batchBusy.value = true
   let succeeded = 0
   let failed = 0
+  const removed: Item[] = []
   try {
     // 逐个请求，避免同时删除大量分块时给 SQLite/Telegram 清理队列造成突发压力。
     for (const item of targets) {
-      if (await cancelItem(item)) succeeded += 1
-      else failed += 1
+      if (await cancelItem(item, false)) {
+        succeeded += 1
+        removed.push(item)
+      } else {
+        failed += 1
+      }
     }
   } finally {
+    removeItems(removed)
     batchBusy.value = false
   }
   if (failed) {
@@ -596,7 +754,7 @@ async function cancelAll() {
 }
 
 function clearFinished() {
-  items.value = items.value.filter((item) => !isDone(item))
+  removeItems(items.value.filter(isDone))
 }
 
 /** 从顶栏打开上传队列；没有任务时也允许打开查看空状态。 */
@@ -604,23 +762,67 @@ function open() {
   visible.value = true
 }
 
-/** 流式计算 SHA-256（32MB 一片），大文件不会一次读入内存。 */
+type HashWorkerMessage =
+  | { type: 'progress'; id: number; percentage: number }
+  | { type: 'done'; id: number; digest: string }
+  | { type: 'cancelled'; id: number }
+  | { type: 'error'; id: number; message: string }
+
+interface PendingHash {
+  onPct: (percentage: number) => void
+  resolve: (digest: string) => void
+  reject: (error: Error) => void
+  stopTimer: number
+}
+
+const hashWorker = new Worker(new URL('../workers/sha256.worker.ts', import.meta.url), {
+  type: 'module',
+})
+const pendingHashes = new Map<number, PendingHash>()
+let hashSequence = 0
+
+function finishHash(id: number, result: { digest?: string; error?: Error }) {
+  const pending = pendingHashes.get(id)
+  if (!pending) return
+  pendingHashes.delete(id)
+  window.clearInterval(pending.stopTimer)
+  if (result.digest !== undefined) pending.resolve(result.digest)
+  else pending.reject(result.error ?? new Error('文件校验失败'))
+}
+
+hashWorker.onmessage = (event: MessageEvent<HashWorkerMessage>) => {
+  const message = event.data
+  const pending = pendingHashes.get(message.id)
+  if (!pending) return
+  if (message.type === 'progress') pending.onPct(message.percentage)
+  else if (message.type === 'done') finishHash(message.id, { digest: message.digest })
+  else if (message.type === 'cancelled') finishHash(message.id, { error: new Error('任务已停止') })
+  else finishHash(message.id, { error: new Error(message.message) })
+}
+
+hashWorker.onerror = () => {
+  for (const id of [...pendingHashes.keys()]) {
+    finishHash(id, { error: new Error('文件校验线程异常退出') })
+  }
+}
+
+/** SHA-256 在独立 Worker 中流式计算，避免 WASM 占用页面主线程。 */
 async function sha256File(
   file: File,
   onPct: (percentage: number) => void,
   stopped: () => boolean = () => false,
 ): Promise<string> {
-  const hasher = await createSHA256()
-  hasher.init()
-  const chunkSize = 32 * 1024 * 1024
-  for (let offset = 0; offset < file.size; offset += chunkSize) {
-    if (stopped()) throw new Error('任务已停止')
-    const buffer = await file.slice(offset, Math.min(offset + chunkSize, file.size)).arrayBuffer()
-    hasher.update(new Uint8Array(buffer))
-    onPct(Math.round((Math.min(offset + chunkSize, file.size) / file.size) * 100))
-  }
-  onPct(100)
-  return hasher.digest('hex')
+  if (stopped()) throw new Error('任务已停止')
+  const id = ++hashSequence
+  return new Promise((resolve, reject) => {
+    const stopTimer = window.setInterval(() => {
+      if (!stopped()) return
+      hashWorker.postMessage({ type: 'cancel', id })
+      finishHash(id, { error: new Error('任务已停止') })
+    }, 100)
+    pendingHashes.set(id, { onPct, resolve, reject, stopTimer })
+    hashWorker.postMessage({ type: 'hash', id, file })
+  })
 }
 
 const THUMB_VIDEO_EXT = new Set(['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv'])
@@ -776,7 +978,7 @@ async function finalizeItem(item: Item, session: UploadSession, generation: numb
     if (confirmed !== true) throw completeError
   }
   if (!isCurrent(item, generation) || item.pauseRequested) return
-  item.status = 'done'
+  setItemStatus(item, 'done')
   item.pct = 100
   item.session = undefined
   emit('uploaded')
@@ -786,7 +988,7 @@ async function uploadMissingParts(item: Item, generation: number) {
   if (!item.session || !item.file) return
   await syncSession(item)
   if (!isCurrent(item, generation) || item.pauseRequested) {
-    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
     return
   }
   const session = item.session
@@ -799,14 +1001,18 @@ async function uploadMissingParts(item: Item, generation: number) {
   let cursor = 0
   let stopped = false
   let failure: unknown
+  let lastProgressAt = 0
 
-  const updateProgress = () => {
+  const updateProgress = (force = false) => {
     if (!item.session || item.session.size === 0) return
+    const now = performance.now()
+    if (!force && now - lastProgressAt < 150) return
+    lastProgressAt = now
     const active = [...activeBytes.values()].reduce((sum, value) => sum + value, 0)
     item.pct = Math.min(99, Math.round(((completedBytes + active) / item.session.size) * 100))
   }
 
-  item.status = 'uploading'
+  setItemStatus(item, 'uploading')
   const worker = async () => {
     while (!stopped && isCurrent(item, generation) && !item.pauseRequested) {
       const index = missing[cursor++]
@@ -831,7 +1037,7 @@ async function uploadMissingParts(item: Item, generation: number) {
         if (!isCurrent(item, generation)) return
         completedBytes += data.size
         activeBytes.delete(index)
-        updateProgress()
+        updateProgress(true)
       } catch (error) {
         activeBytes.delete(index)
         if (isCurrent(item, generation) && !item.pauseRequested) {
@@ -854,7 +1060,7 @@ async function uploadMissingParts(item: Item, generation: number) {
     // 会话可能恰好在完成请求中消失，后面的秒传核实会给出最终状态。
   }
   if (item.pauseRequested) {
-    item.status = 'paused'
+    setItemStatus(item, 'paused')
     return
   }
   if (failure) throw failure
@@ -866,7 +1072,7 @@ async function processItem(item: Item) {
   const generation = item.generation
   if (!isCurrent(item, generation)) return
   if (item.pauseRequested) {
-    item.status = 'paused'
+    setItemStatus(item, 'paused')
     return
   }
   if (
@@ -877,17 +1083,17 @@ async function processItem(item: Item) {
     return
   }
   if (!item.file) {
-    item.status = 'needs_file'
+    setItemStatus(item, 'needs_file')
     return
   }
   const target = item.session ? item.dir : await ensureDir(item)
   if (!isCurrent(item, generation) || item.pauseRequested) {
-    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
     return
   }
 
   if (!item.session) {
-    item.status = 'hashing'
+    setItemStatus(item, 'hashing')
     const thumbnailPromise =
       item.thumbnail === undefined ? createVideoThumbnail(item.file) : Promise.resolve(item.thumbnail)
     item.sha256 = await sha256File(
@@ -897,18 +1103,18 @@ async function processItem(item: Item) {
     )
     item.thumbnail = await thumbnailPromise
     if (!isCurrent(item, generation) || item.pauseRequested) {
-      if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+      if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
       return
     }
 
     try {
       const instant = await api.instant(target, item.name, item.sha256, item.size)
       if (!isCurrent(item, generation) || item.pauseRequested) {
-        if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+        if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
         return
       }
       if (instant.data.linked) {
-        item.status = 'instant'
+        setItemStatus(item, 'instant')
         item.pct = 100
         emit('uploaded')
         return
@@ -917,7 +1123,7 @@ async function processItem(item: Item) {
       // 秒传探测失败时继续创建普通上传会话。
     }
     if (!isCurrent(item, generation) || item.pauseRequested) {
-      if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+      if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
       return
     }
 
@@ -928,12 +1134,12 @@ async function processItem(item: Item) {
     item.pct = sessionPct(item.session)
     if (!isCurrent(item, generation) || item.pauseRequested) {
       if (item.cancelled) await api.uploads.cancel(item.session.id).catch(() => {})
-      else if (isCurrent(item, generation)) item.status = 'paused'
+      else if (isCurrent(item, generation)) setItemStatus(item, 'paused')
       return
     }
   }
   if (!isCurrent(item, generation) || item.pauseRequested) {
-    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
     return
   }
   if (item.thumbnail && item.session && !item.session.uploaded_parts.includes(0)) {
@@ -942,7 +1148,7 @@ async function processItem(item: Item) {
     })
   }
   if (!isCurrent(item, generation) || item.pauseRequested) {
-    if (isCurrent(item, generation) && item.pauseRequested) item.status = 'paused'
+    if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
     return
   }
   await uploadMissingParts(item, generation)
@@ -951,20 +1157,24 @@ async function processItem(item: Item) {
 async function pump() {
   if (busy) return
   busy = true
-  while (queue.length > 0) {
-    const itemId = queue.shift()!
-    const item = items.value.find((candidate) => candidate.id === itemId)
+  while (queueHead < queue.length) {
+    const itemId = queue[queueHead++]!
+    if (!queuedIds.delete(itemId)) continue
+    const item = itemById.get(itemId)
     if (!item || item.cancelled) continue
+    promoteDisplayed(item)
     const generation = item.generation
     try {
       await processItem(item)
     } catch (error) {
       if (isCurrent(item, generation) && !item.pauseRequested) {
-        item.status = 'error'
+        setItemStatus(item, 'error')
         item.error = errMsg(error)
       }
     }
   }
+  queue.length = 0
+  queueHead = 0
   busy = false
 }
 
@@ -981,12 +1191,12 @@ function chooseFile(item: Item) {
 async function attachFile(item: Item, file: File) {
   if (!item.session) return
   if (file.size !== item.session.size) {
-    item.status = 'needs_file'
+    setItemStatus(item, 'needs_file')
     item.error = `文件大小不一致，应为 ${item.session.size} 字节`
     return
   }
   item.file = file
-  item.status = 'hashing'
+  setItemStatus(item, 'hashing')
   item.error = undefined
   item.generation += 1
   const generation = item.generation
@@ -1002,7 +1212,7 @@ async function attachFile(item: Item, file: File) {
       if (item.cancelled) return
       if (item.pauseRequested) {
         item.file = undefined
-        item.status = 'needs_file'
+        setItemStatus(item, 'needs_file')
         item.error = '校验已暂停，请重新选择原文件继续'
       }
       return
@@ -1010,13 +1220,13 @@ async function attachFile(item: Item, file: File) {
     if (item.pauseRequested) {
       // 旧会话自带 sha256；校验尚未完成时不能把未验证的文件交给续传流程。
       item.file = undefined
-      item.status = 'needs_file'
+      setItemStatus(item, 'needs_file')
       item.error = '校验已暂停，请重新选择原文件继续'
       return
     }
     if (digest !== item.session.sha256) {
       item.file = undefined
-      item.status = 'needs_file'
+      setItemStatus(item, 'needs_file')
       item.pct = sessionPct(item.session)
       item.error = '所选文件内容与原任务不一致，请选择原文件'
       return
@@ -1025,7 +1235,7 @@ async function attachFile(item: Item, file: File) {
     item.thumbnail = await createVideoThumbnail(file)
     if (!isCurrent(item, generation)) return
     if (item.pauseRequested) {
-      item.status = 'paused'
+      setItemStatus(item, 'paused')
       return
     }
     resume(item)
@@ -1033,12 +1243,12 @@ async function attachFile(item: Item, file: File) {
     if (item.cancelled) return
     if (item.pauseRequested || item.generation !== generation) {
       item.file = undefined
-      item.status = 'needs_file'
+      setItemStatus(item, 'needs_file')
       item.error = '校验已暂停，请重新选择原文件继续'
       return
     }
     item.file = undefined
-    item.status = 'needs_file'
+    setItemStatus(item, 'needs_file')
     item.error = errMsg(error)
   }
 }
@@ -1048,6 +1258,7 @@ onMounted(async () => {
     const response = await api.uploads.list()
     defaultConcurrency = response.data.concurrency
     if (response.data.sessions.length) {
+      const restored: Item[] = []
       for (const session of response.data.sessions) {
         const item = fromSession(session, response.data.concurrency)
         if (session.uploaded_parts.length === session.part_count) {
@@ -1055,9 +1266,10 @@ onMounted(async () => {
           item.error = undefined
           item.pauseRequested = false
         }
-        items.value.push(item)
-        if (item.status === 'waiting') schedule(item)
+        restored.push(item)
       }
+      const registered = registerItems(restored, false)
+      scheduleMany(registered.filter((item) => item.status === 'waiting'))
       visible.value = true
     }
   } catch {
@@ -1070,6 +1282,10 @@ onBeforeUnmount(() => {
     item.pauseRequested = true
     for (const controller of item.controllers) controller.abort()
   }
+  for (const id of [...pendingHashes.keys()]) {
+    finishHash(id, { error: new Error('页面已关闭') })
+  }
+  hashWorker.terminate()
 })
 
 defineExpose({ enqueue, open })
@@ -1160,6 +1376,15 @@ defineExpose({ enqueue, open })
   color: var(--text-soft);
   text-align: center;
   margin-top: 32px;
+}
+.window-hint {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--el-color-info-light-9);
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 /* ---- 任务卡片 ---- */

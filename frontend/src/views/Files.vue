@@ -497,7 +497,7 @@
       @close="viewerShow = false"
     />
 
-    <UploadDrawer ref="drawer" @uploaded="refresh" />
+    <UploadDrawer ref="drawer" @uploaded="scheduleUploadRefresh" />
     <PreviewDialog ref="preview" />
     <DirPicker ref="dirPicker" />
     <ShareDialog ref="shareDlg" />
@@ -1501,17 +1501,31 @@ function onPick(ev: globalThis.Event) {
   }
 }
 
-function onDirPick(ev: globalThis.Event) {
+async function onDirPick(ev: globalThis.Event) {
   const input = ev.target as HTMLInputElement
-  const files = Array.from(input.files ?? [])
-  if (files.length) {
-    const ups: UploadFile[] = files.map((f) => {
+  const files = input.files
+  if (files?.length) {
+    const ups: UploadFile[] = []
+    for (let index = 0; index < files.length; index += 1) {
+      const f = files[index]!
       const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? ''
-      return { file: f, rel: rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '' }
-    })
-    drawer.value?.enqueue(cur.value, ups)
+      ups.push({ file: f, rel: rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '' })
+      if (index > 0 && index % 500 === 0) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      }
+    }
+    void drawer.value?.enqueue(cur.value, ups)
     input.value = ''
   }
+}
+
+let uploadRefreshTimer: number | undefined
+function scheduleUploadRefresh() {
+  if (uploadRefreshTimer !== undefined) window.clearTimeout(uploadRefreshTimer)
+  uploadRefreshTimer = window.setTimeout(() => {
+    uploadRefreshTimer = undefined
+    void refresh()
+  }, 1000)
 }
 
 async function walkEntry(entry: FileSystemEntry, rel: string, out: UploadFile[]) {
@@ -1578,7 +1592,10 @@ function onPaste(e: ClipboardEvent) {
   drawer.value?.enqueue(cur.value, ups)
 }
 onMounted(() => document.addEventListener('paste', onPaste))
-onUnmounted(() => document.removeEventListener('paste', onPaste))
+onUnmounted(() => {
+  document.removeEventListener('paste', onPaste)
+  if (uploadRefreshTimer !== undefined) window.clearTimeout(uploadRefreshTimer)
+})
 
 async function logout() {
   await api.logout().catch(() => {})

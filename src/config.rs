@@ -10,8 +10,9 @@ pub const OFFICIAL_CHUNK_MAX: u64 = 19_500_000;
 pub const OFFICIAL_CHUNK_DEFAULT: u64 = 18 * 1024 * 1024;
 /// 自建端点单文件上限 2000MB,留 100MB 余量
 pub const SELF_HOSTED_CHUNK_MAX: u64 = 1_900 * 1024 * 1024;
-/// 自建端点默认分块直接取上限
-pub const LOCAL_CHUNK_DEFAULT: u64 = SELF_HOSTED_CHUNK_MAX;
+/// 自建端点默认使用 256MiB。接近 2GiB 的单次 multipart 请求可能持续数分钟，
+/// 并发时更容易因连接中断进入“结果不确定”状态，导致整个大分块无法安全重试。
+pub const LOCAL_CHUNK_DEFAULT: u64 = 256 * 1024 * 1024;
 pub const MIN_CHUNK: u64 = 1024 * 1024;
 pub const DEFAULT_LOCAL_DATA_ROOT: &str = "/var/lib/telegram-bot-api";
 

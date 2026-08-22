@@ -1,7 +1,8 @@
 //! REST API:认证 + 文件操作端点,供 Vue 前端调用
 
 use crate::auth::{Auth, LoginReq};
-use crate::db::{Node, SearchFilter, SearchSort, UploadSessionInfo};
+use crate::db::{BackendLogFilter, Node, SearchFilter, SearchSort, UploadSessionInfo};
+use crate::engine::upload::QueueTrigger;
 use crate::error::{AppError, AppResult};
 use crate::settings::{self, ApplyOutcome, ConfigPatch, Runtime};
 use crate::vfs::Vfs;
@@ -119,6 +120,11 @@ pub fn router(state: AppState) -> Router {
         // 保留旧地址，升级前已打开的管理端仍可触发新版多渠道备份。
         .route("/admin/backup-to-channel", post(admin_backup_now))
         .route("/admin/extras", get(extras_get).post(extras_set))
+        .route("/admin/queues/delete/run", post(admin_run_delete_queue))
+        .route(
+            "/admin/queues/delete",
+            axum::routing::delete(admin_clear_delete_queue),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -538,7 +544,10 @@ async fn upload_cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let freed = state.vfs.db.cancel_upload_session(&id).await?;
+    state.vfs.uploader.begin_cancel_resumable_session(&id).await;
+    let cancelled = state.vfs.db.cancel_upload_session(&id).await;
+    state.vfs.uploader.finish_cancel_resumable_session(&id);
+    let freed = cancelled?;
     state.vfs.uploader.delete_messages_best_effort(freed);
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1073,8 +1082,8 @@ fn db_file_size(path: &str) -> u64 {
 
 async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let (files, dirs, total) = state.vfs.db.stats().await?;
-    let pending_deletes = state.vfs.db.pending_delete_count().await?;
-    let pending_caption_syncs = state.vfs.db.pending_caption_sync_count().await?;
+    let delete_queue = state.vfs.db.delete_queue_overview().await?;
+    let extras = crate::extras::load(&state.vfs.db).await?;
     let inbox_failures = state
         .vfs
         .db
@@ -1083,9 +1092,15 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         .len();
     let c = state.rt.current();
     let db_path = state.rt.env.db_path.clone();
+    // getMe 只有 30 秒连接超时、没有整体超时：telegram-bot-api 不可达时，管理页每 5 秒
+    // 一次的轮询会整个卡住，连带队列计数和自动开关都读不出来。bot 名字只是展示用，
+    // 拿不到就先空着，下次轮询再说。
+    let bot = tokio::time::timeout(std::time::Duration::from_secs(3), state.rt.bot_name())
+        .await
+        .unwrap_or(None);
     Ok(Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "bot": state.rt.bot_name().await,
+        "bot": bot,
         "configured": c.is_configured(),
         "api_base": c.api_base,
         "official_api": c.is_official_api(),
@@ -1100,8 +1115,9 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "listen": state.rt.env.listen.to_string(),
         "started_at": state.rt.started_at,
         "now": crate::db::now_ts(),
-        "pending_deletes": pending_deletes,
-        "pending_caption_syncs": pending_caption_syncs,
+        "pending_deletes": delete_queue.pending,
+        "delete_queue": delete_queue,
+        "auto_delete_message": extras.auto_delete_message,
         "inbox_failures": inbox_failures,
         "tasks": state.tasks.snapshots(),
     })))
@@ -1113,19 +1129,32 @@ struct AdminLogsQuery {
     limit: Option<i64>,
     /// 上一页最后一条日志 id。
     before: Option<i64>,
+    /// 只看某个级别：debug | info | warn | error；其余取值当作不筛选。
+    level: Option<String>,
+    /// 只看某个类别，取值来自响应里的 `facets.categories`。
+    category: Option<String>,
+    /// 在类别与事件内容里做子串搜索。
+    q: Option<String>,
 }
 
 async fn admin_logs(
     State(state): State<AppState>,
     Query(query): Query<AdminLogsQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let filter = BackendLogFilter {
+        level: query.level,
+        category: query.category,
+        keyword: query.q,
+    };
     let (items, has_more) = state
         .vfs
         .db
-        .backend_logs(query.limit.unwrap_or(50), query.before)
+        .backend_logs(query.limit.unwrap_or(50), query.before, &filter)
         .await?;
+    // 切面按全库统计，筛选后为空时前端才能说清“是没有还是不在这一页”
+    let facets = state.vfs.db.backend_log_facets().await?;
     Ok(Json(
-        serde_json::json!({ "items": items, "has_more": has_more }),
+        serde_json::json!({ "items": items, "has_more": has_more, "facets": facets }),
     ))
 }
 
@@ -1823,7 +1852,69 @@ async fn extras_set(
         ));
     }
     crate::extras::save(&state.vfs.db, &p).await?;
+    // 队列开关要立刻推给已在跑的 uploader worker，不然得等下次重启才生效。
+    let saved = crate::extras::load(&state.vfs.db).await?;
+    state.rt.set_delete_queue_mode(saved.auto_delete_message);
+    if saved.auto_delete_message {
+        state.vfs.uploader.process_pending_deletes();
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 后台「立即执行」一次队列。单次上限 200 条，返回剩余量让前端提示可否再点。
+const MANUAL_QUEUE_BATCH: i64 = 200;
+
+async fn admin_run_delete_queue(
+    State(state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    let summary = state
+        .vfs
+        .uploader
+        .run_delete_batch(MANUAL_QUEUE_BATCH, QueueTrigger::Manual)
+        .await?;
+    state
+        .vfs
+        .db
+        .append_backend_log(
+            if summary.failed + summary.discarded > 0 {
+                "warn"
+            } else {
+                "info"
+            },
+            "消息清理",
+            &format!(
+                "手动执行完成：成功 {} 条，永久跳过 {} 条，失败 {} 条，剩余 {} 条{}",
+                summary.completed,
+                summary.discarded,
+                summary.failed,
+                summary.pending,
+                if summary.stopped_early {
+                    "（本轮超时收工，可再执行一次）"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .await
+        .ok();
+    Ok(Json(serde_json::json!(summary)))
+}
+
+async fn admin_clear_delete_queue(
+    State(state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    let cleared = state.vfs.db.clear_delete_jobs().await?;
+    state
+        .vfs
+        .db
+        .append_backend_log(
+            "warn",
+            "消息清理",
+            &format!("后台手动清空消息清理队列，丢弃 {cleared} 条任务；对应消息会留在频道里"),
+        )
+        .await
+        .ok();
+    Ok(Json(serde_json::json!({ "cleared": cleared })))
 }
 
 #[cfg(test)]

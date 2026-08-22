@@ -62,7 +62,6 @@ struct Msg {
     message_id: i64,
     chat: Chat,
     from: Option<User>,
-    caption: Option<String>,
     document: Option<FileRef>,
     video: Option<FileRef>,
     audio: Option<FileRef>,
@@ -297,7 +296,7 @@ async fn handle_update(
 ) -> AppResult<()> {
     // 存储频道里的直发文件:零流量登记
     if let Some(post) = &up.channel_post {
-        if is_storage_chat(&cfg.chat_id, &post.chat) && !is_own_chunk(post) {
+        if is_storage_chat(&cfg.chat_id, &post.chat) {
             if let Some(file) = pick_file(post) {
                 let path = ingest(
                     vfs,
@@ -548,14 +547,6 @@ fn pick_file(m: &Msg) -> Option<PickedFile> {
         });
     }
     None
-}
-
-/// tgdrive 自己传的分块 caption 以 "tgdrive {" 开头;正常情况 getUpdates
-/// 收不到 bot 自己的消息,这里只是多一道保险
-fn is_own_chunk(m: &Msg) -> bool {
-    m.caption
-        .as_deref()
-        .is_some_and(|c| c.starts_with("tgdrive {"))
 }
 
 fn is_storage_chat(cfg_chat: &str, chat: &Chat) -> bool {
@@ -966,6 +957,7 @@ mod tests {
                 },
             ],
             shorts_dir: String::new(),
+            auto_delete_message: false,
         }
     }
 
@@ -999,7 +991,6 @@ mod tests {
                 last_name: None,
             },
             from: None,
-            caption: None,
             document: None,
             video: None,
             audio: None,

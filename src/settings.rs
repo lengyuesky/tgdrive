@@ -248,6 +248,11 @@ impl Runtime {
         self.current.read().unwrap().clone()
     }
 
+    /// 后台改消息清理的自动/手动开关后热更给 uploader worker,无需重启容器
+    pub fn set_delete_queue_mode(&self, auto_delete_message: bool) {
+        self.knobs.set_auto_delete_message(auto_delete_message);
+    }
+
     /// 每项的来源:db(后台改过)/ env(来自环境变量)/ default(内置默认)
     pub async fn sources(&self) -> AppResult<HashMap<String, &'static str>> {
         let db_vals = self.db.settings_with_prefix(P).await?;

@@ -18,18 +18,26 @@ services:
       # local 模式下直读 telegram-bot-api 的文件;官方 API 模式挂着也无害
       # 重要:挂载路径必须与 telegram-bot-api 容器内一致(getFile 返回绝对路径)
       - ./telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+      - ./bot-api-control:/bot-api-control
+    environment:
+      TGDRIVE_BOT_API_RESTART_FILE: /bot-api-control/restart
 
   # 自部署 Bot API 服务器,仅在启用 local-bot-api profile 时启动。
   # 需要在 .env 里配置 TELEGRAM_API_ID / TELEGRAM_API_HASH(https://my.telegram.org 申请);
   # 启动命令:docker compose --profile local-bot-api up -d
   telegram-bot-api:
     profiles: ["local-bot-api"]
-    image: aiogram/telegram-bot-api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.telegram-bot-api
+    image: tgdrive-telegram-bot-api:latest
     restart: unless-stopped
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       # local 模式:上传上限 2000MB,getFile 返回本地路径,tgdrive 经共享卷直读
       TELEGRAM_LOCAL: "1"
+      TGDRIVE_BOT_API_RESTART_FILE: /bot-api-control/restart
     volumes:
       - ./telegram-bot-api-data:/var/lib/telegram-bot-api
+      - ./bot-api-control:/bot-api-control

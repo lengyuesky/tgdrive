@@ -154,6 +154,8 @@ export interface Extras {
   inbox_rules: InboxRouteRule[]
   /** 短视频模式的取材目录(含子目录);空串表示整库。 */
   shorts_dir: string
+  /** 删除文件后自动清理 Telegram 消息;关掉则只入队,等后台手动执行 */
+  auto_delete_message: boolean
 }
 
 export type ExtrasPatch = Omit<Partial<Extras>, 'backup_chunk_size'> & {
@@ -243,9 +245,33 @@ export interface AdminStatus {
   started_at: number
   now: number
   pending_deletes: number
-  pending_caption_syncs: number
+  delete_queue: QueueOverview
+  auto_delete_message: boolean
   inbox_failures: number
   tasks: TaskStatus[]
+}
+
+/** 后台队列概况:待处理量与卡住的原因 */
+export interface QueueOverview {
+  pending: number
+  /** 已失败重试过的任务数 */
+  retrying: number
+  /** 重试次数最多那条试了几次 */
+  max_attempts: number
+  /** 重试次数最多那条的错误,通常就是卡住整个队列的根因 */
+  last_error: string | null
+}
+
+/** 手动执行一轮队列的结果 */
+export interface QueueRunSummary {
+  completed: number
+  failed: number
+  /** Telegram 已确认不可恢复，已退出队列的任务数 */
+  discarded: number
+  pending: number
+  last_error: string | null
+  /** 因超时提前收工;为真时再点一次可以接着处理 */
+  stopped_early: boolean
 }
 
 export interface TaskStatus {
@@ -271,6 +297,27 @@ export interface BackendLog {
   category: string
   message: string
   created_at: number
+}
+
+/** 日志切面:按全库(而非当前页)统计,用于筛选下拉与级别条数 */
+export interface BackendLogFacets {
+  categories: string[]
+  level_counts: Record<string, number>
+}
+
+export interface BackendLogPage {
+  items: BackendLog[]
+  has_more: boolean
+  facets: BackendLogFacets
+}
+
+/** 后台日志筛选;空串表示该维度不限制,发请求前会被剔除 */
+export interface BackendLogQuery {
+  limit?: number
+  before?: number
+  level?: string
+  category?: string
+  q?: string
 }
 
 /** 检测到的会话(最近向 bot 发过消息的频道/用户/群) */
@@ -468,8 +515,13 @@ export const api = {
     detectChats: (probe: { api_base?: string; bot_token?: string } = {}) =>
       http.post<{ bot: string; chats: DetectedChat[] }>('/admin/detect-chats', probe),
     status: () => http.get<AdminStatus>('/admin/status'),
-    logs: (params: { limit?: number; before?: number } = {}) =>
-      http.get<{ items: BackendLog[]; has_more: boolean }>('/admin/logs', { params }),
+    logs: (params: BackendLogQuery = {}) =>
+      http.get<BackendLogPage>('/admin/logs', {
+        // 空串会被后端当成有效筛选,这里先剔掉再发
+        params: Object.fromEntries(
+          Object.entries(params).filter(([, v]) => v !== '' && v !== undefined),
+        ),
+      }),
     inboxFailures: () =>
       http.get<{ items: InboxFailure[] }>('/admin/inbox-failures'),
     removeInboxFailure: (updateId: number) =>
@@ -477,6 +529,8 @@ export const api = {
     clearInboxFailures: () =>
       http.delete<{ cleared: number }>('/admin/inbox-failures'),
     cleanup: () => http.post<{ cleaned: number }>('/admin/cleanup'),
+    runDeleteQueue: () => http.post<QueueRunSummary>('/admin/queues/delete/run'),
+    clearDeleteQueue: () => http.delete<{ cleared: number }>('/admin/queues/delete'),
     logoutAll: () => http.post('/admin/logout-all'),
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
     backupUrl: '/api/admin/backup',

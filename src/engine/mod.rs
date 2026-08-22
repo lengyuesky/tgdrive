@@ -17,7 +17,7 @@ mod tests {
     use bytes::Bytes;
     use std::collections::HashMap;
     use std::io::Read as _;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -29,6 +29,8 @@ mod tests {
         fail_on_send: Option<i64>,
         /// 每次成功发送的 (文件名, 是否视频消息)
         sent: Mutex<Vec<(String, bool)>>,
+        /// 每次成功发送携带的 caption；普通文件上传必须始终为 None。
+        sent_captions: Mutex<Vec<Option<String>>>,
         /// 每次发送是否携带自定义缩略图。
         sent_thumbnail: Mutex<Vec<bool>>,
         /// 每次视频发送时带的元数据(宽高/时长)
@@ -37,6 +39,14 @@ mod tests {
         fail_video: AtomicBool,
         /// 注入结果不确定的视频发送错误，验证不会再次按文档发送
         uncertain_video: AtomicBool,
+        /// 注入 Telegram 对历史消息的永久删除拒绝。
+        fail_delete: AtomicBool,
+        /// 挂起 Telegram 发送，用于验证取消会真正终止在途任务。
+        block_send: AtomicBool,
+        send_started: AtomicBool,
+        send_release: tokio::sync::Notify,
+        /// 验证取消确实通知了 Bot API 监督器。
+        cancel_pending_calls: AtomicU64,
     }
 
     impl MockTg {
@@ -47,11 +57,24 @@ mod tests {
                 deleted: Mutex::new(Vec::new()),
                 fail_on_send,
                 sent: Mutex::new(Vec::new()),
+                sent_captions: Mutex::new(Vec::new()),
                 sent_thumbnail: Mutex::new(Vec::new()),
                 video_meta: Mutex::new(Vec::new()),
                 fail_video: AtomicBool::new(false),
                 uncertain_video: AtomicBool::new(false),
+                fail_delete: AtomicBool::new(false),
+                block_send: AtomicBool::new(false),
+                send_started: AtomicBool::new(false),
+                send_release: tokio::sync::Notify::new(),
+                cancel_pending_calls: AtomicU64::new(0),
             })
+        }
+
+        async fn wait_if_blocked(&self) {
+            if self.block_send.load(Ordering::SeqCst) {
+                self.send_started.store(true, Ordering::SeqCst);
+                self.send_release.notified().await;
+            }
         }
 
         fn store_body(
@@ -60,6 +83,7 @@ mod tests {
             body: &UploadBody,
             video: bool,
             thumbnail: Option<&Bytes>,
+            caption: Option<String>,
         ) -> AppResult<TgMessage> {
             let n = self.seq.fetch_add(1, Ordering::SeqCst);
             if self.fail_on_send == Some(n) {
@@ -87,6 +111,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((filename.to_string(), video));
+            self.sent_captions.lock().unwrap().push(caption);
             self.sent_thumbnail
                 .lock()
                 .unwrap()
@@ -104,11 +129,12 @@ mod tests {
         async fn send_document(
             &self,
             filename: &str,
-            _caption: Option<String>,
+            caption: Option<String>,
             thumbnail: Option<&Bytes>,
             body: &UploadBody,
         ) -> AppResult<TgMessage> {
-            self.store_body(filename, body, false, thumbnail)
+            self.wait_if_blocked().await;
+            self.store_body(filename, body, false, thumbnail, caption)
         }
 
         async fn send_video(
@@ -116,7 +142,7 @@ mod tests {
             filename: &str,
             _mime: &str,
             meta: Option<VideoMeta>,
-            _caption: Option<String>,
+            caption: Option<String>,
             thumbnail: Option<&Bytes>,
             body: &UploadBody,
         ) -> AppResult<TgMessage> {
@@ -126,16 +152,23 @@ mod tests {
             if self.uncertain_video.load(Ordering::SeqCst) {
                 return Err(AppError::TelegramUncertain("mock: 响应丢失".into()));
             }
+            self.wait_if_blocked().await;
             self.video_meta.lock().unwrap().push(meta);
-            self.store_body(filename, body, true, thumbnail)
+            self.store_body(filename, body, true, thumbnail, caption)
         }
 
         async fn delete_message(&self, message_id: i64) -> AppResult<()> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(AppError::Telegram(
+                    "[400] Bad Request: message can't be deleted".into(),
+                ));
+            }
             self.deleted.lock().unwrap().push(message_id);
             Ok(())
         }
 
-        async fn edit_message_caption(&self, _message_id: i64, _caption: &str) -> AppResult<()> {
+        async fn cancel_pending_uploads(&self) -> AppResult<()> {
+            self.cancel_pending_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -178,17 +211,16 @@ mod tests {
             .await
             .unwrap();
         let registry = Arc::new(TgRegistry::with_client(target.id, tg.clone()));
-        let up = Uploader::new(
-            registry,
-            db.clone(),
-            Arc::new(super::upload::UploadKnobs::new(
-                chunk_size,
-                dir.path().to_path_buf(),
-                1,    // 测试用串行,保证 seq 顺序确定
-                true, // 视频消息模式默认开,便于测视频路径;普通扩展名不受影响
-            )),
-            mem_limit,
-        );
+        let knobs = Arc::new(super::upload::UploadKnobs::new(
+            chunk_size,
+            dir.path().to_path_buf(),
+            1,    // 测试用串行,保证 seq 顺序确定
+            true, // 视频消息模式默认开,便于测视频路径;普通扩展名不受影响
+        ));
+        // 生产默认手动消费队列,但这里要验的是上传失败后的补偿删除本身,
+        // 所以显式打开自动模式,让 worker 真的跑起来。
+        knobs.set_auto_delete_message(true);
+        let up = Uploader::new(registry, db.clone(), knobs, mem_limit);
         (up, tg, db, dir)
     }
 
@@ -227,6 +259,7 @@ mod tests {
         let data: Vec<u8> = (0..10u8).collect();
         let node = feed_all(&up, "a.bin", &data, 3).await.unwrap();
         assert_eq!(node.size, 10);
+        assert_eq!(*_tg.sent_captions.lock().unwrap(), vec![None, None, None]);
 
         let chunks = db.chunks_of(node.id).await.unwrap();
         assert_eq!(
@@ -390,13 +423,255 @@ mod tests {
             .await
             .unwrap();
         h.feed(Bytes::from_static(&[1, 2, 3, 4, 5])).await.unwrap(); // 分块 0 已满并上传
-        let join = h.join;
-        drop(h.tx); // 模拟客户端断开:未发 Eof
-        let res = join.await.unwrap();
-        assert!(res.is_err());
+        for _ in 0..50 {
+            if !tg.sent.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(h); // 模拟客户端断开:未发 Eof
+        for _ in 0..50 {
+            if db.resolve(&["drop.bin"]).await.unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(db.resolve(&["drop.bin"]).await.unwrap().is_none());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(*tg.deleted.lock().unwrap(), vec![1000]);
+        assert_eq!(
+            tg.cancel_pending_calls.load(Ordering::SeqCst),
+            0,
+            "已经明确完成的 Telegram 请求不应触发 Bot API 重启"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_upload_stops_inflight_bot_api_send() {
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        tg.block_send.store(true, Ordering::SeqCst);
+        let handle = up
+            .start(ROOT_ID, "cancel-stream.bin", "/cancel-stream.bin", None)
+            .await
+            .unwrap();
+        handle
+            .feed(Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if tg.send_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(tg.send_started.load(Ordering::SeqCst));
+
+        drop(handle);
+        for _ in 0..100 {
+            if tg.cancel_pending_calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 1);
+        assert!(db.resolve(&["cancel-stream.bin"]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_bot_api_request_does_not_restart_it() {
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        let target = db.storage_targets().await.unwrap()[0].id;
+        let session = db
+            .create_upload_session(
+                ROOT_ID,
+                "cancel-early.bin",
+                "/cancel-early.bin",
+                4,
+                &"00".repeat(32),
+                4,
+                target,
+            )
+            .await
+            .unwrap();
+        let ResumablePartStart::Upload(handle) = up
+            .start_resumable_part(&session.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("分块不应提前完成");
+        };
+
+        drop(handle);
+        up.begin_cancel_resumable_session(&session.session.id).await;
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 0);
+        db.cancel_upload_session(&session.session.id).await.unwrap();
+        up.finish_cancel_resumable_session(&session.session.id);
+    }
+
+    #[tokio::test]
+    async fn dropping_part_request_stops_inflight_telegram_send() {
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        let target = db.storage_targets().await.unwrap()[0].id;
+        let session = db
+            .create_upload_session(
+                ROOT_ID,
+                "cancel.bin",
+                "/cancel.bin",
+                4,
+                &"00".repeat(32),
+                4,
+                target,
+            )
+            .await
+            .unwrap();
+        tg.block_send.store(true, Ordering::SeqCst);
+
+        let ResumablePartStart::Upload(handle) = up
+            .start_resumable_part(&session.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("分块不应提前完成");
+        };
+        handle
+            .feed(Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
+        let request = tokio::spawn(handle.finish());
+        for _ in 0..100 {
+            if tg.send_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(tg.send_started.load(Ordering::SeqCst));
+
+        // 模拟浏览器 AbortController 中止 PUT：处理请求的 future 被丢弃。
+        request.abort();
+        let _ = request.await;
+        let mut claim_released = false;
+        for _ in 0..100 {
+            let retry = up.start_resumable_part(&session.session.id, 0).await;
+            if let Ok(ResumablePartStart::Upload(retry_handle)) = retry {
+                drop(retry_handle);
+                claim_released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(claim_released, "取消后应及时释放分块占用");
+        assert!(tg.sent.lock().unwrap().is_empty());
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 1);
+        up.begin_cancel_resumable_session(&session.session.id).await;
+        db.cancel_upload_session(&session.session.id).await.unwrap();
+        up.finish_cancel_resumable_session(&session.session.id);
+    }
+
+    #[tokio::test]
+    async fn cancelling_session_stops_all_inflight_parts() {
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        let target = db.storage_targets().await.unwrap()[0].id;
+        let session = db
+            .create_upload_session(
+                ROOT_ID,
+                "cancel-all.bin",
+                "/cancel-all.bin",
+                4,
+                &"00".repeat(32),
+                4,
+                target,
+            )
+            .await
+            .unwrap();
+        tg.block_send.store(true, Ordering::SeqCst);
+
+        let ResumablePartStart::Upload(handle) = up
+            .start_resumable_part(&session.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("分块不应提前完成");
+        };
+        handle
+            .feed(Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
+        let request = tokio::spawn(handle.finish());
+        for _ in 0..100 {
+            if tg.send_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(tg.send_started.load(Ordering::SeqCst));
+
+        up.begin_cancel_resumable_session(&session.session.id).await;
+        assert!(request.await.unwrap().is_err());
+        assert!(tg.sent.lock().unwrap().is_empty());
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 1);
+        db.cancel_upload_session(&session.session.id).await.unwrap();
+        up.finish_cancel_resumable_session(&session.session.id);
+    }
+
+    #[tokio::test]
+    async fn manual_mode_holds_the_delete_queue_until_asked() {
+        use super::upload::QueueTrigger;
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        up.knobs.set_auto_delete_message(false);
+
+        let node = feed_all(&up, "m.bin", &[1, 2, 3, 4, 5], 5).await.unwrap();
+        db.delete_node(node.id).await.unwrap();
+
+        // 手动模式下 worker 不许动队列:任务照常积压,消息还留在频道里
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            tg.deleted.lock().unwrap().is_empty(),
+            "手动模式不应自动删除消息"
+        );
+        assert!(db.pending_delete_count().await.unwrap() > 0);
+
+        // 后台点「立即执行」才真正消费
+        let summary = up
+            .run_delete_batch(200, QueueTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(summary.completed > 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.pending, 0);
+        assert!(!tg.deleted.lock().unwrap().is_empty());
+        assert_eq!(db.pending_delete_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn manual_run_ignores_retry_backoff() {
+        use super::upload::QueueTrigger;
+        let (up, _tg, db, _g) = fixture(4, 1024, None).await;
+        up.knobs.set_auto_delete_message(false);
+
+        let node = feed_all(&up, "b.bin", &[1, 2, 3, 4, 5], 5).await.unwrap();
+        db.delete_node(node.id).await.unwrap();
+
+        // 模拟整队都已失败重试过多次:退避被推到一小时以后
+        let jobs = db.delete_jobs_due(10, false).await.unwrap();
+        assert!(!jobs.is_empty());
+        let queued = jobs.len();
+        for job in jobs {
+            db.delete_job_failed(job.id, 10, "message can't be deleted")
+                .await
+                .unwrap();
+        }
+        assert!(
+            db.delete_jobs_due(10, false).await.unwrap().is_empty(),
+            "退避未到期时不该取出任务"
+        );
+
+        // 手动执行必须绕开退避,否则后台点了像没反应
+        let summary = up
+            .run_delete_batch(200, QueueTrigger::Manual)
+            .await
+            .unwrap();
+        assert_eq!(summary.completed, queued);
+        assert_eq!(summary.pending, 0);
     }
 
     #[test]
@@ -423,6 +698,7 @@ mod tests {
             *tg.sent.lock().unwrap(),
             vec![("movie.mp4".to_string(), true)]
         );
+        assert_eq!(*tg.sent_captions.lock().unwrap(), vec![None]);
 
         // 读回的字节与上传一致
         let chunks = db.chunks_of(node.id).await.unwrap();
@@ -534,6 +810,7 @@ mod tests {
         tg.uncertain_video.store(true, Ordering::SeqCst);
         let err = feed_all(&up, "movie.mp4", &[9, 8, 7], 3).await.unwrap_err();
         assert!(matches!(err, AppError::TelegramUncertain(_)));
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 1);
         assert!(
             tg.sent.lock().unwrap().is_empty(),
             "结果不确定时不得再按文档发送"

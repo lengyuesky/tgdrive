@@ -97,6 +97,14 @@ async fn serve() -> anyhow::Result<()> {
     ));
     let uploader = Uploader::new(tg.clone(), db.clone(), knobs.clone(), MEMORY_CHUNK_LIMIT);
 
+    // Telegram 消息清理队列的自动/手动开关存在 extras 里，worker 起来之前先同步给 knobs。
+    match crate::extras::load(&db).await {
+        Ok(ex) => {
+            knobs.set_auto_delete_message(ex.auto_delete_message);
+        }
+        Err(error) => tracing::warn!("读取后台队列开关失败，按手动模式启动: {error}"),
+    }
+
     // 进程退出会让在途分块声明失效；已完成分块仍由可恢复会话保留。
     db.reset_upload_part_claims().await?;
     // 旧上传管线的崩溃残留仍需回滚；带 upload_sessions 的节点不能删除。
@@ -110,7 +118,6 @@ async fn serve() -> anyhow::Result<()> {
         tracing::warn!("存在尚未关联存储目标的旧分块，已暂缓清理未完成上传");
     }
     uploader.process_pending_deletes();
-    uploader.process_pending_caption_syncs();
 
     let vfs = Vfs {
         db: db.clone(),
@@ -149,13 +156,8 @@ async fn serve() -> anyhow::Result<()> {
         attempts: crate::security::AttemptLimiter::default(),
         tasks: tasks.clone(),
     };
-    let pending_caption_syncs = db.pending_caption_sync_count().await.unwrap_or(0);
     if let Err(error) = db
-        .append_backend_log(
-            "info",
-            "系统",
-            &format!("tgdrive 服务已启动；待同步路径 {pending_caption_syncs} 条"),
-        )
+        .append_backend_log("info", "系统", "tgdrive 服务已启动")
         .await
     {
         tracing::warn!("记录启动日志失败: {error}");

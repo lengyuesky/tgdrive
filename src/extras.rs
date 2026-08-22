@@ -70,6 +70,8 @@ pub struct Extras {
     pub inbox_rules: Vec<InboxRouteRule>,
     /// 短视频模式的取材目录（含子目录）；空串表示整库。
     pub shorts_dir: String,
+    /// 删除文件后自动清理 Telegram 频道里的对应消息；关闭时改由后台手动执行。
+    pub auto_delete_message: bool,
 }
 
 fn serialize_backup_secret<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
@@ -168,6 +170,8 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
         inbox_dir,
         inbox_rules,
         shorts_dir: get(db, "shorts_dir").await?.unwrap_or_default(),
+        // 消息清理队列默认手动，避免 Telegram 永久性错误持续刷屏。
+        auto_delete_message: get(db, "auto_delete_message").await?.as_deref() == Some("1"),
     })
 }
 
@@ -199,6 +203,7 @@ pub struct ExtrasPatch {
     pub inbox_book_dir: Option<String>,
     pub inbox_rules: Option<Vec<InboxRouteRule>>,
     pub shorts_dir: Option<String>,
+    pub auto_delete_message: Option<bool>,
 }
 
 fn normalize_http_url(raw: &str, label: &str) -> AppResult<String> {
@@ -644,6 +649,9 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     }
     if let Some(v) = shorts_dir {
         set(db, "shorts_dir", &v).await?;
+    }
+    if let Some(v) = p.auto_delete_message {
+        set(db, "auto_delete_message", if v { "1" } else { "0" }).await?;
     }
     Ok(())
 }

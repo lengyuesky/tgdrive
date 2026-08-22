@@ -147,8 +147,11 @@ pub trait TgApi: Send + Sync + 'static {
         self.send_document(filename, caption, thumbnail, body).await
     }
     async fn delete_message(&self, message_id: i64) -> AppResult<()>;
-    /// 更新媒体消息 caption；Telegram 不支持原地修改文档附件名。
-    async fn edit_message_caption(&self, message_id: i64, caption: &str) -> AppResult<()>;
+    /// 终止已经交给自建 Bot API、但尚未完成的上传。
+    /// 官方 Bot API 和测试实现没有进程控制能力，默认无需处理。
+    async fn cancel_pending_uploads(&self) -> AppResult<()> {
+        Ok(())
+    }
     async fn get_me(&self) -> AppResult<String>;
     /// 打开某个分块的字节流，从块内 offset 开始读。
     /// message_id 用于定位日志/后续刷新引用，chunk_size 用于严格限制读取边界。
@@ -399,10 +402,6 @@ impl TgApi for UnconfiguredTg {
         Self::err()
     }
 
-    async fn edit_message_caption(&self, _message_id: i64, _caption: &str) -> AppResult<()> {
-        Self::err()
-    }
-
     async fn get_me(&self) -> AppResult<String> {
         Self::err()
     }
@@ -428,6 +427,8 @@ pub struct TgClient {
     /// 有界 LRU：file_id → file_path。
     path_cache: Mutex<FilePathCache>,
     local_data_root: std::path::PathBuf,
+    /// 自建 Bot API 监督器的重启信号文件；官方端点不启用。
+    bot_api_restart_file: Option<std::path::PathBuf>,
     mtproto: Option<Arc<MtprotoClient>>,
 }
 
@@ -505,6 +506,7 @@ impl TgClient {
         chat_id: &str,
         mtproto: Option<Arc<MtprotoClient>>,
     ) -> anyhow::Result<Self> {
+        let api_base = api_base.trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(60))
@@ -512,7 +514,13 @@ impl TgClient {
             .build()?;
         Ok(TgClient {
             http,
-            api_base: api_base.trim_end_matches('/').to_string(),
+            bot_api_restart_file: (!crate::config::is_official(&api_base))
+                .then(|| std::env::var("TGDRIVE_BOT_API_RESTART_FILE").ok())
+                .flatten()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(Into::into),
+            api_base,
             token: token.to_string(),
             chat_id: chat_id.to_string(),
             path_cache: Mutex::new(FilePathCache::default()),
@@ -955,25 +963,24 @@ impl TgApi for TgClient {
         }
     }
 
-    async fn edit_message_caption(&self, message_id: i64, caption: &str) -> AppResult<()> {
-        let url = self.method_url("editMessageCaption");
-        let result: AppResult<serde_json::Value> = self
-            .call_with_retry("editMessageCaption", || {
-                self.http
-                    .post(&url)
-                    .json(&serde_json::json!({
-                        "chat_id": self.chat_id,
-                        "message_id": message_id,
-                        "caption": caption,
-                    }))
-                    .send()
-            })
-            .await;
-        match result {
-            Ok(_) => Ok(()),
-            // 重试或重复入队时 caption 可能已经是目标值，视为幂等成功。
-            Err(AppError::Telegram(detail)) if detail.contains("message is not modified") => Ok(()),
-            Err(error) => Err(error),
+    async fn cancel_pending_uploads(&self) -> AppResult<()> {
+        let Some(path) = &self.bot_api_restart_file else {
+            return Ok(());
+        };
+
+        tokio::fs::write(path, crate::db::now_ts().to_string()).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::fs::metadata(path).await {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    return Err(AppError::Telegram(
+                        "Bot API 未在 10 秒内确认终止上传".into(),
+                    ));
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
         }
     }
 

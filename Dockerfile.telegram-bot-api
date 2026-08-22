@@ -1,0 +1,6 @@
+FROM aiogram/telegram-bot-api:latest
+
+COPY docker/telegram-bot-api-supervisor.sh /usr/local/bin/tgdrive-bot-api-supervisor
+RUN chmod 0755 /usr/local/bin/tgdrive-bot-api-supervisor
+
+ENTRYPOINT ["/usr/local/bin/tgdrive-bot-api-supervisor"]

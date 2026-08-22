@@ -7,9 +7,11 @@ use crate::db::{Db, Node, StoredMessage, UploadPartClaim, UploadSessionInfo};
 use crate::error::{AppError, AppResult};
 use crate::telegram::{TgApi, TgBinding, TgMessage, TgRegistry, UploadBody};
 use bytes::{Bytes, BytesMut};
+use futures_util::future::{AbortHandle, Abortable};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -38,17 +40,6 @@ pub fn video_mime(filename: &str) -> Option<&'static str> {
     }
 }
 
-/// Telegram caption 中保存可人工恢复的当前路径、分块序号与节点号。
-pub(crate) fn storage_caption(display_path: &str, idx: i64, node_id: i64) -> String {
-    let cap_path: String = display_path.chars().take(700).collect();
-    format!(
-        "tgdrive {{\"p\":\"{}\",\"i\":{},\"u\":{}}}",
-        cap_path.replace('"', "'"),
-        idx,
-        node_id
-    )
-}
-
 /// 后台日志不能影响实际任务；数据库暂时不可写时保留 tracing 诊断即可。
 async fn record_backend_log(db: &Db, level: &str, category: &str, message: &str) {
     if let Err(error) = db.append_backend_log(level, category, message).await {
@@ -59,12 +50,15 @@ async fn record_backend_log(db: &Db, level: &str, category: &str, message: &str)
 async fn send_body_to_telegram(
     tg: Arc<dyn TgApi>,
     filename: &str,
-    caption: String,
     mime: Option<&str>,
     thumbnail: Option<&Bytes>,
     body: &UploadBody,
+    upstream_pending: &AtomicU64,
 ) -> AppResult<TgMessage> {
-    match mime {
+    // 只有请求确定返回后才清零。future 被取消或结果不确定时保持非零，
+    // 外层据此重启自建 Bot API，终止它已经接手的 TDLib 上传。
+    upstream_pending.fetch_add(1, Ordering::AcqRel);
+    let result = match mime {
         Some(mime) => {
             // 从文件头解析宽高/时长；解析不了就让 Telegram 使用默认显示比例。
             let meta = crate::engine::probe::probe_body(mime, body);
@@ -72,34 +66,49 @@ async fn send_body_to_telegram(
                 tracing::debug!("{filename} 未解析出视频宽高，按无元数据发送");
             }
             match tg
-                .send_video(filename, mime, meta, Some(caption.clone()), thumbnail, body)
+                .send_video(filename, mime, meta, None, thumbnail, body)
                 .await
             {
                 Ok(message) => Ok(message),
                 // 只有 Telegram 明确拒绝格式时才安全降级；不确定结果不能重复发送。
                 Err(AppError::TelegramRejected(detail)) => {
                     tracing::warn!("{filename} 以视频消息发送失败({detail})，回退为文档");
-                    tg.send_document(filename, Some(caption), thumbnail, body)
-                        .await
+                    tg.send_document(filename, None, thumbnail, body).await
                 }
                 Err(error) => Err(error),
             }
         }
-        None => {
-            tg.send_document(filename, Some(caption), thumbnail, body)
-                .await
-        }
+        None => tg.send_document(filename, None, thumbnail, body).await,
+    };
+    if !matches!(&result, Err(AppError::TelegramUncertain(_))) {
+        upstream_pending.fetch_sub(1, Ordering::AcqRel);
+    }
+    result
+}
+
+async fn stop_detached_bot_api_upload(
+    api: &Arc<dyn TgApi>,
+    upstream_pending: &AtomicU64,
+    label: &str,
+) {
+    if upstream_pending.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if let Err(error) = api.cancel_pending_uploads().await {
+        tracing::error!("终止 Bot API 在途上传失败（{label}）: {error}");
     }
 }
 
 pub struct UploadHandle {
-    pub tx: mpsc::Sender<UploadMsg>,
-    pub join: tokio::task::JoinHandle<AppResult<Node>>,
+    tx: mpsc::Sender<UploadMsg>,
+    join: tokio::task::JoinHandle<AppResult<Node>>,
+    cancel: AbortHandle,
 }
 
 pub struct ResumablePartHandle {
-    pub tx: mpsc::Sender<UploadMsg>,
-    pub join: tokio::task::JoinHandle<AppResult<()>>,
+    tx: mpsc::Sender<UploadMsg>,
+    join: tokio::task::JoinHandle<AppResult<()>>,
+    cancel: AbortHandle,
 }
 
 impl ResumablePartHandle {
@@ -110,11 +119,18 @@ impl ResumablePartHandle {
             .map_err(|_| AppError::Internal(anyhow::anyhow!("分块上传管线已终止")))
     }
 
-    pub async fn finish(self) -> AppResult<()> {
+    pub async fn finish(mut self) -> AppResult<()> {
         let _ = self.tx.send(UploadMsg::Eof).await;
-        self.join
+        (&mut self.join)
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("分块上传任务崩溃: {e}")))?
+    }
+}
+
+impl Drop for ResumablePartHandle {
+    fn drop(&mut self) {
+        // JoinHandle 被丢弃只会让任务脱离等待，不会停止它；必须显式取消。
+        self.cancel.abort();
     }
 }
 
@@ -132,11 +148,17 @@ impl UploadHandle {
     }
 
     /// 宣告输入结束并等待管线收尾,返回最终节点
-    pub async fn finish(self) -> AppResult<Node> {
+    pub async fn finish(mut self) -> AppResult<Node> {
         let _ = self.tx.send(UploadMsg::Eof).await;
-        self.join
+        (&mut self.join)
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("上传任务崩溃: {e}")))?
+    }
+}
+
+impl Drop for UploadHandle {
+    fn drop(&mut self) {
+        self.cancel.abort();
     }
 }
 
@@ -149,6 +171,8 @@ pub struct UploadKnobs {
     semaphore: RwLock<Arc<Semaphore>>,
     /// 单块以内的视频改用 sendVideo 发送(Telegram 里可直接播放)
     send_video: AtomicBool,
+    /// 关掉后 Telegram 消息清理只入队不自动消费,等后台手动执行
+    auto_delete_message: AtomicBool,
 }
 
 impl UploadKnobs {
@@ -158,7 +182,17 @@ impl UploadKnobs {
             tmp_dir: RwLock::new(tmp_dir),
             semaphore: RwLock::new(Arc::new(Semaphore::new(concurrency))),
             send_video: AtomicBool::new(send_video),
+            // 默认手动：消息清理任务照常入队，由管理员决定何时执行。
+            auto_delete_message: AtomicBool::new(false),
         }
+    }
+
+    pub fn auto_delete_message(&self) -> bool {
+        self.auto_delete_message.load(Ordering::Relaxed)
+    }
+
+    pub fn set_auto_delete_message(&self, v: bool) {
+        self.auto_delete_message.store(v, Ordering::Relaxed);
     }
 
     pub fn chunk_size(&self) -> u64 {
@@ -195,6 +229,107 @@ impl UploadKnobs {
     }
 }
 
+/// 这一轮队列处理是谁触发的。手动触发要绕开指数退避——重试过十几次的任务
+/// 退避已经拉到一小时，不绕开的话后台点「立即执行」会像没反应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueTrigger {
+    Auto,
+    Manual,
+}
+
+impl QueueTrigger {
+    fn ignores_backoff(self) -> bool {
+        self == QueueTrigger::Manual
+    }
+
+    /// 手动执行时有人在网页那头等着，给一轮设个时间上限：Telegram 慢或不可达时
+    /// 200 条挨个超时能拖上好几分钟。到点收工，剩余量交给用户再点一次。
+    /// 自动 worker 在后台跑，没人等，不设限。
+    fn budget(self) -> Option<std::time::Duration> {
+        match self {
+            QueueTrigger::Auto => None,
+            QueueTrigger::Manual => Some(std::time::Duration::from_secs(20)),
+        }
+    }
+
+    /// 本轮预算还剩多少，用来给单条任务的 Telegram 调用封顶；`None` = 不限时。
+    /// 已经超支时返回 `Some(0)`，调用方会立刻判超时收工。
+    fn remaining(self, started: std::time::Instant) -> Option<std::time::Duration> {
+        self.budget()
+            .map(|budget| budget.saturating_sub(started.elapsed()))
+    }
+
+    /// 手动模式下没有下一次自动重试，日志不能承诺“将自动重试”
+    fn retry_hint(self) -> &'static str {
+        match self {
+            QueueTrigger::Auto => "，将自动重试",
+            QueueTrigger::Manual => "",
+        }
+    }
+}
+
+/// 一轮队列处理的结果，既回给后台「立即执行」展示，也用于自动模式写日志。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct QueueRunSummary {
+    pub completed: usize,
+    pub failed: usize,
+    /// Telegram 已确认不可恢复，已安全退出队列的任务数。
+    pub discarded: usize,
+    /// 这一轮结束后队列里还剩多少条
+    pub pending: i64,
+    /// 首个失败原因，后台直接显示，省得再去翻日志
+    pub last_error: Option<String>,
+    /// 是否因为超时提前收工；为真时前端提示可以再点一次继续
+    pub stopped_early: bool,
+}
+
+impl QueueRunSummary {
+    /// 本轮实际动过的任务数；为 0 表示没有可处理的任务
+    fn attempted(&self) -> usize {
+        self.completed + self.failed + self.discarded
+    }
+
+    fn note_error(&mut self, error: &str) {
+        if self.last_error.is_none() {
+            self.last_error = Some(error.chars().take(300).collect());
+        }
+    }
+}
+
+const TELEGRAM_DELETE_WINDOW_SECS: i64 = 48 * 60 * 60;
+
+fn is_expired_undeletable_message(job: &crate::db::DeleteJob, error: &AppError) -> bool {
+    matches!(error, AppError::Telegram(detail) if detail.contains("message can't be deleted"))
+        && crate::db::now_ts().saturating_sub(job.created_at) >= TELEGRAM_DELETE_WINDOW_SECS
+}
+
+#[cfg(test)]
+mod queue_failure_tests {
+    use super::*;
+
+    #[test]
+    fn only_expired_cannot_delete_error_is_permanent() {
+        let now = crate::db::now_ts();
+        let old = crate::db::DeleteJob {
+            id: 1,
+            storage_target_id: 1,
+            tg_message_id: 33,
+            attempts: 3,
+            created_at: now - TELEGRAM_DELETE_WINDOW_SECS,
+        };
+        let recent = crate::db::DeleteJob {
+            created_at: now - 60,
+            ..old.clone()
+        };
+        let denied = AppError::Telegram("[400] Bad Request: message can't be deleted".to_string());
+        let offline = AppError::Telegram("deleteMessage: 连接失败".to_string());
+
+        assert!(is_expired_undeletable_message(&old, &denied));
+        assert!(!is_expired_undeletable_message(&recent, &denied));
+        assert!(!is_expired_undeletable_message(&old, &offline));
+    }
+}
+
 #[derive(Clone)]
 pub struct Uploader {
     pub tg: Arc<TgRegistry>,
@@ -203,7 +338,14 @@ pub struct Uploader {
     /// 分块超过该值转入临时文件(生产用 MEMORY_CHUNK_LIMIT,测试可调小)
     pub mem_limit: u64,
     delete_running: Arc<AtomicBool>,
-    caption_sync_running: Arc<AtomicBool>,
+    active_resumable: Arc<Mutex<ActiveResumableUploads>>,
+}
+
+#[derive(Default)]
+struct ActiveResumableUploads {
+    parts: HashMap<(String, i64), AbortHandle>,
+    /// 防止取消接口与同一会话的新分块请求交错，造成“删会话后仍开始上传”。
+    cancelling_sessions: HashSet<String>,
 }
 
 impl Uploader {
@@ -214,7 +356,7 @@ impl Uploader {
             knobs,
             mem_limit,
             delete_running: Arc::new(AtomicBool::new(false)),
-            caption_sync_running: Arc::new(AtomicBool::new(false)),
+            active_resumable: Arc::new(Mutex::new(ActiveResumableUploads::default())),
         }
     }
 
@@ -233,11 +375,22 @@ impl Uploader {
         let this = self.clone();
         let name = name.to_string();
         let display_path = display_path.to_string();
+        let (cancel, abort_registration) = AbortHandle::new_pair();
+        let cancel_api = target.api.clone();
+        let upstream_pending = Arc::new(AtomicU64::new(0));
+        let pipeline_pending = upstream_pending.clone();
         let join = tokio::spawn(async move {
-            match this
-                .pipeline(node_id, &name, &display_path, thumbnail, target, rx)
-                .await
+            let result = match Abortable::new(
+                this.pipeline(node_id, &name, thumbnail, target, pipeline_pending, rx),
+                abort_registration,
+            )
+            .await
             {
+                Ok(result) => result,
+                Err(_) => Err(AppError::BadRequest("上传已取消".into())),
+            };
+            stop_detached_bot_api_upload(&cancel_api, &upstream_pending, &display_path).await;
+            match result {
                 Ok(node) => Ok(node),
                 Err(e) => {
                     tracing::warn!("上传 {display_path} 失败,回滚: {e}");
@@ -249,7 +402,7 @@ impl Uploader {
                 }
             }
         });
-        Ok(UploadHandle { tx, join })
+        Ok(UploadHandle { tx, join, cancel })
     }
 
     /// 为一个可恢复会话启动独立分块请求。请求体必须恰好等于该分块的期望大小；
@@ -259,27 +412,118 @@ impl Uploader {
         session_id: &str,
         idx: i64,
     ) -> AppResult<ResumablePartStart> {
+        if self
+            .active_resumable
+            .lock()
+            .unwrap()
+            .cancelling_sessions
+            .contains(session_id)
+        {
+            return Err(AppError::BadRequest("上传会话正在取消".into()));
+        }
         let info = match self.db.claim_upload_part(session_id, idx).await? {
             UploadPartClaim::Complete => return Ok(ResumablePartStart::Complete),
             UploadPartClaim::Claimed(info) => *info,
         };
-        if let Err(error) = self.tg.binding(info.session.storage_target_id) {
-            let _ = self.db.release_upload_part(session_id, idx).await;
-            return Err(error);
-        }
+        let target = match self.tg.binding(info.session.storage_target_id) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = self.db.release_upload_part(session_id, idx).await;
+                return Err(error);
+            }
+        };
         let (tx, rx) = mpsc::channel::<UploadMsg>(4);
         let this = self.clone();
         let id = session_id.to_string();
+        let key = (id.clone(), idx);
+        let (cancel, abort_registration) = AbortHandle::new_pair();
+        let accepted = {
+            let mut active = self.active_resumable.lock().unwrap();
+            if active.cancelling_sessions.contains(session_id) {
+                false
+            } else {
+                active.parts.insert(key.clone(), cancel.clone());
+                true
+            }
+        };
+        if !accepted {
+            let _ = self.db.release_upload_part(session_id, idx).await;
+            return Err(AppError::BadRequest("上传会话正在取消".into()));
+        }
+        let active_resumable = self.active_resumable.clone();
+        let cancel_api = target.api.clone();
+        let upstream_pending = Arc::new(AtomicU64::new(0));
+        let pipeline_pending = upstream_pending.clone();
         let join = tokio::spawn(async move {
-            let result = this.resumable_part_pipeline(&id, idx, info, rx).await;
+            let result = match Abortable::new(
+                this.resumable_part_pipeline(&id, idx, info, target, pipeline_pending, rx),
+                abort_registration,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(AppError::BadRequest("分块上传已取消".into())),
+            };
+            stop_detached_bot_api_upload(
+                &cancel_api,
+                &upstream_pending,
+                &format!("会话 {id} 分块 {idx}"),
+            )
+            .await;
             if result.is_err()
                 && let Err(release_error) = this.db.release_upload_part(&id, idx).await
             {
                 tracing::warn!("释放上传会话 {id} 的分块 {idx} 失败: {release_error}");
             }
+            active_resumable.lock().unwrap().parts.remove(&key);
             result
         });
-        Ok(ResumablePartStart::Upload(ResumablePartHandle { tx, join }))
+        Ok(ResumablePartStart::Upload(ResumablePartHandle {
+            tx,
+            join,
+            cancel,
+        }))
+    }
+
+    /// 停止一个可恢复会话的所有在途分块，并阻止取消期间启动新分块。
+    pub async fn begin_cancel_resumable_session(&self, session_id: &str) {
+        let tokens = {
+            let mut active = self.active_resumable.lock().unwrap();
+            active.cancelling_sessions.insert(session_id.to_string());
+            active
+                .parts
+                .iter()
+                .filter(|((id, _), _)| id == session_id)
+                .map(|(_, token)| token.clone())
+                .collect::<Vec<_>>()
+        };
+        for token in tokens {
+            token.abort();
+        }
+
+        // 包含 Bot API 监督器的 10 秒确认期限，再留出任务清理余量。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            let running = self
+                .active_resumable
+                .lock()
+                .unwrap()
+                .parts
+                .keys()
+                .any(|(id, _)| id == session_id);
+            if !running || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    pub fn finish_cancel_resumable_session(&self, session_id: &str) {
+        self.active_resumable
+            .lock()
+            .unwrap()
+            .cancelling_sessions
+            .remove(session_id);
     }
 
     async fn resumable_part_pipeline(
@@ -287,6 +531,8 @@ impl Uploader {
         session_id: &str,
         idx: i64,
         info: UploadSessionInfo,
+        target: TgBinding,
+        upstream_pending: Arc<AtomicU64>,
         mut rx: mpsc::Receiver<UploadMsg>,
     ) -> AppResult<()> {
         let expected = info
@@ -338,7 +584,6 @@ impl Uploader {
                 .ok_or_else(|| AppError::BadRequest("分块内容为空".into()))?,
         };
 
-        let target = self.tg.binding(info.session.storage_target_id)?;
         let _permit = self
             .knobs
             .semaphore()
@@ -350,7 +595,6 @@ impl Uploader {
         } else {
             format!("{}.part{idx}", info.node.name)
         };
-        let caption = storage_caption(&info.session.display_path, idx, info.node.id);
         let mime = (info.part_count() == 1 && self.knobs.send_video())
             .then(|| video_mime(&info.node.name))
             .flatten();
@@ -360,10 +604,10 @@ impl Uploader {
         let msg = send_body_to_telegram(
             target.api.clone(),
             &filename,
-            caption,
             mime,
             thumbnail.as_ref(),
             &body,
+            &upstream_pending,
         )
         .await?;
         let stored = StoredMessage {
@@ -403,6 +647,7 @@ impl Uploader {
     }
 
     /// 处理到期的持久化删除任务。并发触发会合并成一个工作循环。
+    /// 手动模式下循环只空转,不消费队列——任务照常积压,等后台点「立即执行」。
     pub fn process_pending_deletes(&self) {
         if self
             .delete_running
@@ -414,119 +659,56 @@ impl Uploader {
         let this = self.clone();
         tokio::spawn(async move {
             let mut had_work = false;
-            'worker: loop {
-                let jobs = match this.db.delete_jobs_due(100).await {
-                    Ok(jobs) => jobs,
-                    Err(e) => {
-                        tracing::warn!("读取 Telegram 删除队列失败: {e}");
-                        record_backend_log(
-                            &this.db,
-                            "error",
-                            "消息清理",
-                            &format!("读取 Telegram 删除队列失败：{e}"),
-                        )
-                        .await;
-                        break;
-                    }
-                };
-                if jobs.is_empty() {
-                    if had_work {
-                        let pending = this.db.pending_delete_count().await.unwrap_or(0);
-                        let (level, message) = if pending == 0 {
-                            (
-                                "info",
-                                format!("Telegram 消息清理队列已清空；剩余 {pending} 条"),
-                            )
-                        } else {
-                            (
-                                "warn",
-                                format!(
-                                    "Telegram 消息清理本轮完成；剩余 {pending} 条，等待退避重试"
-                                ),
-                            )
-                        };
-                        record_backend_log(&this.db, level, "消息清理", &message).await;
-                        had_work = false;
-                    }
-                    // 常驻轻量 worker，确保指数退避到期后能按时重试，而不是最多
-                    // 等待下一轮 30 分钟维护任务。
+            loop {
+                if !this.knobs.auto_delete_message() {
+                    had_work = false;
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     continue;
                 }
-                had_work = true;
-                let mut completed = 0usize;
-                let mut failed = 0usize;
-                for job in jobs {
-                    let result = match this.tg.binding(job.storage_target_id) {
-                        Ok(binding) => binding.api.delete_message(job.tg_message_id).await,
-                        Err(e) => Err(e),
-                    };
-                    match result {
-                        Ok(()) => {
-                            if let Err(e) = this.db.delete_job_done(job.id).await {
-                                tracing::warn!("确认 Telegram 删除任务 {} 失败: {e}", job.id);
-                                record_backend_log(
-                                    &this.db,
-                                    "error",
-                                    "消息清理",
-                                    &format!("确认 Telegram 删除任务 {} 失败：{e}", job.id),
-                                )
-                                .await;
-                                // Telegram 已删但数据库未确认时不能在紧循环里反复请求；
-                                // 退出并延时重启，避免紧循环重复请求。
-                                break 'worker;
-                            }
-                            completed += 1;
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            tracing::warn!(
-                                "删除存储目标 {} 的消息 {} 失败，将自动重试: {e}",
-                                job.storage_target_id,
-                                job.tg_message_id
-                            );
-                            record_backend_log(
-                                &this.db,
-                                "warn",
-                                "消息清理",
-                                &format!(
-                                    "消息 {} 删除失败，将自动重试（第 {} 次）：{}",
-                                    job.tg_message_id,
-                                    job.attempts + 1,
-                                    e
-                                ),
-                            )
-                            .await;
-                            if let Err(db_err) = this
-                                .db
-                                .delete_job_failed(job.id, job.attempts, &e.to_string())
-                                .await
-                            {
-                                tracing::error!("更新 Telegram 删除任务 {} 失败: {db_err}", job.id);
-                                record_backend_log(
-                                    &this.db,
-                                    "error",
-                                    "消息清理",
-                                    &format!(
-                                        "更新消息清理任务 {} 的重试状态失败：{db_err}",
-                                        job.id
+                match this.run_delete_batch(100, QueueTrigger::Auto).await {
+                    Ok(summary) if summary.attempted() == 0 => {
+                        if had_work {
+                            let (level, message) = if summary.pending == 0 {
+                                ("info", "Telegram 消息清理队列已清空；剩余 0 条".to_string())
+                            } else {
+                                (
+                                    "warn",
+                                    format!(
+                                        "Telegram 消息清理本轮完成；剩余 {} 条，等待退避重试",
+                                        summary.pending
                                     ),
                                 )
-                                .await;
-                                break 'worker;
-                            }
+                            };
+                            record_backend_log(&this.db, level, "消息清理", &message).await;
+                            had_work = false;
                         }
+                        // 常驻轻量 worker，确保指数退避到期后能按时重试，而不是最多
+                        // 等待下一轮 30 分钟维护任务。
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     }
+                    Ok(summary) => {
+                        had_work = true;
+                        record_backend_log(
+                            &this.db,
+                            if summary.failed + summary.discarded > 0 {
+                                "warn"
+                            } else {
+                                "info"
+                            },
+                            "消息清理",
+                            &format!(
+                                "Telegram 消息清理进度：完成 {} 条，永久跳过 {} 条，失败 {} 条，剩余 {} 条",
+                                summary.completed,
+                                summary.discarded,
+                                summary.failed,
+                                summary.pending
+                            ),
+                        )
+                        .await;
+                    }
+                    // 落库确认失败等情况:退出循环,由下面的延时重启兜底,避免紧循环重复请求
+                    Err(_) => break,
                 }
-                let pending = this.db.pending_delete_count().await.unwrap_or(0);
-                let level = if failed > 0 { "warn" } else { "info" };
-                record_backend_log(
-                    &this.db,
-                    level,
-                    "消息清理",
-                    &format!("Telegram 消息清理进度：完成 {completed} 条，失败 {failed} 条，剩余 {pending} 条"),
-                )
-                .await;
             }
             this.delete_running.store(false, Ordering::Release);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -534,182 +716,138 @@ impl Uploader {
         });
     }
 
-    /// 处理重命名/移动产生的 Telegram caption 路径同步任务。
-    /// 任务持久化在 SQLite，限流或网络失败后按指数退避自动重试。
-    pub fn process_pending_caption_syncs(&self) {
-        if self
-            .caption_sync_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+    /// 消费一批删除任务,每条最多尝试一次。自动 worker 与后台「立即执行」共用。
+    pub async fn run_delete_batch(
+        &self,
+        limit: i64,
+        trigger: QueueTrigger,
+    ) -> AppResult<QueueRunSummary> {
+        let jobs = match self
+            .db
+            .delete_jobs_due(limit, trigger.ignores_backoff())
+            .await
         {
-            return;
-        }
-        let this = self.clone();
-        tokio::spawn(async move {
-            let mut had_work = false;
-            'worker: loop {
-                let jobs = match this.db.caption_sync_jobs_due(50).await {
-                    Ok(jobs) => jobs,
-                    Err(error) => {
-                        tracing::warn!("读取 Telegram caption 同步队列失败: {error}");
-                        record_backend_log(
-                            &this.db,
-                            "error",
-                            "路径同步",
-                            &format!("读取 Telegram caption 同步队列失败：{error}"),
-                        )
-                        .await;
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::warn!("读取 Telegram 删除队列失败: {e}");
+                record_backend_log(
+                    &self.db,
+                    "error",
+                    "消息清理",
+                    &format!("读取 Telegram 删除队列失败：{e}"),
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        let mut summary = QueueRunSummary::default();
+        let started = std::time::Instant::now();
+        for job in jobs {
+            if let Some(budget) = trigger.budget()
+                && started.elapsed() >= budget
+            {
+                summary.stopped_early = true;
+                break;
+            }
+            let attempt = async {
+                match self.tg.binding(job.storage_target_id) {
+                    Ok(binding) => binding.api.delete_message(job.tg_message_id).await,
+                    Err(e) => Err(e),
+                }
+            };
+            // 单条调用也要封顶，否则客户端内部的 5 次重试会拖垮一整轮。
+            let result = if let Some(left) = trigger.remaining(started) {
+                match tokio::time::timeout(left, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        summary.stopped_early = true;
                         break;
                     }
-                };
-                if jobs.is_empty() {
-                    if had_work {
-                        let pending = this.db.pending_caption_sync_count().await.unwrap_or(0);
-                        let (level, message) = if pending == 0 {
-                            (
-                                "info",
-                                format!("Telegram caption 路径同步队列已清空；剩余 {pending} 条"),
-                            )
-                        } else {
-                            (
-                                "warn",
-                                format!(
-                                    "Telegram caption 路径同步本轮完成；剩余 {pending} 条，等待退避重试"
-                                ),
-                            )
-                        };
-                        record_backend_log(&this.db, level, "路径同步", &message).await;
-                        had_work = false;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    continue;
                 }
-                had_work = true;
-                let batch_size = jobs.len();
-                let mut completed = 0usize;
-                let mut superseded = 0usize;
-                let mut failed = 0usize;
-                record_backend_log(
-                    &this.db,
-                    "info",
-                    "路径同步",
-                    &format!("开始处理 Telegram caption 路径同步，本批 {batch_size} 条"),
-                )
-                .await;
-                for job in jobs {
-                    let result = match this.db.full_path_if_visible(job.node_id).await {
-                        Ok(Some(path)) => match this.tg.binding(job.storage_target_id) {
-                            Ok(binding) => {
-                                let caption = storage_caption(&path, job.chunk_idx, job.node_id);
-                                binding
-                                    .api
-                                    .edit_message_caption(job.tg_message_id, &caption)
-                                    .await
-                            }
-                            Err(error) => Err(error),
-                        },
-                        // 已进入回收站的节点没有需要展示的当前路径，丢弃旧任务。
-                        Ok(None) => Ok(()),
-                        Err(error) => Err(error),
-                    };
-                    match result {
-                        Ok(()) => {
-                            match this.db.caption_sync_job_done(job.id, job.generation).await {
-                                Ok(true) => completed += 1,
-                                Ok(false) => superseded += 1,
-                                Err(error) => {
-                                    tracing::warn!(
-                                        "确认 Telegram caption 同步任务 {} 失败: {error}",
-                                        job.id
-                                    );
-                                    record_backend_log(
-                                        &this.db,
-                                        "error",
-                                        "路径同步",
-                                        &format!(
-                                            "确认 Telegram caption 同步任务 {} 失败：{error}",
-                                            job.id
-                                        ),
-                                    )
-                                    .await;
-                                    break 'worker;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            failed += 1;
-                            tracing::warn!(
-                                "同步存储目标 {} 的消息 {} caption 失败，将自动重试: {error}",
-                                job.storage_target_id,
+            } else {
+                attempt.await
+            };
+            match result {
+                Ok(()) => {
+                    if let Err(e) = self.db.delete_job_done(job.id).await {
+                        tracing::warn!("确认 Telegram 删除任务 {} 失败: {e}", job.id);
+                        record_backend_log(
+                            &self.db,
+                            "error",
+                            "消息清理",
+                            &format!("确认 Telegram 删除任务 {} 失败：{e}", job.id),
+                        )
+                        .await;
+                        // Telegram 已删但数据库未确认时不能继续,否则会反复请求同一条
+                        return Err(e);
+                    }
+                    summary.completed += 1;
+                }
+                Err(e) => {
+                    if is_expired_undeletable_message(&job, &e) {
+                        self.db.delete_job_done(job.id).await?;
+                        summary.discarded += 1;
+                        record_backend_log(
+                            &self.db,
+                            "warn",
+                            "消息清理",
+                            &format!(
+                                "消息 {} 已超过 Telegram Bot API 的 48 小时删除窗口，停止重试；如频道中仍存在，请在 Telegram 客户端手动删除",
                                 job.tg_message_id
-                            );
-                            record_backend_log(
-                                &this.db,
-                                "warn",
-                                "路径同步",
-                                &format!(
-                                    "消息 {} 的 caption 同步失败，将自动重试（第 {} 次）：{}",
-                                    job.tg_message_id,
-                                    job.attempts + 1,
-                                    error
-                                ),
-                            )
-                            .await;
-                            if let Err(db_error) = this
-                                .db
-                                .caption_sync_job_failed(
-                                    job.id,
-                                    job.generation,
-                                    job.attempts,
-                                    &error.to_string(),
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    "更新 Telegram caption 同步任务 {} 失败: {db_error}",
-                                    job.id
-                                );
-                                record_backend_log(
-                                    &this.db,
-                                    "error",
-                                    "路径同步",
-                                    &format!(
-                                        "更新 caption 同步任务 {} 的重试状态失败：{db_error}",
-                                        job.id
-                                    ),
-                                )
-                                .await;
-                                break 'worker;
-                            }
-                        }
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                    summary.failed += 1;
+                    summary.note_error(&e.to_string());
+                    tracing::warn!(
+                        "删除存储目标 {} 的消息 {} 失败: {e}",
+                        job.storage_target_id,
+                        job.tg_message_id
+                    );
+                    record_backend_log(
+                        &self.db,
+                        "warn",
+                        "消息清理",
+                        &format!(
+                            "消息 {} 删除失败（第 {} 次尝试）{}：{}",
+                            job.tg_message_id,
+                            job.attempts + 1,
+                            trigger.retry_hint(),
+                            e
+                        ),
+                    )
+                    .await;
+                    if let Err(db_err) = self
+                        .db
+                        .delete_job_failed(job.id, job.attempts, &e.to_string())
+                        .await
+                    {
+                        tracing::error!("更新 Telegram 删除任务 {} 失败: {db_err}", job.id);
+                        record_backend_log(
+                            &self.db,
+                            "error",
+                            "消息清理",
+                            &format!("更新消息清理任务 {} 的重试状态失败：{db_err}", job.id),
+                        )
+                        .await;
+                        return Err(db_err);
                     }
                 }
-                let pending = this.db.pending_caption_sync_count().await.unwrap_or(0);
-                let level = if failed > 0 { "warn" } else { "info" };
-                record_backend_log(
-                    &this.db,
-                    level,
-                    "路径同步",
-                    &format!(
-                        "Telegram caption 路径同步进度：完成 {completed} 条，\
-                         已被新改名覆盖 {superseded} 条，失败 {failed} 条，剩余 {pending} 条"
-                    ),
-                )
-                .await;
             }
-            this.caption_sync_running.store(false, Ordering::Release);
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            this.process_pending_caption_syncs();
-        });
+        }
+        summary.pending = self.db.pending_delete_count().await.unwrap_or(0);
+        Ok(summary)
     }
 
     async fn pipeline(
         &self,
         node_id: i64,
         name: &str,
-        display_path: &str,
         thumbnail: Option<Bytes>,
         target: TgBinding,
+        upstream_pending: Arc<AtomicU64>,
         mut rx: mpsc::Receiver<UploadMsg>,
     ) -> AppResult<Node> {
         let mut uploads: JoinSet<AppResult<()>> = JoinSet::new();
@@ -718,9 +856,9 @@ impl Uploader {
                 &mut uploads,
                 node_id,
                 name,
-                display_path,
                 thumbnail,
                 target,
+                upstream_pending,
                 &mut rx,
             )
             .await;
@@ -742,9 +880,9 @@ impl Uploader {
         uploads: &mut JoinSet<AppResult<()>>,
         node_id: i64,
         name: &str,
-        display_path: &str,
         thumbnail: Option<Bytes>,
         target: TgBinding,
+        upstream_pending: Arc<AtomicU64>,
         rx: &mut mpsc::Receiver<UploadMsg>,
     ) -> AppResult<Node> {
         // 整次上传用同一份分块参数快照,中途改配置不会切出大小不一的块
@@ -771,12 +909,12 @@ impl Uploader {
                                 uploads,
                                 node_id,
                                 name,
-                                display_path,
                                 idx,
                                 full,
                                 false,
                                 if idx == 0 { thumbnail.clone() } else { None },
                                 target.clone(),
+                                upstream_pending.clone(),
                             )
                             .await?;
                             idx += 1;
@@ -807,12 +945,12 @@ impl Uploader {
                 uploads,
                 node_id,
                 name,
-                display_path,
                 idx,
                 last,
                 idx == 0,
                 if idx == 0 { thumbnail } else { None },
                 target,
+                upstream_pending,
             )
             .await?;
         }
@@ -839,12 +977,12 @@ impl Uploader {
         uploads: &mut JoinSet<AppResult<()>>,
         node_id: i64,
         name: &str,
-        display_path: &str,
         idx: i64,
         body: UploadBody,
         single_chunk: bool,
         thumbnail: Option<Bytes>,
         target: TgBinding,
+        upstream_pending: Arc<AtomicU64>,
     ) -> AppResult<()> {
         let permit = self
             .knobs
@@ -865,18 +1003,16 @@ impl Uploader {
         let mime = (single_chunk && self.knobs.send_video())
             .then(|| video_mime(name))
             .flatten();
-        // caption 记录路径、分块序号与上传节点号，供异常核对或元数据库丢失时人工恢复。
-        let caption = storage_caption(display_path, idx, node_id);
         uploads.spawn(async move {
             let _permit = permit;
             let size = body.len();
             let msg = send_body_to_telegram(
                 tg.clone(),
                 &filename,
-                caption,
                 mime,
                 thumbnail.as_ref(),
                 &body,
+                &upstream_pending,
             )
             .await?;
             if let Err(e) = db
