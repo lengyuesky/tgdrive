@@ -20,6 +20,8 @@ pub const DEFAULT_LOCAL_DATA_ROOT: &str = "/var/lib/telegram-bot-api";
 pub struct Config {
     pub listen: SocketAddr,
     pub bot_token: String,
+    /// 仅用于上传分流的额外 Bot；主 Bot 仍负责收件箱与数据库备份。
+    pub upload_bot_tokens: Vec<String>,
     /// 存储目标聊天:私有频道 -100xxxxxxxx 或 @channelname
     pub chat_id: String,
     /// Bot API 基地址,官方或自部署 telegram-bot-api
@@ -53,6 +55,18 @@ fn env_opt(key: &str) -> Option<String> {
 
 fn env_required(key: &str) -> anyhow::Result<String> {
     env_opt(key).ok_or_else(|| anyhow::anyhow!("缺少必填环境变量 {key}"))
+}
+
+/// 多 Bot 配置支持逗号、分号和换行分隔，并自动去重、忽略空项。
+pub fn parse_bot_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for token in value.split([',', ';', '\n', '\r']) {
+        let token = token.trim();
+        if !token.is_empty() && !tokens.iter().any(|existing| existing == token) {
+            tokens.push(token.to_string());
+        }
+    }
+    tokens
 }
 
 /// 支持 "18MB" / "512m" / "19500000" 等写法
@@ -152,6 +166,9 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("TGDRIVE_LISTEN 无效: {e}"))?,
             // Telegram 相关都允许留空:服务照常启动,登录后在网页「系统设置」里配
             bot_token: env_opt("TGDRIVE_BOT_TOKEN").unwrap_or_default(),
+            upload_bot_tokens: env_opt("TGDRIVE_UPLOAD_BOT_TOKENS")
+                .map(|value| parse_bot_tokens(&value))
+                .unwrap_or_default(),
             chat_id: env_opt("TGDRIVE_CHAT_ID").unwrap_or_default(),
             api_base,
             chunk_size,
@@ -215,5 +232,13 @@ mod tests {
     fn test_default_send_video() {
         assert!(!default_send_video(OFFICIAL_API_BASE));
         assert!(default_send_video("http://telegram-bot-api:8081"));
+    }
+
+    #[test]
+    fn bot_tokens_accept_multiple_separators_and_deduplicate() {
+        assert_eq!(
+            parse_bot_tokens("a,b\nc; b\r\n d"),
+            vec!["a", "b", "c", "d"]
+        );
     }
 }

@@ -30,6 +30,8 @@ pub enum AppError {
     TelegramRejected(String),
     #[error("Telegram 上传结果不确定（为避免重复未自动重试）: {0}")]
     TelegramUncertain(String),
+    #[error("上传服务已重启，正在重试")]
+    UploadInterrupted,
     #[error("数据库错误: {0}")]
     Db(#[from] sqlx::Error),
     #[error("IO 错误: {0}")]
@@ -51,6 +53,7 @@ impl AppError {
             AppError::Telegram(_)
             | AppError::TelegramRejected(_)
             | AppError::TelegramUncertain(_) => StatusCode::BAD_GATEWAY,
+            AppError::UploadInterrupted => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Db(_) | AppError::Io(_) | AppError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -70,7 +73,9 @@ impl IntoResponse for AppError {
         }
         // 数据库、IO 与网络错误可能携带本地路径或上游 URL；详细信息只进服务端
         // 日志，HTTP 客户端拿到稳定且不泄密的提示。
-        let public_error = if status.is_server_error() {
+        let public_error = if matches!(&self, AppError::UploadInterrupted) {
+            "上传服务已重启，正在重试".to_string()
+        } else if status.is_server_error() {
             match &self {
                 AppError::Telegram(_)
                 | AppError::TelegramRejected(_)
@@ -80,8 +85,12 @@ impl IntoResponse for AppError {
         } else {
             self.to_string()
         };
-        let mut response =
-            (status, Json(serde_json::json!({ "error": public_error }))).into_response();
+        let code = matches!(&self, AppError::UploadInterrupted).then_some("upload_interrupted");
+        let mut response = (
+            status,
+            Json(serde_json::json!({ "error": public_error, "code": code })),
+        )
+            .into_response();
         if let Some(seconds) = retry_after
             && let Ok(value) = seconds.to_string().parse()
         {

@@ -12,6 +12,7 @@ mod error;
 mod extras;
 mod housekeeping;
 mod inbox;
+mod migration;
 mod mtproto;
 mod security;
 mod settings;
@@ -60,6 +61,7 @@ fn main() {
 async fn serve() -> anyhow::Result<()> {
     let env_cfg = Arc::new(Config::from_env()?);
     let db = Db::open(&env_cfg.db_path).await?;
+    db.recover_storage_migration().await?;
     // 环境变量只是底层默认值,后台改过的配置(settings 表)优先
     let mut cfg = RuntimeCfg::load(&db, &env_cfg).await?;
 
@@ -69,11 +71,19 @@ async fn serve() -> anyhow::Result<()> {
         tracing::warn!("尚未配置 Telegram 存储,请登录后打开「系统设置」填写 Bot Token 与存储频道");
     }
     if cfg.is_configured() {
-        let target = db
-            .ensure_storage_target(&cfg.api_base, &cfg.bot_token, &cfg.chat_id)
-            .await?;
-        cfg.storage_target_id = Some(target.id);
-        let migrated = db.backfill_unassigned_chunks(target.id).await?;
+        let mut upload_target_ids = Vec::new();
+        for token in cfg.all_upload_bot_tokens() {
+            let target = db
+                .ensure_storage_target(&cfg.api_base, &token, &cfg.chat_id)
+                .await?;
+            upload_target_ids.push(target.id);
+        }
+        cfg.storage_target_id = upload_target_ids.first().copied();
+        cfg.upload_target_ids = upload_target_ids;
+        let primary_target_id = cfg
+            .storage_target_id
+            .ok_or_else(|| anyhow::anyhow!("Telegram 主存储目标未初始化"))?;
+        let migrated = db.backfill_unassigned_chunks(primary_target_id).await?;
         if migrated > 0 {
             tracing::warn!(
                 "已将 {migrated} 个旧版分块关联到当前 Telegram 存储目标；如数据库曾切换过 Bot/频道，请人工核对历史文件"
@@ -88,11 +98,17 @@ async fn serve() -> anyhow::Result<()> {
             "未配置 api_id/api_hash：文档与视频下载将使用 Bot API，超大分块无法真正按 Range 流式读取"
         );
     }
-    let tg = Arc::new(TgRegistry::new(&targets, cfg.storage_target_id, mtproto)?);
+    let tg = Arc::new(TgRegistry::new(
+        &targets,
+        cfg.storage_target_id,
+        cfg.upload_target_ids.clone(),
+        mtproto,
+    )?);
     let knobs = Arc::new(UploadKnobs::new(
         cfg.chunk_size,
         cfg.tmp_dir.clone(),
-        cfg.upload_concurrency,
+        cfg.upload_concurrency
+            .saturating_mul(cfg.upload_target_ids.len().max(1)),
         cfg.send_video,
     ));
     let uploader = Uploader::new(tg.clone(), db.clone(), knobs.clone(), MEMORY_CHUNK_LIMIT);
@@ -124,6 +140,7 @@ async fn serve() -> anyhow::Result<()> {
         tg: tg.clone(),
         uploader,
     };
+    let migration = crate::migration::StorageMigrationManager::new(db.clone(), tg.clone());
     let auth = Arc::new(
         Auth::init(
             &cfg.username,
@@ -155,6 +172,7 @@ async fn serve() -> anyhow::Result<()> {
         dav: dav_handler,
         attempts: crate::security::AttemptLimiter::default(),
         tasks: tasks.clone(),
+        migration: migration.clone(),
     };
     if let Err(error) = db
         .append_backend_log("info", "系统", "tgdrive 服务已启动")
@@ -236,12 +254,15 @@ async fn serve() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(tasks))
+    .with_graceful_shutdown(shutdown_signal(tasks, migration))
     .await?;
     Ok(())
 }
 
-async fn shutdown_signal(tasks: crate::tasks::TaskManager) {
+async fn shutdown_signal(
+    tasks: crate::tasks::TaskManager,
+    migration: crate::migration::StorageMigrationManager,
+) {
     #[cfg(unix)]
     let terminate = async {
         if let Ok(mut signal) =
@@ -260,6 +281,7 @@ async fn shutdown_signal(tasks: crate::tasks::TaskManager) {
         _ = terminate => {},
     }
     tracing::info!("收到退出信号，正在停止后台任务并等待连接结束");
+    migration.shutdown().await;
     tasks.cancel();
 }
 
@@ -288,6 +310,7 @@ async fn check() -> anyhow::Result<()> {
     let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
     let want = sha2::Sha256::digest(&data);
     let body = UploadBody::Memory(bytes::Bytes::from(data));
+    tg.wait_upload_turn().await;
     let msg = tg
         .send_document(
             "tgdrive-selftest.bin",

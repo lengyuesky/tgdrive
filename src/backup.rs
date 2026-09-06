@@ -395,6 +395,7 @@ async fn backup_telegram(
             file: body_file,
             len: part_len,
         };
+        target.api.wait_upload_turn().await;
         let message = match target
             .api
             .send_document(&filename, Some(caption), None, &body)

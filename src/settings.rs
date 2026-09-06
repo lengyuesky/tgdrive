@@ -13,6 +13,7 @@ use crate::error::{AppError, AppResult};
 #[cfg(test)]
 use crate::telegram::TgApi;
 use crate::telegram::{TgClient, TgRegistry};
+use futures_util::future::join_all;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,6 +29,7 @@ const BOT_NAME_TTL: Duration = Duration::from_secs(60);
 pub const KEYS: &[(&str, &str)] = &[
     ("api_base", "TGDRIVE_API_BASE"),
     ("bot_token", "TGDRIVE_BOT_TOKEN"),
+    ("upload_bot_tokens", "TGDRIVE_UPLOAD_BOT_TOKENS"),
     ("chat_id", "TGDRIVE_CHAT_ID"),
     ("chunk_size", "TGDRIVE_CHUNK_SIZE"),
     ("upload_concurrency", "TGDRIVE_UPLOAD_CONCURRENCY"),
@@ -49,6 +51,8 @@ pub const LOCAL_API_KEYS: &[&str] = &["telegram_api_id", "telegram_api_hash"];
 pub struct RuntimeCfg {
     pub api_base: String,
     pub bot_token: String,
+    /// 额外上传 Bot，不包含主 Bot；主 Bot 仍负责收件箱与备份。
+    pub upload_bot_tokens: Vec<String>,
     pub chat_id: String,
     pub chunk_size: u64,
     pub upload_concurrency: usize,
@@ -61,6 +65,8 @@ pub struct RuntimeCfg {
     pub telegram_api_hash: String,
     /// 不属于用户配置字段；指向上述 Telegram 三元组对应的不可变存储目标。
     pub storage_target_id: Option<i64>,
+    /// 新上传文件可选择的目标，首项始终是主 Bot 对应目标。
+    pub upload_target_ids: Vec<i64>,
 }
 
 impl RuntimeCfg {
@@ -98,11 +104,18 @@ impl RuntimeCfg {
             None => config::default_send_video(&api_base),
         };
 
+        let bot_token = get("bot_token")
+            .map(str::to_string)
+            .unwrap_or_else(|| env.bot_token.clone());
+        let mut upload_bot_tokens = get("upload_bot_tokens")
+            .map(config::parse_bot_tokens)
+            .unwrap_or_else(|| env.upload_bot_tokens.clone());
+        upload_bot_tokens.retain(|token| token.trim() != bot_token.trim());
+
         Ok(RuntimeCfg {
             api_base,
-            bot_token: get("bot_token")
-                .map(str::to_string)
-                .unwrap_or_else(|| env.bot_token.clone()),
+            bot_token,
+            upload_bot_tokens,
             chat_id: get("chat_id")
                 .map(str::to_string)
                 .unwrap_or_else(|| env.chat_id.clone()),
@@ -128,12 +141,25 @@ impl RuntimeCfg {
                 .map(str::to_string)
                 .unwrap_or_else(|| env.telegram_api_hash.clone()),
             storage_target_id: None,
+            upload_target_ids: Vec::new(),
         })
     }
 
     /// Telegram 存储是否已配置好(没配时上传下载会给出提示而不是报 401)
     pub fn is_configured(&self) -> bool {
         !self.bot_token.trim().is_empty() && !self.chat_id.trim().is_empty()
+    }
+
+    /// 主 Bot + 去重后的额外上传 Bot。
+    pub fn all_upload_bot_tokens(&self) -> Vec<String> {
+        let mut tokens = Vec::new();
+        for token in std::iter::once(&self.bot_token).chain(self.upload_bot_tokens.iter()) {
+            let token = token.trim();
+            if !token.is_empty() && !tokens.iter().any(|existing| existing == token) {
+                tokens.push(token.to_string());
+            }
+        }
+        tokens
     }
 
     /// 按当前配置造一个 TG 客户端;没配好就返回占位实现
@@ -156,6 +182,8 @@ impl RuntimeCfg {
         match key {
             "api_base" => self.api_base.clone(),
             "bot_token" => self.bot_token.clone(),
+            // .env 不适合多行值，统一导出为逗号分隔。
+            "upload_bot_tokens" => self.upload_bot_tokens.join(","),
             "chat_id" => self.chat_id.clone(),
             "chunk_size" => self.chunk_size.to_string(),
             "upload_concurrency" => self.upload_concurrency.to_string(),
@@ -181,6 +209,8 @@ fn env_present(key: &str) -> bool {
 pub struct ConfigPatch {
     pub api_base: Option<String>,
     pub bot_token: Option<String>,
+    /// 多行或逗号分隔的额外上传 Bot Token。
+    pub upload_bot_tokens: Option<String>,
     pub chat_id: Option<String>,
     /// 字符串以支持 "18MB" 这类写法
     pub chunk_size: Option<String>,
@@ -315,6 +345,11 @@ impl Runtime {
         if let Some(v) = &patch.bot_token {
             next.bot_token = v.trim().to_string();
         }
+        if let Some(v) = &patch.upload_bot_tokens {
+            next.upload_bot_tokens = config::parse_bot_tokens(v);
+        }
+        next.upload_bot_tokens
+            .retain(|token| token.trim() != next.bot_token.trim());
         if let Some(v) = &patch.chat_id {
             next.chat_id = v.trim().to_string();
         }
@@ -349,15 +384,42 @@ impl Runtime {
         // 动到 Telegram 三项时先验证,别把网盘改到连不上
         let tg_changed = next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
+            || next.upload_bot_tokens != prev.upload_bot_tokens
             || next.chat_id != prev.chat_id;
         let mut bot = None;
         if tg_changed && next.is_configured() && !patch.force {
-            match Self::probe(&next.api_base, &next.bot_token, &next.chat_id).await {
-                Ok(name) => bot = Some(name),
-                Err(e) => {
-                    return Err(AppError::BadRequest(format!(
-                        "新配置连不上 Telegram({e});确认无误可选择强制保存"
-                    )));
+            let tokens = next.all_upload_bot_tokens();
+            let api_base = next.api_base.clone();
+            let chat_id = next.chat_id.clone();
+            let results = join_all(tokens.iter().enumerate().map(|(index, token)| {
+                let api_base = api_base.clone();
+                let chat_id = chat_id.clone();
+                async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        Self::probe(&api_base, token, &chat_id),
+                    )
+                    .await
+                    .map_err(|_| AppError::BadRequest("连接验证超时(15 秒)".into()))
+                    .and_then(|result| result);
+                    (index, result)
+                }
+            }))
+            .await;
+            for (index, result) in results {
+                match result {
+                    Ok(name) if index == 0 => bot = Some(name),
+                    Ok(_) => {}
+                    Err(e) => {
+                        let label = if index == 0 {
+                            "主 Bot".to_string()
+                        } else {
+                            format!("额外上传 Bot #{index}")
+                        };
+                        return Err(AppError::BadRequest(format!(
+                            "{label} 连不上 Telegram({e});确认无误可选择强制保存"
+                        )));
+                    }
                 }
             }
         }
@@ -396,6 +458,7 @@ impl Runtime {
         self.attach_storage_target(&mut next).await?;
         let tg_changed = next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
+            || next.upload_bot_tokens != prev.upload_bot_tokens
             || next.chat_id != prev.chat_id;
         let deletes: Vec<String> = keys.iter().map(|key| format!("{P}{key}")).collect();
         let account_changed = next.username != prev.username || next.password != prev.password;
@@ -417,14 +480,20 @@ impl Runtime {
     async fn attach_storage_target(&self, next: &mut RuntimeCfg) -> AppResult<()> {
         if !next.is_configured() {
             next.storage_target_id = None;
+            next.upload_target_ids.clear();
             return Ok(());
         }
-        let target = self
-            .db
-            .ensure_storage_target(&next.api_base, &next.bot_token, &next.chat_id)
-            .await?;
-        self.tg.register(&target)?;
-        next.storage_target_id = Some(target.id);
+        let mut target_ids = Vec::new();
+        for token in next.all_upload_bot_tokens() {
+            let target = self
+                .db
+                .ensure_storage_target(&next.api_base, &token, &next.chat_id)
+                .await?;
+            self.tg.register(&target)?;
+            target_ids.push(target.id);
+        }
+        next.storage_target_id = target_ids.first().copied();
+        next.upload_target_ids = target_ids;
         Ok(())
     }
 
@@ -436,6 +505,12 @@ impl Runtime {
         // Bot Token 与频道允许同时留空(尚未配置状态);填了就得成对
         if next.bot_token.is_empty() != next.chat_id.is_empty() {
             return Err(bad("Bot Token 与存储频道要么都填,要么都留空".into()));
+        }
+        if !next.upload_bot_tokens.is_empty() && !next.is_configured() {
+            return Err(bad("配置额外上传 Bot 前必须先配置主 Bot 与存储频道".into()));
+        }
+        if next.all_upload_bot_tokens().len() > 20 {
+            return Err(bad("上传 Bot 总数不能超过 20 个".into()));
         }
         config::validate_chunk_size(&next.api_base, next.chunk_size)
             .map_err(|e| bad(e.to_string()))?;
@@ -491,7 +566,8 @@ impl Runtime {
         new_secret: Option<&str>,
     ) -> AppResult<bool> {
         if tg_changed {
-            self.tg.set_current_id(next.storage_target_id)?;
+            self.tg
+                .set_targets(next.storage_target_id, next.upload_target_ids.clone())?;
             *self.bot_name.write().unwrap() = None;
         }
         if next.chunk_size != prev.chunk_size {
@@ -500,8 +576,13 @@ impl Runtime {
         if next.tmp_dir != prev.tmp_dir {
             self.knobs.set_tmp_dir(next.tmp_dir.clone());
         }
-        if next.upload_concurrency != prev.upload_concurrency {
-            self.knobs.set_concurrency(next.upload_concurrency);
+        if next.upload_concurrency != prev.upload_concurrency
+            || next.upload_target_ids != prev.upload_target_ids
+        {
+            self.knobs.set_concurrency(
+                next.upload_concurrency
+                    .saturating_mul(next.upload_target_ids.len().max(1)),
+            );
         }
         if next.send_video != prev.send_video {
             self.knobs.set_send_video(next.send_video);
@@ -598,6 +679,7 @@ mod tests {
         Config {
             listen: "0.0.0.0:8080".parse().unwrap(),
             bot_token: "envtoken".into(),
+            upload_bot_tokens: Vec::new(),
             chat_id: "-100111".into(),
             api_base: config::OFFICIAL_API_BASE.into(),
             chunk_size: 18 * 1024 * 1024,
@@ -630,6 +712,7 @@ mod tests {
         // 没有覆盖时全部取 env
         let c = RuntimeCfg::load(&db, &env).await.unwrap();
         assert_eq!(c.bot_token, "envtoken");
+        assert!(c.upload_bot_tokens.is_empty());
         assert_eq!(c.chunk_size, 18 * 1024 * 1024);
 
         db.setting_set("cfg.bot_token", "dbtoken").await.unwrap();
@@ -638,6 +721,12 @@ mod tests {
         assert_eq!(c.bot_token, "dbtoken");
         assert_eq!(c.chunk_size, 2 * 1024 * 1024);
         assert_eq!(c.username, "envuser"); // 未覆盖的仍来自 env
+
+        db.setting_set("cfg.upload_bot_tokens", "extra1,extra2,extra1")
+            .await
+            .unwrap();
+        let c = RuntimeCfg::load(&db, &env).await.unwrap();
+        assert_eq!(c.upload_bot_tokens, vec!["extra1", "extra2"]);
     }
 
     #[tokio::test]

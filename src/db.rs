@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod entries;
+
 pub const ROOT_ID: i64 = 1;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -64,6 +66,36 @@ pub struct StorageTarget {
     pub chat_id: String,
     #[allow(dead_code)]
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct StorageMigrationSource {
+    pub storage_target_id: i64,
+    pub bot_id: String,
+    pub chat_id: String,
+    pub messages: i64,
+    pub chunks: i64,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct StorageMigrationJob {
+    pub main_target_id: i64,
+    pub status: String,
+    pub total_messages: i64,
+    pub migrated_messages: i64,
+    pub total_chunks: i64,
+    pub migrated_chunks: i64,
+    pub last_error: Option<String>,
+    pub started_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StorageMigrationCandidate {
+    pub source_target_id: i64,
+    pub source_chat_id: String,
+    pub source_message_id: i64,
 }
 
 /// Telegram 消息的完整身份；message_id 只在同一存储目标内有意义。
@@ -320,6 +352,208 @@ impl Db {
             .await?)
     }
 
+    pub async fn storage_target(&self, id: i64) -> AppResult<StorageTarget> {
+        sqlx::query_as::<_, StorageTarget>("SELECT * FROM storage_targets WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::NotFound)
+    }
+
+    /// 当前仍指向非主 Bot 的历史消息，按来源目标汇总。
+    pub async fn storage_migration_sources(
+        &self,
+        main_target_id: i64,
+    ) -> AppResult<Vec<StorageMigrationSource>> {
+        Ok(sqlx::query_as(
+            "SELECT c.storage_target_id,
+                    CASE WHEN instr(st.bot_token, ':') > 0
+                         THEN substr(st.bot_token, 1, instr(st.bot_token, ':') - 1)
+                         ELSE '未知' END AS bot_id,
+                    st.chat_id,
+                    COUNT(DISTINCT c.tg_message_id) AS messages,
+                    COUNT(*) AS chunks,
+                    COALESCE(SUM(c.size), 0) AS bytes
+             FROM chunks c
+             JOIN storage_targets st ON st.id = c.storage_target_id
+             WHERE c.storage_target_id IS NOT NULL AND c.storage_target_id != ?
+             GROUP BY c.storage_target_id, st.bot_token, st.chat_id
+             ORDER BY c.storage_target_id",
+        )
+        .bind(main_target_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn storage_migration_candidate(
+        &self,
+        main_target_id: i64,
+    ) -> AppResult<Option<StorageMigrationCandidate>> {
+        Ok(sqlx::query_as(
+            "SELECT c.storage_target_id AS source_target_id,
+                    st.chat_id AS source_chat_id,
+                    c.tg_message_id AS source_message_id
+             FROM chunks c
+             JOIN storage_targets st ON st.id = c.storage_target_id
+             WHERE c.storage_target_id IS NOT NULL AND c.storage_target_id != ?
+             GROUP BY c.storage_target_id, st.chat_id, c.tg_message_id
+             ORDER BY c.storage_target_id, c.tg_message_id
+             LIMIT 1",
+        )
+        .bind(main_target_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn storage_migration_job(&self) -> AppResult<Option<StorageMigrationJob>> {
+        Ok(sqlx::query_as(
+            "SELECT main_target_id, status, total_messages, migrated_messages,
+                    total_chunks, migrated_chunks, last_error, started_at, updated_at
+             FROM storage_migration_jobs WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// 开始或继续迁移；同一主目标会保留历史进度，切换主目标则重新计数。
+    pub async fn storage_migration_begin(
+        &self,
+        main_target_id: i64,
+        remaining_messages: i64,
+        remaining_chunks: i64,
+    ) -> AppResult<StorageMigrationJob> {
+        let previous = self.storage_migration_job().await?;
+        let same_target = previous
+            .as_ref()
+            .is_some_and(|job| job.main_target_id == main_target_id);
+        let migrated_messages = previous
+            .as_ref()
+            .filter(|_| same_target)
+            .map(|job| job.migrated_messages)
+            .unwrap_or(0);
+        let migrated_chunks = previous
+            .as_ref()
+            .filter(|_| same_target)
+            .map(|job| job.migrated_chunks)
+            .unwrap_or(0);
+        let started_at = previous
+            .as_ref()
+            .filter(|_| same_target)
+            .map(|job| job.started_at)
+            .unwrap_or_else(now_ts);
+        let ts = now_ts();
+        sqlx::query(
+            "INSERT INTO storage_migration_jobs
+                (id, main_target_id, status, total_messages, migrated_messages,
+                 total_chunks, migrated_chunks, last_error, started_at, updated_at)
+             VALUES (1, ?, 'running', ?, ?, ?, ?, NULL, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                main_target_id = excluded.main_target_id,
+                status = 'running',
+                total_messages = excluded.total_messages,
+                migrated_messages = excluded.migrated_messages,
+                total_chunks = excluded.total_chunks,
+                migrated_chunks = excluded.migrated_chunks,
+                last_error = NULL,
+                started_at = excluded.started_at,
+                updated_at = excluded.updated_at",
+        )
+        .bind(main_target_id)
+        .bind(migrated_messages.saturating_add(remaining_messages))
+        .bind(migrated_messages)
+        .bind(migrated_chunks.saturating_add(remaining_chunks))
+        .bind(migrated_chunks)
+        .bind(started_at)
+        .bind(ts)
+        .execute(&self.pool)
+        .await?;
+        self.storage_migration_job()
+            .await?
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("迁移任务创建后无法读取")))
+    }
+
+    pub async fn storage_migration_set_status(
+        &self,
+        status: &str,
+        error: Option<&str>,
+    ) -> AppResult<()> {
+        let detail = error.map(|value| value.chars().take(500).collect::<String>());
+        sqlx::query(
+            "UPDATE storage_migration_jobs
+             SET status = ?, last_error = ?, updated_at = ? WHERE id = 1",
+        )
+        .bind(status)
+        .bind(detail)
+        .bind(now_ts())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Telegram 复制成功后切换所有共享引用，并在同一事务内推进任务进度。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_storage_message_migration(
+        &self,
+        source_target_id: i64,
+        source_message_id: i64,
+        main_target_id: i64,
+        new_file_id: &str,
+        new_message_id: i64,
+        new_thumbnail_file_id: Option<&str>,
+    ) -> AppResult<u64> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let updated = sqlx::query(
+            "UPDATE chunks
+             SET storage_target_id = ?, tg_file_id = ?, tg_message_id = ?,
+                 tg_thumbnail_file_id = ?
+             WHERE storage_target_id = ? AND tg_message_id = ?",
+        )
+        .bind(main_target_id)
+        .bind(new_file_id)
+        .bind(new_message_id)
+        .bind(new_thumbnail_file_id)
+        .bind(source_target_id)
+        .bind(source_message_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated > 0 {
+            sqlx::query(
+                "UPDATE storage_migration_jobs
+                 SET migrated_messages = migrated_messages + 1,
+                     migrated_chunks = migrated_chunks + ?,
+                     updated_at = ?
+                 WHERE id = 1 AND main_target_id = ?",
+            )
+            .bind(i64::try_from(updated).unwrap_or(i64::MAX))
+            .bind(now_ts())
+            .bind(main_target_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn active_upload_claim_count(&self) -> AppResult<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM upload_part_claims")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// 服务重启时，上一轮运行中的任务改为暂停，管理员可继续。
+    pub async fn recover_storage_migration(&self) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE storage_migration_jobs
+             SET status = 'paused', updated_at = ? WHERE id = 1 AND status = 'running'",
+        )
+        .bind(now_ts())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// v3 及更早版本的分块没有存储目标。迁移时只能采用当前生效配置，且只执行一次。
     pub async fn backfill_unassigned_chunks(&self, storage_target_id: i64) -> AppResult<u64> {
         Ok(
@@ -550,7 +784,7 @@ impl Db {
         } else {
             message.trim()
         };
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO backend_logs (level, category, message, created_at)
              VALUES (?, ?, ?, ?)",
@@ -742,7 +976,7 @@ impl Db {
         let node = self.node(node_id).await?;
         let parent_id = node.parent_id.ok_or(AppError::NotFound)?;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // 旧同名 ready 文件(覆盖写场景)
         let old: Option<(i64, bool)> = sqlx::query_as(
             "SELECT id, favorite FROM nodes
@@ -818,7 +1052,7 @@ impl Db {
         node_id: i64,
         enqueue_delete: bool,
     ) -> AppResult<Vec<StoredMessage>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT storage_target_id, tg_message_id FROM chunks
              WHERE node_id = ? AND storage_target_id IS NOT NULL",
@@ -1034,7 +1268,7 @@ impl Db {
         storage_target_id: i64,
         tg_thumbnail_file_id: Option<&str>,
     ) -> AppResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let session: UploadSession = sqlx::query_as("SELECT * FROM upload_sessions WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -1161,7 +1395,7 @@ impl Db {
         if id == ROOT_ID {
             return Err(AppError::BadRequest("不能删除根目录".into()));
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // 收集整棵子树的节点 id(SQLite 递归 CTE)
         let node_ids: Vec<(i64,)> = sqlx::query_as(
             "WITH RECURSIVE sub(id) AS (
@@ -1212,7 +1446,7 @@ impl Db {
             return Err(AppError::AlreadyExists);
         }
         let ts = now_ts();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let new_id = sqlx::query(
             "INSERT INTO nodes (parent_id, name, is_dir, size, status, created_at, modified_at, sha256)
              VALUES (?, ?, 0, ?, 'ready', ?, ?, ?)",
@@ -1251,7 +1485,7 @@ impl Db {
         }
         let node = self.node(id).await?;
         let parent_id = node.parent_id.ok_or(AppError::NotFound)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "WITH RECURSIVE sub(id) AS (
                SELECT ? UNION ALL
@@ -1327,7 +1561,7 @@ impl Db {
             };
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // 先改名/挪位置:此时根仍是 trashed,不受 ready 部分唯一索引约束;
         // 随后整树置 ready 时根已用新名字入索引,不会与占名者冲突
         sqlx::query("UPDATE nodes SET parent_id = ?, name = ?, modified_at = ? WHERE id = ?")
@@ -1474,7 +1708,7 @@ impl Db {
         ticket_expires_at: i64,
     ) -> AppResult<bool> {
         let now = now_ts();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // 顺手控制短期领取记录的体积；计数已经写入 shares，不随记录清理回退。
         sqlx::query("DELETE FROM share_download_claims WHERE expires_at < ?")
@@ -1696,7 +1930,7 @@ impl Db {
             return Err(AppError::IsDirectory);
         }
         let ts = now_ts();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // 覆盖写:删同名旧文件并收集其消息做引用计数
         let old: Option<(i64, bool)> = sqlx::query_as(
             "SELECT id, favorite FROM nodes
@@ -1805,7 +2039,7 @@ impl Db {
         sets: &[(String, String)],
         deletes: &[String],
     ) -> AppResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for key in deletes {
             sqlx::query("DELETE FROM settings WHERE k = ?")
                 .bind(key)
@@ -2525,6 +2759,68 @@ mod tests {
         assert_eq!(node.sha256.as_deref(), Some(sha.as_str()));
         assert_eq!(db.chunks_of(node.id).await.unwrap().len(), 3);
         assert!(db.upload_session_info(&session.session.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn storage_message_migration_switches_all_shared_references() {
+        let (db, _g) = test_db().await;
+        let old = db
+            .ensure_storage_target("http://mock", "200:old", "-1001")
+            .await
+            .unwrap();
+        let uploading = db.create_uploading(ROOT_ID, "old.bin").await.unwrap();
+        db.add_chunk(uploading, 0, 4, "old-file", 55, old.id, Some("old-thumb"))
+            .await
+            .unwrap();
+        db.finalize_upload(uploading, 4, Some("old-sha"))
+            .await
+            .unwrap();
+        let copied = db
+            .copy_file(uploading, ROOT_ID, "shared.bin")
+            .await
+            .unwrap();
+
+        let sources = db.storage_migration_sources(TEST_TARGET).await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].messages, 1);
+        assert_eq!(sources[0].chunks, 2);
+        let candidate = db
+            .storage_migration_candidate(TEST_TARGET)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.source_target_id, old.id);
+        assert_eq!(candidate.source_message_id, 55);
+
+        db.storage_migration_begin(TEST_TARGET, 1, 2).await.unwrap();
+        let updated = db
+            .finish_storage_message_migration(
+                old.id,
+                55,
+                TEST_TARGET,
+                "main-file",
+                88,
+                Some("main-thumb"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 2);
+        for node_id in [uploading, copied] {
+            let chunk = db.chunks_of(node_id).await.unwrap().remove(0);
+            assert_eq!(chunk.storage_target_id, Some(TEST_TARGET));
+            assert_eq!(chunk.tg_message_id, 88);
+            assert_eq!(chunk.tg_file_id, "main-file");
+            assert_eq!(chunk.tg_thumbnail_file_id.as_deref(), Some("main-thumb"));
+        }
+        assert!(
+            db.storage_migration_sources(TEST_TARGET)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let job = db.storage_migration_job().await.unwrap().unwrap();
+        assert_eq!(job.migrated_messages, 1);
+        assert_eq!(job.migrated_chunks, 2);
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ type HashCommand =
 
 const scope = self as unknown as DedicatedWorkerGlobalScope
 const cancelled = new Set<number>()
+let hashQueue = Promise.resolve()
 
 scope.onmessage = (event: MessageEvent<HashCommand>) => {
   const command = event.data
@@ -15,7 +16,9 @@ scope.onmessage = (event: MessageEvent<HashCommand>) => {
     cancelled.add(command.id)
     return
   }
-  void hashFile(command.id, command.file)
+  // Worker 的消息处理器不会自动串行；直接调用会让多个文件同时创建 WASM
+  // 哈希器和 8MB 缓冲区。显式排队，避免万级任务触发内存峰值。
+  hashQueue = hashQueue.then(() => hashFile(command.id, command.file))
 }
 
 async function hashFile(id: number, file: File) {

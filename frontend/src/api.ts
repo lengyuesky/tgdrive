@@ -11,6 +11,30 @@ export interface Entry {
   favorite: boolean
 }
 
+/** 游标目录专用条目；分享、回收站仍使用原类型。 */
+export interface DirectoryEntry extends Entry {
+  id: number
+  has_thumbnail: boolean
+}
+
+export interface EntriesQuery {
+  path: string
+  limit: number
+  cursor?: string
+  sort: 'name' | 'size' | 'mtime'
+  order: 'asc' | 'desc'
+  kind: 'all' | 'dir' | 'file'
+  q: string
+}
+
+export interface EntriesResponse {
+  path: string
+  entries: DirectoryEntry[]
+  next_cursor: string | null
+  has_more: boolean
+  total?: number
+}
+
 export interface EntryProperties extends Entry {
   path: string
   /** 目录内递归文件数；普通文件为 1。 */
@@ -78,7 +102,11 @@ export interface UploadSession {
 
 export interface UploadSessionResponse {
   session: UploadSession
+  /** 单块会话为所有 Bot 的总并发；多分块会话固定返回 1。 */
   concurrency: number
+  bot_count: number
+  /** 当前会话所属 Bot 的 429 冷却剩余秒数。 */
+  retry_after: number
 }
 
 export interface TrashItem {
@@ -190,6 +218,7 @@ export interface BackupOutcome {
 export type CfgKey =
   | 'api_base'
   | 'bot_token'
+  | 'upload_bot_tokens'
   | 'chat_id'
   | 'chunk_size'
   | 'upload_concurrency'
@@ -207,6 +236,8 @@ export interface AdminConfig {
   values: {
     api_base: string
     bot_token: string
+    /** 每行一个额外上传 Bot Token；返回值已逐项脱敏。 */
+    upload_bot_tokens: string
     chat_id: string
     chunk_size: number
     upload_concurrency: number
@@ -236,6 +267,7 @@ export interface AdminStatus {
   official_api: boolean
   chunk_size: number
   upload_concurrency: number
+  upload_bot_count: number
   files: number
   dirs: number
   total_size: number
@@ -272,6 +304,32 @@ export interface QueueRunSummary {
   last_error: string | null
   /** 因超时提前收工;为真时再点一次可以接着处理 */
   stopped_early: boolean
+}
+
+export interface StorageMigrationSource {
+  storage_target_id: number
+  bot_id: string
+  chat_id: string
+  messages: number
+  chunks: number
+  bytes: number
+}
+
+export interface StorageMigrationStatus {
+  status: 'idle' | 'running' | 'paused' | 'failed' | 'completed'
+  running: boolean
+  main_target_id: number
+  main_bot_id: string
+  total_messages: number
+  migrated_messages: number
+  remaining_messages: number
+  total_chunks: number
+  migrated_chunks: number
+  remaining_chunks: number
+  last_error: string | null
+  started_at: number | null
+  updated_at: number | null
+  sources: StorageMigrationSource[]
 }
 
 export interface TaskStatus {
@@ -343,6 +401,7 @@ export interface ApplyOutcome {
 export type ConfigPatch = Partial<{
   api_base: string
   bot_token: string
+  upload_bot_tokens: string
   chat_id: string
   chunk_size: string
   upload_concurrency: number
@@ -382,6 +441,8 @@ export const api = {
   info: () => http.get<ServerInfo>('/info'),
   list: (path: string) =>
     http.get<{ path: string; entries: Entry[] }>('/fs/list', { params: { path } }),
+  entries: (params: EntriesQuery, signal?: AbortSignal) =>
+    http.get<EntriesResponse>('/fs/entries', { params, signal }),
   properties: (path: string) =>
     http.get<{ properties: EntryProperties }>('/fs/properties', { params: { path } }),
   mkdir: (path: string) => http.post('/fs/mkdir', { path }),
@@ -436,7 +497,12 @@ export const api = {
 
   uploads: {
     list: () =>
-      http.get<{ sessions: UploadSession[]; concurrency: number }>('/uploads'),
+      http.get<{
+        sessions: UploadSession[]
+        concurrency: number
+        bot_count: number
+        retry_after: number
+      }>('/uploads'),
     status: (id: string) => http.get<UploadSessionResponse>(`/uploads/${id}`),
     create: (dir: string, name: string, size: number, sha256: string) =>
       http.post<UploadSessionResponse>('/uploads', { dir, name, size, sha256 }),
@@ -531,6 +597,11 @@ export const api = {
     cleanup: () => http.post<{ cleaned: number }>('/admin/cleanup'),
     runDeleteQueue: () => http.post<QueueRunSummary>('/admin/queues/delete/run'),
     clearDeleteQueue: () => http.delete<{ cleared: number }>('/admin/queues/delete'),
+    storageMigration: () => http.get<StorageMigrationStatus>('/admin/storage-migration'),
+    startStorageMigration: () =>
+      http.post<StorageMigrationStatus>('/admin/storage-migration/start'),
+    pauseStorageMigration: () =>
+      http.post<StorageMigrationStatus>('/admin/storage-migration/pause'),
     logoutAll: () => http.post('/admin/logout-all'),
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
     backupUrl: '/api/admin/backup',

@@ -22,6 +22,8 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt as _;
 use tokio_util::io::ReaderStream;
 
+mod entries;
+
 #[derive(Clone)]
 pub struct AppState {
     pub vfs: Vfs,
@@ -32,6 +34,7 @@ pub struct AppState {
     /// 登录与分享提取码的失败限流。
     pub attempts: crate::security::AttemptLimiter,
     pub tasks: crate::tasks::TaskManager,
+    pub migration: crate::migration::StorageMigrationManager,
 }
 
 /// 就绪探针：数据库可用、存储目标已装载且关键后台任务仍有心跳。
@@ -69,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/fs/list", get(list))
+        .route("/fs/entries", get(entries::entries_get))
         .route("/fs/properties", get(properties_get))
         .route("/fs/mkdir", post(mkdir))
         .route(
@@ -104,6 +108,15 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/detect-chats", post(admin_detect_chats))
         .route("/admin/status", get(admin_status))
         .route("/admin/logs", get(admin_logs))
+        .route("/admin/storage-migration", get(admin_storage_migration))
+        .route(
+            "/admin/storage-migration/start",
+            post(admin_storage_migration_start),
+        )
+        .route(
+            "/admin/storage-migration/pause",
+            post(admin_storage_migration_pause),
+        )
         .route(
             "/admin/inbox-failures",
             get(admin_inbox_failures).delete(admin_inbox_failures_clear),
@@ -420,6 +433,22 @@ fn upload_session_json(info: &UploadSessionInfo) -> serde_json::Value {
     })
 }
 
+/// 多分块文件固定走默认(主) Bot；单块文件才参与上传 Bot 池轮询。
+fn requires_primary_upload_target(size: i64, chunk_size: u64) -> bool {
+    size > 0
+        && u64::try_from(size)
+            .ok()
+            .is_some_and(|size| size > chunk_size)
+}
+
+fn session_upload_concurrency(per_bot: usize, bot_count: usize, part_count: i64) -> usize {
+    if part_count > 1 {
+        1
+    } else {
+        per_bot.saturating_mul(bot_count.max(1)).max(1)
+    }
+}
+
 fn normalized_display_path(dir: &str, name: &str) -> AppResult<String> {
     let mut segments = crate::vfs::normalize(dir)?;
     segments.push(name.to_string());
@@ -429,9 +458,18 @@ fn normalized_display_path(dir: &str, name: &str) -> AppResult<String> {
 async fn uploads_index(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let sessions = state.vfs.db.upload_sessions().await?;
     let values: Vec<_> = sessions.iter().map(upload_session_json).collect();
+    let retry_after = state.vfs.tg.upload_retry_after_secs();
+    let bot_count = state.vfs.tg.upload_bot_count();
+    let concurrency = state
+        .rt
+        .current()
+        .upload_concurrency
+        .saturating_mul(bot_count.max(1));
     Ok(Json(serde_json::json!({
         "sessions": values,
-        "concurrency": state.rt.current().upload_concurrency,
+        "concurrency": concurrency,
+        "bot_count": bot_count,
+        "retry_after": retry_after,
     })))
 }
 
@@ -440,9 +478,23 @@ async fn upload_status(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let info = state.vfs.db.upload_session_info(&id).await?;
+    let retry_after = state
+        .vfs
+        .tg
+        .binding(info.session.storage_target_id)
+        .map(|target| target.api.upload_retry_after_secs())
+        .unwrap_or(0);
+    let bot_count = state.vfs.tg.upload_bot_count();
+    let concurrency = session_upload_concurrency(
+        state.rt.current().upload_concurrency,
+        bot_count,
+        info.part_count(),
+    );
     Ok(Json(serde_json::json!({
         "session": upload_session_json(&info),
-        "concurrency": state.rt.current().upload_concurrency,
+        "concurrency": concurrency,
+        "bot_count": bot_count,
+        "retry_after": retry_after,
     })))
 }
 
@@ -455,8 +507,15 @@ async fn uploads_create(
     if !parent.is_dir {
         return Err(AppError::NotDirectory);
     }
-    let target = state.vfs.tg.current()?;
     let cfg = state.rt.current();
+    // 需要拆成多个 Telegram 分块的文件统一固定到主 Bot；只有单块文件
+    // 才参与额外上传 Bot 的轮询。这样大文件不会在多个 Bot/连接之间
+    // 争抢同一个自建 Bot API 进程的上行带宽。
+    let target = if requires_primary_upload_target(body.size, cfg.chunk_size) {
+        state.vfs.tg.current()?
+    } else {
+        state.vfs.tg.next_upload()?
+    };
     let display_path = normalized_display_path(&body.dir, &name)?;
     let info = state
         .vfs
@@ -471,9 +530,18 @@ async fn uploads_create(
             target.storage_target_id,
         )
         .await?;
+    // 同一路径的可恢复会话可能早已绑定到另一个池成员，状态必须按实际目标返回。
+    let session_target = state.vfs.tg.binding(info.session.storage_target_id)?;
+    let bot_count = state.vfs.tg.upload_bot_count();
     Ok(Json(serde_json::json!({
         "session": upload_session_json(&info),
-        "concurrency": cfg.upload_concurrency,
+        "concurrency": session_upload_concurrency(
+            cfg.upload_concurrency,
+            bot_count,
+            info.part_count(),
+        ),
+        "bot_count": bot_count,
+        "retry_after": session_target.api.upload_retry_after_secs(),
     })))
 }
 
@@ -670,8 +738,7 @@ async fn thumbnail_get(
     if node.is_dir {
         return Err(AppError::IsDirectory);
     }
-    let chunks = state.vfs.db.chunks_of(node.id).await?;
-    let Some(first) = chunks.first().filter(|chunk| chunk.idx == 0) else {
+    let Some(first) = state.vfs.db.first_chunk(node.id).await? else {
         return Ok(thumbnail_not_found());
     };
     let Some(file_id) = first.tg_thumbnail_file_id.as_deref() else {
@@ -941,6 +1008,12 @@ async fn admin_config(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "values": {
             "api_base": c.api_base,
             "bot_token": settings::mask(&c.bot_token),
+            "upload_bot_tokens": c
+                .upload_bot_tokens
+                .iter()
+                .map(|token| settings::mask(token))
+                .collect::<Vec<_>>()
+                .join("\n"),
             "chat_id": c.chat_id,
             "chunk_size": c.chunk_size,
             "upload_concurrency": c.upload_concurrency,
@@ -970,6 +1043,29 @@ async fn admin_save(
     let c = state.rt.current();
     if patch.bot_token.as_deref() == Some(settings::mask(&c.bot_token).as_str()) {
         patch.bot_token = None;
+    }
+    let masked_upload_tokens = c
+        .upload_bot_tokens
+        .iter()
+        .map(|token| settings::mask(token))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if patch.upload_bot_tokens.as_deref() == Some(masked_upload_tokens.as_str()) {
+        patch.upload_bot_tokens = None;
+    } else if let Some(value) = patch.upload_bot_tokens.as_deref() {
+        // 多行列表允许保留已有脱敏项并增删真实 Token；逐行把占位恢复为原值。
+        let resolved = crate::config::parse_bot_tokens(value)
+            .into_iter()
+            .map(|submitted| {
+                c.upload_bot_tokens
+                    .iter()
+                    .find(|existing| settings::mask(existing) == submitted)
+                    .cloned()
+                    .unwrap_or(submitted)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        patch.upload_bot_tokens = Some(resolved);
     }
     if patch.telegram_api_hash.as_deref() == Some(settings::mask(&c.telegram_api_hash).as_str()) {
         patch.telegram_api_hash = None;
@@ -1106,6 +1202,7 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "official_api": c.is_official_api(),
         "chunk_size": c.chunk_size,
         "upload_concurrency": c.upload_concurrency,
+        "upload_bot_count": state.vfs.tg.upload_bot_count(),
         "send_video": c.send_video,
         "files": files,
         "dirs": dirs,
@@ -1121,6 +1218,27 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "inbox_failures": inbox_failures,
         "tasks": state.tasks.snapshots(),
     })))
+}
+
+async fn admin_storage_migration(
+    State(state): State<AppState>,
+) -> AppResult<Json<crate::migration::StorageMigrationStatus>> {
+    let target_id = crate::migration::primary_target_id(state.rt.current().storage_target_id)?;
+    Ok(Json(state.migration.status(target_id).await?))
+}
+
+async fn admin_storage_migration_start(
+    State(state): State<AppState>,
+) -> AppResult<Json<crate::migration::StorageMigrationStatus>> {
+    let target_id = crate::migration::primary_target_id(state.rt.current().storage_target_id)?;
+    Ok(Json(state.migration.start(target_id).await?))
+}
+
+async fn admin_storage_migration_pause(
+    State(state): State<AppState>,
+) -> AppResult<Json<crate::migration::StorageMigrationStatus>> {
+    let target_id = crate::migration::primary_target_id(state.rt.current().storage_target_id)?;
+    Ok(Json(state.migration.pause(target_id).await?))
 }
 
 #[derive(Deserialize, Default)]
@@ -1944,6 +2062,21 @@ mod tests {
         let upper = "A".repeat(64);
         assert_eq!(normalized_sha256(&upper).unwrap(), "a".repeat(64));
         assert!(normalized_sha256("bad").is_err());
+    }
+
+    #[test]
+    fn only_multi_part_uploads_use_primary_bot() {
+        assert!(!requires_primary_upload_target(0, 256));
+        assert!(!requires_primary_upload_target(256, 256));
+        assert!(requires_primary_upload_target(257, 256));
+        assert!(!requires_primary_upload_target(-1, 256));
+    }
+
+    #[test]
+    fn multi_part_session_reports_single_concurrency() {
+        assert_eq!(session_upload_concurrency(5, 3, 9), 1);
+        assert_eq!(session_upload_concurrency(5, 3, 1), 15);
+        assert_eq!(session_upload_concurrency(0, 0, 1), 1);
     }
 
     #[test]

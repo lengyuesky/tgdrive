@@ -11,14 +11,18 @@ use bytes::Bytes;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 /// getFile 结果缓存时长(官方 file_path 约 1 小时失效,留余量)
 const FILE_PATH_TTL: Duration = Duration::from_secs(30 * 60);
 const FILE_PATH_CACHE_CAPACITY: usize = 4096;
 const MAX_RETRIES: u32 = 5;
+/// Telegram 建议同一聊天不要持续超过每秒一条消息。这里只错开发送请求的
+/// 起始时间，大文件仍可并行传输，不会把上传并发重新退化成串行。
+const MEDIA_SEND_INTERVAL: Duration = Duration::from_millis(1100);
 /// Telegram 自定义媒体缩略图必须小于该值。
 pub const MAX_THUMBNAIL_SIZE: usize = 200 * 1024;
 
@@ -125,6 +129,15 @@ impl UploadBody {
 
 #[async_trait::async_trait]
 pub trait TgApi: Send + Sync + 'static {
+    /// 多 Bot 共用一个 Bot API 进程时，运行时关闭破坏性的全局重启。
+    fn set_restart_enabled(&self, _enabled: bool) {}
+    /// 在发起一次新的媒体请求前取得共享发送时隙。真实客户端按聊天错峰，
+    /// 测试/占位客户端默认不等待。
+    async fn wait_upload_turn(&self) {}
+    /// 当前 Telegram 429 共享冷却剩余秒数，供上传界面显示。
+    fn upload_retry_after_secs(&self) -> u64 {
+        0
+    }
     async fn send_document(
         &self,
         filename: &str,
@@ -145,6 +158,17 @@ pub trait TgApi: Send + Sync + 'static {
     ) -> AppResult<TgMessage> {
         let _ = (mime, meta);
         self.send_document(filename, caption, thumbnail, body).await
+    }
+    /// 把来源频道中的一条媒体消息复制到当前存储频道，并返回当前 Bot
+    /// 可用的新 file_id。默认实现用于不支持该能力的测试客户端。
+    async fn copy_message_from(
+        &self,
+        _from_chat_id: &str,
+        _message_id: i64,
+    ) -> AppResult<TgMessage> {
+        Err(AppError::BadRequest(
+            "当前 Telegram 客户端不支持消息迁移".into(),
+        ))
     }
     async fn delete_message(&self, message_id: i64) -> AppResult<()>;
     /// 终止已经交给自建 Bot API、但尚未完成的上传。
@@ -275,22 +299,51 @@ pub struct TgBinding {
     pub api: Arc<dyn TgApi>,
 }
 
-/// 同时保留历史存储目标和当前写入目标。读取、删除按分块记录的 target_id 路由，
-/// 当前目标只影响之后开始的上传。
+/// 同时保留历史存储目标、主目标和上传池。读取、删除按分块记录的 target_id 路由；
+/// 主目标供收件与备份使用，新上传则从池中选择。
 pub struct TgRegistry {
     current: std::sync::RwLock<Option<i64>>,
+    upload_pool: std::sync::RwLock<Vec<i64>>,
+    upload_cursor: AtomicUsize,
+    multi_bot_mode: AtomicBool,
     clients: std::sync::RwLock<HashMap<i64, Arc<dyn TgApi>>>,
     mtproto: Option<MtprotoConfig>,
+}
+
+fn choose_upload_target(
+    pool: &[i64],
+    start: usize,
+    mut retry_after: impl FnMut(i64) -> Option<u64>,
+) -> Option<i64> {
+    let mut best: Option<(i64, u64)> = None;
+    for offset in 0..pool.len() {
+        let id = pool[(start + offset) % pool.len()];
+        let Some(wait) = retry_after(id) else {
+            continue;
+        };
+        if best.is_none_or(|(_, best_wait)| wait < best_wait) {
+            best = Some((id, wait));
+            if wait == 0 {
+                break;
+            }
+        }
+    }
+    best.map(|(id, _)| id)
 }
 
 impl TgRegistry {
     pub fn new(
         targets: &[StorageTarget],
         current: Option<i64>,
+        upload_pool: Vec<i64>,
         mtproto: Option<MtprotoConfig>,
     ) -> AppResult<Self> {
+        let multi_bot_mode = upload_pool.len() > 1;
         let registry = TgRegistry {
             current: std::sync::RwLock::new(current),
+            upload_pool: std::sync::RwLock::new(upload_pool),
+            upload_cursor: AtomicUsize::new(0),
+            multi_bot_mode: AtomicBool::new(multi_bot_mode),
             clients: std::sync::RwLock::new(HashMap::new()),
             mtproto,
         };
@@ -304,6 +357,9 @@ impl TgRegistry {
     pub fn with_client(storage_target_id: i64, api: Arc<dyn TgApi>) -> Self {
         TgRegistry {
             current: std::sync::RwLock::new(Some(storage_target_id)),
+            upload_pool: std::sync::RwLock::new(vec![storage_target_id]),
+            upload_cursor: AtomicUsize::new(0),
+            multi_bot_mode: AtomicBool::new(false),
             clients: std::sync::RwLock::new(HashMap::from([(storage_target_id, api)])),
             mtproto: None,
         }
@@ -317,12 +373,13 @@ impl TgRegistry {
             });
         }
         let api: Arc<dyn TgApi> = Arc::new(
-            TgClient::new_with_mtproto(
+            TgClient::new_with_mtproto_and_restart(
                 &target.api_base,
                 &target.bot_token,
                 &target.chat_id,
                 self.mtproto.clone(),
                 target.id,
+                !self.multi_bot_mode.load(Ordering::Acquire),
             )
             .map_err(|e| AppError::BadRequest(format!("Telegram 客户端构造失败: {e}")))?,
         );
@@ -333,11 +390,22 @@ impl TgRegistry {
         })
     }
 
-    pub fn set_current_id(&self, id: Option<i64>) -> AppResult<()> {
-        if let Some(id) = id {
+    /// 热更新主 Bot 与上传池；所有目标必须已注册，避免保存后才在上传途中报错。
+    pub fn set_targets(&self, current: Option<i64>, upload_pool: Vec<i64>) -> AppResult<()> {
+        let multi_bot_mode = upload_pool.len() > 1;
+        self.multi_bot_mode.store(multi_bot_mode, Ordering::Release);
+        if let Some(id) = current {
             self.binding(id)?;
         }
-        *self.current.write().unwrap() = id;
+        for id in &upload_pool {
+            self.binding(*id)?;
+        }
+        *self.current.write().unwrap() = current;
+        *self.upload_pool.write().unwrap() = upload_pool;
+        for api in self.clients.read().unwrap().values() {
+            api.set_restart_enabled(!multi_bot_mode);
+        }
+        self.upload_cursor.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -348,6 +416,38 @@ impl TgRegistry {
             )
         })?;
         self.binding(id)
+    }
+
+    /// 为一个新文件选择上传 Bot：优先没有冷却的目标，同等待时间下轮询分摊。
+    /// 调用方会把返回的 target_id 固定进上传会话，文件续传不会换 Bot。
+    pub fn next_upload(&self) -> AppResult<TgBinding> {
+        let pool = self.upload_pool.read().unwrap().clone();
+        if pool.is_empty() {
+            return self.current();
+        }
+        let start = self.upload_cursor.fetch_add(1, Ordering::AcqRel) % pool.len();
+        let clients = self.clients.read().unwrap();
+        let best = choose_upload_target(&pool, start, |id| {
+            clients.get(&id).map(|api| api.upload_retry_after_secs())
+        });
+        drop(clients);
+        let id = best.ok_or_else(|| AppError::BadRequest("上传 Bot 池中没有可用目标".into()))?;
+        self.binding(id)
+    }
+
+    pub fn upload_bot_count(&self) -> usize {
+        self.upload_pool.read().unwrap().len()
+    }
+
+    /// 只要池中有一个 Bot 可发送，前端就不应显示全局冷却。
+    pub fn upload_retry_after_secs(&self) -> u64 {
+        let pool = self.upload_pool.read().unwrap();
+        let clients = self.clients.read().unwrap();
+        pool.iter()
+            .filter_map(|id| clients.get(id))
+            .map(|api| api.upload_retry_after_secs())
+            .min()
+            .unwrap_or(0)
     }
 
     pub fn binding(&self, storage_target_id: i64) -> AppResult<TgBinding> {
@@ -429,7 +529,83 @@ pub struct TgClient {
     local_data_root: std::path::PathBuf,
     /// 自建 Bot API 监督器的重启信号文件；官方端点不启用。
     bot_api_restart_file: Option<std::path::PathBuf>,
+    bot_api_restart_enabled: AtomicBool,
+    media_throttle: MediaSendThrottle,
     mtproto: Option<Arc<MtprotoClient>>,
+}
+
+struct MediaSendThrottle {
+    state: tokio::sync::Mutex<MediaSendThrottleState>,
+    cooldown_until_unix_ms: AtomicU64,
+    interval: Duration,
+}
+
+struct MediaSendThrottleState {
+    next_send_at: Instant,
+    cooldown_until: Instant,
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+impl MediaSendThrottle {
+    fn new(interval: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            state: tokio::sync::Mutex::new(MediaSendThrottleState {
+                next_send_at: now,
+                cooldown_until: now,
+            }),
+            cooldown_until_unix_ms: AtomicU64::new(0),
+            interval,
+        }
+    }
+
+    /// 所有等待者醒来后重新竞争并检查截止时间，因此延长冷却时不需要逐个通知；
+    /// 同一时刻只会有一个任务取得时隙，其余任务自动按 interval 排开。
+    async fn wait_turn(&self) {
+        loop {
+            let deadline = {
+                let mut state = self.state.lock().await;
+                let now = Instant::now();
+                let deadline = state.next_send_at.max(state.cooldown_until);
+                if deadline <= now {
+                    state.next_send_at = now + self.interval;
+                    return;
+                }
+                deadline
+            };
+            tokio::time::sleep_until(deadline.into()).await;
+        }
+    }
+
+    async fn defer_all(&self, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        {
+            let mut state = self.state.lock().await;
+            state.cooldown_until = state.cooldown_until.max(deadline);
+            state.next_send_at = state.next_send_at.max(deadline);
+        }
+        let wait_ms = wait.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.cooldown_until_unix_ms
+            .fetch_max(unix_millis().saturating_add(wait_ms), Ordering::AcqRel);
+    }
+
+    fn retry_after_secs(&self) -> u64 {
+        self.cooldown_until_unix_ms
+            .load(Ordering::Acquire)
+            .saturating_sub(unix_millis())
+            .div_ceil(1000)
+    }
+}
+
+fn is_flood_limit(error: &AppError) -> bool {
+    matches!(error, AppError::Telegram(detail) if detail.contains("[429]") || detail.contains("HTTP 429"))
 }
 
 struct CachedFilePath {
@@ -485,19 +661,20 @@ impl FilePathCache {
 
 impl TgClient {
     pub fn new(api_base: &str, token: &str, chat_id: &str) -> anyhow::Result<Self> {
-        Self::build(api_base, token, chat_id, None)
+        Self::build(api_base, token, chat_id, None, true)
     }
 
-    fn new_with_mtproto(
+    fn new_with_mtproto_and_restart(
         api_base: &str,
         token: &str,
         chat_id: &str,
         config: Option<MtprotoConfig>,
         storage_target_id: i64,
+        restart_enabled: bool,
     ) -> anyhow::Result<Self> {
         let mtproto =
             config.map(|config| Arc::new(MtprotoClient::new(config, storage_target_id, token)));
-        Self::build(api_base, token, chat_id, mtproto)
+        Self::build(api_base, token, chat_id, mtproto, restart_enabled)
     }
 
     fn build(
@@ -505,6 +682,7 @@ impl TgClient {
         token: &str,
         chat_id: &str,
         mtproto: Option<Arc<MtprotoClient>>,
+        restart_enabled: bool,
     ) -> anyhow::Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
@@ -514,16 +692,18 @@ impl TgClient {
             .build()?;
         Ok(TgClient {
             http,
-            bot_api_restart_file: (!crate::config::is_official(&api_base))
+            bot_api_restart_file: (restart_enabled && !crate::config::is_official(&api_base))
                 .then(|| std::env::var("TGDRIVE_BOT_API_RESTART_FILE").ok())
                 .flatten()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .map(Into::into),
+            bot_api_restart_enabled: AtomicBool::new(restart_enabled),
             api_base,
             token: token.to_string(),
             chat_id: chat_id.to_string(),
             path_cache: Mutex::new(FilePathCache::default()),
+            media_throttle: MediaSendThrottle::new(MEDIA_SEND_INTERVAL),
             local_data_root: std::env::var("TGDRIVE_LOCAL_DATA_ROOT")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -744,6 +924,11 @@ impl TgClient {
         let url = self.method_url(method);
         let mut attempt = 0u32;
         let msg: RawMessage = loop {
+            // 第一次发送已由调用者在“标记上游在途”之前取得时隙；只有安全重试
+            // 需要在这里再次排队，防止取消等待任务时误重启 Bot API。
+            if attempt > 0 {
+                self.media_throttle.wait_turn().await;
+            }
             attempt += 1;
             let mut form = reqwest::multipart::Form::new()
                 .text("chat_id", self.chat_id.clone())
@@ -800,11 +985,17 @@ impl TgClient {
                 Ok(msg) => break msg,
                 Err((Some(wait), err)) if attempt < MAX_RETRIES => {
                     let jitter = Duration::from_millis((attempt as u64 * 137) % 500);
-                    tracing::warn!(
-                        "{method} 第 {attempt} 次失败({err}),{:?} 后安全重试",
-                        wait + jitter
-                    );
-                    tokio::time::sleep(wait + jitter).await;
+                    let wait = wait + jitter;
+                    if is_flood_limit(&err) {
+                        self.media_throttle.defer_all(wait).await;
+                        tracing::warn!(
+                            "{method} 第 {attempt} 次触发 Telegram 限流({err})，该 Bot 的上传共享等待 {:?}",
+                            wait
+                        );
+                    } else {
+                        tracing::warn!("{method} 第 {attempt} 次失败({err}),{:?} 后安全重试", wait);
+                        tokio::time::sleep(wait).await;
+                    }
                 }
                 Err((_, err)) => return Err(err),
             }
@@ -900,6 +1091,19 @@ impl TgClient {
 
 #[async_trait::async_trait]
 impl TgApi for TgClient {
+    fn set_restart_enabled(&self, enabled: bool) {
+        self.bot_api_restart_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    async fn wait_upload_turn(&self) {
+        self.media_throttle.wait_turn().await;
+    }
+
+    fn upload_retry_after_secs(&self) -> u64 {
+        self.media_throttle.retry_after_secs()
+    }
+
     async fn send_document(
         &self,
         filename: &str,
@@ -942,6 +1146,83 @@ impl TgApi for TgClient {
         .await
     }
 
+    async fn copy_message_from(&self, from_chat_id: &str, message_id: i64) -> AppResult<TgMessage> {
+        // Bot API 的 copyMessage 只返回 MessageId，拿不到主 Bot 专属的新 file_id；
+        // forwardMessage 同样在 Telegram 服务端复制媒体，但会返回完整 Message，
+        // 因而能安全更新 tgdrive 的分块映射。
+        let url = self.method_url("forwardMessage");
+        let mut attempt = 0u32;
+        let raw: RawMessage = loop {
+            if attempt > 0 {
+                self.media_throttle.wait_turn().await;
+            }
+            attempt += 1;
+            let outcome = match self
+                .http
+                .post(&url)
+                .json(&serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "from_chat_id": from_chat_id,
+                    "message_id": message_id,
+                    "disable_notification": true,
+                }))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    self.parse::<RawMessage>(response, CallMode::SendMedia)
+                        .await
+                }
+                Err(error) if error.is_connect() => Err((
+                    None,
+                    AppError::Telegram(format!(
+                        "forwardMessage: {}",
+                        reqwest_error_summary(&error)
+                    )),
+                )),
+                Err(error) => Err((
+                    None,
+                    AppError::TelegramUncertain(format!(
+                        "forwardMessage 请求结果不确定（{}）；可能已产生一条未登记的复制消息",
+                        reqwest_error_summary(&error)
+                    )),
+                )),
+            };
+            match outcome {
+                Ok(message) => break message,
+                Err((Some(wait), error)) if is_flood_limit(&error) && attempt < MAX_RETRIES => {
+                    let wait = wait + Duration::from_millis((attempt as u64 * 137) % 500);
+                    self.media_throttle.defer_all(wait).await;
+                    tracing::warn!(
+                        "forwardMessage 第 {attempt} 次触发限流({error})，共享等待 {:?}",
+                        wait
+                    );
+                }
+                // 发送类 5xx 即使带有重试提示也可能已经创建消息，不能自动重放。
+                Err((Some(_), error)) => {
+                    return Err(AppError::TelegramUncertain(format!(
+                        "{error}；可能已产生一条未登记的复制消息"
+                    )));
+                }
+                Err((_, error)) => return Err(error),
+            }
+        };
+        let copied_message_id = raw.message_id;
+        let Some(media) = raw.any_file() else {
+            if let Err(error) = self.delete_message(copied_message_id).await {
+                tracing::warn!("迁移消息 {copied_message_id} 缺少媒体且清理失败: {error}");
+            }
+            return Err(AppError::Telegram(format!(
+                "复制后的消息 {copied_message_id} 没有可用媒体字段"
+            )));
+        };
+        Ok(TgMessage {
+            message_id: copied_message_id,
+            file_id: media.file_id,
+            thumbnail_file_id: media.thumbnail.map(|thumbnail| thumbnail.file_id),
+        })
+    }
+
     async fn delete_message(&self, message_id: i64) -> AppResult<()> {
         let url = self.method_url("deleteMessage");
         let res: Result<bool, AppError> = self
@@ -964,6 +1245,9 @@ impl TgApi for TgClient {
     }
 
     async fn cancel_pending_uploads(&self) -> AppResult<()> {
+        if !self.bot_api_restart_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let Some(path) = &self.bot_api_restart_file else {
             return Ok(());
         };
@@ -1072,6 +1356,35 @@ mod tests {
         );
         assert!(retry.is_none());
         assert!(matches!(err, AppError::TelegramRejected(_)));
+        assert!(is_flood_limit(&AppError::Telegram(
+            "[429] Too Many Requests".into()
+        )));
+        assert!(!is_flood_limit(&AppError::Telegram(
+            "[500] Internal Server Error".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn media_throttle_shares_cooldown_and_staggers_waiters() {
+        let throttle = Arc::new(MediaSendThrottle::new(Duration::from_millis(20)));
+        throttle.defer_all(Duration::from_millis(40)).await;
+        assert_eq!(throttle.retry_after_secs(), 1);
+
+        let started = Instant::now();
+        let first = {
+            let throttle = throttle.clone();
+            tokio::spawn(async move { throttle.wait_turn().await })
+        };
+        let second = {
+            let throttle = throttle.clone();
+            tokio::spawn(async move { throttle.wait_turn().await })
+        };
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "共享冷却结束后，两个等待者仍应按发送间隔错峰"
+        );
     }
 
     #[test]
@@ -1101,6 +1414,25 @@ mod tests {
             ..member
         };
         assert!(validate_storage_member("channel", &missing_delete).is_err());
+    }
+
+    #[test]
+    fn upload_pool_round_robins_and_skips_cooled_bots() {
+        let pool = [10, 20, 30];
+        assert_eq!(choose_upload_target(&pool, 0, |_| Some(0)), Some(10));
+        assert_eq!(choose_upload_target(&pool, 1, |_| Some(0)), Some(20));
+        assert_eq!(
+            choose_upload_target(&pool, 0, |id| Some(if id == 10 { 30 } else { 0 })),
+            Some(20)
+        );
+        assert_eq!(
+            choose_upload_target(&pool, 0, |id| Some(match id {
+                10 => 30,
+                20 => 12,
+                _ => 18,
+            })),
+            Some(20)
+        );
     }
 
     #[test]

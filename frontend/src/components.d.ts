@@ -12,6 +12,9 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AppDialog: typeof import('./components/AppDialog.vue')['default']
+    BoundedImagePreview: typeof import('./components/BoundedImagePreview.vue')['default']
+    DirectoryMedia: typeof import('./components/DirectoryMedia.vue')['default']
+    DirectoryViewport: typeof import('./components/DirectoryViewport.vue')['default']
     DirPicker: typeof import('./components/DirPicker.vue')['default']
     ElAlert: typeof import('element-plus/es')['ElAlert']
     ElBadge: typeof import('element-plus/es')['ElBadge']
@@ -34,7 +37,6 @@ declare module 'vue' {
     ElFormItem: typeof import('element-plus/es')['ElFormItem']
     ElIcon: typeof import('element-plus/es')['ElIcon']
     ElImage: typeof import('element-plus/es')['ElImage']
-    ElImageViewer: typeof import('element-plus/es')['ElImageViewer']
     ElInput: typeof import('element-plus/es')['ElInput']
     ElInputNumber: typeof import('element-plus/es')['ElInputNumber']
     ElLink: typeof import('element-plus/es')['ElLink']
@@ -51,7 +53,6 @@ declare module 'vue' {
     ElTag: typeof import('element-plus/es')['ElTag']
     ElText: typeof import('element-plus/es')['ElText']
     ElTooltip: typeof import('element-plus/es')['ElTooltip']
-    ElTree: typeof import('element-plus/es')['ElTree']
     PreviewDialog: typeof import('./components/PreviewDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
@@ -62,6 +63,8 @@ declare module 'vue' {
     UploadDrawer: typeof import('./components/UploadDrawer.vue')['default']
     VideoPlayer: typeof import('./components/VideoPlayer.vue')['default']
     VideoThumb: typeof import('./components/VideoThumb.vue')['default']
+    VirtualDirectoryTree: typeof import('./components/VirtualDirectoryTree.vue')['default']
+    VirtualViewport: typeof import('./components/VirtualViewport.vue')['default']
   }
   export interface GlobalDirectives {
     vLoading: typeof import('element-plus/es')['ElLoadingDirective']

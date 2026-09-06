@@ -44,7 +44,12 @@ mod tests {
         /// 挂起 Telegram 发送，用于验证取消会真正终止在途任务。
         block_send: AtomicBool,
         send_started: AtomicBool,
+        send_started_count: AtomicU64,
         send_release: tokio::sync::Notify,
+        /// 挂起共享发送时隙，用于验证等待限流时取消不会误重启 Bot API。
+        block_upload_turn: AtomicBool,
+        upload_turn_started: AtomicBool,
+        upload_turn_release: tokio::sync::Notify,
         /// 验证取消确实通知了 Bot API 监督器。
         cancel_pending_calls: AtomicU64,
     }
@@ -65,7 +70,11 @@ mod tests {
                 fail_delete: AtomicBool::new(false),
                 block_send: AtomicBool::new(false),
                 send_started: AtomicBool::new(false),
+                send_started_count: AtomicU64::new(0),
                 send_release: tokio::sync::Notify::new(),
+                block_upload_turn: AtomicBool::new(false),
+                upload_turn_started: AtomicBool::new(false),
+                upload_turn_release: tokio::sync::Notify::new(),
                 cancel_pending_calls: AtomicU64::new(0),
             })
         }
@@ -73,6 +82,7 @@ mod tests {
         async fn wait_if_blocked(&self) {
             if self.block_send.load(Ordering::SeqCst) {
                 self.send_started.store(true, Ordering::SeqCst);
+                self.send_started_count.fetch_add(1, Ordering::SeqCst);
                 self.send_release.notified().await;
             }
         }
@@ -126,6 +136,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TgApi for MockTg {
+        async fn wait_upload_turn(&self) {
+            if self.block_upload_turn.load(Ordering::SeqCst) {
+                self.upload_turn_started.store(true, Ordering::SeqCst);
+                self.upload_turn_release.notified().await;
+            }
+        }
+
         async fn send_document(
             &self,
             filename: &str,
@@ -509,6 +526,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_during_shared_rate_limit_wait_does_not_restart_bot_api() {
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        let target = db.storage_targets().await.unwrap()[0].id;
+        let session = db
+            .create_upload_session(
+                ROOT_ID,
+                "cancel-rate-wait.bin",
+                "/cancel-rate-wait.bin",
+                4,
+                &"00".repeat(32),
+                4,
+                target,
+            )
+            .await
+            .unwrap();
+        tg.block_upload_turn.store(true, Ordering::SeqCst);
+
+        let ResumablePartStart::Upload(handle) = up
+            .start_resumable_part(&session.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("分块不应提前完成");
+        };
+        handle
+            .feed(Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
+        let request = tokio::spawn(handle.finish());
+        for _ in 0..100 {
+            if tg.upload_turn_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(tg.upload_turn_started.load(Ordering::SeqCst));
+
+        request.abort();
+        let _ = request.await;
+        up.begin_cancel_resumable_session(&session.session.id).await;
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 0);
+        assert!(tg.sent.lock().unwrap().is_empty());
+        db.cancel_upload_session(&session.session.id).await.unwrap();
+        up.finish_cancel_resumable_session(&session.session.id);
+    }
+
+    #[tokio::test]
     async fn dropping_part_request_stops_inflight_telegram_send() {
         let (up, tg, db, _g) = fixture(4, 1024, None).await;
         let target = db.storage_targets().await.unwrap()[0].id;
@@ -611,6 +675,101 @@ mod tests {
         assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 1);
         db.cancel_upload_session(&session.session.id).await.unwrap();
         up.finish_cancel_resumable_session(&session.session.id);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_concurrent_session_restarts_once_and_interrupts_the_other() {
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
+        up.knobs.set_concurrency(2);
+        let target = db.storage_targets().await.unwrap()[0].id;
+        let session_a = db
+            .create_upload_session(
+                ROOT_ID,
+                "cancel-a.bin",
+                "/cancel-a.bin",
+                4,
+                &"00".repeat(32),
+                4,
+                target,
+            )
+            .await
+            .unwrap();
+        let session_b = db
+            .create_upload_session(
+                ROOT_ID,
+                "continue-b.bin",
+                "/continue-b.bin",
+                4,
+                &"11".repeat(32),
+                4,
+                target,
+            )
+            .await
+            .unwrap();
+        tg.block_send.store(true, Ordering::SeqCst);
+
+        let ResumablePartStart::Upload(handle_a) = up
+            .start_resumable_part(&session_a.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("A 分块不应提前完成");
+        };
+        let ResumablePartStart::Upload(handle_b) = up
+            .start_resumable_part(&session_b.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("B 分块不应提前完成");
+        };
+        handle_a
+            .feed(Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
+        handle_b
+            .feed(Bytes::from_static(&[5, 6, 7, 8]))
+            .await
+            .unwrap();
+        let request_a = tokio::spawn(handle_a.finish());
+        let request_b = tokio::spawn(handle_b.finish());
+        for _ in 0..100 {
+            if tg.send_started_count.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(tg.send_started_count.load(Ordering::SeqCst), 2);
+
+        up.begin_cancel_resumable_session(&session_a.session.id)
+            .await;
+        let error_a = request_a.await.unwrap().unwrap_err();
+        let error_b = request_b.await.unwrap().unwrap_err();
+        assert!(matches!(error_a, AppError::BadRequest(_)));
+        assert!(matches!(error_b, AppError::UploadInterrupted));
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 1);
+        assert!(tg.sent.lock().unwrap().is_empty());
+
+        // B 收到专用可重试错误前，其数据库声明必须已经释放。
+        let ResumablePartStart::Upload(retry_b) = up
+            .start_resumable_part(&session_b.session.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("B 分块应当可以安全续传");
+        };
+        drop(retry_b);
+
+        // 等待重试句柄的异步清理完成，再删除两个会话，避免测试自身制造写事务竞争。
+        up.begin_cancel_resumable_session(&session_b.session.id)
+            .await;
+        db.cancel_upload_session(&session_a.session.id)
+            .await
+            .unwrap();
+        up.finish_cancel_resumable_session(&session_a.session.id);
+        db.cancel_upload_session(&session_b.session.id)
+            .await
+            .unwrap();
+        up.finish_cancel_resumable_session(&session_b.session.id);
     }
 
     #[tokio::test]

@@ -35,6 +35,12 @@
       </div>
     </div>
 
+    <div v-if="totalCount || recentSuccessCount" class="queue-rate" aria-live="polite">
+      <span>最近 1 分钟上传成功</span>
+      <strong>{{ recentSuccessCount }}</strong>
+      <span>个</span>
+    </div>
+
     <div v-if="totalCount" class="queue-breakdown">
       <el-tag v-if="uploadedCount" size="small" type="success" effect="plain" round>
         普通上传 {{ uploadedCount }}
@@ -109,9 +115,13 @@
     <div v-if="preparingFileCount" class="window-hint">
       正在分批整理并检查 {{ preparingFileCount }} 个文件，页面仍可继续操作…
     </div>
+    <div v-if="chunkedExclusiveBusy" class="window-hint">
+      多分块大文件独占上传中，其余任务暂缓，完成后自动继续
+    </div>
     <div v-if="totalCount === 0 && !preparingFileCount" class="empty">暂无上传任务</div>
     <div v-if="hiddenTaskCount" class="window-hint">
-      队列共 {{ totalCount }} 项；为保持页面流畅，仅展示当前及最近 {{ DISPLAY_TASK_LIMIT }} 项
+      队列共 {{ totalCount }} 项；当前上传中的任务置顶，另展示待处理的前
+      {{ DISPLAY_PENDING_LIMIT }} 项
     </div>
     <div
       v-for="it in displayedItems"
@@ -140,6 +150,9 @@
         <span class="state">
           <span v-if="it.status === 'hashing'">校验中(秒传检测),可暂停…</span>
           <span v-else-if="it.status === 'waiting'">排队中</span>
+          <span v-else-if="it.status === 'uploading' && telegramWaitSeconds(it) > 0">
+            Telegram 限流，约 {{ telegramWaitSeconds(it) }} 秒后自动重试…
+          </span>
           <span v-else-if="it.status === 'uploading'">上传中,可随时暂停</span>
           <span v-else-if="it.status === 'paused'">已暂停,可继续上传</span>
           <span v-else-if="it.status === 'needs_file'">请选择原文件继续</span>
@@ -237,13 +250,19 @@ export interface UploadFile {
   file: File
   rel?: string
 }
+
+/** 文件夹预扫描得到的轻量条目，不持有 File 句柄。 */
+export interface UploadCandidate {
+  name: string
+  rel?: string
+}
 </script>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Close, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
-import { api, errMsg, fmtSize, type UploadSession } from '../api'
+import { api, errMsg, fmtSize, type UploadSession, type UploadSessionResponse } from '../api'
 import { appConfirm } from '../dialog'
 
 type UploadStatus =
@@ -278,6 +297,8 @@ interface Item {
   generation: number
   /** undefined 表示尚未尝试生成，null 表示浏览器无法解码该视频。 */
   thumbnail?: Blob | null
+  /** Telegram 共享限流冷却截止时间；只用于展示，不影响本地取消。 */
+  telegramRetryUntil?: number
 }
 
 function isPauseable(item: Item) {
@@ -296,20 +317,28 @@ function isCurrent(item: Item, generation: number) {
 }
 
 const visible = ref(false)
+const clock = ref(Date.now())
 const items = shallowRef<Item[]>([])
 const batchBusy = ref(false)
 const preparingFileCount = ref(0)
-const emit = defineEmits<{ uploaded: [] }>()
+const emit = defineEmits<{ uploaded: []; 'cancelled-all': [] }>()
 
-const DISPLAY_TASK_LIMIT = 200
+const DISPLAY_PENDING_LIMIT = 30
+const PREVIEW_LIMIT = 200
 const itemById = new Map<number, Item>()
 const displayedIds = ref<number[]>([])
-const displayedItems = computed(() =>
-  displayedIds.value.flatMap((id) => {
+const uploadingIds = new Set<number>()
+const pendingDisplayIds = new Set<number>()
+const displayRevision = ref(0)
+const displayedItems = computed(() => {
+  // Item 故意保持为普通对象，避免几万个任务各自创建 Vue Proxy。
+  // 通过轻量版本号只刷新最多 200 个可见任务。
+  void displayRevision.value
+  return displayedIds.value.flatMap((id) => {
     const item = itemById.get(id)
     return item ? [item] : []
-  }),
-)
+  })
+})
 const hiddenTaskCount = computed(() => Math.max(0, totalCount.value - displayedItems.value.length))
 
 const statusCounts = reactive<Record<UploadStatus, number>>({
@@ -325,10 +354,18 @@ const statusCounts = reactive<Record<UploadStatus, number>>({
   error: 0,
 })
 
-const totalCount = computed(() => items.value.length)
+const deferredFileCount = ref(0)
+const totalCount = computed(() => items.value.length + deferredFileCount.value)
 const uploadedCount = computed(() => statusCounts.done)
 const instantCount = computed(() => statusCounts.instant)
 const successCount = computed(() => uploadedCount.value + instantCount.value)
+const recentSuccessRevision = ref(0)
+const recentSuccessAt: number[] = []
+const recentSuccessCount = computed(() => {
+  void recentSuccessRevision.value
+  const cutoff = clock.value - 60_000
+  return recentSuccessAt.reduce((count, timestamp) => count + (timestamp > cutoff ? 1 : 0), 0)
+})
 const skippedCount = computed(() => statusCounts.skipped)
 const finishedExists = computed(() => successCount.value + skippedCount.value > 0)
 const pendingCount = computed(
@@ -338,10 +375,15 @@ const pendingCount = computed(
     statusCounts.uploading +
     statusCounts.paused +
     statusCounts.needs_file +
-    statusCounts.error,
+    statusCounts.error +
+    deferredFileCount.value,
 )
 const activeCount = computed(
-  () => statusCounts.hashing + statusCounts.waiting + statusCounts.uploading,
+  () =>
+    statusCounts.hashing +
+    statusCounts.waiting +
+    statusCounts.uploading +
+    deferredFileCount.value,
 )
 const pauseableCount = activeCount
 const pausedCount = computed(() => statusCounts.paused)
@@ -351,8 +393,74 @@ const cancellingCount = computed(() => statusCounts.cancelling)
 const resumableCount = pausedCount
 const retryableCount = errorCount
 
+const MAX_BUFFERED_FILES = /Firefox\//i.test(navigator.userAgent) ? 100 : 600
+let capacityClosed = false
+const capacityWaiters: Array<() => void> = []
+
+function occupiesFileBuffer(status: UploadStatus) {
+  return (
+    status === 'hashing' ||
+    status === 'waiting' ||
+    status === 'uploading' ||
+    status === 'paused' ||
+    status === 'error'
+  )
+}
+
+function bufferedFileCount() {
+  return (
+    statusCounts.hashing +
+    statusCounts.waiting +
+    statusCounts.uploading +
+    statusCounts.paused +
+    statusCounts.error
+  )
+}
+
+function wakeCapacityWaiters() {
+  for (const resolve of capacityWaiters.splice(0)) resolve()
+}
+
+function setDeferredFileCount(count: number) {
+  deferredFileCount.value = Math.max(0, Math.floor(count))
+}
+
+function consumeDeferredFiles(count: number) {
+  deferredFileCount.value = Math.max(0, deferredFileCount.value - count)
+}
+
+function clearDeferredFiles() {
+  deferredFileCount.value = 0
+}
+
+/** 惰性目录遍历的背压阀：浏览器内最多保留约 600 个待处理文件句柄。 */
+async function waitForCapacity(additional = 200): Promise<boolean> {
+  const required = Math.max(1, additional)
+  while (!capacityClosed && bufferedFileCount() + required > MAX_BUFFERED_FILES) {
+    await new Promise<void>((resolve) => capacityWaiters.push(resolve))
+  }
+  return !capacityClosed
+}
+
+function recordSuccessfulUpload() {
+  const now = Date.now()
+  const cutoff = now - 60_000
+  while (recentSuccessAt.length && recentSuccessAt[0]! <= cutoff) recentSuccessAt.shift()
+  recentSuccessAt.push(now)
+  recentSuccessRevision.value += 1
+}
+
 function isDone(item: Item) {
   return item.status === 'done' || item.status === 'instant' || item.status === 'skipped'
+}
+
+function telegramWaitSeconds(item: Item) {
+  if (!item.telegramRetryUntil) return 0
+  return Math.max(0, Math.ceil((item.telegramRetryUntil - clock.value) / 1000))
+}
+
+function applyTelegramRetryAfter(item: Item, seconds: number) {
+  item.telegramRetryUntil = seconds > 0 ? Date.now() + seconds * 1000 : undefined
 }
 function displayName(item: Item) {
   if (item.session) return item.session.path.replace(/^\//, '')
@@ -371,6 +479,120 @@ function tone(item: Item): 'ok' | 'err' | 'run' | 'idle' {
 let seq = 0
 let busy = false
 let defaultConcurrency = 1
+let uploadLimit = 1
+let activeUploads = 0
+const uploadWaiters: Array<{
+  ownerId: number
+  resolve: (release: () => void) => void
+}> = []
+/**
+ * 多分块文件是一次长时间的上游请求：它开始后独占上传通道，
+ * 其他文件只保留在队列里，等该文件完成/失败/取消后再继续。
+ */
+let exclusiveChunkedOwner: number | null = null
+let exclusiveChunkedWaiters = 0
+const uploadGateWaiters: Array<() => void> = []
+const uploadGateRevision = ref(0)
+const chunkedExclusiveBusy = computed(() => {
+  void uploadGateRevision.value
+  return exclusiveChunkedOwner !== null || exclusiveChunkedWaiters > 0
+})
+
+function wakeUploadGate() {
+  uploadGateRevision.value += 1
+  const waiters = uploadGateWaiters.splice(0)
+  for (const resolve of waiters) resolve()
+}
+
+function waitUploadGate(): Promise<void> {
+  return new Promise((resolve) => uploadGateWaiters.push(resolve))
+}
+
+function isChunkedSession(session?: UploadSession) {
+  return Boolean(session && session.part_count > 1)
+}
+
+function applySessionConcurrency(item: Item, response: { data: UploadSessionResponse }) {
+  const chunked = isChunkedSession(response.data.session)
+  // 多分块会话的 1 只是该会话的限制，不能把全局单块文件并发永久降成 1。
+  if (!chunked) setUploadConcurrency(response.data.concurrency, response.data.bot_count)
+  item.concurrency = chunked ? 1 : response.data.concurrency
+}
+
+/** 等待所有已有请求排空，再取得多分块文件的独占上传权。 */
+async function acquireChunkedExclusive(item: Item, generation: number) {
+  exclusiveChunkedWaiters += 1
+  wakeUploadGate()
+  try {
+    while (
+      isCurrent(item, generation) &&
+      !item.pauseRequested &&
+      (exclusiveChunkedOwner !== null || activeUploads > 0)
+    ) {
+      await waitUploadGate()
+    }
+    if (!isCurrent(item, generation) || item.pauseRequested) return null
+    exclusiveChunkedOwner = item.id
+    return () => {
+      if (exclusiveChunkedOwner !== item.id) return
+      exclusiveChunkedOwner = null
+      drainUploadSlots()
+      wakeUploadGate()
+    }
+  } finally {
+    exclusiveChunkedWaiters = Math.max(0, exclusiveChunkedWaiters - 1)
+    wakeUploadGate()
+  }
+}
+/** 哈希保持串行；文件管线至少覆盖最多 20 个上传 Bot 的总并发。 */
+const MAX_ACTIVE_FILES = 20
+
+/** 多个文件及其分块共享同一额度，避免“文件并发 × 分块并发”放大请求数。 */
+function drainUploadSlots() {
+  while (activeUploads < uploadLimit) {
+    const eligible = uploadWaiters.findIndex(({ ownerId }) =>
+      exclusiveChunkedOwner === null
+        ? exclusiveChunkedWaiters === 0
+        : ownerId === exclusiveChunkedOwner,
+    )
+    if (eligible < 0) return
+    const { resolve } = uploadWaiters.splice(eligible, 1)[0]!
+    activeUploads += 1
+    let released = false
+    resolve(() => {
+      if (released) return
+      released = true
+      activeUploads = Math.max(0, activeUploads - 1)
+      drainUploadSlots()
+      wakeUploadGate()
+    })
+  }
+}
+
+async function acquireUploadSlot(ownerId: number): Promise<() => void> {
+  // 独占文件等待或占用期间，不再让其他文件开启新的请求；
+  // 独占者自己仍可取得唯一的上传槽位。
+  while (
+    (exclusiveChunkedOwner !== null && exclusiveChunkedOwner !== ownerId) ||
+    (exclusiveChunkedOwner === null && exclusiveChunkedWaiters > 0)
+  ) {
+    await waitUploadGate()
+  }
+  return new Promise((resolve) => {
+    uploadWaiters.push({ ownerId, resolve })
+    drainUploadSlots()
+  })
+}
+
+function setUploadConcurrency(value: number, botCount?: number) {
+  const normalized = Math.max(1, Math.floor(value || 1))
+  defaultConcurrency = normalized
+  void botCount
+  uploadLimit = normalized
+  drainUploadSlots()
+  wakeUploadGate()
+}
+
 /** 数组只追加、游标只前进，避免 shift/includes 在万级队列上退化为 O(n²)。 */
 const queue: number[] = []
 const queuedIds = new Set<number>()
@@ -378,38 +600,67 @@ let queueHead = 0
 /** 本次页面会话已确保存在的目录，避免每个文件都重复调用 mkdir。 */
 const ensuredDirs = new Set<string>()
 
-function promoteDisplayed(item: Item) {
-  const next = [item.id]
-  for (const id of displayedIds.value) {
-    if (id !== item.id && itemById.has(id)) next.push(id)
-    if (next.length >= DISPLAY_TASK_LIMIT) break
+function isDisplayPending(status: UploadStatus) {
+  return status !== 'uploading' && status !== 'done' && status !== 'instant' && status !== 'skipped'
+}
+
+function refreshDisplayWindow() {
+  const next: number[] = []
+  for (const id of uploadingIds) {
+    if (itemById.has(id)) next.push(id)
+  }
+  let pending = 0
+  for (const id of pendingDisplayIds) {
+    if (!itemById.has(id)) continue
+    next.push(id)
+    pending += 1
+    if (pending >= DISPLAY_PENDING_LIMIT) break
   }
   displayedIds.value = next
 }
 
+let displayFrame = 0
+function refreshDisplayed(item?: Item) {
+  if (item && !displayedIds.value.includes(item.id)) return
+  if (displayFrame) return
+  displayFrame = window.requestAnimationFrame(() => {
+    displayFrame = 0
+    displayRevision.value += 1
+  })
+}
+
 function setItemStatus(item: Item, status: UploadStatus) {
   if (item.status === status) return
-  statusCounts[item.status] = Math.max(0, statusCounts[item.status] - 1)
+  const previous = item.status
+  statusCounts[previous] = Math.max(0, statusCounts[previous] - 1)
   statusCounts[status] += 1
   item.status = status
-  if (status !== 'waiting' || displayedIds.value.length < DISPLAY_TASK_LIMIT) {
-    promoteDisplayed(item)
-  }
+  if (status === 'done' || status === 'instant') recordSuccessfulUpload()
+  if (previous === 'uploading') uploadingIds.delete(item.id)
+  if (status === 'uploading') uploadingIds.add(item.id)
+  if (isDisplayPending(previous) && !isDisplayPending(status)) pendingDisplayIds.delete(item.id)
+  if (!isDisplayPending(previous) && isDisplayPending(status)) pendingDisplayIds.add(item.id)
+  if (occupiesFileBuffer(previous) && !occupiesFileBuffer(status)) wakeCapacityWaiters()
+  refreshDisplayWindow()
 }
 
 function registerItems(rawItems: Item[], prepend = true): Item[] {
   if (!rawItems.length) return []
-  const registered = rawItems.map((raw) => reactive(raw) as Item)
-  for (const item of registered) {
+  // 队列对象不做深层响应式代理：File、Set、UploadSession 在万级规模下会造成
+  // 明显的代理和依赖跟踪开销；界面只依赖上面的可见窗口刷新。
+  const increments = new Map<UploadStatus, number>()
+  for (const item of rawItems) {
     itemById.set(item.id, item)
-    statusCounts[item.status] += 1
+    if (item.status === 'uploading') uploadingIds.add(item.id)
+    if (isDisplayPending(item.status)) pendingDisplayIds.add(item.id)
+    increments.set(item.status, (increments.get(item.status) ?? 0) + 1)
   }
-  items.value = prepend ? [...registered, ...items.value] : [...items.value, ...registered]
-  const nextIds = prepend
-    ? [...registered.map((item) => item.id), ...displayedIds.value]
-    : [...displayedIds.value, ...registered.map((item) => item.id)]
-  displayedIds.value = [...new Set(nextIds)].slice(0, DISPLAY_TASK_LIMIT)
-  return registered
+  for (const [status, count] of increments) {
+    statusCounts[status] += count
+  }
+  items.value = prepend ? [...rawItems, ...items.value] : [...items.value, ...rawItems]
+  refreshDisplayWindow()
+  return rawItems
 }
 
 function removeItems(targets: Item[]) {
@@ -419,25 +670,17 @@ function removeItems(targets: Item[]) {
     if (!itemById.delete(item.id)) continue
     ids.add(item.id)
     queuedIds.delete(item.id)
+    uploadingIds.delete(item.id)
+    pendingDisplayIds.delete(item.id)
     statusCounts[item.status] = Math.max(0, statusCounts[item.status] - 1)
-    // 从响应式队列移除前释放大 File/Blob 引用，便于浏览器尽早回收内存。
+    // 从队列移除前释放大 File/Blob 引用，便于浏览器尽早回收内存。
     item.file = undefined
     item.thumbnail = undefined
     item.controllers.clear()
   }
   if (!ids.size) return
   items.value = items.value.filter((item) => !ids.has(item.id))
-  const visibleIds = displayedIds.value.filter((id) => !ids.has(id) && itemById.has(id))
-  if (visibleIds.length < DISPLAY_TASK_LIMIT) {
-    const visibleSet = new Set(visibleIds)
-    for (const item of items.value) {
-      if (visibleSet.has(item.id)) continue
-      visibleIds.push(item.id)
-      visibleSet.add(item.id)
-      if (visibleIds.length >= DISPLAY_TASK_LIMIT) break
-    }
-  }
-  displayedIds.value = visibleIds
+  refreshDisplayWindow()
 }
 
 function joinPath(dir: string, name: string) {
@@ -465,7 +708,7 @@ function fromSession(session: UploadSession, concurrency: number): Item {
     error: '页面刷新后需要重新选择原文件，已完成分块不会重复上传',
     sha256: session.sha256,
     session,
-    concurrency,
+    concurrency: isChunkedSession(session) ? 1 : concurrency,
     controllers: new Set(),
     pauseRequested: true,
     cancelled: false,
@@ -481,9 +724,9 @@ const conflictNames = ref<string[]>([])
 const conflictTotal = ref(0)
 let conflictResolve: ((action: ConflictAction) => void) | null = null
 
-function askConflict(names: string[]): Promise<ConflictAction> {
-  conflictTotal.value = names.length
-  conflictNames.value = names.slice(0, DISPLAY_TASK_LIMIT)
+function askConflict(names: string[], total: number): Promise<ConflictAction> {
+  conflictTotal.value = total
+  conflictNames.value = names
   conflictVisible.value = true
   return new Promise((resolve) => (conflictResolve = resolve))
 }
@@ -500,72 +743,158 @@ function onConflictClose() {
   if (conflictResolve) resolveConflict('cancel')
 }
 
+/**
+ * 文件夹上传开始前一次性查重并取得用户决策。这里只处理路径字符串，
+ * 不创建 File 对象；返回值会被之后所有流式批次复用。
+ */
+async function resolveUploadConflicts(
+  dir: string,
+  candidates: UploadCandidate[],
+): Promise<ConflictAction> {
+  visible.value = true
+  preparingFileCount.value += candidates.length
+  try {
+    const relOf = (candidate: UploadCandidate) =>
+      (candidate.rel ?? '').replace(/^\/+|\/+$/g, '')
+    const groups = new Map<string, UploadCandidate[]>()
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index]!
+      const rel = relOf(candidate)
+      const target = rel ? joinPath(dir, rel) : dir
+      const group = groups.get(target)
+      if (group) group.push(candidate)
+      else groups.set(target, [candidate])
+      if (index > 0 && index % 500 === 0) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      }
+    }
+
+    const conflictPreview: string[] = []
+    let conflictTotal = 0
+    const grouped = [...groups.entries()]
+    let groupCursor = 0
+    const worker = async () => {
+      for (;;) {
+        const current = grouped[groupCursor++]
+        if (!current) return
+        const [target, group] = current
+        for (let start = 0; start < group.length; start += 500) {
+          const batch = group.slice(start, start + 500)
+          try {
+            const response = await api.exists(
+              target,
+              batch.map((candidate) => candidate.name),
+            )
+            const existing = new Set(response.data.existing)
+            for (const candidate of batch) {
+              if (!existing.has(candidate.name)) continue
+              conflictTotal += 1
+              if (conflictPreview.length < PREVIEW_LIMIT) {
+                const rel = relOf(candidate)
+                conflictPreview.push(rel ? `${rel}/${candidate.name}` : candidate.name)
+              }
+            }
+          } catch {
+            // 预检查失败时按无冲突继续，真正上传仍由后端保证一致性。
+          }
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(4, grouped.length) }, () => worker()))
+    if (!conflictTotal) return 'overwrite'
+    return await askConflict(conflictPreview, conflictTotal)
+  } finally {
+    preparingFileCount.value = Math.max(0, preparingFileCount.value - candidates.length)
+  }
+}
+
 /** 入队前按目标目录批量查重，有同名文件时让用户选择覆盖、跳过或取消。 */
-async function enqueue(dir: string, files: UploadFile[]) {
+async function enqueue(
+  dir: string,
+  files: UploadFile[],
+  preferredConflictAction?: Exclude<ConflictAction, 'cancel'>,
+  fromDeferredSource = false,
+): Promise<ConflictAction | undefined> {
   visible.value = true
   preparingFileCount.value += files.length
   try {
-    await prepareEnqueue(dir, files)
+    return await prepareEnqueue(dir, files, preferredConflictAction, fromDeferredSource)
   } finally {
     preparingFileCount.value = Math.max(0, preparingFileCount.value - files.length)
   }
 }
 
-async function prepareEnqueue(dir: string, files: UploadFile[]) {
+async function prepareEnqueue(
+  dir: string,
+  files: UploadFile[],
+  preferredConflictAction?: Exclude<ConflictAction, 'cancel'>,
+  fromDeferredSource = false,
+): Promise<ConflictAction | undefined> {
   const relOf = (upload: UploadFile) => (upload.rel ?? '').replace(/^\/+|\/+$/g, '')
-  const groups = new Map<string, UploadFile[]>()
-  for (let index = 0; index < files.length; index += 1) {
-    const upload = files[index]!
-    const rel = relOf(upload)
-    const target = rel ? joinPath(dir, rel) : dir
-    const group = groups.get(target)
-    if (group) group.push(upload)
-    else groups.set(target, [upload])
-    if (index > 0 && index % 500 === 0) {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-    }
-  }
   const duplicates = new Set<UploadFile>()
-  const grouped = [...groups.entries()]
-  let groupCursor = 0
-  const duplicateWorker = async () => {
-    for (;;) {
-      const current = grouped[groupCursor++]
-      if (!current) return
-      const [target, group] = current
-      for (let start = 0; start < group.length; start += 500) {
-        const batch = group.slice(start, start + 500)
-        try {
-          const response = await api.exists(
-            target,
-            batch.map((upload) => upload.file.name),
-          )
-          const existing = new Set(response.data.existing)
-          for (const upload of batch) if (existing.has(upload.file.name)) duplicates.add(upload)
-        } catch {
-          // 查重只是交互增强，短暂失败时仍允许后续上传接口处理。
+  // 已选择“覆盖”时不再在上传过程中重复查重；“跳过”仍需静默判断每批哪些文件跳过。
+  if (preferredConflictAction !== 'overwrite') {
+    const groups = new Map<string, UploadFile[]>()
+    for (let index = 0; index < files.length; index += 1) {
+      const upload = files[index]!
+      const rel = relOf(upload)
+      const target = rel ? joinPath(dir, rel) : dir
+      const group = groups.get(target)
+      if (group) group.push(upload)
+      else groups.set(target, [upload])
+      if (index > 0 && index % 500 === 0) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      }
+    }
+    const grouped = [...groups.entries()]
+    let groupCursor = 0
+    const duplicateWorker = async () => {
+      for (;;) {
+        const current = grouped[groupCursor++]
+        if (!current) return
+        const [target, group] = current
+        for (let start = 0; start < group.length; start += 500) {
+          const batch = group.slice(start, start + 500)
+          try {
+            const response = await api.exists(
+              target,
+              batch.map((upload) => upload.file.name),
+            )
+            const existing = new Set(response.data.existing)
+            for (const upload of batch) if (existing.has(upload.file.name)) duplicates.add(upload)
+          } catch {
+            // 查重只是交互增强，短暂失败时仍允许后续上传接口处理。
+          }
         }
       }
     }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(4, grouped.length) }, () => duplicateWorker()),
-  )
-
-  let action: ConflictAction = 'overwrite'
-  if (duplicates.size > 0) {
-    action = await askConflict(
-      files
-        .filter((upload) => duplicates.has(upload))
-        .map((upload) =>
-          relOf(upload) ? `${relOf(upload)}/${upload.file.name}` : upload.file.name,
-        ),
+    await Promise.all(
+      Array.from({ length: Math.min(4, grouped.length) }, () => duplicateWorker()),
     )
-    if (action === 'cancel') return
+  }
+
+  let action: ConflictAction = preferredConflictAction ?? 'overwrite'
+  let selectedAction: ConflictAction | undefined
+  if (duplicates.size > 0) {
+    const conflictPreview: string[] = []
+    let conflictCount = 0
+    for (const upload of files) {
+      if (!duplicates.has(upload)) continue
+      conflictCount += 1
+      if (conflictPreview.length < PREVIEW_LIMIT) {
+        conflictPreview.push(
+          relOf(upload) ? `${relOf(upload)}/${upload.file.name}` : upload.file.name,
+        )
+      }
+    }
+    if (preferredConflictAction === undefined) {
+      action = await askConflict(conflictPreview, conflictCount)
+      selectedAction = action
+    }
+    if (action === 'cancel') return action
   }
 
   const rawItems: Item[] = []
-  const scheduledIds = new Set<number>()
   for (let index = 0; index < files.length; index += 1) {
     const upload = files[index]!
     const item: Item = {
@@ -586,16 +915,19 @@ async function prepareEnqueue(dir: string, files: UploadFile[]) {
     if (action === 'skip' && duplicates.has(upload)) {
       item.status = 'skipped'
       item.pct = 100
-    } else {
-      scheduledIds.add(item.id)
+      // 跳过项不再需要持有浏览器文件句柄。
+      item.file = undefined
     }
     rawItems.push(item)
     if (index > 0 && index % 500 === 0) {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
     }
   }
+  // 与任务注册放在同一个同步片段内，保证“实体任务 + 尚未读取任务”总数不跳变。
+  if (fromDeferredSource) consumeDeferredFiles(rawItems.length)
   const registered = registerItems(rawItems)
-  scheduleMany(registered.filter((item) => scheduledIds.has(item.id)))
+  scheduleMany(registered, (item) => item.status === 'waiting')
+  return selectedAction
 }
 
 function schedule(item: Item) {
@@ -606,13 +938,16 @@ function schedule(item: Item) {
   void pump()
 }
 
-function scheduleMany(batch: Item[]) {
+function scheduleMany(batch: Item[], shouldSchedule: (item: Item) => boolean = () => true) {
+  let scheduled = false
   for (const item of batch) {
+    if (!shouldSchedule(item)) continue
     if (queuedIds.has(item.id)) continue
     queuedIds.add(item.id)
     queue.push(item.id)
+    scheduled = true
   }
-  if (batch.length) void pump()
+  if (scheduled) void pump()
 }
 
 function removeQueued(id: number) {
@@ -627,6 +962,8 @@ function stopItem(item: Item) {
   removeQueued(item.id)
   for (const controller of item.controllers) controller.abort()
   item.controllers.clear()
+  item.telegramRetryUntil = undefined
+  wakeUploadGate()
 }
 
 function pause(item: Item) {
@@ -715,11 +1052,13 @@ async function cancelItem(item: Item, removeOnSuccess = true): Promise<boolean> 
 async function cancelAll() {
   if (batchBusy.value) return
   const targets = items.value.filter(isPending)
-  if (!targets.length) return
+  const pendingTotal = pendingCount.value
+  const deferredAtStart = deferredFileCount.value
+  if (!pendingTotal) return
   try {
     await appConfirm({
       title: '取消全部上传',
-      message: `确定取消 ${targets.length} 个未完成上传吗？已上传的 Telegram 分块会进入清理队列，任务将从队列移除。`,
+      message: `确定取消 ${pendingTotal} 个未完成上传吗？已上传的 Telegram 分块会进入清理队列，任务将从队列移除。`,
       kind: 'danger',
       confirmText: '全部取消',
       cancelText: '保留任务',
@@ -727,6 +1066,10 @@ async function cancelAll() {
   } catch {
     return
   }
+
+  // 同时停止仍在惰性枚举的文件夹，避免取消后又有新任务进入队列。
+  emit('cancelled-all')
+  clearDeferredFiles()
 
   batchBusy.value = true
   let succeeded = 0
@@ -748,8 +1091,8 @@ async function cancelAll() {
   }
   if (failed) {
     ElMessage.warning(`已取消 ${succeeded} 个任务，另有 ${failed} 个取消失败，请单独重试`)
-  } else if (succeeded) {
-    ElMessage.success(`已取消 ${succeeded} 个上传任务`)
+  } else if (succeeded || deferredAtStart) {
+    ElMessage.success(`已取消 ${succeeded + deferredAtStart} 个上传任务`)
   }
 }
 
@@ -959,8 +1302,9 @@ function partSize(session: UploadSession, index: number) {
 async function syncSession(item: Item) {
   if (!item.session) return
   const response = await api.uploads.status(item.session.id)
+  applySessionConcurrency(item, response)
+  applyTelegramRetryAfter(item, response.data.retry_after)
   item.session = response.data.session
-  item.concurrency = response.data.concurrency
   item.pct = sessionPct(item.session)
 }
 
@@ -981,12 +1325,23 @@ async function finalizeItem(item: Item, session: UploadSession, generation: numb
   setItemStatus(item, 'done')
   item.pct = 100
   item.session = undefined
+  item.file = undefined
+  item.thumbnail = undefined
   emit('uploaded')
 }
 
 async function uploadMissingParts(item: Item, generation: number) {
   if (!item.session || !item.file) return
-  await syncSession(item)
+  const needsExclusive = isChunkedSession(item.session)
+  const releaseExclusive = needsExclusive
+    ? await acquireChunkedExclusive(item, generation)
+    : null
+  if (needsExclusive && !releaseExclusive) {
+    if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
+    return
+  }
+  try {
+    await syncSession(item)
   if (!isCurrent(item, generation) || item.pauseRequested) {
     if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
     return
@@ -1010,49 +1365,100 @@ async function uploadMissingParts(item: Item, generation: number) {
     lastProgressAt = now
     const active = [...activeBytes.values()].reduce((sum, value) => sum + value, 0)
     item.pct = Math.min(99, Math.round(((completedBytes + active) / item.session.size) * 100))
+    refreshDisplayed(item)
   }
 
   setItemStatus(item, 'uploading')
+  const isUploadInterrupted = (error: unknown) =>
+    (error as { response?: { data?: { code?: string } } }).response?.data?.code ===
+    'upload_interrupted'
   const worker = async () => {
     while (!stopped && isCurrent(item, generation) && !item.pauseRequested) {
       const index = missing[cursor++]
       if (index === undefined) return
-      const start = index * session.chunk_size
-      const data = item.file!.slice(start, start + partSize(session, index))
-      const controller = new AbortController()
-      item.controllers.add(controller)
-      activeBytes.set(index, 0)
-      try {
-        await api.uploads.part(
-          session.id,
-          index,
-          data,
-          (loaded) => {
-            if (!isCurrent(item, generation)) return
-            activeBytes.set(index, Math.min(loaded, data.size))
-            updateProgress()
-          },
-          controller.signal,
-        )
-        if (!isCurrent(item, generation)) return
-        completedBytes += data.size
-        activeBytes.delete(index)
-        updateProgress(true)
-      } catch (error) {
-        activeBytes.delete(index)
-        if (isCurrent(item, generation) && !item.pauseRequested) {
-          failure = error
-          stopped = true
-          for (const active of item.controllers) active.abort()
+      let restartRetries = 0
+      for (;;) {
+        const release = await acquireUploadSlot(item.id)
+        if (stopped || !isCurrent(item, generation) || item.pauseRequested) {
+          release()
+          return
         }
-      } finally {
-        item.controllers.delete(controller)
+        // 取得全局槽位后才创建 Blob，万级队列不会同时持有大量切片对象。
+        const start = index * session.chunk_size
+        const data = item.file!.slice(start, start + partSize(session, index))
+        const controller = new AbortController()
+        item.controllers.add(controller)
+        activeBytes.set(index, 0)
+        let retryInterrupted = false
+        try {
+          await api.uploads.part(
+            session.id,
+            index,
+            data,
+            (loaded) => {
+              if (!isCurrent(item, generation)) return
+              activeBytes.set(index, Math.min(loaded, data.size))
+              updateProgress()
+            },
+            controller.signal,
+          )
+          if (!isCurrent(item, generation)) return
+          completedBytes += data.size
+          activeBytes.delete(index)
+          item.error = undefined
+          updateProgress(true)
+        } catch (error) {
+          activeBytes.delete(index)
+          if (
+            isUploadInterrupted(error) &&
+            restartRetries < 5 &&
+            isCurrent(item, generation) &&
+            !item.pauseRequested
+          ) {
+            restartRetries += 1
+            retryInterrupted = true
+          } else if (
+            !stopped &&
+            isCurrent(item, generation) &&
+            !item.pauseRequested
+          ) {
+            failure = error
+            stopped = true
+            for (const active of item.controllers) active.abort()
+          }
+        } finally {
+          item.controllers.delete(controller)
+          release()
+        }
+        if (!retryInterrupted) break
+        // 后端已确认共享 Bot API 完成重启且释放了分块声明，此错误才允许自动重试。
+        await new Promise((resolve) => window.setTimeout(resolve, 400))
+        if (stopped || !isCurrent(item, generation) || item.pauseRequested) return
       }
     }
   }
 
-  const workerCount = Math.max(1, Math.min(item.concurrency, missing.length || 1))
-  await Promise.all(Array.from({ length: workerCount }, worker))
+  // 多分块文件固定单并发；单块文件仍按服务端返回的总并发上传。
+  const workerCount = needsExclusive
+    ? 1
+    : Math.max(1, Math.min(item.concurrency, missing.length || 1))
+  const refreshTelegramWait = async () => {
+    if (!item.session || !isCurrent(item, generation) || item.pauseRequested) return
+    try {
+      const response = await api.uploads.status(item.session.id)
+      if (!isCurrent(item, generation)) return
+      applySessionConcurrency(item, response)
+      applyTelegramRetryAfter(item, response.data.retry_after)
+    } catch {
+      // 状态提示失败不影响正在进行的上传请求。
+    }
+  }
+  const retryPollTimer = window.setInterval(() => void refreshTelegramWait(), 2000)
+  try {
+    await Promise.all(Array.from({ length: workerCount }, worker))
+  } finally {
+    window.clearInterval(retryPollTimer)
+  }
   if (!isCurrent(item, generation)) return
   try {
     await syncSession(item)
@@ -1066,6 +1472,9 @@ async function uploadMissingParts(item: Item, generation: number) {
   if (failure) throw failure
 
   await finalizeItem(item, session, generation)
+  } finally {
+    releaseExclusive?.()
+  }
 }
 
 async function processItem(item: Item) {
@@ -1094,14 +1503,15 @@ async function processItem(item: Item) {
 
   if (!item.session) {
     setItemStatus(item, 'hashing')
-    const thumbnailPromise =
-      item.thumbnail === undefined ? createVideoThumbnail(item.file) : Promise.resolve(item.thumbnail)
     item.sha256 = await sha256File(
       item.file,
-      (percentage) => (item.pct = percentage),
+      (percentage) => {
+        item.pct = percentage
+        refreshDisplayed(item)
+      },
       () => !isCurrent(item, generation) || item.pauseRequested,
     )
-    item.thumbnail = await thumbnailPromise
+    if (item.thumbnail === undefined) item.thumbnail = await createVideoThumbnail(item.file)
     if (!isCurrent(item, generation) || item.pauseRequested) {
       if (isCurrent(item, generation) && item.pauseRequested) setItemStatus(item, 'paused')
       return
@@ -1116,6 +1526,8 @@ async function processItem(item: Item) {
       if (instant.data.linked) {
         setItemStatus(item, 'instant')
         item.pct = 100
+        item.file = undefined
+        item.thumbnail = undefined
         emit('uploaded')
         return
       }
@@ -1128,8 +1540,9 @@ async function processItem(item: Item) {
     }
 
     const created = await api.uploads.create(target, item.name, item.size, item.sha256)
+    applySessionConcurrency(item, created)
+    applyTelegramRetryAfter(item, created.data.retry_after)
     item.session = created.data.session
-    item.concurrency = created.data.concurrency
     item.dir = parentOf(item.session.path)
     item.pct = sessionPct(item.session)
     if (!isCurrent(item, generation) || item.pauseRequested) {
@@ -1157,25 +1570,35 @@ async function processItem(item: Item) {
 async function pump() {
   if (busy) return
   busy = true
-  while (queueHead < queue.length) {
-    const itemId = queue[queueHead++]!
-    if (!queuedIds.delete(itemId)) continue
-    const item = itemById.get(itemId)
-    if (!item || item.cancelled) continue
-    promoteDisplayed(item)
-    const generation = item.generation
-    try {
-      await processItem(item)
-    } catch (error) {
-      if (isCurrent(item, generation) && !item.pauseRequested) {
-        setItemStatus(item, 'error')
-        item.error = errMsg(error)
+  const fileWorker = async () => {
+    while (queueHead < queue.length) {
+      const itemId = queue[queueHead++]!
+      if (!queuedIds.delete(itemId)) continue
+      const item = itemById.get(itemId)
+      if (!item || item.cancelled) continue
+      const generation = item.generation
+      try {
+        await processItem(item)
+      } catch (error) {
+        if (isCurrent(item, generation) && !item.pauseRequested) {
+          setItemStatus(item, 'error')
+          item.error = errMsg(error)
+        }
       }
     }
   }
-  queue.length = 0
-  queueHead = 0
-  busy = false
+  try {
+    const workerCount = Math.max(1, Math.min(defaultConcurrency, MAX_ACTIVE_FILES))
+    await Promise.all(Array.from({ length: workerCount }, () => fileWorker()))
+  } finally {
+    busy = false
+    if (queueHead >= queue.length) {
+      queue.length = 0
+      queueHead = 0
+    }
+    // worker 刚退出时若又有任务入队，主动开启下一轮，避免任务滞留。
+    if (queueHead < queue.length) void pump()
+  }
 }
 
 function chooseFile(item: Item) {
@@ -1205,7 +1628,10 @@ async function attachFile(item: Item, file: File) {
   try {
     const digest = await sha256File(
       file,
-      (percentage) => (item.pct = percentage),
+      (percentage) => {
+        item.pct = percentage
+        refreshDisplayed(item)
+      },
       () => !isCurrent(item, generation) || item.pauseRequested,
     )
     if (!isCurrent(item, generation)) {
@@ -1253,14 +1679,18 @@ async function attachFile(item: Item, file: File) {
   }
 }
 
+let clockTimer = 0
+
 onMounted(async () => {
+  clockTimer = window.setInterval(() => (clock.value = Date.now()), 1000)
   try {
     const response = await api.uploads.list()
-    defaultConcurrency = response.data.concurrency
+    setUploadConcurrency(response.data.concurrency, response.data.bot_count)
     if (response.data.sessions.length) {
       const restored: Item[] = []
       for (const session of response.data.sessions) {
         const item = fromSession(session, response.data.concurrency)
+        applyTelegramRetryAfter(item, response.data.retry_after)
         if (session.uploaded_parts.length === session.part_count) {
           item.status = 'waiting'
           item.error = undefined
@@ -1269,7 +1699,7 @@ onMounted(async () => {
         restored.push(item)
       }
       const registered = registerItems(restored, false)
-      scheduleMany(registered.filter((item) => item.status === 'waiting'))
+      scheduleMany(registered, (item) => item.status === 'waiting')
       visible.value = true
     }
   } catch {
@@ -1278,6 +1708,11 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  window.clearInterval(clockTimer)
+  if (displayFrame) window.cancelAnimationFrame(displayFrame)
+  capacityClosed = true
+  wakeCapacityWaiters()
+  wakeUploadGate()
   for (const item of items.value) {
     item.pauseRequested = true
     for (const controller of item.controllers) controller.abort()
@@ -1288,7 +1723,14 @@ onBeforeUnmount(() => {
   hashWorker.terminate()
 })
 
-defineExpose({ enqueue, open })
+defineExpose({
+  enqueue,
+  open,
+  resolveUploadConflicts,
+  waitForCapacity,
+  setDeferredFileCount,
+  clearDeferredFiles,
+})
 </script>
 
 <style scoped>
@@ -1341,6 +1783,24 @@ defineExpose({ enqueue, open })
 }
 .summary-error .summary-value {
   color: var(--el-color-danger);
+}
+.queue-rate {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: var(--tile-bg);
+  color: var(--text-soft);
+  font-size: 12px;
+}
+.queue-rate strong {
+  color: var(--el-color-success);
+  font-size: 18px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
 }
 .queue-breakdown {
   display: flex;

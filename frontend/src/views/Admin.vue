@@ -31,6 +31,7 @@ import {
   Tools,
   Upload,
   User,
+  VideoPause,
   VideoPlay,
   WarnTriangleFilled,
 } from '@element-plus/icons-vue'
@@ -55,6 +56,7 @@ import {
   type InboxRouteRule,
   type InboxFailure,
   type QueueRunSummary,
+  type StorageMigrationStatus,
 } from '../api'
 import DirPicker from '../components/DirPicker.vue'
 import SettingField from '../components/SettingField.vue'
@@ -82,6 +84,9 @@ const backendLogLevel = ref('')
 const backendLogCategory = ref('')
 const backendLogKeyword = ref('')
 let backendLogsTimer: ReturnType<typeof setInterval> | undefined
+let storageMigrationTimer: ReturnType<typeof setInterval> | undefined
+const storageMigration = ref<StorageMigrationStatus>()
+const storageMigrationBusy = ref(false)
 
 // ---- 分区导航:一次只显示一块,避免整页长滚动 ----
 type SectionKey =
@@ -133,6 +138,7 @@ function go(key: SectionKey) {
 const form = ref({
   api_base: '',
   bot_token: '',
+  upload_bot_tokens: '',
   chat_id: '',
   chunk_size: '',
   upload_concurrency: 2,
@@ -168,6 +174,7 @@ async function load() {
     form.value = {
       api_base: c.data.values.api_base,
       bot_token: c.data.values.bot_token, // 脱敏值,不动则不提交
+      upload_bot_tokens: c.data.values.upload_bot_tokens,
       chat_id: c.data.values.chat_id,
       chunk_size: sizeInput(c.data.values.chunk_size),
       upload_concurrency: c.data.values.upload_concurrency,
@@ -179,6 +186,7 @@ async function load() {
       telegram_api_hash: c.data.values.telegram_api_hash, // 脱敏值,同上
     }
     origin.value = { ...form.value }
+    if (c.data.configured) void loadStorageMigration(true)
   } catch (e) {
     ElMessage.error(errMsg(e))
   } finally {
@@ -283,6 +291,7 @@ function logLevelType(level: string): 'success' | 'warning' | 'danger' | 'info' 
 
 watch(section, (key) => {
   if (key === 'logs') void loadBackendLogs()
+  if (key === 'queues') void loadStorageMigration(true)
 })
 // 下拉即时生效;关键字防抖 300ms,免得每敲一个字打一次请求
 watch([backendLogLevel, backendLogCategory], () => void reloadBackendLogs())
@@ -299,10 +308,14 @@ onMounted(() => {
       void loadBackendLogs(true, true)
     }
   }, 5000)
+  storageMigrationTimer = setInterval(() => {
+    if (section.value === 'queues') void loadStorageMigration(true)
+  }, 5000)
 })
 
 onUnmounted(() => {
   if (backendLogsTimer) clearInterval(backendLogsTimer)
+  if (storageMigrationTimer) clearInterval(storageMigrationTimer)
   clearTimeout(keywordTimer)
 })
 
@@ -409,6 +422,63 @@ async function reloadStatus() {
   }
 }
 
+async function loadStorageMigration(silent = false) {
+  if (!cfg.value?.configured) return
+  try {
+    storageMigration.value = (await api.admin.storageMigration()).data
+  } catch (e) {
+    if (!silent) ElMessage.error(errMsg(e))
+  }
+}
+
+const storageMigrationPct = computed(() => {
+  const migration = storageMigration.value
+  if (!migration?.total_messages) return migration?.remaining_messages === 0 ? 100 : 0
+  return Math.min(100, Math.round((migration.migrated_messages / migration.total_messages) * 100))
+})
+
+async function startStorageMigration() {
+  const migration = storageMigration.value
+  if (!migration?.remaining_messages) {
+    ElMessage.info('没有需要迁移的历史消息')
+    return
+  }
+  try {
+    await appConfirm({
+      title: migration.status === 'failed' ? '重试历史存储迁移?' : '开始历史存储迁移?',
+      message:
+        `将通过主 Bot 在 Telegram 服务端复制 ${migration.remaining_messages} 条历史消息，` +
+        `并切换 ${migration.remaining_chunks} 个分块引用。\n` +
+        '旧消息会保留，不会自动删除；用户上传期间迁移会主动让路。',
+      kind: 'warning',
+      confirmText: migration.status === 'failed' ? '重试' : '开始迁移',
+    })
+  } catch {
+    return
+  }
+  storageMigrationBusy.value = true
+  try {
+    storageMigration.value = (await api.admin.startStorageMigration()).data
+    ElMessage.success('历史存储迁移已在后台启动')
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  } finally {
+    storageMigrationBusy.value = false
+  }
+}
+
+async function pauseStorageMigration() {
+  storageMigrationBusy.value = true
+  try {
+    storageMigration.value = (await api.admin.pauseStorageMigration()).data
+    ElMessage.info('已请求暂停，当前复制消息完成后生效')
+  } catch (e) {
+    ElMessage.error(errMsg(e))
+  } finally {
+    storageMigrationBusy.value = false
+  }
+}
+
 const isOfficial = computed(
   () => form.value.api_base.replace(/\/$/, '') === cfg.value?.official_api_base,
 )
@@ -506,6 +576,9 @@ function buildPatch(): ConfigPatch {
   const o = origin.value
   if (f.api_base !== o.api_base) p.api_base = f.api_base
   if (f.bot_token !== o.bot_token) p.bot_token = f.bot_token
+  if (f.upload_bot_tokens !== o.upload_bot_tokens) {
+    p.upload_bot_tokens = f.upload_bot_tokens
+  }
   if (f.chat_id !== o.chat_id) p.chat_id = f.chat_id
   if (f.chunk_size !== o.chunk_size) p.chunk_size = f.chunk_size
   if (f.upload_concurrency !== o.upload_concurrency) p.upload_concurrency = f.upload_concurrency
@@ -914,6 +987,7 @@ const changed = computed(() => {
 const CFG_SECTION: Record<string, SectionKey> = {
   api_base: 'telegram',
   bot_token: 'telegram',
+  upload_bot_tokens: 'telegram',
   chat_id: 'telegram',
   chunk_size: 'telegram',
   upload_concurrency: 'telegram',
@@ -1019,7 +1093,11 @@ const statTiles = computed<Tile[]>(() => {
     { label: '文件 / 目录', value: `${s?.files ?? 0} / ${s?.dirs ?? 0}`, icon: Document },
     { label: '占用空间', value: s ? fmtSize(s.total_size) : '-', icon: Coin },
     { label: '分块大小', value: s ? fmtSize(s.chunk_size) : '-', icon: Histogram },
-    { label: '上传并发', value: String(s?.upload_concurrency ?? '-'), icon: Cpu },
+    {
+      label: '上传 Bot / 并发',
+      value: s ? `${s.upload_bot_count} / ${s.upload_concurrency}` : '-',
+      icon: Cpu,
+    },
     {
       label: '元数据库',
       value: s ? fmtSize(s.db_size) : '-',
@@ -1358,6 +1436,108 @@ function downloadBackup() {
                 </div>
               </div>
 
+              <div v-if="storageMigration" class="queue-card migration-card">
+                <div class="queue-head">
+                  <span class="queue-ico"><el-icon><Promotion /></el-icon></span>
+                  <div class="queue-title">
+                    <b>历史存储迁移</b>
+                    <em>通过 Telegram 服务端复制，把其他 Bot 的分块切换到主 Bot。</em>
+                  </div>
+                  <el-tag
+                    size="small"
+                    round
+                    :type="
+                      storageMigration.status === 'failed'
+                        ? 'danger'
+                        : storageMigration.running
+                          ? 'warning'
+                          : storageMigration.remaining_messages === 0
+                            ? 'success'
+                            : 'info'
+                    "
+                  >
+                    {{
+                      storageMigration.running
+                        ? '迁移中'
+                        : storageMigration.status === 'failed'
+                          ? '失败'
+                          : storageMigration.status === 'paused'
+                            ? '已暂停'
+                            : storageMigration.remaining_messages === 0
+                              ? '已完成'
+                              : '未开始'
+                    }}
+                  </el-tag>
+                </div>
+
+                <div class="queue-stats">
+                  <div class="queue-stat">
+                    <b>{{ storageMigration.main_bot_id }}</b>
+                    <em>主 Bot</em>
+                  </div>
+                  <div class="queue-stat">
+                    <b>{{ storageMigration.migrated_messages }}</b>
+                    <em>已迁移消息</em>
+                  </div>
+                  <div class="queue-stat">
+                    <b :class="{ warn: storageMigration.remaining_messages > 0 }">
+                      {{ storageMigration.remaining_messages }}
+                    </b>
+                    <em>剩余消息</em>
+                  </div>
+                  <div class="queue-stat">
+                    <b>{{ storageMigration.remaining_chunks }}</b>
+                    <em>剩余分块引用</em>
+                  </div>
+                </div>
+
+                <el-progress
+                  :percentage="storageMigrationPct"
+                  :stroke-width="8"
+                  :status="storageMigration.status === 'failed' ? 'exception' : undefined"
+                />
+
+                <div v-if="storageMigration.sources.length" class="migration-sources">
+                  <div v-for="source in storageMigration.sources" :key="source.storage_target_id">
+                    <span>Bot {{ source.bot_id }}</span>
+                    <span>{{ source.messages }} 条消息 / {{ source.chunks }} 个引用</span>
+                    <span>{{ fmtSize(source.bytes) }}</span>
+                  </div>
+                </div>
+
+                <div v-if="storageMigration.last_error" class="queue-error">
+                  <el-icon><WarnTriangleFilled /></el-icon>
+                  <span>{{ storageMigration.last_error }}</span>
+                </div>
+
+                <div class="queue-actions">
+                  <el-button
+                    v-if="storageMigration.running"
+                    type="warning"
+                    plain
+                    :icon="VideoPause"
+                    :loading="storageMigrationBusy"
+                    @click="pauseStorageMigration"
+                  >
+                    暂停
+                  </el-button>
+                  <el-button
+                    v-else
+                    type="primary"
+                    plain
+                    :icon="VideoPlay"
+                    :loading="storageMigrationBusy"
+                    :disabled="storageMigration.remaining_messages === 0"
+                    @click="startStorageMigration"
+                  >
+                    {{ storageMigration.status === 'failed' ? '重试' : storageMigration.status === 'paused' ? '继续' : '开始迁移' }}
+                  </el-button>
+                  <span class="muted queue-hint">
+                    旧消息会保留；每 3 秒最多复制 1 条，用户上传优先。完成后可从上传 Bot 池移除旧 Bot，避免新文件再次分流。
+                  </span>
+                </div>
+              </div>
+
               <div class="note">
                 <el-icon><InfoFilled /></el-icon>
                 <div>
@@ -1502,10 +1682,27 @@ function downloadBackup() {
                 <SettingField
                   label="Bot Token"
                   :source="cfg?.sources.bot_token"
-                  help="找 @BotFather 申请;显示的是脱敏值,不修改就保持原样。"
+                  help="主 Bot：负责收件箱、数据库备份，也参与上传池；显示的是脱敏值。"
                   @reset="resetKey('bot_token', 'Bot Token')"
                 >
                   <el-input v-model="form.bot_token" placeholder="不修改就保持原样" />
+                </SettingField>
+
+                <SettingField
+                  label="额外上传 Bot"
+                  :source="cfg?.sources.upload_bot_tokens"
+                  wide
+                  @reset="resetKey('upload_bot_tokens', '额外上传 Bot')"
+                >
+                  <el-input
+                    v-model="form.upload_bot_tokens"
+                    type="textarea"
+                    :autosize="{ minRows: 3, maxRows: 8 }"
+                    placeholder="每行一个 Bot Token；留空只使用主 Bot"
+                  />
+                  <template #help>
+                    所有 Bot 必须加入同一个存储频道，并授予发消息和删消息权限。单块文件会按冷却状态和轮询分配给其中一个 Bot；需要多个分块的文件统一交给默认 Bot，并串行上传。最多 20 个 Bot。
+                  </template>
                 </SettingField>
 
                 <SettingField
@@ -1539,7 +1736,7 @@ function downloadBackup() {
                   label="上传并发"
                   :source="cfg?.sources.upload_concurrency"
                   inline
-                  help="同时发往频道的分块数;调太高容易触发限流。"
+                  help="每个 Bot API 实例的并发数；总并发 = 此值 × 上传 Bot 数量。例如 3 个 Bot、此处为 2 时总并发为 6。"
                   @reset="resetKey('upload_concurrency', '上传并发')"
                 >
                   <el-input-number
@@ -2418,6 +2615,26 @@ function downloadBackup() {
   background: var(--tile-bg);
   padding: 14px 16px;
 }
+.migration-card {
+  margin-bottom: 14px;
+}
+.migration-sources {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.migration-sources > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.7fr) minmax(190px, 1.5fr) minmax(90px, 0.5fr);
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  background: var(--tile-bg-hover);
+  color: var(--text-soft);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
 .queue-head {
   display: flex;
   align-items: flex-start;
@@ -2966,6 +3183,12 @@ function downloadBackup() {
   .log-time {
     margin-left: 0;
   }
+  .migration-sources > div {
+    grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.2fr);
+  }
+  .migration-sources > div > span:last-child {
+    grid-column: 1 / -1;
+  }
 }
 @media (max-width: 900px) {
   .layout {
@@ -2988,6 +3211,14 @@ function downloadBackup() {
   .pane {
     width: 100%;
     box-sizing: border-box;
+  }
+}
+@media (max-width: 560px) {
+  .migration-sources > div {
+    grid-template-columns: 1fr;
+  }
+  .migration-sources > div > span:last-child {
+    grid-column: auto;
   }
 }
 </style>

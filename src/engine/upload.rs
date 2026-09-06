@@ -10,10 +10,10 @@ use bytes::{Bytes, BytesMut};
 use futures_util::future::{AbortHandle, Abortable};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 pub enum UploadMsg {
@@ -54,7 +54,11 @@ async fn send_body_to_telegram(
     thumbnail: Option<&Bytes>,
     body: &UploadBody,
     upstream_pending: &AtomicU64,
+    persisting_stage: Option<&AtomicU8>,
 ) -> AppResult<TgMessage> {
+    // 等待共享发送时隙时尚未向 Bot API 发请求，因此必须先等待、再标记在途；
+    // 用户在限流倒计时中取消任务不会误触发 Bot API 重启。
+    tg.wait_upload_turn().await;
     // 只有请求确定返回后才清零。future 被取消或结果不确定时保持非零，
     // 外层据此重启自建 Bot API，终止它已经接手的 TDLib 上传。
     upstream_pending.fetch_add(1, Ordering::AcqRel);
@@ -73,6 +77,9 @@ async fn send_body_to_telegram(
                 // 只有 Telegram 明确拒绝格式时才安全降级；不确定结果不能重复发送。
                 Err(AppError::TelegramRejected(detail)) => {
                     tracing::warn!("{filename} 以视频消息发送失败({detail})，回退为文档");
+                    upstream_pending.fetch_sub(1, Ordering::AcqRel);
+                    tg.wait_upload_turn().await;
+                    upstream_pending.fetch_add(1, Ordering::AcqRel);
                     tg.send_document(filename, None, thumbnail, body).await
                 }
                 Err(error) => Err(error),
@@ -80,6 +87,13 @@ async fn send_body_to_telegram(
         }
         None => tg.send_document(filename, None, thumbnail, body).await,
     };
+    // 成功响应后必须先进入落库阶段，再清除在途标记。这样另一个取消任务
+    // 在重启共享 Bot API 时不会误杀“消息已经创建、只差落库”的分块。
+    if result.is_ok()
+        && let Some(stage) = persisting_stage
+    {
+        stage.store(PART_STAGE_PERSISTING, Ordering::Release);
+    }
     if !matches!(&result, Err(AppError::TelegramUncertain(_))) {
         upstream_pending.fetch_sub(1, Ordering::AcqRel);
     }
@@ -109,6 +123,7 @@ pub struct ResumablePartHandle {
     tx: mpsc::Sender<UploadMsg>,
     join: tokio::task::JoinHandle<AppResult<()>>,
     cancel: AbortHandle,
+    cancel_reason: Arc<AtomicU8>,
 }
 
 impl ResumablePartHandle {
@@ -130,6 +145,12 @@ impl ResumablePartHandle {
 impl Drop for ResumablePartHandle {
     fn drop(&mut self) {
         // JoinHandle 被丢弃只会让任务脱离等待，不会停止它；必须显式取消。
+        let _ = self.cancel_reason.compare_exchange(
+            PART_CANCEL_NONE,
+            PART_CANCEL_USER,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.cancel.abort();
     }
 }
@@ -339,11 +360,29 @@ pub struct Uploader {
     pub mem_limit: u64,
     delete_running: Arc<AtomicBool>,
     active_resumable: Arc<Mutex<ActiveResumableUploads>>,
+    bot_restart_lock: Arc<AsyncMutex<()>>,
+    bot_restart_generation: Arc<AtomicU64>,
+}
+
+const PART_STAGE_RECEIVING: u8 = 0;
+const PART_STAGE_SENDING: u8 = 1;
+const PART_STAGE_PERSISTING: u8 = 2;
+
+const PART_CANCEL_NONE: u8 = 0;
+const PART_CANCEL_USER: u8 = 1;
+const PART_CANCEL_BOT_RESTART: u8 = 2;
+const PART_CANCEL_RESTART_FAILED: u8 = 3;
+
+#[derive(Clone)]
+struct ActiveResumablePart {
+    cancel: AbortHandle,
+    cancel_reason: Arc<AtomicU8>,
+    stage: Arc<AtomicU8>,
 }
 
 #[derive(Default)]
 struct ActiveResumableUploads {
-    parts: HashMap<(String, i64), AbortHandle>,
+    parts: HashMap<(String, i64), ActiveResumablePart>,
     /// 防止取消接口与同一会话的新分块请求交错，造成“删会话后仍开始上传”。
     cancelling_sessions: HashSet<String>,
 }
@@ -357,6 +396,8 @@ impl Uploader {
             mem_limit,
             delete_running: Arc::new(AtomicBool::new(false)),
             active_resumable: Arc::new(Mutex::new(ActiveResumableUploads::default())),
+            bot_restart_lock: Arc::new(AsyncMutex::new(())),
+            bot_restart_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -368,8 +409,8 @@ impl Uploader {
         display_path: &str,
         thumbnail: Option<Bytes>,
     ) -> AppResult<UploadHandle> {
-        // 一次上传固定使用同一个存储目标；后台改配置只影响之后开始的上传。
-        let target = self.tg.current()?;
+        // 一个文件从池中选择一次目标并固定下来；后台改配置只影响之后开始的上传。
+        let target = self.tg.next_upload()?;
         let node_id = self.db.create_uploading(parent_id, name).await?;
         let (tx, rx) = mpsc::channel::<UploadMsg>(4);
         let this = self.clone();
@@ -437,39 +478,72 @@ impl Uploader {
         let id = session_id.to_string();
         let key = (id.clone(), idx);
         let (cancel, abort_registration) = AbortHandle::new_pair();
+        let cancel_reason = Arc::new(AtomicU8::new(PART_CANCEL_NONE));
+        let stage = Arc::new(AtomicU8::new(PART_STAGE_RECEIVING));
+        // 注册任务与 Bot API 重启共用同一把异步锁，避免任务在“递增代次”与
+        // “中断旧任务”的间隙进入，从而逃过本轮重启协调。
+        let restart_guard = self.bot_restart_lock.lock().await;
+        let restart_generation = self.bot_restart_generation.load(Ordering::Acquire);
         let accepted = {
             let mut active = self.active_resumable.lock().unwrap();
             if active.cancelling_sessions.contains(session_id) {
                 false
             } else {
-                active.parts.insert(key.clone(), cancel.clone());
+                active.parts.insert(
+                    key.clone(),
+                    ActiveResumablePart {
+                        cancel: cancel.clone(),
+                        cancel_reason: cancel_reason.clone(),
+                        stage: stage.clone(),
+                    },
+                );
                 true
             }
         };
+        drop(restart_guard);
         if !accepted {
             let _ = self.db.release_upload_part(session_id, idx).await;
             return Err(AppError::BadRequest("上传会话正在取消".into()));
         }
         let active_resumable = self.active_resumable.clone();
-        let cancel_api = target.api.clone();
         let upstream_pending = Arc::new(AtomicU64::new(0));
         let pipeline_pending = upstream_pending.clone();
+        let pipeline_stage = stage.clone();
+        let task_cancel_reason = cancel_reason.clone();
         let join = tokio::spawn(async move {
-            let result = match Abortable::new(
-                this.resumable_part_pipeline(&id, idx, info, target, pipeline_pending, rx),
+            let pipeline_result = Abortable::new(
+                this.resumable_part_pipeline(
+                    &id,
+                    idx,
+                    info,
+                    target.clone(),
+                    pipeline_pending,
+                    pipeline_stage,
+                    rx,
+                ),
                 abort_registration,
             )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(AppError::BadRequest("分块上传已取消".into())),
-            };
-            stop_detached_bot_api_upload(
-                &cancel_api,
+            .await;
+            this.restart_detached_resumable_upload(
+                &target.api,
                 &upstream_pending,
+                restart_generation,
+                &key,
                 &format!("会话 {id} 分块 {idx}"),
             )
             .await;
+            // 其他任务必须等重启领导者释放锁后再读取原因；若监督器重启失败，
+            // 绝不能把该分块标为可自动重试，否则可能制造重复 Telegram 消息。
+            let result = match pipeline_result {
+                Ok(result) => result,
+                Err(_) => match task_cancel_reason.load(Ordering::Acquire) {
+                    PART_CANCEL_BOT_RESTART => Err(AppError::UploadInterrupted),
+                    PART_CANCEL_RESTART_FAILED => Err(AppError::TelegramUncertain(
+                        "共享 Bot API 重启失败，其他并发分块已停止".into(),
+                    )),
+                    _ => Err(AppError::BadRequest("分块上传已取消".into())),
+                },
+            };
             if result.is_err()
                 && let Err(release_error) = this.db.release_upload_part(&id, idx).await
             {
@@ -482,6 +556,7 @@ impl Uploader {
             tx,
             join,
             cancel,
+            cancel_reason,
         }))
     }
 
@@ -494,11 +569,17 @@ impl Uploader {
                 .parts
                 .iter()
                 .filter(|((id, _), _)| id == session_id)
-                .map(|(_, token)| token.clone())
+                .map(|(_, part)| part.clone())
                 .collect::<Vec<_>>()
         };
-        for token in tokens {
-            token.abort();
+        for part in tokens {
+            let _ = part.cancel_reason.compare_exchange(
+                PART_CANCEL_NONE,
+                PART_CANCEL_USER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            part.cancel.abort();
         }
 
         // 包含 Bot API 监督器的 10 秒确认期限，再留出任务清理余量。
@@ -526,6 +607,65 @@ impl Uploader {
             .remove(session_id);
     }
 
+    /// 一个分块被客户端中止时，TDLib 可能仍在后台上传。共享 Bot API 必须只重启
+    /// 一次；同一代的其他分块先被标记为可安全重试并中断，避免收到模糊的 502。
+    async fn restart_detached_resumable_upload(
+        &self,
+        api: &Arc<dyn TgApi>,
+        upstream_pending: &AtomicU64,
+        started_generation: u64,
+        own_key: &(String, i64),
+        label: &str,
+    ) {
+        // 自建 Bot API 是所有 Bot 共用的单进程；多 Bot 池下重启它会同时打断
+        // 其他 Bot 的在途请求，宁可让单个取消请求自然收尾，也不要制造全局 503。
+        if self.tg.upload_bot_count() > 1 {
+            return;
+        }
+        if upstream_pending.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let _restart_guard = self.bot_restart_lock.lock().await;
+        if self.bot_restart_generation.load(Ordering::Acquire) != started_generation {
+            return;
+        }
+        self.bot_restart_generation.fetch_add(1, Ordering::AcqRel);
+
+        let interrupted = {
+            let active = self.active_resumable.lock().unwrap();
+            active
+                .parts
+                .iter()
+                .filter(|(key, part)| {
+                    *key != own_key && part.stage.load(Ordering::Acquire) < PART_STAGE_PERSISTING
+                })
+                .map(|(_, part)| part.clone())
+                .collect::<Vec<_>>()
+        };
+        for part in &interrupted {
+            let _ = part.cancel_reason.compare_exchange(
+                PART_CANCEL_NONE,
+                PART_CANCEL_BOT_RESTART,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            part.cancel.abort();
+        }
+
+        if let Err(error) = api.cancel_pending_uploads().await {
+            for part in interrupted {
+                let _ = part.cancel_reason.compare_exchange(
+                    PART_CANCEL_BOT_RESTART,
+                    PART_CANCEL_RESTART_FAILED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            tracing::error!("终止 Bot API 在途上传失败（{label}）: {error}");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn resumable_part_pipeline(
         &self,
         session_id: &str,
@@ -533,6 +673,7 @@ impl Uploader {
         info: UploadSessionInfo,
         target: TgBinding,
         upstream_pending: Arc<AtomicU64>,
+        stage: Arc<AtomicU8>,
         mut rx: mpsc::Receiver<UploadMsg>,
     ) -> AppResult<()> {
         let expected = info
@@ -601,6 +742,7 @@ impl Uploader {
         let thumbnail = (idx == 0)
             .then(|| info.session.thumbnail.clone().map(Bytes::from))
             .flatten();
+        stage.store(PART_STAGE_SENDING, Ordering::Release);
         let msg = send_body_to_telegram(
             target.api.clone(),
             &filename,
@@ -608,6 +750,7 @@ impl Uploader {
             thumbnail.as_ref(),
             &body,
             &upstream_pending,
+            Some(&stage),
         )
         .await?;
         let stored = StoredMessage {
@@ -1013,6 +1156,7 @@ impl Uploader {
                 thumbnail.as_ref(),
                 &body,
                 &upstream_pending,
+                None,
             )
             .await?;
             if let Err(e) = db
