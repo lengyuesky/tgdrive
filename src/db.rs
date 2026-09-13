@@ -10,9 +10,27 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "../apps/backend/db.rs"]
+pub mod apps;
 pub mod entries;
 
 pub const ROOT_ID: i64 = 1;
+
+/// 仅标记已核实的收件入口，缺少记录的历史节点仍属于来源未知。
+#[derive(Clone, Copy)]
+pub enum InboxSource {
+    Bot,
+    Channel,
+}
+
+impl InboxSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bot => "bot",
+            Self::Channel => "channel",
+        }
+    }
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Node {
@@ -889,6 +907,37 @@ impl Db {
 
     // ---------- 上传生命周期 ----------
 
+    pub async fn record_inbox_source(&self, node_id: i64, source: InboxSource) -> AppResult<()> {
+        sqlx::query("INSERT INTO inbox_sources (node_id, source) VALUES (?, ?)")
+            .bind(node_id)
+            .bind(source.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 同一频道里其他上传 Bot 的消息也会推送给主 Bot，已有映射的消息不能重复收件。
+    /// 同时接受配置中的频道名和 update 返回的数字 ID。
+    pub async fn has_stored_message_in_chat(
+        &self,
+        configured_chat: &str,
+        numeric_chat: i64,
+        message_id: i64,
+    ) -> AppResult<bool> {
+        let (exists,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(
+                SELECT 1 FROM chunks c JOIN storage_targets t ON t.id = c.storage_target_id
+                WHERE c.tg_message_id = ? AND t.chat_id IN (?, ?)
+             )",
+        )
+        .bind(message_id)
+        .bind(configured_chat)
+        .bind(numeric_chat.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     /// 创建 uploading 状态的文件占位节点(允许与同名 ready 文件并存,finalize 时替换)
     pub async fn create_uploading(&self, parent_id: i64, name: &str) -> AppResult<i64> {
         let parent = self.node(parent_id).await?;
@@ -1472,6 +1521,14 @@ impl Db {
         .bind(src_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT INTO inbox_sources (node_id, source)
+             SELECT ?, source FROM inbox_sources WHERE node_id = ?",
+        )
+        .bind(new_id)
+        .bind(src_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(new_id)
     }
@@ -2014,6 +2071,22 @@ impl Db {
         Ok(row.map(|r| r.0))
     }
 
+    /// 一次读取所需设置，避免开关读取混入规则和大体积收件死信。
+    pub async fn settings_get(&self, keys: &[&str]) -> AppResult<HashMap<String, String>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT k, v FROM settings WHERE k IN (");
+        let mut separated = query.separated(", ");
+        for key in keys {
+            separated.push_bind(key);
+        }
+        separated.push_unseparated(")");
+        let rows: Vec<(String, String)> = query.build_query_as().fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().collect())
+    }
+
     pub async fn setting_set(&self, k: &str, v: &str) -> AppResult<()> {
         sqlx::query(
             "INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
@@ -2431,6 +2504,37 @@ mod tests {
         let node = db.resolve(&["f"]).await.unwrap().unwrap();
         assert_eq!(node.size, 7);
         assert_eq!(node.id, v2);
+    }
+
+    #[tokio::test]
+    async fn inbox_source_survives_copy_and_is_removed_with_its_node() {
+        let (db, _dir) = test_db().await;
+        let node = db.create_uploading(ROOT_ID, "channel.pdf").await.unwrap();
+        db.record_inbox_source(node, InboxSource::Channel)
+            .await
+            .unwrap();
+        db.add_chunk(node, 0, 12, "inbox-file", 201, TEST_TARGET, None)
+            .await
+            .unwrap();
+        db.finalize_upload(node, 12, None).await.unwrap();
+        let copy = db.copy_file(node, ROOT_ID, "copy.pdf").await.unwrap();
+        let sources: Vec<(i64, String)> =
+            sqlx::query_as("SELECT node_id,source FROM inbox_sources ORDER BY node_id")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            sources,
+            vec![(node, "channel".into()), (copy, "channel".into())]
+        );
+        db.abort_upload_keep_messages(node).await.unwrap();
+        db.abort_upload_keep_messages(copy).await.unwrap();
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM inbox_sources")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(db.pending_delete_count().await.unwrap(), 0);
     }
 
     #[tokio::test]

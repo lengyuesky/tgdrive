@@ -1,6 +1,8 @@
 /target
 /frontend/node_modules
 /frontend/dist
+/apps/catalog
+/apps/.build
 .env
 *.db
 *.db-shm

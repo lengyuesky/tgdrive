@@ -2,6 +2,8 @@
 //! 子命令:serve(默认)| check(实测 Bot API 链路)| healthcheck(容器健康检查)
 
 mod api;
+#[path = "../apps/backend/mod.rs"]
+mod apps;
 mod auth;
 mod backup;
 mod config;
@@ -14,11 +16,13 @@ mod housekeeping;
 mod inbox;
 mod migration;
 mod mtproto;
+mod proxy;
 mod security;
 mod settings;
 mod tasks;
 mod telegram;
 mod vfs;
+mod web;
 
 use crate::api::AppState;
 use crate::auth::Auth;
@@ -103,6 +107,7 @@ async fn serve() -> anyhow::Result<()> {
         cfg.storage_target_id,
         cfg.upload_target_ids.clone(),
         mtproto,
+        cfg.proxy.clone(),
     )?);
     let knobs = Arc::new(UploadKnobs::new(
         cfg.chunk_size,
@@ -220,13 +225,7 @@ async fn serve() -> anyhow::Result<()> {
     match static_dir {
         Some(dir) => {
             tracing::info!("静态前端目录: {dir}");
-            let index = std::path::Path::new(&dir).join("index.html");
-            let serve = tower_http::services::ServeDir::new(&dir)
-                .not_found_service(tower_http::services::ServeFile::new(index));
-            let serve = tower::ServiceBuilder::new()
-                .layer(tower_http::compression::CompressionLayer::new())
-                .service(serve);
-            app = app.fallback_service(serve);
+            app = app.fallback_service(web::router(&dir));
         }
         None => {
             tracing::warn!("未找到静态前端目录,仅提供 API(开发模式请用 vite dev server)");
@@ -300,7 +299,7 @@ async fn check() -> anyhow::Result<()> {
         "尚未配置 Telegram 存储:请在 .env 里填 TGDRIVE_BOT_TOKEN / TGDRIVE_CHAT_ID,\
          或启动服务后在网页「系统设置」里配置"
     );
-    let tg = TgClient::new(&cfg.api_base, &cfg.bot_token, &cfg.chat_id)?;
+    let tg = TgClient::new(&cfg.api_base, &cfg.bot_token, &cfg.chat_id, cfg.proxy.clone())?;
 
     println!("[1/4] 验证 Bot 与存储频道权限 ...");
     let me = tg.probe_storage().await?;
@@ -342,7 +341,7 @@ async fn healthcheck() -> anyhow::Result<()> {
     let listen = std::env::var("TGDRIVE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let port = listen.rsplit(':').next().unwrap_or("8080");
     let url = format!("http://127.0.0.1:{port}/healthz");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder().no_proxy().build()?
         .get(&url)
         .timeout(std::time::Duration::from_secs(5))
         .send()

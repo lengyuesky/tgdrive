@@ -5,19 +5,26 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "typecheck": "vue-tsc --noEmit",
+    "build": "vite build && npm run build:apps",
+    "build:apps": "node ../apps/build.mjs",
+    "typecheck": "vue-tsc --noEmit && tsc --noEmit -p playwright.apps.tsconfig.json",
     "check": "npm run typecheck && npm run build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:mobile": "playwright test --config playwright.mobile.config.ts",
+    "test:apps": "playwright test --config playwright.apps.config.ts"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
     "@tanstack/vue-virtual": "^3.13.26",
+    "@zip.js/zip.js": "2.14.0",
     "axios": "^1.13.0",
+    "dompurify": "3.4.15",
     "element-plus": "^2.13.0",
     "hash-wasm": "^4.12.0",
+    "mediabunny": "1.56.1",
+    "pdfjs-dist": "6.3.289",
     "vue": "^3.5.0",
     "vue-router": "^4.5.0"
   },

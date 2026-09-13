@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" title="回收站" width="760px" align-center append-to-body>
+  <ResponsivePanel v-model="visible" title="回收站" width="760px" align-center append-to-body>
     <div class="bar">
       <span class="tip">
         回收站中的内容可以恢复;Telegram 消息在彻底删除时才释放。网页删除时也可选择直接删除,保留天数可在「系统设置 → 维护」调整。
@@ -14,7 +14,11 @@
         清空回收站
       </el-button>
     </div>
-    <el-table :data="items" v-loading="loading" size="small">
+    <div v-if="mobile" v-loading="loading" class="management-cards">
+      <article v-for="row in items" :key="row.id" class="management-card"><h3>{{ row.name }}</h3><p>{{ row.orig_path }}</p><p>{{ row.is_dir ? '文件夹' : fmtSize(row.size) }} · {{ fmtTime(row.trashed_at) }}</p><div class="card-actions"><el-button type="primary" plain @click="restore(row)">恢复</el-button><el-button type="danger" plain @click="purge(row)">彻底删除</el-button></div></article>
+      <el-empty v-if="!loading && !items.length" description="回收站是空的" />
+    </div>
+    <el-table v-else :data="items" v-loading="loading" size="small">
       <el-table-column label="名称" min-width="200">
         <template #default="{ row }">
           <div class="name-line">
@@ -49,10 +53,12 @@
         <el-empty description="回收站是空的" :image-size="72" />
       </template>
     </el-table>
-  </el-dialog>
+  </ResponsivePanel>
 </template>
 
 <script setup lang="ts">
+import ResponsivePanel from './ResponsivePanel.vue'
+import { mobile } from '../mobile/viewport'
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { DeleteFilled, Document, Folder } from '@element-plus/icons-vue'
@@ -143,6 +149,7 @@ defineExpose({ open })
 <style scoped>
 .bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;

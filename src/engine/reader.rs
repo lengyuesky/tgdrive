@@ -38,6 +38,7 @@ pub struct ChunkedReader {
     tg: Arc<TgRegistry>,
     chunks: Vec<ChunkPos>,
     total: u64,
+    read_end: u64,
     pos: u64,
     state: State,
 }
@@ -60,6 +61,7 @@ impl ChunkedReader {
             tg,
             chunks: list,
             total: off,
+            read_end: off,
             pos: start_pos.min(off),
             state: State::Idle,
         }
@@ -67,6 +69,13 @@ impl ChunkedReader {
 
     pub fn total_size(&self) -> u64 {
         self.total
+    }
+
+    /// 将本次读取限制到指定长度，并把 Range 终点传递给底层预取器。
+    pub fn with_read_limit(mut self, length: u64) -> Self {
+        self.read_end = self.pos.saturating_add(length).min(self.total);
+        self.state = State::Idle;
+        self
     }
 
     /// 当前位置所在分块的下标
@@ -82,15 +91,15 @@ impl AsyncRead for ChunkedReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            if self.pos >= self.total {
-                return Poll::Ready(Ok(())); // EOF
+            if buf.remaining() == 0 || self.pos >= self.read_end {
+                return Poll::Ready(Ok(()));
             }
             match &mut self.state {
                 State::Idle => {
                     let ci = self.locate(self.pos);
                     let chunk = &self.chunks[ci];
                     let in_off = self.pos - chunk.start;
-                    let remain = chunk.size - in_off;
+                    let remain = (chunk.size - in_off).min(self.read_end - self.pos);
                     let tg = self.tg.clone();
                     let fid = chunk.file_id.clone();
                     let message_id = chunk.message_id;
@@ -104,7 +113,7 @@ impl AsyncRead for ChunkedReader {
                         })?;
                         tg.binding(target_id)?
                             .api
-                            .open_chunk_stream(&fid, message_id, chunk_size, in_off)
+                            .open_chunk_range(&fid, message_id, chunk_size, in_off, remain)
                             .await
                     }
                     .boxed();

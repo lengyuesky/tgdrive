@@ -1,9 +1,8 @@
 <template>
-  <el-dialog
+  <ResponsivePanel
     v-model="visible"
     :title="name"
     :width="dialogWidth"
-    :fullscreen="narrow && kind === 'video'"
     top="4vh"
     destroy-on-close
   >
@@ -44,10 +43,11 @@
         <el-button type="primary" @click="visible = false">关闭</el-button>
       </div>
     </template>
-  </el-dialog>
+  </ResponsivePanel>
 </template>
 
 <script setup lang="ts">
+import ResponsivePanel from './ResponsivePanel.vue'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import axios from 'axios'
 import { ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
@@ -166,7 +166,8 @@ function download() {
   window.open(api.downloadUrl(path.value), '_blank')
 }
 
-defineExpose({ open })
+function close() { visible.value = false; player.value?.stop() }
+defineExpose({ open, close })
 </script>
 
 <style scoped>

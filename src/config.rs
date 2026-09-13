@@ -15,6 +15,9 @@ pub const SELF_HOSTED_CHUNK_MAX: u64 = 1_900 * 1024 * 1024;
 pub const LOCAL_CHUNK_DEFAULT: u64 = 256 * 1024 * 1024;
 pub const MIN_CHUNK: u64 = 1024 * 1024;
 pub const DEFAULT_LOCAL_DATA_ROOT: &str = "/var/lib/telegram-bot-api";
+pub const MIN_DOWNLOAD_CONCURRENCY: usize = 1;
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 4;
+pub const MAX_DOWNLOAD_CONCURRENCY: usize = 8;
 
 #[derive(Clone)]
 pub struct Config {
@@ -26,8 +29,12 @@ pub struct Config {
     pub chat_id: String,
     /// Bot API 基地址,官方或自部署 telegram-bot-api
     pub api_base: String,
+    /// tgdrive 出站请求代理；独立 Bot API 服务的联网配置不受影响。
+    pub proxy: crate::proxy::ProxyConfig,
     pub chunk_size: u64,
     pub upload_concurrency: usize,
+    /// 每个下载流并行读取的 Telegram 分段数。
+    pub download_concurrency: usize,
     pub db_path: String,
     pub tmp_dir: PathBuf,
     /// 自建 Bot API `--local` 返回的绝对路径只能从此目录下读取。
@@ -55,6 +62,15 @@ fn env_opt(key: &str) -> Option<String> {
 
 fn env_required(key: &str) -> anyhow::Result<String> {
     env_opt(key).ok_or_else(|| anyhow::anyhow!("缺少必填环境变量 {key}"))
+}
+
+pub fn parse_download_concurrency(value: &str) -> anyhow::Result<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (MIN_DOWNLOAD_CONCURRENCY..=MAX_DOWNLOAD_CONCURRENCY).contains(n))
+        .ok_or_else(|| anyhow::anyhow!("下载并发数需为 1~8 之间的整数"))
 }
 
 /// 多 Bot 配置支持逗号、分号和换行分隔，并自动去重、忽略空项。
@@ -159,6 +175,14 @@ impl Config {
             None => default_send_video(&api_base),
         };
 
+        let proxy_url = env_opt("TGDRIVE_PROXY_URL").unwrap_or_default();
+        let proxy_enabled = env_opt("TGDRIVE_PROXY_ENABLED")
+            .map(|value| parse_bool(&value))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("TGDRIVE_PROXY_ENABLED 应为 true 或 false"))?
+            .unwrap_or(!proxy_url.is_empty());
+        let proxy = crate::proxy::ProxyConfig::new(proxy_enabled, &proxy_url)?;
+
         let cfg = Config {
             listen: env_opt("TGDRIVE_LISTEN")
                 .unwrap_or_else(|| "0.0.0.0:8080".into())
@@ -171,6 +195,7 @@ impl Config {
                 .unwrap_or_default(),
             chat_id: env_opt("TGDRIVE_CHAT_ID").unwrap_or_default(),
             api_base,
+            proxy,
             chunk_size,
             upload_concurrency: env_opt("TGDRIVE_UPLOAD_CONCURRENCY")
                 .map(|v| v.parse::<usize>())
@@ -178,6 +203,10 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("TGDRIVE_UPLOAD_CONCURRENCY 无效: {e}"))?
                 .unwrap_or(2)
                 .clamp(1, 16),
+            download_concurrency: env_opt("TGDRIVE_DOWNLOAD_CONCURRENCY")
+                .map(|v| parse_download_concurrency(&v))
+                .transpose()?
+                .unwrap_or(DEFAULT_DOWNLOAD_CONCURRENCY),
             db_path: env_opt("TGDRIVE_DB_PATH").unwrap_or_else(|| "data/tgdrive.db".into()),
             tmp_dir: env_opt("TGDRIVE_TMP_DIR")
                 .map(PathBuf::from)

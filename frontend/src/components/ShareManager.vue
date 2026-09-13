@@ -1,6 +1,13 @@
 <template>
-  <el-dialog v-model="visible" title="分享管理" width="820px" align-center append-to-body>
-    <el-table :data="items" v-loading="loading" size="small">
+  <ResponsivePanel v-model="visible" title="分享管理" width="820px" align-center append-to-body>
+    <div v-if="mobile" v-loading="loading" class="management-cards">
+      <article v-for="row in items" :key="row.id" class="management-card">
+        <h3>{{ row.name }}</h3><p>{{ row.path }}</p>
+        <dl><dt>提取码</dt><dd>{{ row.password || '无' }}</dd><dt>有效期</dt><dd>{{ row.expires_at ? (row.expires_at < now ? '已过期' : fmtTime(row.expires_at)) : '永久' }}</dd><dt>下载</dt><dd>{{ row.downloads }}{{ row.max_downloads ? ` / ${row.max_downloads}` : '' }}</dd></dl>
+        <div class="card-actions"><el-button @click="copy(row)">复制链接</el-button><el-button type="danger" plain @click="remove(row)">取消分享</el-button></div>
+      </article><el-empty v-if="!loading && !items.length" description="暂无分享" />
+    </div>
+    <el-table v-else :data="items" v-loading="loading" size="small">
       <el-table-column label="内容" min-width="200">
         <template #default="{ row }">
           <div class="name-line">
@@ -40,10 +47,13 @@
         <el-empty description="还没有分享;在文件的「更多」菜单里创建" :image-size="72" />
       </template>
     </el-table>
-  </el-dialog>
+  </ResponsivePanel>
 </template>
 
 <script setup lang="ts">
+import ResponsivePanel from './ResponsivePanel.vue'
+import { mobile } from '../mobile/viewport'
+import { copyText } from '../mobile/share'
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Document, Folder, Share } from '@element-plus/icons-vue'
@@ -74,12 +84,7 @@ function open() {
 async function copy(row: ShareItem) {
   const url = `${location.origin}/s/${row.token}`
   const text = row.password ? `${url}  提取码: ${row.password}` : url
-  try {
-    await navigator.clipboard.writeText(text)
-    ElMessage.success('已复制')
-  } catch {
-    ElMessage.warning('浏览器不允许自动复制,请手动复制:' + text)
-  }
+  await copyText(text)
 }
 
 async function remove(row: ShareItem) {

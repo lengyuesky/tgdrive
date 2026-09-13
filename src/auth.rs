@@ -10,6 +10,9 @@ use sha2::Sha256;
 use std::sync::{Arc, RwLock};
 use subtle::ConstantTimeEq;
 
+#[path = "../apps/backend/auth.rs"]
+mod app_tokens;
+
 const COOKIE_NAME: &str = "tgdrive_token";
 const TOKEN_TTL_SECS: i64 = 7 * 24 * 3600;
 const SHARE_COOKIE_NAME: &str = "tgdrive_share";

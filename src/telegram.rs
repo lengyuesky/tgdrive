@@ -7,6 +7,7 @@
 use crate::db::StorageTarget;
 use crate::error::{AppError, AppResult};
 use crate::mtproto::{MtprotoClient, MtprotoConfig};
+use crate::proxy::{ProxyClient, ProxyConfig, ProxySnapshot};
 use bytes::Bytes;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -187,6 +188,21 @@ pub trait TgApi: Send + Sync + 'static {
         offset: u64,
     ) -> AppResult<ByteReader>;
 
+    /// 同时传递结束边界，避免很短的浏览器 Range 触发整窗预读。
+    async fn open_chunk_range(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        chunk_size: u64,
+        offset: u64,
+        length: u64,
+    ) -> AppResult<ByteReader> {
+        let reader = self
+            .open_chunk_stream(file_id, message_id, chunk_size, offset)
+            .await?;
+        Ok(Box::pin(reader.take(length)))
+    }
+
     /// 打开 Telegram 小缩略图。默认实现便于测试客户端复用普通读取逻辑；
     /// 真实客户端会绕过 MTProto 文档解析，直接使用 Bot API 的 getFile。
     async fn open_thumbnail_stream(&self, file_id: &str, message_id: i64) -> AppResult<ByteReader> {
@@ -308,6 +324,7 @@ pub struct TgRegistry {
     multi_bot_mode: AtomicBool,
     clients: std::sync::RwLock<HashMap<i64, Arc<dyn TgApi>>>,
     mtproto: Option<MtprotoConfig>,
+    network: Arc<ProxyClient>,
 }
 
 fn choose_upload_target(
@@ -337,6 +354,7 @@ impl TgRegistry {
         current: Option<i64>,
         upload_pool: Vec<i64>,
         mtproto: Option<MtprotoConfig>,
+        proxy: ProxyConfig,
     ) -> AppResult<Self> {
         let multi_bot_mode = upload_pool.len() > 1;
         let registry = TgRegistry {
@@ -346,6 +364,7 @@ impl TgRegistry {
             multi_bot_mode: AtomicBool::new(multi_bot_mode),
             clients: std::sync::RwLock::new(HashMap::new()),
             mtproto,
+            network: Arc::new(ProxyClient::new(proxy)?),
         };
         for target in targets {
             registry.register(target)?;
@@ -362,6 +381,7 @@ impl TgRegistry {
             multi_bot_mode: AtomicBool::new(false),
             clients: std::sync::RwLock::new(HashMap::from([(storage_target_id, api)])),
             mtproto: None,
+            network: Arc::new(ProxyClient::new(ProxyConfig::default()).unwrap()),
         }
     }
 
@@ -380,6 +400,7 @@ impl TgRegistry {
                 self.mtproto.clone(),
                 target.id,
                 !self.multi_bot_mode.load(Ordering::Acquire),
+                self.network.clone(),
             )
             .map_err(|e| AppError::BadRequest(format!("Telegram 客户端构造失败: {e}")))?,
         );
@@ -388,6 +409,11 @@ impl TgRegistry {
             storage_target_id: target.id,
             api,
         })
+    }
+
+    /// 共享句柄同时覆盖历史目标，已发出的请求继续使用其客户端快照。
+    pub fn set_proxy(&self, snapshot: Arc<ProxySnapshot>) {
+        self.network.install(snapshot);
     }
 
     /// 热更新主 Bot 与上传池；所有目标必须已注册，避免保存后才在上传途中报错。
@@ -437,6 +463,13 @@ impl TgRegistry {
 
     pub fn upload_bot_count(&self) -> usize {
         self.upload_pool.read().unwrap().len()
+    }
+
+    /// 只影响之后打开的下载流，已有请求保持启动时的有界窗口。
+    pub fn set_download_concurrency(&self, concurrency: usize) {
+        if let Some(mtproto) = &self.mtproto {
+            mtproto.set_download_concurrency(concurrency);
+        }
     }
 
     /// 只要池中有一个 Bot 可发送，前端就不应显示全局冷却。
@@ -520,7 +553,7 @@ impl TgApi for UnconfiguredTg {
 // ---------- 真实客户端 ----------
 
 pub struct TgClient {
-    http: reqwest::Client,
+    network: Arc<ProxyClient>,
     api_base: String,
     token: String,
     chat_id: String,
@@ -660,8 +693,9 @@ impl FilePathCache {
 }
 
 impl TgClient {
-    pub fn new(api_base: &str, token: &str, chat_id: &str) -> anyhow::Result<Self> {
-        Self::build(api_base, token, chat_id, None, true)
+    pub fn new(api_base: &str, token: &str, chat_id: &str, proxy: ProxyConfig) -> anyhow::Result<Self> {
+        let network = Arc::new(ProxyClient::new(proxy)?);
+        Self::build(api_base, token, chat_id, None, true, network)
     }
 
     fn new_with_mtproto_and_restart(
@@ -671,10 +705,12 @@ impl TgClient {
         config: Option<MtprotoConfig>,
         storage_target_id: i64,
         restart_enabled: bool,
+        network: Arc<ProxyClient>,
     ) -> anyhow::Result<Self> {
-        let mtproto =
-            config.map(|config| Arc::new(MtprotoClient::new(config, storage_target_id, token)));
-        Self::build(api_base, token, chat_id, mtproto, restart_enabled)
+        let mtproto = config.map(|config| Arc::new(MtprotoClient::new(
+            config, storage_target_id, token, network.clone(),
+        )));
+        Self::build(api_base, token, chat_id, mtproto, restart_enabled, network)
     }
 
     fn build(
@@ -683,15 +719,11 @@ impl TgClient {
         chat_id: &str,
         mtproto: Option<Arc<MtprotoClient>>,
         restart_enabled: bool,
+        network: Arc<ProxyClient>,
     ) -> anyhow::Result<Self> {
         let api_base = api_base.trim_end_matches('/').to_string();
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(60))
-            // 上传/下载大分块耗时不可控,不设总超时
-            .build()?;
         Ok(TgClient {
-            http,
+            network,
             bot_api_restart_file: (restart_enabled && !crate::config::is_official(&api_base))
                 .then(|| std::env::var("TGDRIVE_BOT_API_RESTART_FILE").ok())
                 .flatten()
@@ -714,6 +746,10 @@ impl TgClient {
         })
     }
 
+    fn http(&self) -> reqwest::Client {
+        self.network.current().http.clone()
+    }
+
     fn method_url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.api_base, self.token, method)
     }
@@ -724,7 +760,7 @@ impl TgClient {
 
     async fn raw_me(&self) -> AppResult<RawUser> {
         let url = self.method_url("getMe");
-        self.call_with_retry("getMe", || self.http.get(&url).send())
+        self.call_with_retry("getMe", || self.http().get(&url).send())
             .await
     }
 
@@ -743,7 +779,7 @@ impl TgClient {
         let get_chat_url = self.method_url("getChat");
         let chat: RawChat = self
             .call_with_retry("getChat", || {
-                self.http
+                self.http()
                     .post(&get_chat_url)
                     .json(&serde_json::json!({ "chat_id": self.chat_id }))
                     .send()
@@ -754,7 +790,7 @@ impl TgClient {
             let member_url = self.method_url("getChatMember");
             let member: RawChatMember = self
                 .call_with_retry("getChatMember", || {
-                    self.http
+                    self.http()
                         .post(&member_url)
                         .json(&serde_json::json!({
                             "chat_id": self.chat_id,
@@ -868,7 +904,7 @@ impl TgClient {
         let url = self.method_url("getFile");
         let file: RawFile = self
             .call_with_retry("getFile", || {
-                self.http.get(&url).query(&[("file_id", file_id)]).send()
+                self.http().get(&url).query(&[("file_id", file_id)]).send()
             })
             .await?;
         let path = file.file_path.ok_or_else(|| {
@@ -965,7 +1001,7 @@ impl TgClient {
             let part = self.body_to_part(filename, mime, body)?;
             form = form.part(field, part);
 
-            let outcome = match self.http.post(&url).multipart(form).send().await {
+            let outcome = match self.http().post(&url).multipart(form).send().await {
                 Ok(resp) => self.parse::<RawMessage>(resp, CallMode::SendMedia).await,
                 // 连接尚未建立或请求体没有发完整时，Telegram 不可能成功解析媒体，可安全重试。
                 Err(e) if e.is_connect() || e.is_body() => Err((
@@ -1022,7 +1058,7 @@ impl TgClient {
     /// HTTP 下载分块;offset>0 时先试 Range,服务器不支持则丢弃前缀
     async fn open_http_stream(&self, file_path: &str, offset: u64) -> AppResult<ByteReader> {
         let url = self.file_url(file_path);
-        let mut req = self.http.get(&url);
+        let mut req = self.http().get(&url);
         if offset > 0 {
             req = req.header(http::header::RANGE, format!("bytes={offset}-"));
         }
@@ -1158,7 +1194,7 @@ impl TgApi for TgClient {
             }
             attempt += 1;
             let outcome = match self
-                .http
+                .http()
                 .post(&url)
                 .json(&serde_json::json!({
                     "chat_id": self.chat_id,
@@ -1227,7 +1263,7 @@ impl TgApi for TgClient {
         let url = self.method_url("deleteMessage");
         let res: Result<bool, AppError> = self
             .call_with_retry("deleteMessage", || {
-                self.http
+                self.http()
                     .post(&url)
                     .json(&serde_json::json!({
                         "chat_id": self.chat_id,
@@ -1283,19 +1319,44 @@ impl TgApi for TgClient {
         chunk_size: u64,
         offset: u64,
     ) -> AppResult<ByteReader> {
+        self.open_chunk_range(
+            file_id,
+            message_id,
+            chunk_size,
+            offset,
+            chunk_size.saturating_sub(offset),
+        )
+        .await
+    }
+
+    async fn open_chunk_range(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        chunk_size: u64,
+        offset: u64,
+        length: u64,
+    ) -> AppResult<ByteReader> {
+        if offset > chunk_size {
+            return Err(AppError::Telegram("下载偏移超过分块大小".into()));
+        }
+        let length = length.min(chunk_size - offset);
+        if length == 0 {
+            return Ok(Box::pin(std::io::Cursor::new(Vec::<u8>::new())));
+        }
         // 已经明确知道并且仍可用的本地缓存最快，也完全没有外网流量。
         let cached_path = self.path_cache.lock().unwrap().get(file_id);
         if let Some(path) = cached_path
             && let Some(reader) = self.open_known_path(&path, offset).await?
         {
-            return Ok(reader);
+            return Ok(Box::pin(reader.take(length)));
         }
 
         // 文档/视频直接走 MTProto 小块读取。失败时不回退 getFile，避免一次 Range
         // 请求悄悄变成最多 1.9GB 的整块下载。
         if let Some(mtproto) = &self.mtproto
             && let Some(reader) = mtproto
-                .open_stream(file_id, message_id, chunk_size, offset)
+                .open_stream(file_id, message_id, chunk_size, offset, length)
                 .await?
         {
             return Ok(reader);
@@ -1304,13 +1365,14 @@ impl TgApi for TgClient {
         // 未配置 MTProto，或照片等不支持的 file_id，保留原 Bot API 路径。
         let file_path = self.get_file_path(file_id).await?;
         if let Some(reader) = self.open_known_path(&file_path, offset).await? {
-            return Ok(reader);
+            return Ok(Box::pin(reader.take(length)));
         }
         tracing::warn!(
             message_id,
             "本地 Bot API 文件无法从共享卷直接读取，回退其 HTTP 文件端点"
         );
-        self.open_http_stream(&file_path, offset).await
+        let reader = self.open_http_stream(&file_path, offset).await?;
+        Ok(Box::pin(reader.take(length)))
     }
 
     async fn open_thumbnail_stream(

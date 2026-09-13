@@ -1,6 +1,7 @@
 <template>
   <div
     class="page"
+    :class="{ 'mobile-files': mobile, 'is-selecting': selecting }"
     @dragenter.prevent="onDragEnter"
     @dragover.prevent
     @dragleave.prevent="onDragLeave"
@@ -11,8 +12,26 @@
       <strong>松开后分批上传文件夹</strong>
       <span>文件会惰性读取，不会一次性塞入浏览器内存</span>
     </div>
-    <!-- 顶栏:Logo · 搜索 · 统计 · 操作按钮 · 状态灯 · 设置/退出 -->
-    <div class="topbar glass">
+    <header v-if="mobile" class="mobile-file-header">
+      <button class="touch-icon" aria-label="返回上一级" :disabled="cur === '/' && !searchMode && !selecting" @click="mobileBack"><el-icon><ArrowLeft /></el-icon></button>
+      <h1>{{ searchMode ? searchTitle : segments.at(-1) || '文件' }}</h1>
+      <button class="touch-icon" aria-label="搜索文件" :aria-expanded="searchOpen" @click="searchOpen = !searchOpen"><el-icon><Search /></el-icon></button>
+      <button class="touch-icon primary" aria-label="上传或新建" @click="addOpen = true"><el-icon><Plus /></el-icon></button>
+    </header>
+    <div v-if="mobile && searchOpen" class="mobile-search">
+      <el-input v-model="query" placeholder="搜索文件" clearable @keydown.enter="!isComposingKey($event) && searchScope === 'global' && doGlobalSearch()" />
+      <div class="search-scope"><button :aria-pressed="searchScope === 'directory'" @click="searchScope = 'directory'; exitSearch()">当前目录</button><button :aria-pressed="searchScope === 'global'" @click="searchScope = 'global'">全局</button><button v-if="searchScope === 'global'" @click="doGlobalSearch">搜索</button><button @click="advancedVisible = true">高级</button></div>
+    </div>
+    <div v-if="mobile" class="mobile-file-tools">
+      <button class="path-button" aria-label="打开目录导航" @click="sidebarVisible = true"><el-icon><Folder /></el-icon>目录</button>
+      <span class="mobile-count">{{ countText }}</span>
+      <button class="touch-icon" aria-label="刷新" @click="refresh"><el-icon><Refresh /></el-icon></button>
+      <button @click="optionsOpen = true">视图</button>
+      <button @click="selecting ? finishSelection() : selecting = true">{{ selecting ? '完成' : '选择' }}</button>
+    </div>
+    <!-- 桌面保留原工具栏，手机使用独立操作层级。 -->
+    <div v-if="!mobile" class="topbar glass">
+      <el-button class="icon-btn mobile-sidebar-button" aria-label="打开侧边栏" :icon="Menu" @click="sidebarVisible = true" />
       <div class="logo-badge"><el-icon><Promotion /></el-icon></div>
       <div class="brand brand-text">tgdrive</div>
 
@@ -22,7 +41,7 @@
         placeholder="过滤当前目录，回车全局搜索"
         :prefix-icon="Search"
         clearable
-        @keyup.enter="doGlobalSearch"
+        @keydown.enter="!isComposingKey($event) && doGlobalSearch()"
       />
       <el-tooltip content="高级搜索">
         <el-button class="icon-btn" :icon="Filter" @click="advancedVisible = true" />
@@ -51,7 +70,7 @@
           </template>
         </el-dropdown>
         <el-tooltip content="上传队列">
-          <el-button class="icon-btn" :icon="UploadFilled" @click="drawer?.open()" />
+          <el-button class="icon-btn" :icon="UploadFilled" @click="queue.open()" />
         </el-tooltip>
         <el-tooltip content="新建文件夹">
           <el-button class="icon-btn" :icon="FolderAdd" @click="mkdir" />
@@ -136,10 +155,6 @@
           />
         </el-tooltip>
 
-        <el-tooltip content="短视频模式(随机刷文件夹里的视频)">
-          <el-button class="icon-btn" :icon="VideoPlay" @click="openShorts" />
-        </el-tooltip>
-
         <span class="vsep" />
 
         <el-tooltip :content="isDark ? '切换亮色' : '切换暗色'">
@@ -193,7 +208,7 @@
     </el-alert>
 
     <!-- 面包屑独立胶囊条 -->
-    <div class="crumb-bar glass">
+    <div v-if="!mobile" class="crumb-bar glass">
       <el-icon class="crumb-ico"><Position /></el-icon>
       <el-breadcrumb separator="/" class="crumbs">
         <el-breadcrumb-item>
@@ -208,40 +223,10 @@
     </div>
 
     <div class="layout">
-      <!-- 左侧悬浮目录树 -->
-      <aside class="sidebar glass">
-        <div class="side-head">
-          <el-icon><FolderOpened /></el-icon>
-          <span>目录</span>
-          <div class="spacer" />
-          <el-tooltip content="新建文件夹">
-            <el-button text circle size="small" :icon="FolderAdd" @click="mkdir" />
-          </el-tooltip>
-          <el-tooltip content="刷新目录树">
-            <el-button text circle size="small" :icon="Refresh" @click="treeKey++" />
-          </el-tooltip>
-        </div>
-        <div class="side-root" :class="{ on: cur === '/' }" @click="goto('/')">
-          <el-icon color="#f6a821"><Folder /></el-icon>
-          <span>全部文件</span>
-          <div class="spacer" />
-          <span v-if="info" class="side-count">{{ info.files }}</span>
-        </div>
-        <VirtualDirectoryTree :key="treeKey" :current="cur" @select="goto" />
-        <div class="side-sep" />
-        <div class="side-root" :class="{ on: searchMode && searchView === 'favorites' }" @click="showFavorites">
-          <el-icon color="#f59e0b"><StarFilled /></el-icon>
-          <span>我的收藏</span>
-        </div>
-        <div class="side-root" @click="trashPanel?.open()">
-          <el-icon color="#94a3b8"><DeleteFilled /></el-icon>
-          <span>回收站</span>
-        </div>
-        <div class="side-root" @click="shareMgr?.open()">
-          <el-icon color="#0ea5e9"><Share /></el-icon>
-          <span>分享管理</span>
-        </div>
-      </aside>
+      <!-- 桌面与窄屏共用同一套侧栏内容，应用区位于分享管理下方。 -->
+      <FilesSidebar v-if="!narrowScreen" :current="cur" :tree-key="treeKey" :file-count="info?.files"
+        :favorites-active="searchMode && searchView === 'favorites'" @navigate="navigateSidebar" @mkdir="mkdirFromSidebar"
+        @refresh="treeKey++" @action="sidebarAction" @app-navigate="sidebarVisible = false" />
 
       <!-- 主内容 -->
       <div class="panel glass" @contextmenu="onBlankCtx">
@@ -254,7 +239,15 @@
             </span>
             <el-button text size="small" @click="exitSearch">退出搜索</el-button>
           </div>
-          <el-table :data="searchHits" size="default">
+          <div v-if="mobile" class="mobile-search-results">
+            <article v-for="hit in searchHits" :key="hit.path" class="result-card">
+              <button class="result-name" @click="openHit(hit)">{{ hit.name }}</button>
+              <button class="result-path" @click="goto(parentOf(hit.path))">{{ parentOf(hit.path) }}</button>
+              <div><span>{{ hit.is_dir ? '文件夹' : fmtSize(hit.size) }} · {{ fmtTime(hit.modified_at) }}</span><button :aria-label="hit.favorite ? '取消收藏' : '收藏'" @click="toggleSearchFavorite(hit)"><el-icon><component :is="hit.favorite ? StarFilled : Star" /></el-icon></button></div>
+            </article>
+            <el-empty v-if="!searchHits.length" description="没有找到匹配的内容" />
+          </div>
+          <el-table v-else :data="searchHits" size="default">
             <el-table-column label="名称" min-width="240">
               <template #default="{ row }">
                 <span class="name-cell clickable" @click="openHit(row as SearchHit)">
@@ -299,9 +292,9 @@
             上传已更新目录，当前浏览和选择已保留。<el-button text @click="refresh">刷新查看</el-button>
           </div>
           <div v-if="batchProgress" class="directory-notice" role="status">{{ batchProgress }}</div>
-          <DirectoryViewport :entries="entries" :count="entries.length" :mode="viewMode" :generation="generation"
+          <DirectoryViewport ref="directoryViewport" :active="pageActive" :entries="entries" :count="entries.length" :mode="viewMode" :generation="generation"
             :revision="revision" :index-of="directory.indexOf" @near-end="loadNextBatch"
-            @scroll="(offset) => scrollOffset = offset">
+            @scroll="rememberScroll">
             <template #header>
               <div class="list-row list-heading">
                 <input type="checkbox" aria-label="全选已加载项目" :checked="allSelected" @change="toggleSelectAll" />
@@ -315,12 +308,12 @@
               <div :class="mode === 'list' ? 'list-row' : ['tile', 'tile-' + mode, { sel: isSelected(row), img: !row.is_dir && (isImage(row.name) || isVideo(row.name)) }]"
                 :data-media-generation="mediaGeneration" :data-media-key="mediaKey"
                 @contextmenu.prevent.stop="openCtxMenu($event, row)">
-                <input class="entry-check" type="checkbox" :aria-label="`选择 ${row.name}`"
-                  :checked="isSelected(row)" @click.stop @change="toggleSelect(row)" />
-                <div :class="mode === 'list' ? 'name-cell clickable' : 'tile-content'" @click="openEntry(row)">
+                <label v-if="!mobile || selecting" class="entry-check-target"><input class="entry-check" type="checkbox" :aria-label="`选择 ${row.name}`"
+                  :checked="isSelected(row)" @click.stop @change="toggleSelect(row)" /></label>
+                <div :class="mode === 'list' ? 'name-cell clickable' : 'tile-content'" @click="mobile && selecting ? toggleSelect(row) : openEntry(row)">
                   <div :class="mode === 'list' ? 'thumb' : 'tile-media'">
                     <el-icon v-if="row.is_dir" color="#f6a821"><Folder /></el-icon>
-                    <DirectoryMedia v-else-if="isImage(row.name) || isVideo(row.name)" :key="mediaKey"
+                    <DirectoryMedia v-else-if="pageActive && (isImage(row.name) || isVideo(row.name))" :key="mediaKey"
                       :entry="row" :path="joinPath(cur, row.name)" :video="isVideo(row.name)" :generation="mediaGeneration" />
                     <el-icon v-else :color="iconOf(row.name).color"><component :is="iconOf(row.name).icon" /></el-icon>
                   </div>
@@ -333,7 +326,8 @@
                   <el-button v-if="mode === 'list'" text size="small" :class="{ 'favorite-on': row.favorite }" @click="toggleEntryFavorite(row)">{{ row.favorite ? '已收藏' : '收藏' }}</el-button>
                   <el-button v-if="mode === 'list' && !row.is_dir" text size="small" @click="download(row)">下载</el-button>
                   <el-button v-if="mode === 'list'" text size="small" @click="rename(row)">重命名</el-button>
-                  <el-dropdown trigger="click" @command="(cmd: string) => onTileCmd(cmd, row)">
+                  <button v-if="mobile" class="touch-icon" :aria-label="`更多操作 ${row.name}`" @click="actionEntry = row"><el-icon><MoreFilled /></el-icon></button>
+                  <el-dropdown v-else trigger="click" @command="(cmd: string) => onTileCmd(cmd, row)">
                     <el-button text size="small" :icon="MoreFilled" aria-label="更多操作" />
                     <template #dropdown><el-dropdown-menu>
                       <el-dropdown-item v-if="!row.is_dir" command="download">下载</el-dropdown-item>
@@ -363,24 +357,37 @@
       </div>
     </div>
 
-    <input ref="fileInput" type="file" multiple hidden @change="onPick" />
-    <input ref="dirInput" type="file" webkitdirectory hidden @change="onDirPick" />
 
+    <div v-if="mobile && selecting" class="mobile-selection-bar" aria-label="批量操作">
+      <button @click="toggleSelectAll">{{ allSelected ? '取消全选' : '全选已加载' }}</button><span>{{ selected.length }} 项</span>
+      <button :disabled="!selected.length" @click="moveSelected">移动</button><button class="danger-text" :disabled="!selected.length" @click="removeSelected">删除</button>
+    </div>
+    <ResponsivePanel v-model="addOpen" title="上传或新建" sheet>
+      <div class="action-sheet-list"><button @click="addOpen = false; fileInput.click()">上传文件或照片</button><button v-if="intake.supportsDirectory" @click="addOpen = false; pickDirectory()">上传文件夹</button><button @click="addOpen = false; mkdir()">新建文件夹</button><button @click="addOpen = false; queue.open()">查看上传队列</button></div>
+    </ResponsivePanel>
+    <ResponsivePanel v-model="optionsOpen" title="显示与排序" sheet>
+      <div class="view-options"><button v-for="item in mobileViews" :key="item.value" :aria-label="item.label" :aria-pressed="viewMode === item.value" @click="viewMode = item.value">{{ item.label }}</button></div>
+      <div class="action-sheet-list"><button v-for="sort in SORTS" :key="sort.key" :aria-pressed="sortKey === sort.key" :disabled="viewMode === 'timeline'" @click="onSortCmd(sort.key)">{{ sort.label }}</button><button :disabled="viewMode === 'timeline'" @click="onSortCmd(sortAsc ? 'desc' : 'asc')">{{ sortAsc ? '升序 ↑' : '降序 ↓' }}</button></div>
+      <template #footer><el-button type="primary" @click="optionsOpen = false">完成</el-button></template>
+    </ResponsivePanel>
+    <ResponsivePanel v-model="actionOpen" :title="actionEntry?.name || '文件操作'" sheet>
+      <div class="action-sheet-list"><button v-if="!actionEntry?.is_dir" @click="runMobileAction('download')">下载</button><button @click="runMobileAction('favorite')">{{ actionEntry?.favorite ? '取消收藏' : '收藏' }}</button><button @click="runMobileAction('share')">分享</button><button @click="runMobileAction('rename')">重命名</button><button @click="runMobileAction('move')">移动到…</button><button @click="runMobileAction('copy')">复制到…</button><button @click="runMobileAction('properties')">属性</button><button class="danger-text" @click="runMobileAction('delete')">删除…</button></div>
+    </ResponsivePanel>
     <BoundedImagePreview v-if="viewerShow" v-model:index="viewerIndex"
       :entries="displayEntries" :count="displayEntries.length" :base="cur" @close="viewerShow = false" />
 
-    <UploadDrawer
-      ref="drawer"
-      @uploaded="scheduleUploadRefresh"
-      @cancelled-all="cancelDirectoryScan"
-    />
     <PreviewDialog ref="preview" />
     <DirPicker ref="dirPicker" />
     <ShareDialog ref="shareDlg" />
+    <el-drawer v-if="narrowScreen" v-model="sidebarVisible" :lock-scroll="false" title="导航" direction="ltr" size="min(340px, 92vw)" destroy-on-close>
+      <FilesSidebar drawer :current="cur" :tree-key="treeKey" :file-count="info?.files"
+        :favorites-active="searchMode && searchView === 'favorites'" @navigate="navigateSidebar" @mkdir="mkdirFromSidebar"
+        @refresh="treeKey++" @action="sidebarAction" @app-navigate="sidebarVisible = false" />
+    </el-drawer>
     <ShareManager ref="shareMgr" />
     <TrashPanel ref="trashPanel" @changed="onTrashChanged" />
 
-    <el-dialog
+    <ResponsivePanel
       v-model="advancedVisible"
       title="高级搜索"
       width="640px"
@@ -474,9 +481,9 @@
           搜索
         </el-button>
       </template>
-    </el-dialog>
+    </ResponsivePanel>
 
-    <el-dialog
+    <ResponsivePanel
       v-model="propertyVisible"
       :title="`属性：${propertyDisplayName}`"
       width="600px"
@@ -528,7 +535,7 @@
       <template #footer>
         <el-button type="primary" @click="propertyVisible = false">确定</el-button>
       </template>
-    </el-dialog>
+    </ResponsivePanel>
 
     <!-- 自定义右键菜单 -->
     <teleport to="body">
@@ -551,14 +558,19 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { mobile, compact } from '../mobile/viewport'
+import { closeTopOverlay, useOverlay } from '../mobile/overlays'
+import { isComposingKey } from '../mobile/keyboard'
+import ResponsivePanel from '../components/ResponsivePanel.vue'
+defineOptions({ name: 'Files' })
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
-  Box, Calendar, CopyDocument, Delete, DeleteFilled, Document, EditPen, Film, Finished,
-  Filter, Folder, FolderAdd, FolderOpened, Grid, Headset, List, Moon, MoreFilled, Picture, Position,
+  ArrowLeft, Plus, Box, Calendar, CopyDocument, Delete, Document, EditPen, Film, Finished,
+  Filter, Folder, FolderAdd, Grid, Headset, List, Menu, Moon, MoreFilled, Picture, Position,
   Promotion, Rank, Refresh, Search, Setting, Share, Sort, Star, StarFilled, Sunny, SwitchButton, Tickets,
-  TrendCharts, Upload, UploadFilled, VideoPlay,
+  TrendCharts, Upload, UploadFilled,
 } from '@element-plus/icons-vue'
 import { appAlert, appChoice, appPrompt } from '../dialog'
 import {
@@ -576,15 +588,12 @@ import {
   type ServerInfo,
 } from '../api'
 import { isDark, toggleDark } from '../theme'
-import UploadDrawer, {
-  type UploadCandidate,
-  type UploadFile,
-} from '../components/UploadDrawer.vue'
+import FilesSidebar from '../components/FilesSidebar.vue'
+import { useTransfers, useUploadIntake } from '../transfers/context'
 import PreviewDialog from '../components/PreviewDialog.vue'
 import DirectoryMedia from '../components/DirectoryMedia.vue'
 import BoundedImagePreview from '../components/BoundedImagePreview.vue'
 import DirectoryViewport from '../components/DirectoryViewport.vue'
-import VirtualDirectoryTree from '../components/VirtualDirectoryTree.vue'
 import { createDirectoryController } from '../directory/controller'
 import { deleteBatches, freezeTargets, moveSerial, type OperationProgress } from '../directory/operations'
 import DirPicker from '../components/DirPicker.vue'
@@ -597,18 +606,61 @@ const router = useRouter()
 const directory = createDirectoryController(async (params, signal) => (await api.entries(params, signal)).data)
 const { entries, selected, selectedIds, loading, total, hasMore, generation, revision, error: directoryError } = directory
 const scrollOffset = ref(0)
+const pageActive = ref(true)
+let savedScrollOffset = 0
+let restoringScroll = false
+let restoreFrame = 0
+function rememberScroll(offset: number) { if (pageActive.value && !restoringScroll) scrollOffset.value = offset }
+const directoryViewport = ref<InstanceType<typeof DirectoryViewport>>()
 const uploadDirty = ref(false)
 const batchProgress = ref('')
 let batchBusy = false
 const info = ref<ServerInfo | null>(null)
-const fileInput = ref<HTMLInputElement>()
-const dirInput = ref<HTMLInputElement>()
-const drawer = ref<InstanceType<typeof UploadDrawer>>()
+const queue = useTransfers()
+const intake = useUploadIntake()
+const { dragging, isFirefoxBrowser, onDragEnter, onDragLeave } = intake
+const fileInput = { click: () => intake.pickFiles(cur.value) }
+function pickDirectory() { intake.targetDirectory.value = cur.value; return intake.pickDirectory() }
+function onDrop(event: DragEvent) { intake.targetDirectory.value = cur.value; return intake.onDrop(event) }
+function onPaste(event: ClipboardEvent) { intake.targetDirectory.value = cur.value; intake.onPaste(event) }
 const preview = ref<InstanceType<typeof PreviewDialog>>()
 const dirPicker = ref<InstanceType<typeof DirPicker>>()
 const shareDlg = ref<InstanceType<typeof ShareDialog>>()
 const shareMgr = ref<InstanceType<typeof ShareManager>>()
 const trashPanel = ref<InstanceType<typeof TrashPanel>>()
+const narrowScreen = compact
+const sidebarVisible = ref(false)
+
+watch(narrowScreen, (narrow) => { if (!narrow) sidebarVisible.value = false }, { flush: 'sync' })
+function navigateSidebar(path: string) { sidebarVisible.value = false; goto(path) }
+function mkdirFromSidebar() { sidebarVisible.value = false; void mkdir() }
+function sidebarAction(action: 'favorites' | 'trash' | 'shares') {
+  sidebarVisible.value = false
+  if (action === 'favorites') showFavorites()
+  else if (action === 'trash') trashPanel.value?.open()
+  else shareMgr.value?.open()
+}
+const selecting = ref(false)
+const searchOpen = ref(false)
+const searchScope = ref<'directory' | 'global'>('directory')
+const addOpen = ref(false)
+const optionsOpen = ref(false)
+const actionEntry = ref<Entry | null>(null)
+const actionOpen = computed({ get: () => actionEntry.value !== null, set: (open: boolean) => { if (!open) actionEntry.value = null } })
+const mobileViews = [{ value: 'list', label: '列表视图' }, { value: 'grid', label: '网格视图' }, { value: 'photo', label: '大图视图' }, { value: 'timeline', label: '时间线(按日期看图)' }] as const
+function finishSelection() { selecting.value = false; setAllSelected(false) }
+function mobileBack() { if (closeTopOverlay()) return; if (selecting.value) finishSelection(); else if (searchMode.value) exitSearch(); else goto(parentOf(cur.value)) }
+function beforeFileNavigate(to: { path: string }) {
+  if (to.path === '/login' || !pageActive.value) return true
+  if (closeTopOverlay()) return false
+  if (mobile.value && selecting.value) { finishSelection(); return false }
+  return true
+}
+onBeforeRouteLeave(beforeFileNavigate)
+onBeforeRouteUpdate(beforeFileNavigate)
+function runMobileAction(command: string) { const entry = actionEntry.value; actionEntry.value = null; if (entry) onTileCmd(command, entry) }
+watch([selecting, pageActive, mobile], ([value, active, phone]) => document.documentElement.classList.toggle('selection-active', value && active && phone))
+useOverlay(sidebarVisible)
 const propertyVisible = ref(false)
 const propertyLoading = ref(false)
 const propertyData = ref<EntryProperties | null>(null)
@@ -949,8 +1001,8 @@ const ctxItems = computed<CtxItem[]>(() => {
   const row = ctx.value.row
   if (!row) {
     return [
-      { label: '上传文件', action: () => fileInput.value?.click() },
-      { label: '上传文件夹', action: () => dirInput.value?.click() },
+      { label: '上传文件', action: () => fileInput.click() },
+      { label: '上传文件夹', action: () => { void pickDirectory() } },
       { label: '新建文件夹', action: mkdir },
       { label: '刷新', action: refresh },
       { label: allSelected.value ? '取消全选' : '全选', action: toggleSelectAll, divided: true },
@@ -1016,23 +1068,15 @@ function onGlobalKey(e: KeyboardEvent) {
     setAllSelected(true)
   }
 }
-onMounted(() => {
-  document.addEventListener('click', closeCtx)
-  document.addEventListener('keydown', onGlobalKey)
-  window.addEventListener('scroll', closeCtx, true)
-})
-onUnmounted(() => {
-  document.removeEventListener('click', closeCtx)
-  document.removeEventListener('keydown', onGlobalKey)
-  window.removeEventListener('scroll', closeCtx, true)
-})
 
 // ---- 图片预览：只在已加载元数据内导航，最多挂载三张原图。 ----
 const viewerShow = ref(false)
 const viewerIndex = ref(0)
 
+const filePath = ref(route.params.path)
+watch(() => route.params.path, (path) => { if (route.path?.startsWith('/files') || !route.path) filePath.value = path }, { flush: 'sync' })
 const segments = computed(() => {
-  const p = route.params.path
+  const p = filePath.value
   const arr = Array.isArray(p) ? p : p ? [p] : []
   return arr.filter((s) => s !== '')
 })
@@ -1091,6 +1135,8 @@ function loadNextBatch() {
   if (queryTimer === undefined && !searchMode.value) void directory.loadMore()
 }
 function resetDirectory(start = true) {
+  savedScrollOffset = 0
+  scrollOffset.value = 0
   if (queryTimer !== undefined) clearTimeout(queryTimer)
   queryTimer = undefined
   uploadDirty.value = false
@@ -1108,6 +1154,7 @@ watch(query, () => {
 }, { flush: 'sync' })
 watch(cur, () => {
   query.value = ''
+  finishSelection()
   exitSearch()
   void refresh()
 }, { flush: 'sync' })
@@ -1139,11 +1186,6 @@ function openEntry(row: Entry) {
   } else {
     preview.value?.open(joinPath(cur.value, row.name))
   }
-}
-
-/** 进入短视频模式;取材范围在后台「流式播放」里设,这里只带上返回目录 */
-function openShorts() {
-  router.push({ path: '/shorts', query: { from: cur.value } })
 }
 
 function download(row: Entry) {
@@ -1309,454 +1351,58 @@ async function removeSelected() {
 
 // ---- 上传入口:选文件 / 选文件夹 / 拖拽(含文件夹) / 粘贴 ----
 
-type StreamConflictAction = 'overwrite' | 'skip'
-interface PickerFileHandle {
-  kind: 'file'
-  name: string
-  getFile(): Promise<File>
-}
-interface PickerDirectoryHandle {
-  kind: 'directory'
-  name: string
-  values(): AsyncIterableIterator<PickerFileHandle | PickerDirectoryHandle>
-}
-
-const isFirefoxBrowser = /Firefox\//i.test(navigator.userAgent)
-const DIRECTORY_BATCH_SIZE = isFirefoxBrowser ? 25 : 200
-const MAX_SAFE_FIREFOX_DROP_ITEMS = 1000
-let directoryScanGeneration = 0
-const dragging = ref(false)
-let dragDepth = 0
-
-function onDragEnter() {
-  dragDepth += 1
-  dragging.value = true
-}
-
-function onDragLeave() {
-  dragDepth = Math.max(0, dragDepth - 1)
-  if (dragDepth === 0) dragging.value = false
-}
-
-function cancelDirectoryScan() {
-  directoryScanGeneration += 1
-  drawer.value?.clearDeferredFiles()
-}
-
-function beginDirectoryScan() {
-  cancelDirectoryScan()
-  return directoryScanGeneration
-}
-
-/**
- * 把惰性文件源按固定窗口送入上传队列。只有队列释放容量后才读取下一批 File，
- * 因此几万个文件不会同时变成前端任务和浏览器文件句柄。
- */
-async function consumeUploadStream(
-  target: string,
-  generation: number,
-  produce: (push: (file: File, rel: string) => Promise<boolean>) => Promise<void>,
-  initialConflictAction: StreamConflictAction,
-  fromDeferredSource = false,
-) {
-  let batch: UploadFile[] = []
-  let conflictAction: StreamConflictAction = initialConflictAction
-
-  const flush = async () => {
-    if (!batch.length) return generation === directoryScanGeneration
-    const current = batch
-    batch = []
-    const selected = await drawer.value?.enqueue(
-      target,
-      current,
-      conflictAction,
-      fromDeferredSource,
-    )
-    if (selected === 'cancel') {
-      cancelDirectoryScan()
-      return false
-    }
-    if (selected === 'overwrite' || selected === 'skip') conflictAction = selected
-    return generation === directoryScanGeneration
-  }
-
-  const push = async (file: File, rel: string) => {
-    if (generation !== directoryScanGeneration) return false
-    if (batch.length === 0) {
-      const available = await drawer.value?.waitForCapacity(DIRECTORY_BATCH_SIZE)
-      if (!available || generation !== directoryScanGeneration) return false
-    }
-    batch.push({ file, rel })
-    return batch.length < DIRECTORY_BATCH_SIZE || flush()
-  }
-
-  await produce(push)
-  if (generation === directoryScanGeneration) await flush()
-}
-
-async function walkDirectoryHandle(
-  handle: PickerDirectoryHandle,
-  rel: string,
-  push: (file: File, rel: string) => Promise<boolean>,
-): Promise<boolean> {
-  for await (const child of handle.values()) {
-    if (child.kind === 'file') {
-      if (!(await push(await child.getFile(), rel))) return false
-      continue
-    }
-    const childRel = rel ? `${rel}/${child.name}` : child.name
-    if (!(await walkDirectoryHandle(child, childRel, push))) return false
-  }
-  return true
-}
-
-async function scanDirectoryHandle(
-  handle: PickerDirectoryHandle,
-  rel: string,
-  candidates: UploadCandidate[],
-  isCurrent: () => boolean,
-): Promise<boolean> {
-  for await (const child of handle.values()) {
-    if (!isCurrent()) return false
-    if (child.kind === 'file') {
-      candidates.push({ name: child.name, rel })
-      continue
-    }
-    const childRel = rel ? `${rel}/${child.name}` : child.name
-    if (!(await scanDirectoryHandle(child, childRel, candidates, isCurrent))) return false
-  }
-  return true
-}
-
-function fileRelativeDir(file: File) {
-  const path = (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? ''
-  return path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
-}
-
-async function candidatesFromFileList(files: FileList, withRelativePath: boolean) {
-  const candidates: UploadCandidate[] = []
-  for (let index = 0; index < files.length; index += 1) {
-    const file = files[index]!
-    candidates.push({ name: file.name, rel: withRelativePath ? fileRelativeDir(file) : '' })
-    if (index > 0 && index % 500 === 0) {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-    }
-  }
-  return candidates
-}
-
-async function chooseConflictPolicy(
-  target: string,
-  candidates: UploadCandidate[],
-  generation: number,
-): Promise<StreamConflictAction | null> {
-  if (generation !== directoryScanGeneration) return null
-  const selected = await drawer.value?.resolveUploadConflicts(target, candidates)
-  if (!selected || selected === 'cancel' || generation !== directoryScanGeneration) {
-    cancelDirectoryScan()
-    return null
-  }
-  return selected
-}
-
-/** Chromium 优先使用惰性目录句柄；不支持时退回 webkitdirectory。 */
-async function pickDirectory() {
-  const showDirectoryPicker = (
-    window as Window & { showDirectoryPicker?: () => Promise<PickerDirectoryHandle> }
-  ).showDirectoryPicker
-  if (!showDirectoryPicker) {
-    if (isFirefoxBrowser) {
-      await appAlert({
-        title: 'Firefox 请拖拽文件夹上传',
-        message:
-          'Firefox 的文件夹选择器会在网页接管前一次性载入全部文件，几万个文件可能直接导致浏览器退出。请关闭此提示后，把文件夹从系统文件管理器拖到当前页面；拖拽入口会按批次惰性读取。',
-        kind: 'warning',
-        confirmText: '知道了',
-      })
-      return
-    }
-    dirInput.value?.click()
-    return
-  }
-
-  try {
-    // 必须在菜单点击事件内直接调用，浏览器才会认可用户手势。
-    const root = await showDirectoryPicker.call(window)
-    const target = cur.value
-    const generation = beginDirectoryScan()
-    const candidates: UploadCandidate[] = []
-    await scanDirectoryHandle(
-      root,
-      root.name,
-      candidates,
-      () => generation === directoryScanGeneration,
-    )
-    if (generation !== directoryScanGeneration) return
-    const conflictAction = await chooseConflictPolicy(target, candidates, generation)
-    if (!conflictAction) return
-    drawer.value?.setDeferredFileCount(candidates.length)
-    try {
-      await consumeUploadStream(
-        target,
-        generation,
-        async (push) => {
-          await walkDirectoryHandle(root, root.name, push)
-        },
-        conflictAction,
-        true,
-      )
-    } finally {
-      if (generation === directoryScanGeneration) drawer.value?.clearDeferredFiles()
-    }
-  } catch (error) {
-    if ((error as { name?: string }).name !== 'AbortError') {
-      ElMessage.error(`读取文件夹失败：${errMsg(error)}`)
-    }
-  }
-}
-
-async function onPick(ev: globalThis.Event) {
-  const input = ev.target as HTMLInputElement
-  const files = input.files
-  if (files?.length) {
-    const target = cur.value
-    const generation = beginDirectoryScan()
-    const candidates = await candidatesFromFileList(files, false)
-    const conflictAction = await chooseConflictPolicy(target, candidates, generation)
-    if (!conflictAction) {
-      input.value = ''
-      return
-    }
-    drawer.value?.setDeferredFileCount(candidates.length)
-    try {
-      await consumeUploadStream(
-        target,
-        generation,
-        async (push) => {
-          for (let index = 0; index < files.length; index += 1) {
-            if (!(await push(files[index]!, ''))) return
-          }
-        },
-        conflictAction,
-        true,
-      )
-    } finally {
-      if (generation === directoryScanGeneration) drawer.value?.clearDeferredFiles()
-    }
-    input.value = ''
-  }
-}
-
-async function onDirPick(ev: globalThis.Event) {
-  const input = ev.target as HTMLInputElement
-  const files = input.files
-  if (files?.length) {
-    const target = cur.value
-    const generation = beginDirectoryScan()
-    const candidates = await candidatesFromFileList(files, true)
-    const conflictAction = await chooseConflictPolicy(target, candidates, generation)
-    if (!conflictAction) {
-      input.value = ''
-      return
-    }
-    drawer.value?.setDeferredFileCount(candidates.length)
-    try {
-      await consumeUploadStream(
-        target,
-        generation,
-        async (push) => {
-          for (let index = 0; index < files.length; index += 1) {
-            const file = files[index]!
-            if (!(await push(file, fileRelativeDir(file)))) return
-          }
-        },
-        conflictAction,
-        true,
-      )
-    } finally {
-      if (generation === directoryScanGeneration) drawer.value?.clearDeferredFiles()
-    }
-    input.value = ''
-  }
-}
-
+const stopUploaded = queue.onUploaded((target) => scheduleUploadRefresh(target))
+onUnmounted(stopUploaded)
 let uploadRefreshTimer: number | undefined
-function scheduleUploadRefresh() {
+function scheduleUploadRefresh(target: string) {
+  if (target !== cur.value) return
   if (uploadRefreshTimer !== undefined) window.clearTimeout(uploadRefreshTimer)
   uploadRefreshTimer = window.setTimeout(() => {
     uploadRefreshTimer = undefined
-    if (scrollOffset.value > 0 || selectedIds.value.size || searchMode.value || batchBusy) uploadDirty.value = true
+    if (!pageActive.value || scrollOffset.value > 0 || selectedIds.value.size || searchMode.value || batchBusy) uploadDirty.value = true
     else void refresh()
   }, 1000)
 }
 
-async function walkEntry(
-  entry: FileSystemEntry,
-  rel: string,
-  push: (file: File, rel: string) => Promise<boolean>,
-): Promise<boolean> {
-  if (entry.isFile) {
-    const f = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej))
-    return push(f, rel)
-  } else if (entry.isDirectory) {
-    const dirRel = rel ? `${rel}/${entry.name}` : entry.name
-    const reader = (entry as FileSystemDirectoryEntry).createReader()
-    for (;;) {
-      // readEntries 单次最多返回 100 项,要循环读到空为止
-      const batch = await new Promise<FileSystemEntry[]>((res, rej) =>
-        reader.readEntries(res, rej),
-      )
-      if (!batch.length) break
-      for (const e of batch) if (!(await walkEntry(e, dirRel, push))) return false
-    }
-  }
-  return true
-}
-
-async function scanEntry(
-  entry: FileSystemEntry,
-  rel: string,
-  candidates: UploadCandidate[],
-  isCurrent: () => boolean,
-): Promise<boolean> {
-  if (!isCurrent()) return false
-  if (entry.isFile) {
-    candidates.push({ name: entry.name, rel })
-    return true
-  }
-  if (!entry.isDirectory) return true
-  const dirRel = rel ? `${rel}/${entry.name}` : entry.name
-  const reader = (entry as FileSystemDirectoryEntry).createReader()
-  for (;;) {
-    if (!isCurrent()) return false
-    const batch = await new Promise<FileSystemEntry[]>((resolve, reject) =>
-      reader.readEntries(resolve, reject),
-    )
-    if (!batch.length) return true
-    for (const child of batch) {
-      if (!(await scanEntry(child, dirRel, candidates, isCurrent))) return false
-    }
-  }
-}
-
-async function onDrop(ev: DragEvent) {
-  dragDepth = 0
-  dragging.value = false
-  const items = ev.dataTransfer?.items
-  if (isFirefoxBrowser && items && items.length > MAX_SAFE_FIREFOX_DROP_ITEMS) {
-    await appAlert({
-      title: 'Firefox 无法安全处理此次拖拽',
-      message: `Firefox 已把文件夹展开为 ${items.length} 个顶层文件项；网页无法在不复制这些文件句柄的情况下继续，强行处理会再次导致浏览器退出。请改用 Chrome/Edge 上传这个超大目录，或把目录拆分后再用 Firefox。`,
-      kind: 'warning',
-      confirmText: '知道了',
+onMounted(attachPageEvents)
+onActivated(() => {
+  restoringScroll = true
+  pageActive.value = true
+  attachPageEvents()
+  void nextTick(() => {
+    restoreFrame = requestAnimationFrame(() => {
+      directoryViewport.value?.restoreOffset(savedScrollOffset)
+      scrollOffset.value = savedScrollOffset
+      restoreFrame = requestAnimationFrame(() => { restoringScroll = false })
     })
-    return
-  }
-  // 优先走 entry 递归(支持拖入整个文件夹);await 前必须同步取完 entry
-  const firstItem = items?.[0] as
-    | (DataTransferItem & { getAsEntry?: () => FileSystemEntry | null })
-    | undefined
-  const firstEntryGetter = firstItem?.webkitGetAsEntry ?? firstItem?.getAsEntry
-  if (items?.length && typeof firstEntryGetter === 'function') {
-    const roots: FileSystemEntry[] = []
-    for (const it of items) {
-      const extended = it as DataTransferItem & { getAsEntry?: () => FileSystemEntry | null }
-      const getEntry = extended.webkitGetAsEntry ?? extended.getAsEntry
-      const e = getEntry?.call(extended)
-      if (e) roots.push(e)
-    }
-    if (roots.length) {
-      const target = cur.value
-      const generation = beginDirectoryScan()
-      try {
-        const candidates: UploadCandidate[] = []
-        for (const root of roots) {
-          if (
-            !(await scanEntry(
-              root,
-              '',
-              candidates,
-              () => generation === directoryScanGeneration,
-            ))
-          ) {
-            return
-          }
-        }
-        if (generation !== directoryScanGeneration) return
-        const conflictAction = await chooseConflictPolicy(target, candidates, generation)
-        if (!conflictAction) return
-        drawer.value?.setDeferredFileCount(candidates.length)
-        await consumeUploadStream(
-          target,
-          generation,
-          async (push) => {
-            for (const root of roots) if (!(await walkEntry(root, '', push))) return
-          },
-          conflictAction,
-          true,
-        )
-      } catch {
-        /* 个别条目读取失败时保留已经进入队列的任务。 */
-      } finally {
-        if (generation === directoryScanGeneration) drawer.value?.clearDeferredFiles()
-      }
-      return
-    }
-  }
-  const files = ev.dataTransfer?.files
-  if (files?.length) {
-    const target = cur.value
-    const generation = beginDirectoryScan()
-    const candidates = await candidatesFromFileList(files, false)
-    const conflictAction = await chooseConflictPolicy(target, candidates, generation)
-    if (!conflictAction) return
-    drawer.value?.setDeferredFileCount(candidates.length)
-    try {
-      await consumeUploadStream(
-        target,
-        generation,
-        async (push) => {
-          for (let index = 0; index < files.length; index += 1) {
-            if (!(await push(files[index]!, ''))) return
-          }
-        },
-        conflictAction,
-        true,
-      )
-    } finally {
-      if (generation === directoryScanGeneration) drawer.value?.clearDeferredFiles()
-    }
-  }
-}
-
-function pasteStamp() {
-  const d = new Date()
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
-}
-
-function onPaste(e: ClipboardEvent) {
-  const files = Array.from(e.clipboardData?.files ?? [])
-  if (!files.length) return // 纯文本粘贴(输入框等)不拦截
-  const stamp = pasteStamp()
-  const ups: UploadFile[] = files.map((f, i) => {
-    const ext = extOf(f.name) || 'png'
-    const name = `粘贴_${stamp}${files.length > 1 ? `_${i + 1}` : ''}.${ext}`
-    return { file: new File([f], name, { type: f.type }) }
   })
-  drawer.value?.enqueue(cur.value, ups)
-}
-onMounted(() => document.addEventListener('paste', onPaste))
+  if (route.query?.view === 'favorites' && searchView.value !== 'favorites') void showFavorites()
+})
+onDeactivated(() => {
+  cancelAnimationFrame(restoreFrame)
+  savedScrollOffset = scrollOffset.value
+  pageActive.value = false
+  viewerShow.value = false
+  preview.value?.close()
+  detachPageEvents()
+  document.documentElement.classList.remove('selection-active')
+})
+function attachPageEvents() { document.addEventListener('paste', onPaste); document.addEventListener('keydown', onGlobalKey); document.addEventListener('click', closeCtx); window.addEventListener('scroll', closeCtx, true) }
+function detachPageEvents() { document.removeEventListener('paste', onPaste); document.removeEventListener('keydown', onGlobalKey); document.removeEventListener('click', closeCtx); window.removeEventListener('scroll', closeCtx, true) }
+watch(() => route.query?.view, (view) => { if (view === 'favorites') void showFavorites() })
 onUnmounted(() => {
-  cancelDirectoryScan()
   dragging.value = false
-  document.removeEventListener('paste', onPaste)
+  detachPageEvents()
+  cancelAnimationFrame(restoreFrame)
+  document.documentElement.classList.remove('selection-active')
   if (uploadRefreshTimer !== undefined) window.clearTimeout(uploadRefreshTimer)
 })
 
 async function logout() {
-  await api.logout().catch(() => {})
-  router.push('/login')
+  try {
+    await api.logout()
+    await router.push('/login')
+  } catch (error) { ElMessage.error(`退出登录失败：${errMsg(error)}`) }
 }
 </script>
 
@@ -1892,71 +1538,7 @@ async function logout() {
   gap: 14px;
   align-items: flex-start;
 }
-.sidebar {
-  width: 224px;
-  flex-shrink: 0;
-  border-radius: 16px;
-  padding: 12px 10px;
-  position: sticky;
-  top: 76px;
-  max-height: calc(100vh - 100px);
-  overflow: auto;
-  box-sizing: border-box;
-}
-.side-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 700;
-  font-size: 14px;
-  padding: 0 6px 8px;
-  border-bottom: 1px solid var(--glass-border);
-  margin-bottom: 8px;
-}
-.side-root {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 8px;
-  border-radius: 8px;
-  font-size: 14px;
-  cursor: pointer;
-  margin-bottom: 2px;
-}
-.side-root:hover {
-  background: var(--tile-bg-hover);
-}
-.side-root.on {
-  color: var(--el-color-primary);
-  background: rgba(64, 158, 255, 0.12);
-  font-weight: 600;
-}
-.side-count {
-  font-size: 12px;
-  color: var(--text-soft);
-  background: var(--tile-bg);
-  border-radius: 999px;
-  padding: 1px 8px;
-}
-.side-sep {
-  height: 1px;
-  background: var(--glass-border);
-  margin: 8px 4px;
-}
-.side-tree {
-  font-size: 14px;
-}
-.tree-node {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  overflow: hidden;
-}
-.tree-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.mobile-sidebar-button { display: none; }
 .panel {
   flex: 1;
   min-width: 0;
@@ -2200,10 +1782,9 @@ html.dark .tile-favorite {
 }
 
 /* 窄屏:收起侧栏与次要徽章 */
-@media (max-width: 960px) {
-  .sidebar {
-    display: none;
-  }
+@media (max-width: 1023px) {
+  .mobile-sidebar-button { display: inline-flex; }
+  .btns { flex-wrap: wrap; flex-shrink: 1; max-width: 100%; }
   .hide-sm {
     display: none;
   }
@@ -2293,5 +1874,32 @@ html.dark .tile-favorite {
   height: 1px;
   margin: 4px 8px;
   background: var(--el-border-color-lighter);
+}
+
+/* 手机独立布局：虚拟列表占满剩余高度，避免页面与列表双重滚动。 */
+.mobile-file-header { display:flex; align-items:center; gap:4px; padding:8px 12px 0; flex-shrink:0; }
+.mobile-file-header h1 { min-width:0; flex:1; margin:0 6px; font-size:24px; font-weight:750; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.touch-icon { display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; width:44px; height:44px; padding:0; border:0; border-radius:12px; background:transparent; color:inherit; font-size:21px; cursor:pointer; }
+.touch-icon.primary { color:var(--el-color-primary); }.touch-icon:disabled { opacity:.3; }
+.mobile-search { padding:8px 16px; flex-shrink:0; }.search-scope { display:flex; gap:8px; margin-top:6px; }.search-scope button, .mobile-file-tools button { min-height:44px; border:0; background:transparent; color:var(--el-color-primary); font:inherit; border-radius:10px; padding:0 8px; }
+.search-scope button[aria-pressed=true] { background:var(--tile-bg-hover); }
+.mobile-file-tools { display:flex; align-items:center; padding:0 10px; gap:0; flex-shrink:0; font-size:13px; }.mobile-file-tools .path-button { display:flex; align-items:center; gap:4px; }.mobile-count { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:11px; color:var(--text-soft); }
+.mobile-selection-bar { position:fixed; bottom:0; left:0; right:0; display:flex; align-items:center; justify-content:space-around; padding:0 var(--safe-right) var(--safe-bottom) var(--safe-left); min-height:56px; z-index:41; background:var(--glass-bg-heavy); border-top:1px solid var(--glass-border); font-size:13px; }.mobile-selection-bar button { min-height:44px; border:0; background:none; color:var(--el-color-primary); font:inherit; }.mobile-selection-bar button:disabled { opacity:.35; }.mobile-selection-bar .danger-text { color:var(--el-color-danger); }
+.action-sheet-list { display:flex; flex-direction:column; }.action-sheet-list button { min-height:52px; padding:10px 12px; text-align:left; border:0; border-bottom:1px solid var(--glass-border); background:transparent; color:var(--el-text-color-primary); font:inherit; cursor:pointer; }.action-sheet-list button[aria-pressed=true] { color:var(--el-color-primary); font-weight:650; }.action-sheet-list .danger-text { color:var(--el-color-danger); }.action-sheet-list button:disabled { opacity:.4; }
+.view-options { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-bottom:12px; }.view-options button { min-height:48px; border:1px solid var(--glass-border); border-radius:12px; background:var(--tile-bg); color:inherit; font:inherit; }.view-options button[aria-pressed=true] { border-color:var(--el-color-primary); color:var(--el-color-primary); }
+.mobile-search-results { overflow:auto; min-height:0; }.result-card { padding:10px 6px; border-bottom:1px solid var(--glass-border); }.result-card button { background:none; border:0; color:inherit; font:inherit; min-height:44px; }.result-card .result-name { display:block; width:100%; text-align:left; overflow-wrap:anywhere; font-weight:600; }.result-card .result-path { display:block; width:100%; text-align:left; color:var(--el-color-primary); overflow-wrap:anywhere; font-size:13px; }.result-card > div { display:flex; align-items:center; justify-content:space-between; font-size:12px; color:var(--text-soft); }
+@media (max-width:767px) {
+  .page.mobile-files { width:100%; flex:1; min-height:0; padding:0; display:flex; flex-direction:column; overflow:hidden; }
+  .mobile-files .layout { flex:1; min-height:0; display:flex; padding:0 8px; }
+  .mobile-files .panel { height:100%; min-height:0; box-sizing:border-box; display:flex; flex-direction:column; padding:0 8px; border-radius:14px 14px 0 0; overflow:hidden; }
+  .mobile-files .panel > div:has(.mobile-search-results) { display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+  .mobile-files :deep(.panel > .virtual-viewport) { flex:1; height:auto; min-height:0; max-height:none; overscroll-behavior:contain; }
+  .mobile-files .list-row { height:72px; grid-template-columns:minmax(0,1fr) 44px; grid-template-rows:44px 20px; gap:0 4px; padding:4px 0; }
+  .mobile-files .list-row .name-cell { grid-column:1; grid-row:1; min-height:44px; gap:10px; }.mobile-files .list-row .thumb { width:38px; height:38px; flex-shrink:0; border-radius:8px; overflow:hidden; font-size:26px; }
+  .mobile-files .entry-size { grid-column:1; grid-row:2; padding-left:48px; color:var(--text-soft); font-size:12px; }.mobile-files .entry-time { display:none; }.mobile-files .entry-actions { grid-column:2; grid-row:1 / 3; }
+  .mobile-files .entry-actions > .el-button { display:none; }
+  .mobile-files.is-selecting .list-row { grid-template-columns:44px minmax(0,1fr) 44px; }.mobile-files.is-selecting .list-row .name-cell, .mobile-files.is-selecting .entry-size { grid-column:2; }.mobile-files.is-selecting .entry-actions { grid-column:3; }
+  .mobile-files .entry-check-target { display:flex; align-items:center; justify-content:center; width:44px; min-height:44px; grid-row:1 / 3; grid-column:1; cursor:pointer; }.mobile-files .entry-check { width:22px; height:22px; margin:0; accent-color:var(--el-color-primary); }
+  .mobile-files .tile .entry-check-target { position:absolute; right:0; top:0; z-index:3; }.mobile-files .tile .entry-check { position:static; }.mobile-files .tile-actions { top:0; left:0; }.mobile-files .tile-actions .touch-icon { font-size:19px; }.mobile-files .search-head { padding:12px 0; gap:8px; flex-shrink:0; }.mobile-files .setup-hint { margin:4px 12px; max-height:140px; overflow:auto; flex-shrink:0; }
 }
 </style>

@@ -22,7 +22,7 @@
             v-model="pwd"
             placeholder="请输入提取码"
             maxlength="16"
-            @keyup.enter="unlock"
+            @keydown.enter="!isComposingKey($event) && unlock()"
           />
           <el-button type="primary" :loading="unlocking" style="width: 100%" @click="unlock">
             提取文件
@@ -59,7 +59,11 @@
               <span class="clickable" @click="goto(segs.slice(0, i + 1).join('/'))">{{ seg }}</span>
             </el-breadcrumb-item>
           </el-breadcrumb>
-          <el-table :data="entries" v-loading="listing" size="small" class="dir-table">
+          <div v-if="mobile" v-loading="listing" class="management-cards">
+            <article v-for="row in entries" :key="row.name" class="management-card"><button class="share-entry" @click="openEntry(row)"><el-icon><component :is="row.is_dir ? Folder : Document" /></el-icon><span>{{ row.name }}</span></button><div class="card-actions"><span>{{ row.is_dir ? '文件夹' : fmtSize(row.size) }}</span><el-button v-if="!row.is_dir" @click="dl(row)">下载</el-button></div></article>
+            <el-empty v-if="!listing && !entries.length" description="空目录" />
+          </div>
+          <el-table v-else :data="entries" v-loading="listing" size="small" class="dir-table">
             <el-table-column label="名称" min-width="220">
               <template #default="{ row }">
                 <span class="name-cell clickable" @click="openEntry(row as Entry)">
@@ -97,6 +101,8 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { mobile } from '../mobile/viewport'
+import { isComposingKey } from '../mobile/keyboard'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Document, Download, Folder, Promotion } from '@element-plus/icons-vue'
@@ -136,7 +142,7 @@ onMounted(async () => {
 })
 
 async function unlock() {
-  if (!pwd.value.trim()) return
+  if (unlocking.value || !pwd.value.trim()) return
   unlocking.value = true
   try {
     await api.share.authorize(token, pwd.value)
@@ -195,6 +201,7 @@ function downloadRoot() {
 .card {
   width: 640px;
   max-width: 100%;
+  box-sizing: border-box;
   border-radius: 20px;
   padding: 28px 28px 32px;
 }
@@ -252,5 +259,10 @@ function downloadRoot() {
 }
 .loading-box {
   height: 160px;
+}
+@media (max-width: 767px) {
+  .wrap { min-height: var(--app-height); padding: max(16px, var(--safe-top)) max(12px, var(--safe-right)) max(24px, var(--safe-bottom)) max(12px, var(--safe-left)); }
+  .card { padding: 20px 16px; }.fname { overflow-wrap: anywhere; max-width: 100%; }.dir-box :deep(.el-breadcrumb) { display: flex; flex-wrap: wrap; line-height: 44px; }
+  .share-entry { min-height: 44px; width: 100%; display: flex; gap: 10px; align-items: center; border: 0; color: inherit; font: inherit; text-align: left; background: none; }.share-entry span { overflow-wrap: anywhere; min-width: 0; }
 }
 </style>

@@ -1,5 +1,6 @@
-import axios from 'axios'
-import { router } from './router'
+import { http } from './http'
+import { invalidateSession } from './session'
+import { appApi } from '@apps/client'
 
 export interface Entry {
   name: string
@@ -55,8 +56,6 @@ export interface ServerInfo {
   files: number
   dirs: number
   total_size: number
-  /** 后台设置的短视频取材目录;空串表示整库。 */
-  shorts_dir: string
 }
 
 export interface SearchHit {
@@ -173,15 +172,14 @@ export interface Extras {
   /** 可选临时凭据；已保存时为固定脱敏占位符。 */
   backup_s3_session_token: string
   backup_s3_path_style: boolean
-  inbox_enabled: boolean
+  inbox_bot_enabled: boolean
+  inbox_channel_enabled: boolean
   inbox_allowed_chats: string
   inbox_dir: string
   inbox_video_dir: string
   inbox_image_dir: string
   inbox_book_dir: string
   inbox_rules: InboxRouteRule[]
-  /** 短视频模式的取材目录(含子目录);空串表示整库。 */
-  shorts_dir: string
   /** 删除文件后自动清理 Telegram 消息;关掉则只入队,等后台手动执行 */
   auto_delete_message: boolean
 }
@@ -217,11 +215,14 @@ export interface BackupOutcome {
 /** 可在后台修改的配置项键名 */
 export type CfgKey =
   | 'api_base'
+  | 'proxy_enabled'
+  | 'proxy_url'
   | 'bot_token'
   | 'upload_bot_tokens'
   | 'chat_id'
   | 'chunk_size'
   | 'upload_concurrency'
+  | 'download_concurrency'
   | 'send_video'
   | 'tmp_dir'
   | 'username'
@@ -235,12 +236,16 @@ export type CfgSource = 'db' | 'env' | 'default'
 export interface AdminConfig {
   values: {
     api_base: string
+    proxy_enabled: boolean
+    /** 代理 URL 中的用户名和密码均已脱敏。 */
+    proxy_url: string
     bot_token: string
     /** 每行一个额外上传 Bot Token；返回值已逐项脱敏。 */
     upload_bot_tokens: string
     chat_id: string
     chunk_size: number
     upload_concurrency: number
+    download_concurrency: number
     /** 单块以内的视频以「视频消息」发送,Telegram 里可直接播放 */
     send_video: boolean
     tmp_dir: string
@@ -268,6 +273,7 @@ export interface AdminStatus {
   chunk_size: number
   upload_concurrency: number
   upload_bot_count: number
+  download_concurrency: number
   files: number
   dirs: number
   total_size: number
@@ -400,12 +406,15 @@ export interface ApplyOutcome {
 /** 提交的改动;只带用户实际改过的字段 */
 export type ConfigPatch = Partial<{
   api_base: string
+  proxy_enabled: boolean
+  proxy_url: string
   bot_token: string
   upload_bot_tokens: string
   chat_id: string
   chunk_size: string
   upload_concurrency: number
   send_video: boolean
+  download_concurrency: number
   tmp_dir: string
   username: string
   password: string
@@ -414,29 +423,24 @@ export type ConfigPatch = Partial<{
   force: boolean
 }>
 
-const http = axios.create({ baseURL: '/api' })
-
-// 任意接口 401 → 回登录页
-http.interceptors.response.use(
-  (r) => r,
-  (err) => {
-    if (err.response?.status === 401 && router.currentRoute.value.path !== '/login') {
-      router.push('/login')
-    }
-    return Promise.reject(err)
-  },
-)
-
 /** 后端返回的错误信息(JSON {error}) */
 export function errMsg(e: unknown): string {
   const any = e as { response?: { data?: { error?: string } }; message?: string }
   return any.response?.data?.error ?? any.message ?? String(e)
 }
 
+/** 注销响应成功后立即清理本地工作，不等待登录页懒加载及路由动画。 */
+async function endSession(path: string) {
+  const response = await http.post(path)
+  invalidateSession()
+  return response
+}
+
 export const api = {
+  apps: appApi,
   login: (username: string, password: string) =>
     http.post('/auth/login', { username, password }),
-  logout: () => http.post('/auth/logout'),
+  logout: () => endSession('/auth/logout'),
   me: () => http.get<{ username: string }>('/auth/me'),
   info: () => http.get<ServerInfo>('/info'),
   list: (path: string) =>
@@ -445,7 +449,7 @@ export const api = {
     http.get<EntriesResponse>('/fs/entries', { params, signal }),
   properties: (path: string) =>
     http.get<{ properties: EntryProperties }>('/fs/properties', { params: { path } }),
-  mkdir: (path: string) => http.post('/fs/mkdir', { path }),
+  mkdir: (path: string, signal?: AbortSignal) => http.post('/fs/mkdir', { path }, { signal }),
   rename: (from: string, to: string) => http.post('/fs/rename', { from, to }),
   copy: (from: string, to: string) => http.post('/fs/copy', { from, to }),
   del: (paths: string[], permanent = false) =>
@@ -477,8 +481,8 @@ export const api = {
   /** 只请求 Telegram 小图，不会读取原视频。 */
   thumbnailUrl: (path: string) => `/api/fs/thumbnail?path=${encodeURIComponent(path)}`,
   /** 上传前批量查重:返回目录下已存在的名字 */
-  exists: (dir: string, names: string[]) =>
-    http.post<{ existing: string[] }>('/fs/exists', { dir, names }),
+  exists: (dir: string, names: string[], signal?: AbortSignal) =>
+    http.post<{ existing: string[] }>('/fs/exists', { dir, names }, { signal }),
 
   search: (params: SearchParams | string) =>
     http.get<{ results: SearchHit[] }>('/fs/search', {
@@ -487,28 +491,29 @@ export const api = {
   favorite: (path: string, favorite: boolean) =>
     http.post<{ ok: boolean; favorite: boolean }>('/fs/favorite', { path, favorite }),
   /** 秒传探测:库里有同内容文件则零流量落位 */
-  instant: (dir: string, name: string, sha256: string, size: number) =>
+  instant: (dir: string, name: string, sha256: string, size: number, signal?: AbortSignal) =>
     http.post<{ linked: boolean; pending: boolean; entry?: Entry }>('/fs/instant', {
       dir,
       name,
       sha256,
       size,
-    }),
+    }, { signal }),
 
   uploads: {
-    list: () =>
+    list: (signal?: AbortSignal) =>
       http.get<{
         sessions: UploadSession[]
         concurrency: number
         bot_count: number
         retry_after: number
-      }>('/uploads'),
-    status: (id: string) => http.get<UploadSessionResponse>(`/uploads/${id}`),
-    create: (dir: string, name: string, size: number, sha256: string) =>
-      http.post<UploadSessionResponse>('/uploads', { dir, name, size, sha256 }),
-    thumbnail: (id: string, image: Blob) =>
+      }>('/uploads', { signal }),
+    status: (id: string, signal?: AbortSignal) => http.get<UploadSessionResponse>(`/uploads/${id}`, { signal }),
+    create: (dir: string, name: string, size: number, sha256: string, signal?: AbortSignal) =>
+      http.post<UploadSessionResponse>('/uploads', { dir, name, size, sha256 }, { signal }),
+    thumbnail: (id: string, image: Blob, signal?: AbortSignal) =>
       http.post<{ ok: boolean }>(`/uploads/${id}/thumbnail`, image, {
         headers: { 'Content-Type': image.type || 'image/jpeg' },
+        signal,
       }),
     part: (
       id: string,
@@ -526,9 +531,9 @@ export const api = {
           onUploadProgress: (event) => onProgress(event.loaded),
         },
       ),
-    complete: (id: string) =>
-      http.post<{ ok: boolean; entry: Entry }>(`/uploads/${id}/complete`),
-    cancel: (id: string) => http.delete<{ ok: boolean }>(`/uploads/${id}`),
+    complete: (id: string, signal?: AbortSignal) =>
+      http.post<{ ok: boolean; entry: Entry }>(`/uploads/${id}/complete`, undefined, { signal }),
+    cancel: (id: string, signal?: AbortSignal) => http.delete<{ ok: boolean }>(`/uploads/${id}`, { signal }),
   },
 
   trash: {
@@ -575,10 +580,10 @@ export const api = {
     config: () => http.get<AdminConfig>('/admin/config'),
     save: (patch: ConfigPatch) => http.post<ApplyOutcome>('/admin/config', patch),
     reset: (keys: CfgKey[]) => http.post<ApplyOutcome>('/admin/config/reset', { keys }),
-    test: (probe: { api_base?: string; bot_token?: string; chat_id?: string } = {}) =>
+    test: (probe: { api_base?: string; bot_token?: string; chat_id?: string; proxy_enabled?: boolean; proxy_url?: string } = {}) =>
       http.post<{ ok: boolean; bot: string; api_base: string }>('/admin/test', probe),
     /** 根据 Bot Token 检测最近向 bot 发过消息的频道/用户,辅助填 chat_id */
-    detectChats: (probe: { api_base?: string; bot_token?: string } = {}) =>
+    detectChats: (probe: { api_base?: string; bot_token?: string; proxy_enabled?: boolean; proxy_url?: string } = {}) =>
       http.post<{ bot: string; chats: DetectedChat[] }>('/admin/detect-chats', probe),
     status: () => http.get<AdminStatus>('/admin/status'),
     logs: (params: BackendLogQuery = {}) =>
@@ -602,7 +607,7 @@ export const api = {
       http.post<StorageMigrationStatus>('/admin/storage-migration/start'),
     pauseStorageMigration: () =>
       http.post<StorageMigrationStatus>('/admin/storage-migration/pause'),
-    logoutAll: () => http.post('/admin/logout-all'),
+    logoutAll: () => endSession('/admin/logout-all'),
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
     backupUrl: '/api/admin/backup',
     backupNow: () => http.post<BackupOutcome>('/admin/backup-now'),

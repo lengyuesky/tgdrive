@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" :title="title" width="440px" align-center append-to-body @close="finish(null)">
+  <ResponsivePanel v-model="visible" :title="title" width="440px" align-center append-to-body @close="finish(null)">
     <div class="picked">
       目标:<code>{{ picked }}</code>
     </div>
@@ -16,10 +16,11 @@
       <el-button @click="finish(null)">取消</el-button>
       <el-button type="primary" @click="finish(picked)">确定</el-button>
     </template>
-  </el-dialog>
+  </ResponsivePanel>
 </template>
 
 <script setup lang="ts">
+import ResponsivePanel from './ResponsivePanel.vue'
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import VirtualDirectoryTree from './VirtualDirectoryTree.vue'
@@ -73,7 +74,7 @@ function open(dialogTitle: string, initial = '/'): Promise<string | null> {
   return new Promise((res) => (resolver = res))
 }
 
-defineExpose({ open })
+defineExpose({ open, close: () => finish(null) })
 </script>
 
 <style scoped>

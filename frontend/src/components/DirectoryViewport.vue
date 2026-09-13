@@ -1,8 +1,8 @@
 <template>
-  <VirtualViewport ref="viewport" :count="rowCount" :estimate-size="estimateSize" :item-key="rowKey"
+  <VirtualViewport ref="viewport" :active="active" :count="rowCount" :estimate-size="estimateSize" :item-key="rowKey"
     :row-height="rowHeight" :max-rows="Math.floor(200 / columns)"
     @near-end="$emit('nearEnd')" @scroll="(offset) => $emit('scroll', offset)" @resize="resize">
-    <template v-if="mode === 'list'" #header><slot name="header" /></template>
+    <template v-if="mode === 'list' && !mobile" #header><slot name="header" /></template>
     <template #default="{ index }">
       <div v-if="row(index).group" class="timeline-heading">
         {{ row(index).group!.label }} · 已加载 {{ row(index).group!.count }} 项
@@ -23,20 +23,22 @@ import { computed, nextTick, ref, shallowRef, triggerRef, watch } from 'vue'
 import type { DirectoryEntry } from '../api'
 import { TimelineRows, type DirectoryRow, type DirectoryView } from '../directory/layout'
 import VirtualViewport from './VirtualViewport.vue'
-const props = defineProps<{
+import { mobile } from '../mobile/viewport'
+const props = withDefaults(defineProps<{
+  active?: boolean
   entries: readonly DirectoryEntry[]
   count: number
   mode: DirectoryView
   generation: number
   revision: number
   indexOf: (id: number) => number | undefined
-}>()
+}>(), { active: true })
 defineEmits<{ nearEnd: []; scroll: [offset: number] }>()
 const viewport = ref<InstanceType<typeof VirtualViewport>>()
 const width = ref(800)
 const columns = computed(() => props.mode === 'list' ? 1 : Math.max(1, Math.min(20,
-  Math.floor(width.value / (props.mode === 'grid' ? 164 : 246)))))
-const rowHeight = computed(() => props.mode === 'list' ? 56 : props.mode === 'grid' ? 192 : 272)
+  Math.floor(width.value / (props.mode === 'grid' ? (mobile.value ? 140 : 164) : 246)))))
+const rowHeight = computed(() => props.mode === 'list' ? (mobile.value ? 72 : 56) : props.mode === 'grid' ? 192 : 272)
 const timeline = shallowRef(new TimelineRows(columns.value))
 watch(() => [props.generation, props.mode, columns.value] as const, () => {
   timeline.value = new TimelineRows(columns.value)
@@ -70,7 +72,7 @@ function estimateSize(index: number) {
 }
 let resizeSequence = 0
 async function resize(nextWidth: number) {
-  if (nextWidth === width.value) return
+  if (!props.active || nextWidth <= 0 || nextWidth === width.value) return
   const sequence = ++resizeSequence
   const generation = props.generation
   const mode = props.mode
@@ -85,6 +87,7 @@ async function resize(nextWidth: number) {
     if (index !== undefined) viewport.value?.scrollToIndex(props.mode === 'timeline' ? timeline.value.rowOf(index) : Math.floor(index / columns.value))
   }
 }
+defineExpose({ restoreOffset: (offset: number) => viewport.value?.restoreOffset(offset) })
 </script>
 
 <style scoped>

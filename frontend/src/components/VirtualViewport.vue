@@ -19,11 +19,12 @@ import { boundedRange } from '../directory/layout'
 
 const props = withDefaults(defineProps<{
   count: number
+  active?: boolean
   estimateSize: (index: number) => number
   itemKey: (index: number) => string | number
   maxRows?: number
   rowHeight: number
-}>(), { maxRows: 200 })
+}>(), { maxRows: 200, active: true })
 const emit = defineEmits<{
   nearEnd: []
   scroll: [offset: number]
@@ -35,6 +36,7 @@ const headerHeight = ref(0)
 const height = ref(600)
 const virtualizer = useVirtualizer(computed(() => ({
   count: props.count,
+  enabled: props.active,
   getScrollElement: () => element.value ?? null,
   estimateSize: props.estimateSize,
   getItemKey: props.itemKey,
@@ -47,7 +49,7 @@ const virtualizer = useVirtualizer(computed(() => ({
 })))
 function checkEnd() {
   const el = element.value
-  if (el && props.count && headerHeight.value + virtualizer.value.getTotalSize() - el.scrollTop - el.clientHeight <= el.clientHeight * 2) {
+  if (props.active && el && props.count && headerHeight.value + virtualizer.value.getTotalSize() - el.scrollTop - el.clientHeight <= el.clientHeight * 2) {
     emit('nearEnd')
   }
 }
@@ -92,7 +94,12 @@ function reset() {
   virtualizer.value.scrollToOffset(0)
   emit('scroll', 0)
 }
-defineExpose({ firstVisibleIndex, scrollToIndex, reset, measure: () => virtualizer.value.measure() })
+function restoreOffset(offset: number) {
+  virtualizer.value.measure()
+  if (element.value) element.value.scrollTop = offset
+  virtualizer.value.scrollToOffset(offset)
+}
+defineExpose({ firstVisibleIndex, scrollToIndex, reset, restoreOffset, measure: () => virtualizer.value.measure() })
 </script>
 
 <style scoped>

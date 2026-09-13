@@ -10,6 +10,7 @@ use crate::config::{self, Config};
 use crate::db::Db;
 use crate::engine::upload::UploadKnobs;
 use crate::error::{AppError, AppResult};
+use crate::proxy::{ProxyConfig, ProxySnapshot};
 #[cfg(test)]
 use crate::telegram::TgApi;
 use crate::telegram::{TgClient, TgRegistry};
@@ -28,11 +29,14 @@ const BOT_NAME_TTL: Duration = Duration::from_secs(60);
 /// 可运行时修改的项:(键名, 对应环境变量名)。键名同时用作 REST 字段名。
 pub const KEYS: &[(&str, &str)] = &[
     ("api_base", "TGDRIVE_API_BASE"),
+    ("proxy_enabled", "TGDRIVE_PROXY_ENABLED"),
+    ("proxy_url", "TGDRIVE_PROXY_URL"),
     ("bot_token", "TGDRIVE_BOT_TOKEN"),
     ("upload_bot_tokens", "TGDRIVE_UPLOAD_BOT_TOKENS"),
     ("chat_id", "TGDRIVE_CHAT_ID"),
     ("chunk_size", "TGDRIVE_CHUNK_SIZE"),
     ("upload_concurrency", "TGDRIVE_UPLOAD_CONCURRENCY"),
+    ("download_concurrency", "TGDRIVE_DOWNLOAD_CONCURRENCY"),
     ("send_video", "TGDRIVE_SEND_VIDEO"),
     ("tmp_dir", "TGDRIVE_TMP_DIR"),
     ("username", "TGDRIVE_USERNAME"),
@@ -50,12 +54,14 @@ pub const LOCAL_API_KEYS: &[&str] = &["telegram_api_id", "telegram_api_hash"];
 #[derive(Clone)]
 pub struct RuntimeCfg {
     pub api_base: String,
+    pub proxy: ProxyConfig,
     pub bot_token: String,
     /// 额外上传 Bot，不包含主 Bot；主 Bot 仍负责收件箱与备份。
     pub upload_bot_tokens: Vec<String>,
     pub chat_id: String,
     pub chunk_size: u64,
     pub upload_concurrency: usize,
+    pub download_concurrency: usize,
     /// 单块以内的视频改用 sendVideo 发送,在 Telegram 里可直接播放
     pub send_video: bool,
     pub tmp_dir: PathBuf,
@@ -112,8 +118,18 @@ impl RuntimeCfg {
             .unwrap_or_else(|| env.upload_bot_tokens.clone());
         upload_bot_tokens.retain(|token| token.trim() != bot_token.trim());
 
+        let proxy = ProxyConfig::new(
+            get("proxy_enabled")
+                .map(config::parse_bool)
+                .transpose()
+                .map_err(|_| AppError::BadRequest("代理开关配置无效".into()))?
+                .unwrap_or(env.proxy.enabled),
+            get("proxy_url").unwrap_or(&env.proxy.url),
+        )?;
+
         Ok(RuntimeCfg {
             api_base,
+            proxy,
             bot_token,
             upload_bot_tokens,
             chat_id: get("chat_id")
@@ -124,6 +140,9 @@ impl RuntimeCfg {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(env.upload_concurrency)
                 .clamp(1, 16),
+            download_concurrency: get("download_concurrency")
+                .and_then(|v| config::parse_download_concurrency(v).ok())
+                .unwrap_or(env.download_concurrency),
             send_video,
             tmp_dir: get("tmp_dir")
                 .map(PathBuf::from)
@@ -168,7 +187,7 @@ impl RuntimeCfg {
         if !self.is_configured() {
             return Ok(Arc::new(crate::telegram::UnconfiguredTg));
         }
-        let client = TgClient::new(&self.api_base, &self.bot_token, &self.chat_id)
+        let client = TgClient::new(&self.api_base, &self.bot_token, &self.chat_id, self.proxy.clone())
             .map_err(|e| AppError::BadRequest(format!("客户端构造失败: {e}")))?;
         Ok(Arc::new(client))
     }
@@ -181,12 +200,15 @@ impl RuntimeCfg {
     fn value_of(&self, key: &str) -> String {
         match key {
             "api_base" => self.api_base.clone(),
+            "proxy_enabled" => self.proxy.enabled.to_string(),
+            "proxy_url" => self.proxy.url.clone(),
             "bot_token" => self.bot_token.clone(),
             // .env 不适合多行值，统一导出为逗号分隔。
             "upload_bot_tokens" => self.upload_bot_tokens.join(","),
             "chat_id" => self.chat_id.clone(),
             "chunk_size" => self.chunk_size.to_string(),
             "upload_concurrency" => self.upload_concurrency.to_string(),
+            "download_concurrency" => self.download_concurrency.to_string(),
             "send_video" => self.send_video.to_string(),
             "tmp_dir" => self.tmp_dir.display().to_string(),
             "username" => self.username.clone(),
@@ -208,6 +230,8 @@ fn env_present(key: &str) -> bool {
 #[derive(Deserialize, Default)]
 pub struct ConfigPatch {
     pub api_base: Option<String>,
+    pub proxy_enabled: Option<bool>,
+    pub proxy_url: Option<String>,
     pub bot_token: Option<String>,
     /// 多行或逗号分隔的额外上传 Bot Token。
     pub upload_bot_tokens: Option<String>,
@@ -215,6 +239,7 @@ pub struct ConfigPatch {
     /// 字符串以支持 "18MB" 这类写法
     pub chunk_size: Option<String>,
     pub upload_concurrency: Option<usize>,
+    pub download_concurrency: Option<usize>,
     pub send_video: Option<bool>,
     pub tmp_dir: Option<String>,
     pub username: Option<String>,
@@ -245,6 +270,8 @@ pub struct Runtime {
     /// 环境变量层,用于来源标注与「恢复」
     pub env: Arc<Config>,
     current: RwLock<Arc<RuntimeCfg>>,
+    /// 串行提交，防止同时保存或恢复时让代理句柄与持久配置互相覆盖。
+    update_lock: tokio::sync::Mutex<()>,
     tg: Arc<TgRegistry>,
     knobs: Arc<UploadKnobs>,
     pub auth: Arc<Auth>,
@@ -261,10 +288,12 @@ impl Runtime {
         knobs: Arc<UploadKnobs>,
         auth: Arc<Auth>,
     ) -> Self {
+        tg.set_download_concurrency(cfg.download_concurrency);
         Runtime {
             db,
             env,
             current: RwLock::new(Arc::new(cfg)),
+            update_lock: tokio::sync::Mutex::new(()),
             tg,
             knobs,
             auth,
@@ -328,16 +357,20 @@ impl Runtime {
     }
 
     /// 用指定参数试连(不落库),返回 bot 名
-    pub async fn probe(api_base: &str, token: &str, chat_id: &str) -> AppResult<String> {
-        let client = TgClient::new(api_base, token, chat_id)
+    pub async fn probe(api_base: &str, token: &str, chat_id: &str, proxy: &ProxyConfig) -> AppResult<String> {
+        let client = TgClient::new(api_base, token, chat_id, proxy.clone())
             .map_err(|e| AppError::BadRequest(format!("客户端构造失败: {e}")))?;
-        client.probe_storage().await
+        tokio::time::timeout(Duration::from_secs(15), client.probe_storage())
+            .await
+            .map_err(|_| AppError::BadRequest("连接验证超时(15 秒)".into()))?
     }
 
     /// 保存并热生效
     pub async fn apply(&self, patch: ConfigPatch) -> AppResult<ApplyOutcome> {
+        let _guard = self.update_lock.lock().await;
         let prev = self.current();
         let mut next = (*prev).clone();
+        next.proxy = prev.proxy.patched(patch.proxy_enabled, patch.proxy_url.as_deref())?;
 
         if let Some(v) = &patch.api_base {
             next.api_base = v.trim().trim_end_matches('/').to_string();
@@ -360,6 +393,9 @@ impl Runtime {
         if let Some(v) = patch.upload_concurrency {
             next.upload_concurrency = v;
         }
+        if let Some(v) = patch.download_concurrency {
+            next.download_concurrency = v;
+        }
         if let Some(v) = patch.send_video {
             next.send_video = v;
         }
@@ -381,8 +417,11 @@ impl Runtime {
 
         self.validate(&next)?;
 
-        // 动到 Telegram 三项时先验证,别把网盘改到连不上
-        let tg_changed = next.api_base != prev.api_base
+        // 端点、凭据或代理变化时先验证，避免把网盘改到连不上。
+        let proxy_update = (next.proxy != prev.proxy)
+            .then(|| ProxySnapshot::new(next.proxy.clone()))
+            .transpose()?;
+        let tg_changed = next.proxy != prev.proxy || next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
             || next.upload_bot_tokens != prev.upload_bot_tokens
             || next.chat_id != prev.chat_id;
@@ -394,10 +433,11 @@ impl Runtime {
             let results = join_all(tokens.iter().enumerate().map(|(index, token)| {
                 let api_base = api_base.clone();
                 let chat_id = chat_id.clone();
+                let proxy = next.proxy.clone();
                 async move {
                     let result = tokio::time::timeout(
                         Duration::from_secs(15),
-                        Self::probe(&api_base, token, &chat_id),
+                        Self::probe(&api_base, token, &chat_id, &proxy),
                     )
                     .await
                     .map_err(|_| AppError::BadRequest("连接验证超时(15 秒)".into()))
@@ -430,7 +470,7 @@ impl Runtime {
         let new_secret = account_changed.then(crate::auth::random_secret);
         let changed = self.persist(&prev, &next, new_secret.as_deref()).await?;
         let needs_local_api_restart = changed.iter().any(|k| LOCAL_API_KEYS.contains(&k.as_str()));
-        self.install(&prev, next, tg_changed, new_secret.as_deref())?;
+        self.install(&prev, next, tg_changed, new_secret.as_deref(), proxy_update)?;
         Ok(ApplyOutcome {
             changed,
             account_changed,
@@ -441,6 +481,7 @@ impl Runtime {
 
     /// 恢复指定项为环境变量/默认值
     pub async fn reset(&self, keys: &[String]) -> AppResult<ApplyOutcome> {
+        let _guard = self.update_lock.lock().await;
         let prev = self.current();
         for k in keys {
             if !KEYS.iter().any(|(name, _)| name == k) {
@@ -455,8 +496,11 @@ impl Runtime {
         let mut next = RuntimeCfg::from_overrides(&overrides, &self.env)?;
         // 恢复出的组合仍要合法(例如端点回落到官方而分块过大)
         self.validate(&next)?;
+        let proxy_update = (next.proxy != prev.proxy)
+            .then(|| ProxySnapshot::new(next.proxy.clone()))
+            .transpose()?;
         self.attach_storage_target(&mut next).await?;
-        let tg_changed = next.api_base != prev.api_base
+        let tg_changed = next.proxy != prev.proxy || next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
             || next.upload_bot_tokens != prev.upload_bot_tokens
             || next.chat_id != prev.chat_id;
@@ -468,7 +512,7 @@ impl Runtime {
             .map(|secret| vec![(crate::auth::SECRET_KEY.to_string(), secret.clone())])
             .unwrap_or_default();
         self.db.settings_apply(&secret_sets, &deletes).await?;
-        self.install(&prev, next, tg_changed, new_secret.as_deref())?;
+        self.install(&prev, next, tg_changed, new_secret.as_deref(), proxy_update)?;
         Ok(ApplyOutcome {
             changed: keys.to_vec(),
             account_changed,
@@ -517,6 +561,8 @@ impl Runtime {
         if !(1..=16).contains(&next.upload_concurrency) {
             return Err(bad("上传并发数需在 1~16 之间".into()));
         }
+        config::parse_download_concurrency(&next.download_concurrency.to_string())
+            .map_err(|e| bad(e.to_string()))?;
         if next.username.trim().is_empty() || next.password.is_empty() {
             return Err(bad("用户名与密码都不能为空".into()));
         }
@@ -564,7 +610,11 @@ impl Runtime {
         next: RuntimeCfg,
         tg_changed: bool,
         new_secret: Option<&str>,
+        proxy_update: Option<Arc<ProxySnapshot>>,
     ) -> AppResult<bool> {
+        if let Some(snapshot) = proxy_update {
+            self.tg.set_proxy(snapshot);
+        }
         if tg_changed {
             self.tg
                 .set_targets(next.storage_target_id, next.upload_target_ids.clone())?;
@@ -586,6 +636,9 @@ impl Runtime {
         }
         if next.send_video != prev.send_video {
             self.knobs.set_send_video(next.send_video);
+        }
+        if next.download_concurrency != prev.download_concurrency {
+            self.tg.set_download_concurrency(next.download_concurrency);
         }
         let account_changed = next.username != prev.username || next.password != prev.password;
         if account_changed {
@@ -682,8 +735,10 @@ mod tests {
             upload_bot_tokens: Vec::new(),
             chat_id: "-100111".into(),
             api_base: config::OFFICIAL_API_BASE.into(),
+            proxy: ProxyConfig::default(),
             chunk_size: 18 * 1024 * 1024,
             upload_concurrency: 2,
+            download_concurrency: config::DEFAULT_DOWNLOAD_CONCURRENCY,
             db_path: "x.db".into(),
             tmp_dir: std::env::temp_dir(),
             local_data_root: config::DEFAULT_LOCAL_DATA_ROOT.into(),
@@ -727,6 +782,100 @@ mod tests {
             .unwrap();
         let c = RuntimeCfg::load(&db, &env).await.unwrap();
         assert_eq!(c.upload_bot_tokens, vec!["extra1", "extra2"]);
+    }
+
+    #[tokio::test]
+    async fn download_concurrency_is_validated_persisted_and_applied_without_restart() {
+        let (db, _guard) = test_db().await;
+        let mut env = env_cfg();
+        env.bot_token.clear();
+        env.chat_id.clear();
+        let env = Arc::new(env);
+        let cfg = RuntimeCfg::load(&db, &env).await.unwrap();
+        let mtproto = crate::mtproto::MtprotoConfig::from_values(db.clone(), "1", "test-hash")
+            .unwrap()
+            .unwrap();
+        let tg = Arc::new(TgRegistry::new(&[], None, vec![], Some(mtproto.clone()), ProxyConfig::default()).unwrap());
+        let knobs = Arc::new(UploadKnobs::new(
+            cfg.chunk_size,
+            cfg.tmp_dir.clone(),
+            2,
+            false,
+        ));
+        let auth = Arc::new(
+            Auth::init(&cfg.username, &cfg.password, None, false, &db)
+                .await
+                .unwrap(),
+        );
+        let rt = Runtime::new(db.clone(), env.clone(), cfg, tg, knobs, auth);
+
+        for concurrency in [1, 2, 3] {
+            rt.apply(ConfigPatch {
+                download_concurrency: Some(concurrency),
+                ..ConfigPatch::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(mtproto.download_concurrency(), concurrency);
+            assert_eq!(rt.current().download_concurrency, concurrency);
+            assert_eq!(
+                RuntimeCfg::load(&db, &env)
+                    .await
+                    .unwrap()
+                    .download_concurrency,
+                concurrency
+            );
+        }
+
+        let result = rt
+            .apply(ConfigPatch {
+                download_concurrency: Some(8),
+                ..ConfigPatch::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.changed, vec!["download_concurrency"]);
+        assert!(!result.needs_local_api_restart);
+        assert_eq!(mtproto.download_concurrency(), 8);
+        assert_eq!(rt.current().download_concurrency, 8);
+        assert_eq!(
+            RuntimeCfg::load(&db, &env)
+                .await
+                .unwrap()
+                .download_concurrency,
+            8
+        );
+        assert_eq!(rt.sources().await.unwrap()["download_concurrency"], "db");
+        assert!(rt.env_export().contains("TGDRIVE_DOWNLOAD_CONCURRENCY=8\n"));
+
+        for invalid in [0, 9, usize::MAX] {
+            assert!(
+                rt.apply(ConfigPatch {
+                    download_concurrency: Some(invalid),
+                    ..ConfigPatch::default()
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(mtproto.download_concurrency(), 8);
+            assert_eq!(rt.current().download_concurrency, 8);
+        }
+        assert_eq!(
+            db.setting_get("cfg.download_concurrency")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("8")
+        );
+        rt.reset(&["download_concurrency".into()]).await.unwrap();
+        assert_eq!(mtproto.download_concurrency(), 4);
+        assert_eq!(rt.current().download_concurrency, 4);
+        assert!(
+            db.setting_get("cfg.download_concurrency")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

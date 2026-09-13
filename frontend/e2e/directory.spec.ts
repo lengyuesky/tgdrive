@@ -52,7 +52,7 @@ async function mockDrive(page: Page, options: { media?: boolean; failSecond?: bo
       return
     }
     if (url.pathname === '/api/info') return route.fulfill({ json: { username: '测试', files: TOTAL,
-      dirs: 1, total_size: 1000000, configured: true, official_api: false, api_base: '', chunk_size: 100, shorts_dir: '' } })
+      dirs: 1, total_size: 1000000, configured: true, official_api: false, api_base: '', chunk_size: 100 } })
     if (url.pathname === '/api/uploads') return route.fulfill({ json: { sessions: [] } })
     if (url.pathname === '/api/auth/me') return route.fulfill({ json: { username: '测试' } })
     if (url.pathname === '/api/fs/list') throw new Error('主目录不应调用旧全量接口')

@@ -10,6 +10,10 @@ pub enum AppError {
     NotFound,
     #[error("目标已存在")]
     AlreadyExists,
+    #[error("{0}")]
+    Conflict(String),
+    #[error("阅读记录已被另一页面更新，请选择使用已保存进度或从当前页继续")]
+    AppDataConflict,
     #[error("非法路径: {0}")]
     InvalidPath(String),
     #[error("目标是目录")]
@@ -45,6 +49,7 @@ impl AppError {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::AlreadyExists => StatusCode::CONFLICT,
+            AppError::Conflict(_) | AppError::AppDataConflict => StatusCode::CONFLICT,
             AppError::InvalidPath(_) | AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::IsDirectory | AppError::NotDirectory => StatusCode::UNPROCESSABLE_ENTITY,
@@ -85,7 +90,11 @@ impl IntoResponse for AppError {
         } else {
             self.to_string()
         };
-        let code = matches!(&self, AppError::UploadInterrupted).then_some("upload_interrupted");
+        let code = match &self {
+            AppError::UploadInterrupted => Some("upload_interrupted"),
+            AppError::AppDataConflict => Some("storage_conflict"),
+            _ => None,
+        };
         let mut response = (
             status,
             Json(serde_json::json!({ "error": public_error, "code": code })),

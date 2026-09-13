@@ -1,15 +1,19 @@
 import { flushPromises, shallowMount } from '@vue/test-utils'
-import { defineComponent, nextTick, reactive } from 'vue'
+import { defineComponent, nextTick, reactive, ref } from 'vue'
 import ElementPlus from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { EntriesQuery, EntriesResponse } from '../api'
 import { entry } from '../test/fixtures'
 import Files from './Files.vue'
 import DirectoryViewport from '../components/DirectoryViewport.vue'
-import UploadDrawer from '../components/UploadDrawer.vue'
+import { TRANSFERS, UPLOAD_INTAKE } from '../transfers/context'
+const uploadListeners = new Set<(target: string) => void>()
+const uploaded = (target = '/') => uploadListeners.forEach((listener) => listener(target))
+const queue = { open: vi.fn(), onUploaded: (listener: (target: string) => void) => { uploadListeners.add(listener); return () => uploadListeners.delete(listener) } }
+const intake = { dragging: ref(false), isFirefoxBrowser: false, pickFiles: vi.fn(), supportsDirectory: true }
 
 const mocks = vi.hoisted(() => ({ entries: vi.fn(), info: vi.fn(), route: { params: { path: [] as string[] } } }))
-vi.mock('vue-router', () => ({ useRoute: () => mocks.route, useRouter: () => ({ push: vi.fn() }) }))
+vi.mock('vue-router', () => ({ useRoute: () => mocks.route, useRouter: () => ({ push: vi.fn() }), onBeforeRouteLeave: vi.fn(), onBeforeRouteUpdate: vi.fn() }))
 vi.mock('../api', () => ({
   api: { entries: mocks.entries, info: mocks.info, downloadUrl: (path: string) => path, thumbnailUrl: (path: string) => path },
   errMsg: String, fmtSize: String, fmtTime: String, isVideo: () => false, VIDEO_EXT: ['mp4'],
@@ -28,7 +32,7 @@ beforeEach(() => {
 })
 afterEach(() => { wrapper?.unmount(); vi.useRealTimers() })
 async function render() {
-  wrapper = shallowMount(Files, { global: { plugins: [ElementPlus], stubs: {
+  wrapper = shallowMount(Files, { global: { plugins: [ElementPlus], provide: { [TRANSFERS as symbol]: queue, [UPLOAD_INTAKE as symbol]: intake }, stubs: {
     ElTooltip: defineComponent({ name: 'ElTooltip', props: ['content'], template: '<div><slot /></div>' }),
   } } })
   await flushPromises()
@@ -77,13 +81,13 @@ describe('Files远端接入与刷新语义', () => {
   it('上传完成在向下浏览时仅提示；顶部无选择时合并刷新', async () => {
     const view = await render()
     view.findComponent(DirectoryViewport).vm.$emit('scroll', 500)
-    view.findComponent(UploadDrawer).vm.$emit('uploaded')
+    uploaded()
     await vi.advanceTimersByTimeAsync(1000)
     expect(mocks.entries).toHaveBeenCalledTimes(1)
     expect(view.text()).toContain('当前浏览和选择已保留')
     view.findComponent(DirectoryViewport).vm.$emit('scroll', 0)
-    view.findComponent(UploadDrawer).vm.$emit('uploaded')
-    view.findComponent(UploadDrawer).vm.$emit('uploaded')
+    uploaded()
+    uploaded()
     await vi.advanceTimersByTimeAsync(1000)
     expect(mocks.entries).toHaveBeenCalledTimes(2)
   })
@@ -92,7 +96,7 @@ describe('Files远端接入与刷新语义', () => {
     const view = await render()
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true }))
     await nextTick()
-    view.findComponent(UploadDrawer).vm.$emit('uploaded')
+    uploaded()
     await vi.advanceTimersByTimeAsync(1000)
     expect(mocks.entries).toHaveBeenCalledTimes(1)
     expect(view.text()).toContain('当前浏览和选择已保留')

@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" :title="`分享「${name}」`" width="460px" align-center append-to-body>
+  <ResponsivePanel v-model="visible" :title="`分享「${name}」`" width="460px" align-center append-to-body>
     <!-- 第一步:设置选项 -->
     <el-form v-if="!created" label-width="90px" label-position="left">
       <el-form-item label="提取码">
@@ -42,13 +42,16 @@
       </template>
       <template v-else>
         <el-button @click="visible = false">关闭</el-button>
+        <el-button @click="shareLink(url, name, password)">系统分享</el-button>
         <el-button type="primary" @click="copy">复制链接与提取码</el-button>
       </template>
     </template>
-  </el-dialog>
+  </ResponsivePanel>
 </template>
 
 <script setup lang="ts">
+import ResponsivePanel from './ResponsivePanel.vue'
+import { copyText, shareLink } from '../mobile/share'
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CircleCheckFilled } from '@element-plus/icons-vue'
@@ -99,12 +102,7 @@ async function create() {
 
 async function copy() {
   const text = password.value ? `${url.value}  提取码: ${password.value}` : url.value
-  try {
-    await navigator.clipboard.writeText(text)
-    ElMessage.success('已复制')
-  } catch {
-    ElMessage.warning('浏览器不允许自动复制,请手动复制')
-  }
+  await copyText(text)
 }
 
 defineExpose({ open })

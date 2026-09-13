@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import ResponsivePanel from '../components/ResponsivePanel.vue'
+import { closeTopOverlay } from '../mobile/overlays'
+import { isComposingKey } from '../mobile/keyboard'
 import { computed, onMounted, onUnmounted, ref, type Component, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -94,6 +97,7 @@ type SectionKey =
   | 'queues'
   | 'logs'
   | 'telegram'
+  | 'proxy'
   | 'stream'
   | 'account'
   | 'backup'
@@ -105,6 +109,7 @@ const SECTIONS: { key: SectionKey; label: string; desc: string; icon: Component 
   { key: 'queues', label: '后台任务', desc: 'Telegram 消息删除', icon: Cpu },
   { key: 'logs', label: '后台日志', desc: '操作进度与失败重试', icon: Notebook },
   { key: 'telegram', label: 'Telegram 存储', desc: 'Bot、频道与分块', icon: Promotion },
+  { key: 'proxy', label: '网络代理', desc: 'HTTP / SOCKS5', icon: Link },
   { key: 'stream', label: '流式播放', desc: 'MTProto / 自建 Bot API', icon: VideoPlay },
   { key: 'account', label: '账号', desc: '登录用户名与密码', icon: User },
   { key: 'backup', label: '备份与回收站', desc: '数据库快照与保留期', icon: FolderOpened },
@@ -137,11 +142,14 @@ function go(key: SectionKey) {
 /** 表单当前值(字符串化,便于比对是否改动) */
 const form = ref({
   api_base: '',
+  proxy_enabled: false,
+  proxy_url: '',
   bot_token: '',
   upload_bot_tokens: '',
   chat_id: '',
   chunk_size: '',
   upload_concurrency: 2,
+  download_concurrency: 4,
   send_video: false,
   tmp_dir: '',
   username: '',
@@ -173,11 +181,14 @@ async function load() {
     status.value = s.data
     form.value = {
       api_base: c.data.values.api_base,
+      proxy_enabled: c.data.values.proxy_enabled ?? false,
+      proxy_url: c.data.values.proxy_url ?? '',
       bot_token: c.data.values.bot_token, // 脱敏值,不动则不提交
       upload_bot_tokens: c.data.values.upload_bot_tokens,
       chat_id: c.data.values.chat_id,
       chunk_size: sizeInput(c.data.values.chunk_size),
       upload_concurrency: c.data.values.upload_concurrency,
+      download_concurrency: c.data.values.download_concurrency,
       send_video: c.data.values.send_video,
       tmp_dir: c.data.values.tmp_dir,
       username: c.data.values.username,
@@ -575,6 +586,8 @@ function buildPatch(): ConfigPatch {
   const f = form.value
   const o = origin.value
   if (f.api_base !== o.api_base) p.api_base = f.api_base
+  if (f.proxy_enabled !== o.proxy_enabled) p.proxy_enabled = f.proxy_enabled
+  if (f.proxy_url !== o.proxy_url) p.proxy_url = f.proxy_url
   if (f.bot_token !== o.bot_token) p.bot_token = f.bot_token
   if (f.upload_bot_tokens !== o.upload_bot_tokens) {
     p.upload_bot_tokens = f.upload_bot_tokens
@@ -582,6 +595,7 @@ function buildPatch(): ConfigPatch {
   if (f.chat_id !== o.chat_id) p.chat_id = f.chat_id
   if (f.chunk_size !== o.chunk_size) p.chunk_size = f.chunk_size
   if (f.upload_concurrency !== o.upload_concurrency) p.upload_concurrency = f.upload_concurrency
+  if (f.download_concurrency !== o.download_concurrency) p.download_concurrency = f.download_concurrency
   if (f.send_video !== o.send_video) p.send_video = f.send_video
   if (f.tmp_dir !== o.tmp_dir) p.tmp_dir = f.tmp_dir
   if (f.username !== o.username) p.username = f.username
@@ -665,7 +679,9 @@ async function resetKey(key: CfgKey, label: string) {
     return
   }
   try {
-    const { data } = await api.admin.reset([key])
+    // 恢复空地址时同时恢复开关，避免留下「已启用但无地址」的无效组合。
+    const keys: CfgKey[] = key === 'proxy_url' ? ['proxy_enabled', 'proxy_url'] : [key]
+    const { data } = await api.admin.reset(keys)
     if (data.account_changed) {
       leaving.value = true
       await appAlert({
@@ -691,6 +707,8 @@ async function test() {
       api_base: form.value.api_base,
       bot_token: form.value.bot_token,
       chat_id: form.value.chat_id,
+      proxy_enabled: form.value.proxy_enabled,
+      proxy_url: form.value.proxy_url,
     })
     ElMessage.success(`连接正常:@${data.bot}`)
   } catch (e) {
@@ -721,6 +739,8 @@ async function detect() {
     const { data } = await api.admin.detectChats({
       api_base: form.value.api_base,
       bot_token: form.value.bot_token,
+      proxy_enabled: form.value.proxy_enabled,
+      proxy_url: form.value.proxy_url,
     })
     detectBot.value = data.bot
     detectedChats.value = data.chats
@@ -784,9 +804,11 @@ async function logoutAll() {
   } catch {
     return
   }
-  leaving.value = true
-  await api.admin.logoutAll().catch(() => {})
-  router.push('/login')
+  try {
+    await api.admin.logoutAll()
+    leaving.value = true
+    await router.push('/login')
+  } catch (error) { ElMessage.error(`登出失败：${errMsg(error)}`) }
 }
 
 // ---- 导出 .env ----
@@ -859,17 +881,6 @@ async function chooseInboxDir(key: InboxDirKey) {
     return
   }
   extras.value[key] = picked
-}
-
-/** 短视频取材目录允许是根目录(整库),所以不像收件目录那样拦截 "/" */
-async function chooseShortsDir() {
-  if (!extras.value) return
-  const picked = await inboxDirPicker.value?.open(
-    '选择短视频取材文件夹(含子目录)',
-    extras.value.shorts_dir || '/',
-  )
-  if (picked === null || picked === undefined) return
-  extras.value.shorts_dir = picked === '/' ? '' : picked
 }
 
 async function chooseRuleDir(rule: InboxRouteRule) {
@@ -986,11 +997,14 @@ const changed = computed(() => {
 /** 配置项 → 所属分区,用于在导航上标出哪块有改动 */
 const CFG_SECTION: Record<string, SectionKey> = {
   api_base: 'telegram',
+  proxy_enabled: 'proxy',
+  proxy_url: 'proxy',
   bot_token: 'telegram',
   upload_bot_tokens: 'telegram',
   chat_id: 'telegram',
   chunk_size: 'telegram',
   upload_concurrency: 'telegram',
+  download_concurrency: 'stream',
   send_video: 'telegram',
   telegram_api_id: 'stream',
   telegram_api_hash: 'stream',
@@ -1010,9 +1024,7 @@ const dirtySections = computed(() => {
         ? 'queues'
         : k.startsWith('inbox')
           ? 'inbox'
-          : k.startsWith('shorts')
-            ? 'stream'
-            : 'backup',
+          : 'backup',
     )
   }
   return set
@@ -1057,8 +1069,10 @@ async function reloadAll() {
 // ---- 离开前确认,避免切分区后忘了保存 ----
 /** 保存账号 / 登出后主动跳转,此时不该再拦截 */
 const leaving = ref(false)
-onBeforeRouteLeave(async () => {
-  if (leaving.value || !changed.value.total) return true
+onBeforeRouteLeave(async (to) => {
+  if (to.path === '/login' || leaving.value) return true
+  if (closeTopOverlay()) return false
+  if (!changed.value.total) return true
   try {
     await appConfirm({
       title: '放弃未保存的改动?',
@@ -1192,20 +1206,20 @@ function downloadBackup() {
   <div class="page" v-loading="loading">
     <div class="topbar glass">
       <el-tooltip content="返回文件">
-        <el-button class="icon-btn" :icon="ArrowLeft" @click="router.push('/files/')" />
+        <el-button class="icon-btn" aria-label="返回文件" :icon="ArrowLeft" @click="router.push('/files/')" />
       </el-tooltip>
       <div class="logo-badge"><el-icon><Setting /></el-icon></div>
       <div class="brand brand-text">系统设置</div>
       <el-tag v-if="status" size="small" round type="info" class="ver">v{{ status.version }}</el-tag>
       <div class="spacer" />
       <el-tooltip content="导出 .env">
-        <el-button class="icon-btn" :icon="Download" @click="exportEnv" />
+        <el-button class="icon-btn" aria-label="导出环境配置" :icon="Download" @click="exportEnv" />
       </el-tooltip>
       <el-tooltip content="刷新">
-        <el-button class="icon-btn" :icon="Refresh" @click="reloadAll" />
+        <el-button class="icon-btn" aria-label="刷新" :icon="Refresh" @click="reloadAll" />
       </el-tooltip>
       <el-tooltip :content="isDark ? '切换亮色' : '切换暗色'">
-        <el-button class="icon-btn" :icon="isDark ? Sunny : Moon" @click="toggleDark" />
+        <el-button class="icon-btn" :aria-label="isDark ? '切换亮色' : '切换暗色'" :icon="isDark ? Sunny : Moon" @click="toggleDark" />
       </el-tooltip>
     </div>
 
@@ -1251,7 +1265,7 @@ function downloadBackup() {
             <div class="pane-desc">{{ activeSection.desc }}</div>
           </div>
           <div class="pane-actions">
-            <el-button v-if="section === 'telegram'" :loading="testing" @click="test">
+            <el-button v-if="section === 'telegram' || section === 'proxy'" :loading="testing" @click="test">
               测试连接
             </el-button>
             <el-button v-if="section === 'backup'" :loading="backingUp" @click="backupNow">
@@ -1766,15 +1780,69 @@ function downloadBackup() {
               </div>
             </template>
 
+            <!-- ========== 网络代理 ========== -->
+            <template v-else-if="section === 'proxy'">
+              <div class="note">
+                <el-icon><InfoFilled /></el-icon>
+                <div>
+                  <div>代理用于 tgdrive 的 Telegram 上传、下载、MTProto 流式播放、Bot 收件及 WebDAV / S3 备份。</div>
+                  <div>保存后新请求使用新配置，无需重启；已发出的请求、已打开的下载流和本轮收件继续使用原连接。</div>
+                </div>
+              </div>
+              <div class="fields">
+                <SettingField
+                  label="启用代理"
+                  :source="cfg?.sources.proxy_enabled"
+                  inline
+                  wide
+                  help="关闭时保留代理地址，tgdrive 恢复直连，不再使用系统 HTTP_PROXY / ALL_PROXY。"
+                  @reset="resetKey('proxy_enabled', '代理开关')"
+                >
+                  <el-switch v-model="form.proxy_enabled" aria-label="启用代理" />
+                </SettingField>
+                <SettingField
+                  label="代理地址"
+                  :source="cfg?.sources.proxy_url"
+                  wide
+                  @reset="resetKey('proxy_url', '代理设置（地址与开关）')"
+                >
+                  <el-input
+                    v-model="form.proxy_url"
+                    type="password"
+                    show-password
+                    clearable
+                    autocomplete="new-password"
+                    aria-label="代理地址"
+                    placeholder="http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080"
+                  />
+                  <template #help>
+                    HTTP：<code>http://主机:端口</code>；SOCKS5：<code>socks5://主机:端口</code>，
+                    推荐 <code>socks5h://主机:端口</code> 由代理解析目标域名，<code>socks://</code> 与之等效。
+                    需要认证时使用 <code>协议://用户名:密码@主机:端口</code>，特殊字符需 URL 编码。
+                    已保存的认证信息会脱敏；不修改可保留原样，修改地址时请重新输入完整凭据。
+                  </template>
+                </SettingField>
+              </div>
+              <div class="note warn">
+                <el-icon><WarnTriangleFilled /></el-icon>
+                <div>
+                  <div>HTTP 代理需允许 HTTP CONNECT 才能用于 MTProto 流式播放。</div>
+                  <div>此设置不会修改独立的 telegram-bot-api 服务；该服务访问 Telegram 的代理需另行配置。</div>
+                  <div>HTTP 请求到 localhost、127.0.0.1、::1 和 telegram-bot-api 时保持直连，避免本地服务被转发到远端代理。</div>
+                  <div>Docker 中的 127.0.0.1 指容器本身。使用宿主机代理时，请填写容器可访问的宿主机地址并允许容器连接。</div>
+                  <div>「测试连接」使用当前表单中的代理、Bot Token 和存储频道，不会保存配置。</div>
+                </div>
+              </div>
+            </template>
+
             <!-- ========== 流式播放 ========== -->
             <template v-else-if="section === 'stream'">
               <div class="note">
                 <el-icon><InfoFilled /></el-icon>
                 <div>
                   <div>
-                    tgdrive 使用 MTProto 把视频按 512KiB 响应浏览器 Range,关闭预览后停止后续请求;
-                    不改变已有 Telegram 分块大小。自建 telegram-bot-api 仍负责 GB
-                    级分块上传和本地缓存直读。
+                    tgdrive 使用并行下载和有限预读改善视频播放，支持拖动进度；关闭预览后停止后续请求。
+                    自建 telegram-bot-api 负责大文件上传和本地缓存直读。
                   </div>
                   <div>
                     下面两项在
@@ -1807,7 +1875,29 @@ function downloadBackup() {
               </div>
 
               <div class="block">
-                <div class="block-head">启用步骤</div>
+                <div class="block-head">下载速度</div>
+                <div class="fields">
+                  <SettingField
+                    label="下载并发"
+                    :source="cfg?.sources.download_concurrency"
+                    inline
+                    help="可调 1～8 路，默认 4 路。同一 Bot 最多同时处理 8 路下载请求。保存后对新打开的播放和下载生效。"
+                    @reset="resetKey('download_concurrency', '下载并发')"
+                  >
+                    <el-input-number
+                      v-model="form.download_concurrency"
+                      :min="1"
+                      :max="8"
+                      :precision="0"
+                      size="small"
+                      controls-position="right"
+                    />
+                  </SettingField>
+                </div>
+              </div>
+
+              <div class="block">
+                <div class="block-head">应用凭据启用步骤</div>
                 <div class="steps">
                   <div class="step"><span>1</span><div>填好上面两项,点右下角「保存并生效」</div></div>
                   <div class="step">
@@ -1818,25 +1908,6 @@ function downloadBackup() {
                     <span>3</span>
                     <div>在宿主机执行 <code>{{ RESTART_CMD }}</code>,重启这两个服务</div>
                   </div>
-                </div>
-              </div>
-
-              <div v-if="extras" class="block">
-                <div class="block-head">短视频模式</div>
-                <div class="fields">
-                  <SettingField
-                    label="取材文件夹"
-                    wide
-                    help="文件页顶栏「短视频模式」随机播放这个文件夹(含子目录)下的所有视频。留空表示整库。"
-                  >
-                    <div class="ctl-row">
-                      <el-input v-model="extras.shorts_dir" placeholder="留空 = 整库" />
-                      <el-button @click="chooseShortsDir">选择</el-button>
-                      <el-button text :disabled="!extras.shorts_dir" @click="extras.shorts_dir = ''">
-                        整库
-                      </el-button>
-                    </div>
-                  </SettingField>
                 </div>
               </div>
 
@@ -2084,16 +2155,27 @@ function downloadBackup() {
                   <el-icon><InfoFilled /></el-icon>
                   <div>
                     <div>
-                      开启后:<b>直接往存储频道发媒体</b>会自动登记进网盘(零流量);
-                      白名单用户私聊发送<b>文件、视频、图片或音频</b>也会按原类型零流量转存。
+                      <b>Bot 私聊收件</b>和<b>频道收件</b>可独立开启或关闭，
+                      文件、视频、图片或音频按原类型零流量入库，两种入口共用下方分类目录。
                     </div>
                     <div>官方 Bot API 下载单文件上限 20MB:更大的文件也会入库,但需要自建端点才能下载。</div>
                   </div>
                 </div>
 
                 <div class="fields">
-                  <SettingField label="启用收件" inline wide>
-                    <el-switch v-model="extras.inbox_enabled" />
+                  <SettingField
+                    label="Bot 私聊收件"
+                    help="将白名单用户私聊发给主 Bot 的文件转存到存储频道。"
+                    inline
+                  >
+                    <el-switch v-model="extras.inbox_bot_enabled" />
+                  </SettingField>
+                  <SettingField
+                    label="频道收件"
+                    help="将直接发送到存储频道的文件登记进网盘。"
+                    inline
+                  >
+                    <el-switch v-model="extras.inbox_channel_enabled" />
                   </SettingField>
 
                   <SettingField
@@ -2116,7 +2198,7 @@ function downloadBackup() {
                     <div class="ctl-row">
                       <el-input
                         v-model="extras.inbox_allowed_chats"
-                        placeholder="如 123456789,987654321;留空则只收频道直发"
+                        placeholder="如 123456789,987654321；留空则不接收私聊文件"
                       />
                       <el-button @click="openDetect">检测 ID</el-button>
                     </div>
@@ -2177,7 +2259,7 @@ function downloadBackup() {
                               <el-input
                                 v-model="inboxRuleExtensionDrafts[index]"
                                 placeholder="输入 mp3、flac 或 tar.gz"
-                                @keydown.enter.prevent="addRuleExtensions(rule, index)"
+                                @keydown.enter="!isComposingKey($event) && ($event.preventDefault(), addRuleExtensions(rule, index))"
                               />
                               <el-button @click="addRuleExtensions(rule, index)">添加</el-button>
                             </div>
@@ -2253,7 +2335,7 @@ function downloadBackup() {
       </div>
     </transition>
 
-    <el-dialog v-model="inboxFailureDialog" title="Bot 收件死信" width="760px" align-center>
+    <ResponsivePanel v-model="inboxFailureDialog" title="Bot 收件死信" width="760px" align-center>
       <el-table :data="inboxFailures" v-loading="inboxFailureLoading" size="small">
         <el-table-column prop="update_id" label="Update ID" width="120" />
         <el-table-column prop="attempts" label="尝试" width="72" />
@@ -2274,11 +2356,11 @@ function downloadBackup() {
         </el-button>
         <el-button type="primary" @click="inboxFailureDialog = false">关闭</el-button>
       </template>
-    </el-dialog>
+    </ResponsivePanel>
 
     <DirPicker ref="inboxDirPicker" />
 
-    <el-dialog v-model="detectDialog" title="检测频道 / 用户 ID" width="680px" align-center>
+    <ResponsivePanel v-model="detectDialog" title="检测频道 / 用户 ID" width="680px" align-center>
       <div class="note">
         <el-icon><InfoFilled /></el-icon>
         <div>
@@ -2339,9 +2421,9 @@ function downloadBackup() {
         <el-button @click="detectDialog = false">关闭</el-button>
         <el-button type="primary" :loading="detecting" @click="detect">重新检测</el-button>
       </template>
-    </el-dialog>
+    </ResponsivePanel>
 
-    <el-dialog v-model="envDialog" title="当前生效配置(.env 格式)" width="640px" align-center>
+    <ResponsivePanel v-model="envDialog" title="当前生效配置(.env 格式)" width="640px" align-center>
       <div class="note warn">
         <el-icon><WarnTriangleFilled /></el-icon>
         <div>包含 Bot Token 与密码,注意不要外传。</div>
@@ -2351,7 +2433,7 @@ function downloadBackup() {
         <el-button @click="envDialog = false">关闭</el-button>
         <el-button type="primary" @click="copyEnv">复制</el-button>
       </template>
-    </el-dialog>
+    </ResponsivePanel>
   </div>
 </template>
 
@@ -3221,4 +3303,17 @@ function downloadBackup() {
     grid-column: auto;
   }
 }
+@media (max-width: 767px) {
+  .page { min-height: 0; padding: 12px 12px 100px; }
+  .topbar { gap: 6px; flex-wrap: wrap; padding: 8px; }
+  .layout { gap: 12px; }.pane { min-width: 0; padding: 16px; }
+  .nav { box-sizing: border-box; }.nav-item { min-height: 44px; }
+  .fields, .ro-grid { grid-template-columns: minmax(0, 1fr); }
+  .row, .ctl-row, .block-head { flex-wrap: wrap; }
+  .ctl-row > *, .fields > *, .ro-item { min-width: 0; max-width: 100%; box-sizing: border-box; }
+  .ro-val, code { overflow-wrap: anywhere; }
+  .savebar { bottom: calc(64px + var(--safe-bottom)); width: calc(100% - 24px - var(--safe-left) - var(--safe-right)); box-sizing: border-box; flex-wrap: wrap; justify-content: center; padding: 10px; gap: 8px; }
+  .savebar-text { min-width: 0; }.log-content { max-width: 100%; overflow: auto; }
+}
+:global(.keyboard-open) .savebar { bottom: calc(var(--app-height) - var(--visual-height) - var(--visual-top) + 8px); }
 </style>

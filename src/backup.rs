@@ -228,6 +228,7 @@ async fn backup_selected(
     }
     let _guard = BACKUP_LOCK.lock().await;
     let snapshot = create_snapshot(vfs, runtime).await?;
+    let proxy = runtime.current().proxy.clone();
 
     let telegram = async {
         if selection.telegram {
@@ -243,7 +244,7 @@ async fn backup_selected(
     let webdav = async {
         if selection.webdav {
             Some(
-                backup_webdav(&vfs.db, extras, &snapshot)
+                backup_webdav(&vfs.db, extras, &snapshot, &proxy)
                     .await
                     .map(|()| (Destination::Webdav, 1)),
             )
@@ -254,7 +255,7 @@ async fn backup_selected(
     let s3 = async {
         if selection.s3 {
             Some(
-                backup_s3(&vfs.db, extras, &snapshot)
+                backup_s3(&vfs.db, extras, &snapshot, &proxy)
                     .await
                     .map(|()| (Destination::S3, 1)),
             )
@@ -530,8 +531,8 @@ async fn enqueue_telegram_cleanup(vfs: &Vfs, messages: &[StoredMessage]) {
 
 // ---------- WebDAV ----------
 
-async fn backup_webdav(db: &Db, extras: &Extras, snapshot: &Snapshot) -> AppResult<()> {
-    let client = backup_http_client()?;
+async fn backup_webdav(db: &Db, extras: &Extras, snapshot: &Snapshot, proxy: &crate::proxy::ProxyConfig) -> AppResult<()> {
+    let client = backup_http_client(proxy)?;
     let url = webdav_object_url(&extras.backup_webdav_url, &snapshot.name)?;
     let file = tokio::fs::File::open(&snapshot.path).await?;
     let mut request = client
@@ -627,8 +628,8 @@ fn webdav_identity(extras: &Extras) -> String {
 
 // ---------- S3 ----------
 
-async fn backup_s3(db: &Db, extras: &Extras, snapshot: &Snapshot) -> AppResult<()> {
-    let client = backup_http_client()?;
+async fn backup_s3(db: &Db, extras: &Extras, snapshot: &Snapshot, proxy: &crate::proxy::ProxyConfig) -> AppResult<()> {
+    let client = backup_http_client(proxy)?;
     let key = s3_object_key(&extras.backup_s3_prefix, &snapshot.name);
     let url = s3_object_url(extras, &key)?;
     let payload_hash = sha256_file(&snapshot.path).await?;
@@ -898,14 +899,14 @@ async fn finish_remote_cleanup(
     db.setting_set(setting_key, &serialized).await
 }
 
-fn backup_http_client() -> AppResult<reqwest::Client> {
-    reqwest::Client::builder()
+fn backup_http_client(proxy: &crate::proxy::ProxyConfig) -> AppResult<reqwest::Client> {
+    proxy.http_builder()?
         .connect_timeout(Duration::from_secs(15))
         .timeout(HTTP_TIMEOUT)
         // 带认证的 PUT 不跨主机自动跳转，避免凭据或签名被错误转发。
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|error| AppError::Internal(error.into()))
+        .map_err(|_| AppError::BadRequest("构造备份 HTTP 客户端失败".into()))
 }
 
 fn remote_request_error(action: &str, error: &reqwest::Error) -> AppError {
@@ -1055,14 +1056,14 @@ mod tests {
             backup_s3_secret_key: "secret".into(),
             backup_s3_session_token: String::new(),
             backup_s3_path_style: true,
-            inbox_enabled: false,
+            inbox_bot_enabled: false,
+            inbox_channel_enabled: false,
             inbox_allowed_chats: String::new(),
             inbox_dir: "/收件箱".into(),
             inbox_video_dir: "/收件箱/视频".into(),
             inbox_image_dir: "/收件箱/图片".into(),
             inbox_book_dir: "/收件箱/书籍".into(),
             inbox_rules: Vec::new(),
-            shorts_dir: String::new(),
             auto_delete_message: false,
         }
     }
@@ -1148,7 +1149,7 @@ mod tests {
         extras.backup_webdav_password = "secret".into();
         let snapshot = test_snapshot(b"sqlite snapshot");
 
-        backup_webdav(&db, &extras, &snapshot).await.unwrap();
+        backup_webdav(&db, &extras, &snapshot, &crate::proxy::ProxyConfig::default()).await.unwrap();
         server.abort();
         {
             let requests = requests.lock().unwrap();
@@ -1181,7 +1182,7 @@ mod tests {
         extras.backup_s3_prefix = "tgdrive".into();
         let snapshot = test_snapshot(b"sqlite snapshot");
 
-        backup_s3(&db, &extras, &snapshot).await.unwrap();
+        backup_s3(&db, &extras, &snapshot, &crate::proxy::ProxyConfig::default()).await.unwrap();
         server.abort();
         {
             let requests = requests.lock().unwrap();
@@ -1204,6 +1205,35 @@ mod tests {
             setting_i64(&db, Destination::S3.last_key()).await.unwrap(),
             Some(snapshot.ts)
         );
+    }
+
+    #[tokio::test]
+    async fn remote_backups_use_proxy_without_replacing_destination_credentials() {
+        let (endpoint, requests, server) = mock_storage_server().await;
+        let proxy_url = endpoint.replacen("http://", "http://proxy-user:proxy-pass@", 1);
+        let proxy = crate::proxy::ProxyConfig::new(true, &proxy_url).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(directory.path().join("proxy-backup.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut extras = s3_extras();
+        extras.backup_webdav_url = "http://dav-proxy-test.invalid/backups".into();
+        extras.backup_webdav_username = "alice".into();
+        extras.backup_webdav_password = "secret".into();
+        extras.backup_s3_endpoint = "http://s3-proxy-test.invalid/api".into();
+        let snapshot = test_snapshot(b"proxied snapshot");
+        backup_webdav(&db, &extras, &snapshot, &proxy).await.unwrap();
+        backup_s3(&db, &extras, &snapshot, &proxy).await.unwrap();
+        server.abort();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].headers["authorization"], "Basic YWxpY2U6c2VjcmV0");
+        assert!(requests[1].headers["authorization"].to_str().unwrap().starts_with("AWS4-HMAC-SHA256"));
+        for request in requests.iter() {
+            assert_eq!(request.method, Method::PUT);
+            assert_eq!(request.headers["proxy-authorization"], "Basic cHJveHktdXNlcjpwcm94eS1wYXNz");
+            assert_eq!(request.body, b"proxied snapshot");
+        }
     }
 
     #[tokio::test]

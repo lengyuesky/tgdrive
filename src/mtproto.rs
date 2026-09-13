@@ -1,13 +1,19 @@
 //! 通过 MTProto 按需读取 Telegram 文件。
 //!
 //! 本地 Bot API 的 `getFile` 会在返回路径前先下载完整文件，不适合浏览器 Range
-//! 播放。这里直接解析 Bot API `file_id`，每次最多向 Telegram 请求 512 KiB，
-//! 再通过有背压的管道交给现有 `ChunkedReader`。
+//! 播放。这里直接解析 Bot API `file_id`，并行请求 1~8 个 512 KiB 分段，
+//! 按顺序交给现有 `ChunkedReader`；有界预读随读取流一起释放。
 
+use crate::config::{
+    DEFAULT_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_CONCURRENCY, MIN_DOWNLOAD_CONCURRENCY,
+};
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
+use crate::proxy::{DcTunnel, ProxyClient, ProxyConfig};
 use crate::telegram::ByteReader;
 use base64::Engine as _;
+use bytes::Bytes;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use grammers_client::Client;
 use grammers_client::media::Downloadable;
 use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
@@ -18,14 +24,14 @@ use grammers_session::{BoxFuture, Session, SessionData};
 use grammers_tl_types as tl;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddrV4;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::OnceCell;
+use tokio::sync::Semaphore;
 
-/// Telegram 单次 `upload.getFile` 请求允许的最大值。
+/// 当前 grammers 下载接口支持的最大分段；Telegram 协议本身可支持更大的请求。
 const REQUEST_SIZE: i32 = 512 * 1024;
-/// 小管道用于制造背压，避免播放器暂停时继续预取很多数据。
-const PIPE_CAPACITY: usize = 64 * 1024;
 const SESSION_VERSION: u8 = 1;
 
 const WEB_LOCATION_FLAG: i32 = 1 << 24;
@@ -37,6 +43,13 @@ pub struct MtprotoConfig {
     db: Db,
     api_id: i32,
     api_hash: Arc<str>,
+    download: Arc<DownloadControl>,
+}
+
+/// 并发设置热更新；同一 Bot 的历史存储目标共享总量限制。
+struct DownloadControl {
+    concurrency: AtomicUsize,
+    bot_requests: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl MtprotoConfig {
@@ -59,7 +72,32 @@ impl MtprotoConfig {
             db,
             api_id,
             api_hash: Arc::from(api_hash),
+            download: Arc::new(DownloadControl {
+                concurrency: AtomicUsize::new(DEFAULT_DOWNLOAD_CONCURRENCY),
+                bot_requests: Mutex::new(HashMap::new()),
+            }),
         }))
+    }
+
+    pub fn download_concurrency(&self) -> usize {
+        self.download.concurrency.load(Ordering::Acquire)
+    }
+
+    pub fn set_download_concurrency(&self, concurrency: usize) {
+        self.download.concurrency.store(
+            concurrency.clamp(MIN_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_CONCURRENCY),
+            Ordering::Release,
+        );
+    }
+
+    fn request_slots(&self, bot_token: &str) -> Arc<Semaphore> {
+        self.download
+            .bot_requests
+            .lock()
+            .unwrap()
+            .entry(bot_token.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY)))
+            .clone()
     }
 }
 
@@ -68,71 +106,68 @@ pub struct MtprotoClient {
     config: MtprotoConfig,
     storage_target_id: i64,
     bot_token: Arc<str>,
-    state: OnceCell<ClientState>,
+    state: tokio::sync::Mutex<Option<Arc<ClientState>>>,
+    network: Arc<ProxyClient>,
+    request_slots: Arc<Semaphore>,
 }
 
 struct ClientState {
+    proxy: ProxyConfig,
     client: Client,
     handle: SenderPoolFatHandle,
-    /// 保留任务句柄；连接由 `handle.quit()` 结束。
-    _runner_task: tokio::task::JoinHandle<()>,
+    runner_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for ClientState {
     fn drop(&mut self) {
         self.handle.quit();
+        // 登录途中取消、代理切换或最后一个读取流释放时都不能留下连接任务。
+        self.runner_task.abort();
     }
 }
 
 impl MtprotoClient {
-    pub fn new(config: MtprotoConfig, storage_target_id: i64, bot_token: &str) -> Self {
+    pub fn new(config: MtprotoConfig, storage_target_id: i64, bot_token: &str, network: Arc<ProxyClient>) -> Self {
+        let request_slots = config.request_slots(bot_token);
         Self {
             config,
             storage_target_id,
             bot_token: Arc::from(bot_token),
-            state: OnceCell::new(),
+            state: tokio::sync::Mutex::new(None),
+            network,
+            request_slots,
         }
     }
 
-    async fn state(&self) -> AppResult<&ClientState> {
-        self.state
-            .get_or_try_init(|| async {
-                let key = format!("mtproto.session.{}", self.storage_target_id);
-                let session = Arc::new(PersistentSession::load(self.config.db.clone(), key).await?);
-                let SenderPool { runner, handle, .. } =
-                    SenderPool::new(session, self.config.api_id);
-                let client = Client::new(handle.clone());
-                let runner_task = tokio::spawn(runner.run());
-
-                let authorized = match client.is_authorized().await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        handle.quit();
-                        runner_task.abort();
-                        return Err(mtproto_error("检查登录状态失败", error));
-                    }
-                };
-                if !authorized
-                    && let Err(error) = client
-                        .bot_sign_in(&self.bot_token, &self.config.api_hash)
-                        .await
-                {
-                    handle.quit();
-                    runner_task.abort();
-                    return Err(mtproto_error("Bot 登录失败", error));
-                }
-
-                tracing::info!(
-                    storage_target_id = self.storage_target_id,
-                    "MTProto 流式下载会话已就绪"
-                );
-                Ok(ClientState {
-                    client,
-                    handle,
-                    _runner_task: runner_task,
-                })
-            })
-            .await
+    async fn state(&self) -> AppResult<Arc<ClientState>> {
+        let mut current = self.state.lock().await;
+        let snapshot = self.network.current();
+        if let Some(state) = current.as_ref()
+            && state.proxy == snapshot.config
+        {
+            return Ok(state.clone());
+        }
+        let key = format!("mtproto.session.{}", self.storage_target_id);
+        let mut session = PersistentSession::load(self.config.db.clone(), key).await?;
+        session.proxy = snapshot.config.clone();
+        let SenderPool { runner, handle, .. } =
+            SenderPool::new(Arc::new(session), self.config.api_id);
+        let state = Arc::new(ClientState {
+            proxy: snapshot.config.clone(),
+            client: Client::new(handle.clone()),
+            handle,
+            runner_task: tokio::spawn(runner.run()),
+        });
+        let authorized = state.client.is_authorized().await
+            .map_err(|error| mtproto_error("检查登录状态失败", error))?;
+        if !authorized {
+            state.client.bot_sign_in(&self.bot_token, &self.config.api_hash).await
+                .map_err(|error| mtproto_error("Bot 登录失败", error))?;
+        }
+        tracing::info!(storage_target_id = self.storage_target_id, "MTProto 流式下载会话已就绪");
+        // 已打开的读取流持有旧会话，新代理只用于之后打开的流。
+        *current = Some(state.clone());
+        Ok(state)
     }
 
     /// 尝试按 Range 打开文档型文件。
@@ -145,13 +180,14 @@ impl MtprotoClient {
         message_id: i64,
         size: u64,
         offset: u64,
+        length: u64,
     ) -> AppResult<Option<ByteReader>> {
         if offset > size {
             return Err(AppError::Telegram(format!(
                 "分块偏移 {offset} 超过分块大小 {size}"
             )));
         }
-        if offset == size {
+        if offset == size || length == 0 {
             return Ok(Some(Box::pin(std::io::Cursor::new(Vec::<u8>::new()))));
         }
 
@@ -159,76 +195,109 @@ impl MtprotoClient {
             return Ok(None);
         };
         let state = self.state().await?;
-
-        // Telegram 要求 offset 与请求块大小对齐；只多取当前位置之前不足 512 KiB 的前缀。
-        let aligned = offset / REQUEST_SIZE as u64 * REQUEST_SIZE as u64;
-        let skip = usize::try_from(offset - aligned)
-            .map_err(|_| AppError::Telegram("分块偏移无法转换".into()))?;
-        let skip_chunks = i32::try_from(aligned / REQUEST_SIZE as u64)
-            .map_err(|_| AppError::Telegram("分块偏移过大".into()))?;
-        let mut download = state
-            .client
-            .iter_download(&location)
-            .chunk_size(REQUEST_SIZE)
-            .skip_chunks(skip_chunks);
-
-        // 首次请求在返回 HTTP body 前完成，使解析、鉴权和首块网络错误能正常返回。
-        let first = download
-            .next()
-            .await
-            .map_err(|error| mtproto_error("读取首个数据块失败", error))?
-            .ok_or_else(|| AppError::Telegram("Telegram 未返回分块数据".into()))?;
-        if skip >= first.len() {
-            return Err(AppError::Telegram(
-                "Telegram 返回的首个数据块比请求偏移短".into(),
-            ));
-        }
-
-        let mut remaining = size - offset;
-        let first_len = (first.len() - skip).min(remaining as usize);
-        let first = first[skip..skip + first_len].to_vec();
-        remaining -= first_len as u64;
-
-        let (mut writer, reader) = tokio::io::duplex(PIPE_CAPACITY);
+        let location = Arc::new(location);
         let storage_target_id = self.storage_target_id;
-        tokio::spawn(async move {
-            if writer.write_all(&first).await.is_err() {
-                return;
-            }
-            while remaining > 0 {
-                let bytes = match download.next().await {
-                    Ok(Some(bytes)) if !bytes.is_empty() => bytes,
-                    Ok(_) => {
-                        tracing::warn!(
-                            storage_target_id,
-                            message_id,
-                            remaining,
-                            "MTProto 分块提前结束"
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            storage_target_id,
-                            message_id,
-                            error = %error,
-                            "MTProto 分段读取中断"
-                        );
-                        return;
-                    }
-                };
-                let take = bytes.len().min(remaining as usize);
-                // HTTP 客户端关闭预览后 reader 会被丢弃，此处立刻失败并停止后续请求。
-                if writer.write_all(&bytes[..take]).await.is_err() {
-                    return;
+        let concurrency = self.config.download_concurrency();
+        let reader = open_parallel_stream(
+            offset.saturating_add(length).min(size),
+            offset,
+            concurrency,
+            self.request_slots.clone(),
+            move |part_offset| {
+                let state = state.clone();
+                let location = location.clone();
+                async move {
+                    let skip_chunks = i32::try_from(part_offset / REQUEST_SIZE as u64)
+                        .map_err(|_| AppError::Telegram("分块偏移过大".into()))?;
+                    let mut download = state.client
+                        .iter_download(location.as_ref())
+                        .chunk_size(REQUEST_SIZE)
+                        .skip_chunks(skip_chunks);
+                    download
+                        .next()
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                storage_target_id,
+                                message_id,
+                                part_offset,
+                                error = %error,
+                                "MTProto 分段读取中断"
+                            );
+                            mtproto_error("读取数据块失败", error)
+                        })
+                        .map(|bytes| bytes.unwrap_or_default())
                 }
-                remaining -= take as u64;
-            }
-            let _ = writer.shutdown().await;
-        });
-
-        Ok(Some(Box::pin(reader)))
+            },
+        )
+        .await?;
+        Ok(Some(reader))
     }
+}
+
+/// 按需填充固定大小的请求窗口，乱序完成的数据仍按文件偏移输出。
+/// 没有独立预取任务：暂停读取不再补充请求，丢弃 reader 同时丢弃全部待取分段。
+async fn open_parallel_stream<F, Fut>(
+    end: u64,
+    offset: u64,
+    concurrency: usize,
+    request_slots: Arc<Semaphore>,
+    fetch: F,
+) -> AppResult<ByteReader>
+where
+    F: Fn(u64) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = AppResult<Vec<u8>>> + Send + 'static,
+{
+    if offset > end {
+        return Err(AppError::Telegram("下载偏移超过范围终点".into()));
+    }
+    if offset == end {
+        return Ok(Box::pin(std::io::Cursor::new(Vec::<u8>::new())));
+    }
+    let part_size = REQUEST_SIZE as u64;
+    let first_part = offset / part_size;
+    let part_count = end.div_ceil(part_size);
+    let fetch = Arc::new(fetch);
+    let mut parts = stream::iter(first_part..part_count)
+        .map(move |index| {
+            let fetch = fetch.clone();
+            let request_slots = request_slots.clone();
+            async move {
+                let _permit = request_slots.acquire_owned().await.map_err(|_| {
+                    AppError::Telegram("下载并发控制已关闭".into())
+                })?;
+                let part_offset = index * part_size;
+                let expected = (end - part_offset).min(part_size) as usize;
+                let bytes = fetch(part_offset).await?;
+                if bytes.len() < expected {
+                    return Err(AppError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "MTProto 分段提前结束：偏移 {part_offset}，预期 {expected} 字节，实际 {} 字节",
+                            bytes.len()
+                        ),
+                    )));
+                }
+                let skip = offset.saturating_sub(part_offset) as usize;
+                Ok(Bytes::from(bytes).slice(skip..expected))
+            }
+        })
+        .buffered(concurrency.clamp(MIN_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_CONCURRENCY))
+        .boxed();
+
+    // 在交给 ChunkedReader 前验证首段；后续错误通过读取流原样返回。
+    let first = parts
+        .try_next()
+        .await?
+        .ok_or_else(|| AppError::Telegram("Telegram 未返回分块数据".into()))?;
+    let stream = stream::once(async move { Ok(first) })
+        .chain(parts)
+        .map_err(|error| match error {
+            AppError::Io(error) => error,
+            other => std::io::Error::other(other.to_string()),
+        })
+        .boxed();
+    Ok(Box::pin(tokio_util::io::StreamReader::new(stream)))
 }
 
 fn mtproto_error(context: &str, error: impl std::fmt::Display) -> AppError {
@@ -434,6 +503,8 @@ struct PersistentSession {
     key: String,
     state: Mutex<SessionState>,
     persist_lock: tokio::sync::Mutex<()>,
+    proxy: ProxyConfig,
+    tunnels: Mutex<HashMap<SocketAddrV4, DcTunnel>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -446,6 +517,8 @@ enum SessionError {
     Database(String),
     #[error("会话数据无效: {0}")]
     Invalid(String),
+    #[error("MTProto 代理隧道不可用: {0}")]
+    Tunnel(#[from] std::io::Error),
 }
 
 impl PersistentSession {
@@ -468,6 +541,8 @@ impl PersistentSession {
             key,
             state: Mutex::new(state),
             persist_lock: tokio::sync::Mutex::new(()),
+            proxy: ProxyConfig::default(),
+            tunnels: Mutex::new(HashMap::new()),
         })
     }
 
@@ -504,12 +579,29 @@ impl Session for PersistentSession {
     }
 
     fn dc_option(&self, dc_id: i32) -> Result<Option<DcOption>, Self::Error> {
-        Ok(self.state()?.dc_options.get(&dc_id).cloned())
+        let Some(mut option) = self.state()?.dc_options.get(&dc_id).cloned() else {
+            return Ok(None);
+        };
+        if self.proxy.enabled {
+            let mut tunnels = self.tunnels.lock().map_err(|_| SessionError::Poisoned)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = tunnels.entry(option.ipv4) {
+                entry.insert(DcTunnel::new(&self.proxy, option.ipv4)?);
+            }
+            option.ipv4 = tunnels[&option.ipv4].address;
+        }
+        Ok(Some(option))
     }
 
     fn set_dc_option(&self, dc_option: &DcOption) -> BoxFuture<'_, Result<(), Self::Error>> {
-        let dc_option = dc_option.clone();
+        let mut dc_option = dc_option.clone();
         Box::pin(async move {
+            // grammers 会把查询所得的 DC 地址连同新 auth_key 写回，必须还原真实地址。
+            {
+                let tunnels = self.tunnels.lock().map_err(|_| SessionError::Poisoned)?;
+                if let Some((destination, _)) = tunnels.iter().find(|(_, tunnel)| tunnel.address == dc_option.ipv4) {
+                    dc_option.ipv4 = *destination;
+                }
+            }
             self.state()?.dc_options.insert(dc_option.id, dc_option);
             self.persist().await
         })
@@ -564,6 +656,301 @@ impl Session for PersistentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    struct ActiveFetch(Arc<AtomicUsize>);
+
+    impl Drop for ActiveFetch {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_reads_preserve_range_bytes_and_bound_concurrency() {
+        let part_size = REQUEST_SIZE as usize;
+        let data = Arc::new(
+            (0..part_size * 10 + 137)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        for concurrency in [1, 4, 8] {
+            for offset in [0, 19, part_size + 31, data.len() - 7] {
+                let active = Arc::new(AtomicUsize::new(0));
+                let peak = Arc::new(AtomicUsize::new(0));
+                let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
+                let mut reader = open_parallel_stream(
+                    data.len() as u64,
+                    offset as u64,
+                    concurrency,
+                    slots.clone(),
+                    {
+                        let data = data.clone();
+                        let active = active.clone();
+                        let peak = peak.clone();
+                        move |part_offset| {
+                            let data = data.clone();
+                            let active = active.clone();
+                            let peak = peak.clone();
+                            async move {
+                                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                let _guard = ActiveFetch(active);
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                // 故意让靠前的分段更慢，验证输出顺序不受完成顺序影响。
+                                let delay = if (part_offset / REQUEST_SIZE as u64).is_multiple_of(4)
+                                {
+                                    8
+                                } else {
+                                    1
+                                };
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                                let start = part_offset as usize;
+                                Ok(data[start..(start + part_size).min(data.len())].to_vec())
+                            }
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).await.unwrap();
+                assert_eq!(actual, data[offset..]);
+                assert!(peak.load(Ordering::SeqCst) <= concurrency);
+                if offset == 0 {
+                    assert_eq!(peak.load(Ordering::SeqCst), concurrency);
+                }
+                assert_eq!(active.load(Ordering::SeqCst), 0);
+                assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pausing_bounds_prefetch_and_dropping_cancels_pending_reads() {
+        for concurrency in [1, 4, 8] {
+            let started = Arc::new(AtomicUsize::new(0));
+            let active = Arc::new(AtomicUsize::new(0));
+            let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
+            let mut reader =
+                open_parallel_stream(REQUEST_SIZE as u64 * 100, 0, concurrency, slots.clone(), {
+                    let started = started.clone();
+                    let active = active.clone();
+                    move |part_offset| {
+                        let started = started.clone();
+                        let active = active.clone();
+                        async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            active.fetch_add(1, Ordering::SeqCst);
+                            let _guard = ActiveFetch(active);
+                            if part_offset == 0 {
+                                tokio::task::yield_now().await;
+                                Ok(vec![7; REQUEST_SIZE as usize])
+                            } else {
+                                std::future::pending().await
+                            }
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            let mut prefix = [0; 37];
+            reader.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix, [7; 37]);
+            tokio::task::yield_now().await;
+            assert_eq!(started.load(Ordering::SeqCst), concurrency);
+            assert_eq!(active.load(Ordering::SeqCst), concurrency - 1);
+            // 模拟关闭预览或 seek 丢弃旧流；所有未完成分段及其并发许可立即释放。
+            drop(reader);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
+            assert_eq!(started.load(Ordering::SeqCst), concurrency);
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_streams_share_the_bot_request_limit() {
+        let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let readers = (0..3).map(|_| {
+            open_parallel_stream(REQUEST_SIZE as u64 * 100, 0, 8, slots.clone(), {
+                let active = active.clone();
+                let started = started.clone();
+                move |_| {
+                    let active = active.clone();
+                    let started = started.clone();
+                    async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _guard = ActiveFetch(active);
+                        std::future::pending().await
+                    }
+                }
+            })
+        });
+        let mut opening = Box::pin(futures_util::future::join_all(readers));
+        assert!(futures_util::poll!(opening.as_mut()).is_pending());
+        assert_eq!(started.load(Ordering::SeqCst), MAX_DOWNLOAD_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), MAX_DOWNLOAD_CONCURRENCY);
+        drop(opening);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn truncated_parts_and_network_errors_are_reported() {
+        for first_bad in [true, false] {
+            let reader = open_parallel_stream(
+                REQUEST_SIZE as u64 + 13,
+                0,
+                4,
+                Arc::new(Semaphore::new(8)),
+                move |offset| async move {
+                    if offset == 0 {
+                        Ok(vec![0; REQUEST_SIZE as usize - usize::from(first_bad)])
+                    } else {
+                        Ok(vec![0; 12])
+                    }
+                },
+            )
+            .await;
+            if first_bad {
+                assert!(
+                    matches!(reader, Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+                );
+            } else {
+                let error = reader
+                    .unwrap()
+                    .read_to_end(&mut Vec::new())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+        }
+        let mut reader = open_parallel_stream(
+            REQUEST_SIZE as u64 * 3,
+            0,
+            4,
+            Arc::new(Semaphore::new(8)),
+            |offset| async move {
+                if offset == 0 {
+                    Ok(vec![0; REQUEST_SIZE as usize])
+                } else {
+                    Err(AppError::Telegram("注入下载错误".into()))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let mut actual = Vec::new();
+        let error = reader.read_to_end(&mut actual).await.unwrap_err();
+        assert!(error.to_string().contains("注入下载错误"));
+        assert_eq!(actual.len(), REQUEST_SIZE as usize);
+    }
+
+    #[tokio::test]
+    async fn eof_and_invalid_offsets_do_not_fetch_data() {
+        let calls = Arc::new(AtomicU64::new(0));
+        for offset in [17, 18] {
+            let result = open_parallel_stream(17, offset, 4, Arc::new(Semaphore::new(8)), {
+                let calls = calls.clone();
+                move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(Vec::new()) }
+                }
+            })
+            .await;
+            if offset == 17 {
+                assert_eq!(result.unwrap().read(&mut [0; 1]).await.unwrap(), 0);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_dc_addresses_are_reused_but_never_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("proxy-session.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let key = "test.proxy.session";
+        let mut session = PersistentSession::load(db.clone(), key.into()).await.unwrap();
+        let dc = session.home_dc_id().unwrap();
+        let original = session.dc_option(dc).unwrap().unwrap();
+        session.proxy = ProxyConfig::new(true, "http://proxy-test.invalid:7890").unwrap();
+        let mut proxied = session.dc_option(dc).unwrap().unwrap();
+        assert!(proxied.ipv4.ip().is_loopback());
+        assert_ne!(proxied.ipv4, original.ipv4);
+        assert_eq!(session.dc_option(dc).unwrap().unwrap().ipv4, proxied.ipv4);
+        assert_eq!(session.tunnels.lock().unwrap().len(), 1);
+        proxied.auth_key = Some([7; 256]);
+        session.set_dc_option(&proxied).await.unwrap();
+
+        let reloaded = PersistentSession::load(db, key.into()).await.unwrap();
+        let saved = reloaded.dc_option(dc).unwrap().unwrap();
+        assert_eq!(saved.ipv4, original.ipv4);
+        assert_eq!(saved.ipv6, original.ipv6);
+        assert_eq!(saved.auth_key, proxied.auth_key);
+        assert!(reloaded.tunnels.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn historical_targets_for_one_bot_share_request_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("limits.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let config = MtprotoConfig::from_values(db, "1", "test-hash")
+            .unwrap()
+            .unwrap();
+        let network = Arc::new(ProxyClient::new(ProxyConfig::default()).unwrap());
+        let first = MtprotoClient::new(config.clone(), 1, "same-bot", network.clone());
+        let historical = MtprotoClient::new(config.clone(), 2, "same-bot", network.clone());
+        let another = MtprotoClient::new(config.clone(), 3, "another-bot", network);
+        assert!(Arc::ptr_eq(&first.request_slots, &historical.request_slots));
+        assert!(!Arc::ptr_eq(&first.request_slots, &another.request_slots));
+        config.set_download_concurrency(8);
+        assert_eq!(first.config.download_concurrency(), 8);
+        assert_eq!(historical.config.download_concurrency(), 8);
+    }
+
+    #[tokio::test]
+    async fn short_ranges_only_fetch_the_parts_they_cover() {
+        let part_size = REQUEST_SIZE as u64;
+        for (offset, length) in [(13, 1), (part_size - 7, 29), (part_size + 31, 17)] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut reader =
+                open_parallel_stream(offset + length, offset, 8, Arc::new(Semaphore::new(8)), {
+                    let requests = requests.clone();
+                    move |start| {
+                        requests.lock().unwrap().push(start);
+                        async move {
+                            Ok((start..start + part_size)
+                                .map(|i| (i % 251) as u8)
+                                .collect())
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.unwrap();
+            assert_eq!(
+                actual,
+                (offset..offset + length)
+                    .map(|i| (i % 251) as u8)
+                    .collect::<Vec<_>>()
+            );
+            let expected = (offset / part_size..(offset + length).div_ceil(part_size))
+                .map(|i| i * part_size)
+                .collect::<Vec<_>>();
+            assert_eq!(*requests.lock().unwrap(), expected);
+        }
+    }
 
     fn encode_file_id(file_type: i32, file_reference: &[u8], id: i64, hash: i64) -> String {
         let mut raw = Vec::new();

@@ -20,6 +20,7 @@ async fn fixture() -> (Router, AppState, tempfile::TempDir) {
     let db = Db::open(&db_path).await.unwrap();
     // 不读取环境配置，也不创建任何 Telegram 客户端；元数据请求必须仍能成功。
     let env = Arc::new(Config {
+        proxy: crate::proxy::ProxyConfig::default(),
         listen: "127.0.0.1:0".parse().unwrap(),
         bot_token: String::new(),
         upload_bot_tokens: vec![],
@@ -27,6 +28,7 @@ async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         api_base: "http://127.0.0.1:1".into(),
         chunk_size: 1024 * 1024,
         upload_concurrency: 1,
+        download_concurrency: crate::config::DEFAULT_DOWNLOAD_CONCURRENCY,
         db_path,
         tmp_dir: dir.path().to_path_buf(),
         local_data_root: dir.path().to_path_buf(),
@@ -39,7 +41,7 @@ async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         send_video: false,
     });
     let cfg = RuntimeCfg::load(&db, &env).await.unwrap();
-    let tg = Arc::new(TgRegistry::new(&[], None, vec![], None).unwrap());
+    let tg = Arc::new(TgRegistry::new(&[], None, vec![], None, crate::proxy::ProxyConfig::default()).unwrap());
     assert!(tg.current().is_err());
     let knobs = Arc::new(UploadKnobs::new(
         cfg.chunk_size,

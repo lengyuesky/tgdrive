@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "paths": {
+      "@playwright/test": ["./node_modules/@playwright/test"],
+      "@apps/*": ["../apps/frontend/*"],
+      "@drive/*": ["./src/*"]
+    }
+  },
+  "include": ["../apps/tests/browser/**/*.ts", "../apps/tests/browser/**/*.mts", "./mobile-e2e/**/*.ts", "./playwright.mobile.config.ts"]
+}

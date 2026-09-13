@@ -62,6 +62,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
+        .merge(crate::apps::public_router())
         .route("/auth/login", post(login))
         // 分享链接:免登录访问
         .route("/share/{token}", get(share_meta))
@@ -69,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         .route("/share/{token}/list", get(share_list_dir))
         .route("/share/{token}/download", get(share_download));
     let protected = Router::new()
+        .merge(crate::apps::protected_router())
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/fs/list", get(list))
@@ -150,6 +152,14 @@ pub fn router(state: AppState) -> Router {
 
 /// cookie 或 Basic 任一通过即放行
 pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    // 隔离应用只能经宿主的权限网关调用能力，不能借浏览器 Cookie 直连管理接口。
+    if req
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|value| value == "null")
+    {
+        return AppError::Forbidden("隔离页面不能直接访问网盘接口".into()).into_response();
+    }
     if state.auth.check_headers(req.headers()) {
         return next.run(req).await;
     }
@@ -735,6 +745,14 @@ async fn thumbnail_get(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let node = state.vfs.resolve(&q.path).await?;
+    thumbnail_for_node(&state, &node, &headers).await
+}
+
+pub(crate) async fn thumbnail_for_node(
+    state: &AppState,
+    node: &Node,
+    headers: &HeaderMap,
+) -> AppResult<Response> {
     if node.is_dir {
         return Err(AppError::IsDirectory);
     }
@@ -824,7 +842,7 @@ async fn download(
 }
 
 /// 流式返回一个文件节点(带 Range 支持);REST 下载与分享下载共用
-async fn stream_node(
+pub(crate) async fn stream_node(
     state: &AppState,
     node: &Node,
     headers: &HeaderMap,
@@ -876,7 +894,8 @@ async fn stream_node(
         Ok(Some((start, end))) => {
             let len = end - start + 1;
             let reader = state.vfs.open_reader(node, start).await?;
-            let body = axum::body::Body::from_stream(ReaderStream::new(reader.take(len)));
+            let body =
+                axum::body::Body::from_stream(ReaderStream::new(reader.with_read_limit(len)));
             Ok(Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, response_mime)
@@ -980,8 +999,6 @@ async fn delete(
 async fn info(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let (files, dirs, total) = state.vfs.db.stats().await?;
     let c = state.rt.current();
-    // 短视频模式的取材目录由后台设置,前端每次进入都读最新值。
-    let shorts_dir = crate::extras::load(&state.vfs.db).await?.shorts_dir;
     Ok(Json(serde_json::json!({
         "username": state.auth.username(),
         "api_base": c.api_base,
@@ -991,7 +1008,6 @@ async fn info(State(state): State<AppState>) -> AppResult<Json<serde_json::Value
         "files": files,
         "dirs": dirs,
         "total_size": total,
-        "shorts_dir": shorts_dir,
     })))
 }
 
@@ -1007,6 +1023,8 @@ async fn admin_config(State(state): State<AppState>) -> AppResult<Json<serde_jso
     Ok(Json(serde_json::json!({
         "values": {
             "api_base": c.api_base,
+            "proxy_enabled": c.proxy.enabled,
+            "proxy_url": crate::proxy::mask_url(&c.proxy.url),
             "bot_token": settings::mask(&c.bot_token),
             "upload_bot_tokens": c
                 .upload_bot_tokens
@@ -1017,6 +1035,7 @@ async fn admin_config(State(state): State<AppState>) -> AppResult<Json<serde_jso
             "chat_id": c.chat_id,
             "chunk_size": c.chunk_size,
             "upload_concurrency": c.upload_concurrency,
+            "download_concurrency": c.download_concurrency,
             "send_video": c.send_video,
             "tmp_dir": c.tmp_dir.display().to_string(),
             "username": c.username,
@@ -1094,6 +1113,8 @@ struct TestBody {
     api_base: Option<String>,
     bot_token: Option<String>,
     chat_id: Option<String>,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
 }
 
 /// 试连当前或页面上正在编辑的配置,不保存
@@ -1117,7 +1138,8 @@ async fn admin_test(
     if token.trim().is_empty() || chat_id.trim().is_empty() {
         return Err(AppError::BadRequest("请先填写 Bot Token 与存储频道".into()));
     }
-    let bot = Runtime::probe(&api_base, &token, &chat_id).await?;
+    let proxy = c.proxy.patched(b.proxy_enabled, b.proxy_url.as_deref())?;
+    let bot = Runtime::probe(&api_base, &token, &chat_id, &proxy).await?;
     Ok(Json(
         serde_json::json!({ "ok": true, "bot": bot, "api_base": api_base }),
     ))
@@ -1127,6 +1149,8 @@ async fn admin_test(
 struct DetectBody {
     api_base: Option<String>,
     bot_token: Option<String>,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
 }
 
 /// 根据 Bot Token 探测最近向 bot 发过消息的频道/用户/群,辅助填写
@@ -1152,10 +1176,11 @@ async fn admin_detect_chats(
         return Err(AppError::BadRequest("请先填写 Bot Token".into()));
     }
     // 先验证 token 可用,顺带拿 bot 用户名给前端展示操作指引
-    let bot = Runtime::probe(&api_base, &token, "0").await?;
+    let proxy = c.proxy.patched(b.proxy_enabled, b.proxy_url.as_deref())?;
+    let bot = Runtime::probe(&api_base, &token, "0", &proxy).await?;
     // 快速拉一次未确认的消息。收件轮询开着时消息会被它抢走(但它会记进
     // seen_chats),这里失败/为空都不致命,合并库里的记录照样能列出来
-    match crate::inbox::probe_updates(&api_base, &token).await {
+    match crate::inbox::probe_updates(&api_base, &token, &proxy).await {
         Ok(found) => {
             if let Err(e) = crate::inbox::remember_chats(&state.vfs.db, found).await {
                 tracing::warn!("检测:记录会话失败: {e}");
@@ -1202,6 +1227,7 @@ async fn admin_status(State(state): State<AppState>) -> AppResult<Json<serde_jso
         "official_api": c.is_official_api(),
         "chunk_size": c.chunk_size,
         "upload_concurrency": c.upload_concurrency,
+        "download_concurrency": c.download_concurrency,
         "upload_bot_count": state.vfs.tg.upload_bot_count(),
         "send_video": c.send_video,
         "files": files,
@@ -1359,7 +1385,7 @@ async fn admin_env_export(State(state): State<AppState>) -> Response {
 // ---------- 搜索 / 秒传 ----------
 
 #[derive(Deserialize, Default)]
-struct SearchQuery {
+pub(crate) struct SearchQuery {
     #[serde(default)]
     q: Option<String>,
     #[serde(default)]
@@ -1382,7 +1408,7 @@ struct SearchQuery {
     limit: Option<usize>,
 }
 
-async fn search(
+pub(crate) async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -1483,12 +1509,12 @@ async fn search(
 }
 
 #[derive(Deserialize)]
-struct FavoriteBody {
+pub(crate) struct FavoriteBody {
     path: String,
     favorite: bool,
 }
 
-async fn favorite_set(
+pub(crate) async fn favorite_set(
     State(state): State<AppState>,
     Json(body): Json<FavoriteBody>,
 ) -> AppResult<Json<serde_json::Value>> {

@@ -10,7 +10,7 @@
       </template>
       <el-form @submit.prevent="doLogin" label-position="top">
         <el-form-item label="用户名">
-          <el-input v-model="username" autocomplete="username" @keyup.enter="doLogin" />
+          <el-input v-model="username" autocomplete="username" @keydown.enter="onEnter" />
         </el-form-item>
         <el-form-item label="密码">
           <el-input
@@ -18,7 +18,7 @@
             type="password"
             show-password
             autocomplete="current-password"
-            @keyup.enter="doLogin"
+            @keydown.enter="onEnter"
           />
         </el-form-item>
         <el-button type="primary" style="width: 100%" :loading="loading" @click="doLogin">
@@ -35,14 +35,21 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Promotion } from '@element-plus/icons-vue'
 import { api, errMsg } from '../api'
+import { isComposingKey } from '../mobile/keyboard'
 
 const router = useRouter()
 const username = ref('')
 const password = ref('')
 const loading = ref(false)
 
+function onEnter(event: Event) {
+  if (isComposingKey(event)) return
+  event.preventDefault()
+  void doLogin()
+}
+
 async function doLogin() {
-  if (!username.value || !password.value) return
+  if (loading.value || !username.value || !password.value) return
   loading.value = true
   try {
     await api.login(username.value, password.value)
@@ -60,10 +67,13 @@ async function doLogin() {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 100vh;
+  min-height: var(--app-height, 100dvh);
+  padding: max(24px, var(--safe-top)) max(16px, var(--safe-right)) max(24px, var(--safe-bottom)) max(16px, var(--safe-left));
+  box-sizing: border-box;
 }
 .login-card {
   width: 380px;
+  max-width: 100%;
   border-radius: 20px;
 }
 .login-head {
@@ -89,4 +99,5 @@ async function doLogin() {
   color: var(--text-soft);
   font-size: 12px;
 }
+@media (max-width: 767px) { .login-wrap { align-items: flex-start; padding-top: max(56px, var(--safe-top)); }.login-card { border: 0; }.login-sub { font-size: 14px; } }
 </style>

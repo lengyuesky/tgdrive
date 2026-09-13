@@ -52,6 +52,8 @@ mod tests {
         upload_turn_release: tokio::sync::Notify,
         /// 验证取消确实通知了 Bot API 监督器。
         cancel_pending_calls: AtomicU64,
+        /// 记录底层实际收到的块内范围，验证 HTTP 终点能跨分块传递。
+        read_ranges: Mutex<Vec<(u64, u64)>>,
     }
 
     impl MockTg {
@@ -76,6 +78,7 @@ mod tests {
                 upload_turn_started: AtomicBool::new(false),
                 upload_turn_release: tokio::sync::Notify::new(),
                 cancel_pending_calls: AtomicU64::new(0),
+                read_ranges: Mutex::new(Vec::new()),
             })
         }
 
@@ -211,6 +214,21 @@ mod tests {
                 data.slice(offset as usize..),
             )))
         }
+
+        async fn open_chunk_range(
+            &self,
+            file_id: &str,
+            message_id: i64,
+            chunk_size: u64,
+            offset: u64,
+            length: u64,
+        ) -> AppResult<ByteReader> {
+            self.read_ranges.lock().unwrap().push((offset, length));
+            let reader = self
+                .open_chunk_stream(file_id, message_id, chunk_size, offset)
+                .await?;
+            Ok(Box::pin(reader.take(length)))
+        }
     }
 
     async fn fixture(
@@ -286,6 +304,7 @@ mod tests {
 
         // 顺序读全量
         let mut r = ChunkedReader::new(up.tg.clone(), &chunks, 0);
+        assert_eq!(r.read(&mut []).await.unwrap(), 0);
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
@@ -308,6 +327,20 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, &data[9..]);
+    }
+
+    #[tokio::test]
+    async fn limited_reader_passes_range_boundaries_to_each_chunk() {
+        let (up, tg, db, _guard) = fixture(4, 1024, None).await;
+        let data: Vec<u8> = (0..10).collect();
+        let node = feed_all(&up, "range.bin", &data, 3).await.unwrap();
+        let chunks = db.chunks_of(node.id).await.unwrap();
+        let mut reader = ChunkedReader::new(up.tg.clone(), &chunks, 2).with_read_limit(5);
+        assert_eq!(reader.total_size(), 10);
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, data[2..7]);
+        assert_eq!(*tg.read_ranges.lock().unwrap(), vec![(2, 2), (0, 3)]);
     }
 
     #[tokio::test]

@@ -54,9 +54,11 @@ pub struct Extras {
     pub backup_s3_session_token: String,
     /// true 使用 endpoint/bucket/key，false 使用 bucket.endpoint/key。
     pub backup_s3_path_style: bool,
-    /// Bot 收件(频道直发 + 私聊白名单转存)
-    pub inbox_enabled: bool,
-    /// 允许私聊收件的 chat id,逗号分隔;空 = 只收存储频道内直发
+    /// 白名单用户私聊 Bot 的文件转存。
+    pub inbox_bot_enabled: bool,
+    /// 存储频道内直接发送的文件自动入库，与私聊收件独立控制。
+    pub inbox_channel_enabled: bool,
+    /// 允许私聊收件的 chat id，逗号分隔；空表示不接收任何私聊文件。
     pub inbox_allowed_chats: String,
     /// 未命中任何类型规则时的兜底目录
     pub inbox_dir: String,
@@ -68,8 +70,6 @@ pub struct Extras {
     pub inbox_book_dir: String,
     /// 自定义类型规则；优先于内置类型，重叠时更长的后缀优先
     pub inbox_rules: Vec<InboxRouteRule>,
-    /// 短视频模式的取材目录（含子目录）；空串表示整库。
-    pub shorts_dir: String,
     /// 删除文件后自动清理 Telegram 频道里的对应消息；关闭时改由后台手动执行。
     pub auto_delete_message: bool,
 }
@@ -94,6 +94,7 @@ async fn set(db: &Db, k: &str, v: &str) -> AppResult<()> {
 }
 
 pub async fn load(db: &Db) -> AppResult<Extras> {
+    let (inbox_bot_enabled, inbox_channel_enabled) = load_inbox_switches(db).await?;
     let inbox_dir = get(db, "inbox_dir")
         .await?
         .filter(|v| !v.trim().is_empty())
@@ -153,7 +154,8 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
             .await?
             .unwrap_or_default(),
         backup_s3_path_style: get(db, "backup_s3_path_style").await?.as_deref() != Some("0"),
-        inbox_enabled: get(db, "inbox_enabled").await?.as_deref() == Some("1"),
+        inbox_bot_enabled,
+        inbox_channel_enabled,
         inbox_allowed_chats: get(db, "inbox_allowed_chats").await?.unwrap_or_default(),
         inbox_video_dir: get(db, "inbox_video_dir")
             .await?
@@ -169,7 +171,6 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
             .unwrap_or_else(|| child_dir("书籍")),
         inbox_dir,
         inbox_rules,
-        shorts_dir: get(db, "shorts_dir").await?.unwrap_or_default(),
         // 消息清理队列默认手动，避免 Telegram 永久性错误持续刷屏。
         auto_delete_message: get(db, "auto_delete_message").await?.as_deref() == Some("1"),
     })
@@ -195,15 +196,36 @@ pub struct ExtrasPatch {
     pub backup_s3_secret_key: Option<String>,
     pub backup_s3_session_token: Option<String>,
     pub backup_s3_path_style: Option<bool>,
+    /// 兼容旧版总开关；新开关同时提交时，以各自的新值为准。
     pub inbox_enabled: Option<bool>,
+    pub inbox_bot_enabled: Option<bool>,
+    pub inbox_channel_enabled: Option<bool>,
     pub inbox_allowed_chats: Option<String>,
     pub inbox_dir: Option<String>,
     pub inbox_video_dir: Option<String>,
     pub inbox_image_dir: Option<String>,
     pub inbox_book_dir: Option<String>,
     pub inbox_rules: Option<Vec<InboxRouteRule>>,
-    pub shorts_dir: Option<String>,
     pub auto_delete_message: Option<bool>,
+}
+
+/// 旧版只有总开关，尚未保存独立开关时继承原有行为。
+pub async fn load_inbox_switches(db: &Db) -> AppResult<(bool, bool)> {
+    let values = db
+        .settings_get(&[
+            "extra.inbox_enabled",
+            "extra.inbox_bot_enabled",
+            "extra.inbox_channel_enabled",
+        ])
+        .await?;
+    let legacy = values
+        .get("extra.inbox_enabled")
+        .is_some_and(|value| value == "1");
+    let enabled = |key: &str| values.get(key).map_or(legacy, |value| value == "1");
+    Ok((
+        enabled("extra.inbox_bot_enabled"),
+        enabled("extra.inbox_channel_enabled"),
+    ))
 }
 
 fn normalize_http_url(raw: &str, label: &str) -> AppResult<String> {
@@ -456,14 +478,6 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
         .map(|v| normalize_dir(v, "书籍目录"))
         .transpose()?;
     let inbox_rules = p.inbox_rules.as_deref().map(normalize_rules).transpose()?;
-    // 短视频取材目录允许留空(整库),所以不能直接套拒绝根目录的 normalize_dir。
-    let shorts_dir = match p.shorts_dir.as_deref().map(str::trim) {
-        None => None,
-        Some(raw) => Some(match crate::vfs::normalize(raw)?.as_slice() {
-            [] => String::new(),
-            segs => format!("/{}", segs.join("/")),
-        }),
-    };
     let backup_chunk_size = p
         .backup_chunk_size
         .as_deref()
@@ -624,8 +638,31 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     if let Some(value) = p.backup_s3_path_style {
         set(db, "backup_s3_path_style", if value { "1" } else { "0" }).await?;
     }
-    if let Some(b) = p.inbox_enabled {
-        set(db, "inbox_enabled", if b { "1" } else { "0" }).await?;
+    if p.inbox_enabled.is_some()
+        || p.inbox_bot_enabled.is_some()
+        || p.inbox_channel_enabled.is_some()
+    {
+        let (bot, channel) = load_inbox_switches(db).await?;
+        let bot = p.inbox_bot_enabled.or(p.inbox_enabled).unwrap_or(bot);
+        let channel = p
+            .inbox_channel_enabled
+            .or(p.inbox_enabled)
+            .unwrap_or(channel);
+        // 同时固化两个新开关，关闭其中一个不会再通过旧总开关联动另一个。
+        db.settings_apply(
+            &[
+                (
+                    "extra.inbox_bot_enabled".into(),
+                    if bot { "1" } else { "0" }.into(),
+                ),
+                (
+                    "extra.inbox_channel_enabled".into(),
+                    if channel { "1" } else { "0" }.into(),
+                ),
+            ],
+            &["extra.inbox_enabled".into()],
+        )
+        .await?;
     }
     if let Some(v) = inbox_allowed_chats {
         set(db, "inbox_allowed_chats", v).await?;
@@ -646,9 +683,6 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
         let raw = serde_json::to_string(&rules)
             .map_err(|e| AppError::BadRequest(format!("自定义收件规则序列化失败:{e}")))?;
         set(db, "inbox_rules", &raw).await?;
-    }
-    if let Some(v) = shorts_dir {
-        set(db, "shorts_dir", &v).await?;
     }
     if let Some(v) = p.auto_delete_message {
         set(db, "auto_delete_message", if v { "1" } else { "0" }).await?;
@@ -701,48 +735,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shorts_dir_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("extras.db").to_str().unwrap())
+    async fn inbox_switches_upgrade_and_save_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(directory.path().join("switches.db").to_str().unwrap())
             .await
             .unwrap();
-        // 默认整库
-        assert_eq!(load(&db).await.unwrap().shorts_dir, "");
+        assert_eq!(load_inbox_switches(&db).await.unwrap(), (false, false));
 
+        db.setting_set("extra.inbox_enabled", "1").await.unwrap();
+        let old = load(&db).await.unwrap();
+        assert!(old.inbox_bot_enabled && old.inbox_channel_enabled);
         save(
             &db,
             &ExtrasPatch {
-                shorts_dir: Some("影视//短片/".into()),
+                inbox_bot_enabled: Some(false),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-        assert_eq!(load(&db).await.unwrap().shorts_dir, "/影视/短片");
-
-        // 留空表示恢复成整库
-        save(
-            &db,
-            &ExtrasPatch {
-                shorts_dir: Some("  ".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(load(&db).await.unwrap().shorts_dir, "");
-
+        assert_eq!(load_inbox_switches(&db).await.unwrap(), (false, true));
         assert!(
-            save(
-                &db,
-                &ExtrasPatch {
-                    shorts_dir: Some("/影视/../etc".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .is_err()
+            db.setting_get("extra.inbox_enabled")
+                .await
+                .unwrap()
+                .is_none()
         );
+
+        save(
+            &db,
+            &ExtrasPatch {
+                inbox_channel_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(load_inbox_switches(&db).await.unwrap(), (false, false));
+        save(
+            &db,
+            &ExtrasPatch {
+                inbox_bot_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(load_inbox_switches(&db).await.unwrap(), (true, false));
+
+        // 旧客户端仍可提交总开关，新客户端显式提交的独立值优先。
+        save(
+            &db,
+            &ExtrasPatch {
+                inbox_enabled: Some(true),
+                inbox_channel_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(load_inbox_switches(&db).await.unwrap(), (true, false));
+        save(
+            &db,
+            &ExtrasPatch {
+                inbox_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(load_inbox_switches(&db).await.unwrap(), (true, true));
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 <template>
   <Transition name="nd" appear @after-leave="emit('done')">
     <div v-if="visible" class="nd-mask" @mousedown.self="onMask">
-      <div class="nd-card" role="dialog" aria-modal="true">
+      <div ref="cardRef" class="nd-card" role="dialog" aria-modal="true" :aria-label="title" tabindex="-1">
         <div class="nd-badge" :class="kind">
           <component :is="icon ?? fallbackIcon" class="nd-ico" />
         </div>
@@ -46,6 +46,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, type Component } from 'vue'
 import { InfoFilled, WarningFilled } from '@element-plus/icons-vue'
+import { isTopOverlay, registerOverlay } from '../mobile/overlays'
+import { isComposingKey } from '../mobile/keyboard'
 
 const props = withDefaults(
   defineProps<{
@@ -84,6 +86,8 @@ const text = ref(props.value)
 const err = ref('')
 const shaking = ref(false)
 const inputRef = ref<HTMLInputElement>()
+const cardRef = ref<HTMLElement>()
+let releaseOverlay: (() => void) | undefined
 let closing = false
 
 const fallbackIcon = computed(() => (props.kind === 'primary' ? InfoFilled : WarningFilled))
@@ -92,6 +96,9 @@ function finish(action: 'resolve' | 'alternate' | 'reject') {
   if (closing) return
   closing = true
   visible.value = false
+  // 先退出返回拦截栈，再通知调用方；离场动画不能阻挡确认后的路由跳转。
+  releaseOverlay?.()
+  releaseOverlay = undefined
   if (action === 'resolve') emit('resolve', text.value)
   else if (action === 'alternate') emit('alternate')
   else emit('reject')
@@ -128,20 +135,31 @@ function onMask() {
 }
 
 function onKey(e: KeyboardEvent) {
-  if (e.key === 'Escape') {
-    e.stopPropagation()
+  if (closing || !isTopOverlay(onCancel) || isComposingKey(e)) return
+  if (e.key === 'Tab') {
+    const elements = [...(cardRef.value?.querySelectorAll<HTMLElement>('button:not(:disabled), input') ?? [])]
+    if (!elements.length) return
+    const current = elements.indexOf(document.activeElement as HTMLElement)
+    elements[(current + (e.shiftKey ? -1 : 1) + elements.length) % elements.length]?.focus()
+    e.preventDefault(); e.stopImmediatePropagation()
+  } else if (e.key === 'Escape') {
+    e.preventDefault()
+    e.stopImmediatePropagation()
     onCancel()
   } else if (e.key === 'Enter') {
-    e.stopPropagation()
+    // 按钮保留浏览器的 Enter 激活语义，输入框才提交主操作。
+    if (e.target instanceof HTMLButtonElement) return
+    e.preventDefault()
+    e.stopImmediatePropagation()
     onOk()
   }
 }
 
 // 捕获阶段监听:比页面里其他快捷键先拿到,且不透传给下层 el-dialog
-const prevOverflow = document.body.style.overflow
 onMounted(() => {
   document.addEventListener('keydown', onKey, true)
-  document.body.style.overflow = 'hidden'
+  releaseOverlay = registerOverlay(onCancel, () => cardRef.value ?? null)
+  cardRef.value?.focus({ preventScroll: true })
   if (props.mode === 'prompt') {
     void nextTick(() => {
       inputRef.value?.focus()
@@ -151,7 +169,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   document.removeEventListener('keydown', onKey, true)
-  document.body.style.overflow = prevOverflow
+  releaseOverlay?.()
 })
 </script>
 
@@ -163,8 +181,9 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: max(16px, var(--safe-top, 0px)) max(16px, var(--safe-right, 0px)) max(16px, var(--safe-bottom, 0px)) max(16px, var(--safe-left, 0px));
   box-sizing: border-box;
+  overflow: auto;
   background: rgba(15, 23, 42, 0.32);
   backdrop-filter: blur(10px) saturate(1.2);
   -webkit-backdrop-filter: blur(10px) saturate(1.2);
@@ -175,6 +194,8 @@ html.dark .nd-mask {
 
 .nd-card {
   width: min(400px, 100%);
+  max-height: 100%;
+  overflow: auto;
   box-sizing: border-box;
   padding: 30px 28px 24px;
   border-radius: 22px;
