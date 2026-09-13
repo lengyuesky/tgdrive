@@ -480,6 +480,7 @@ async fn app_fixture(
         attempts: Default::default(),
         tasks: crate::tasks::TaskManager::new(),
         migration: crate::migration::StorageMigrationManager::new(db, tg),
+        apps_catalog: Arc::new(crate::apps::CatalogManager::disabled()),
     };
     (state, dir)
 }

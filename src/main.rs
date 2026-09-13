@@ -2,7 +2,6 @@
 //! 子命令:serve(默认)| check(实测 Bot API 链路)| healthcheck(容器健康检查)
 
 mod api;
-#[path = "../apps/backend/mod.rs"]
 mod apps;
 mod auth;
 mod backup;
@@ -162,7 +161,7 @@ async fn serve() -> anyhow::Result<()> {
         (cfg.api_base.clone(), cfg.chunk_size, cfg.is_official_api());
     let rt = Arc::new(Runtime::new(
         db.clone(),
-        env_cfg,
+        env_cfg.clone(),
         cfg,
         tg,
         knobs,
@@ -170,6 +169,14 @@ async fn serve() -> anyhow::Result<()> {
     ));
     let dav_handler = dav::build_handler(vfs.clone());
     let tasks = crate::tasks::TaskManager::new();
+    let catalog_cache_dir = std::path::Path::new(&env_cfg.db_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("app-catalog-cache");
+    let apps_catalog = Arc::new(crate::apps::CatalogManager::from_env(
+        catalog_cache_dir,
+        rt.clone(),
+    ));
     let state = AppState {
         vfs,
         auth,
@@ -178,6 +185,7 @@ async fn serve() -> anyhow::Result<()> {
         attempts: crate::security::AttemptLimiter::default(),
         tasks: tasks.clone(),
         migration: migration.clone(),
+        apps_catalog,
     };
     if let Err(error) = db
         .append_backend_log("info", "系统", "tgdrive 服务已启动")
@@ -299,7 +307,12 @@ async fn check() -> anyhow::Result<()> {
         "尚未配置 Telegram 存储:请在 .env 里填 TGDRIVE_BOT_TOKEN / TGDRIVE_CHAT_ID,\
          或启动服务后在网页「系统设置」里配置"
     );
-    let tg = TgClient::new(&cfg.api_base, &cfg.bot_token, &cfg.chat_id, cfg.proxy.clone())?;
+    let tg = TgClient::new(
+        &cfg.api_base,
+        &cfg.bot_token,
+        &cfg.chat_id,
+        cfg.proxy.clone(),
+    )?;
 
     println!("[1/4] 验证 Bot 与存储频道权限 ...");
     let me = tg.probe_storage().await?;
@@ -341,7 +354,9 @@ async fn healthcheck() -> anyhow::Result<()> {
     let listen = std::env::var("TGDRIVE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let port = listen.rsplit(':').next().unwrap_or("8080");
     let url = format!("http://127.0.0.1:{port}/healthz");
-    let resp = reqwest::Client::builder().no_proxy().build()?
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()?
         .get(&url)
         .timeout(std::time::Duration::from_secs(5))
         .send()

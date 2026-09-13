@@ -41,7 +41,16 @@ async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         send_video: false,
     });
     let cfg = RuntimeCfg::load(&db, &env).await.unwrap();
-    let tg = Arc::new(TgRegistry::new(&[], None, vec![], None, crate::proxy::ProxyConfig::default()).unwrap());
+    let tg = Arc::new(
+        TgRegistry::new(
+            &[],
+            None,
+            vec![],
+            None,
+            crate::proxy::ProxyConfig::default(),
+        )
+        .unwrap(),
+    );
     assert!(tg.current().is_err());
     let knobs = Arc::new(UploadKnobs::new(
         cfg.chunk_size,
@@ -76,6 +85,7 @@ async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         attempts: Default::default(),
         tasks: crate::tasks::TaskManager::new(),
         migration: crate::migration::StorageMigrationManager::new(db, tg),
+        apps_catalog: Arc::new(crate::apps::CatalogManager::disabled()),
     };
     let app = Router::new()
         .nest("/api", crate::api::router(state.clone()))

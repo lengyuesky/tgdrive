@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[path = "../apps/backend/db.rs"]
+#[path = "apps/db.rs"]
 pub mod apps;
 pub mod entries;
 

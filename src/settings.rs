@@ -187,8 +187,13 @@ impl RuntimeCfg {
         if !self.is_configured() {
             return Ok(Arc::new(crate::telegram::UnconfiguredTg));
         }
-        let client = TgClient::new(&self.api_base, &self.bot_token, &self.chat_id, self.proxy.clone())
-            .map_err(|e| AppError::BadRequest(format!("客户端构造失败: {e}")))?;
+        let client = TgClient::new(
+            &self.api_base,
+            &self.bot_token,
+            &self.chat_id,
+            self.proxy.clone(),
+        )
+        .map_err(|e| AppError::BadRequest(format!("客户端构造失败: {e}")))?;
         Ok(Arc::new(client))
     }
 
@@ -357,7 +362,12 @@ impl Runtime {
     }
 
     /// 用指定参数试连(不落库),返回 bot 名
-    pub async fn probe(api_base: &str, token: &str, chat_id: &str, proxy: &ProxyConfig) -> AppResult<String> {
+    pub async fn probe(
+        api_base: &str,
+        token: &str,
+        chat_id: &str,
+        proxy: &ProxyConfig,
+    ) -> AppResult<String> {
         let client = TgClient::new(api_base, token, chat_id, proxy.clone())
             .map_err(|e| AppError::BadRequest(format!("客户端构造失败: {e}")))?;
         tokio::time::timeout(Duration::from_secs(15), client.probe_storage())
@@ -370,7 +380,9 @@ impl Runtime {
         let _guard = self.update_lock.lock().await;
         let prev = self.current();
         let mut next = (*prev).clone();
-        next.proxy = prev.proxy.patched(patch.proxy_enabled, patch.proxy_url.as_deref())?;
+        next.proxy = prev
+            .proxy
+            .patched(patch.proxy_enabled, patch.proxy_url.as_deref())?;
 
         if let Some(v) = &patch.api_base {
             next.api_base = v.trim().trim_end_matches('/').to_string();
@@ -421,7 +433,8 @@ impl Runtime {
         let proxy_update = (next.proxy != prev.proxy)
             .then(|| ProxySnapshot::new(next.proxy.clone()))
             .transpose()?;
-        let tg_changed = next.proxy != prev.proxy || next.api_base != prev.api_base
+        let tg_changed = next.proxy != prev.proxy
+            || next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
             || next.upload_bot_tokens != prev.upload_bot_tokens
             || next.chat_id != prev.chat_id;
@@ -500,7 +513,8 @@ impl Runtime {
             .then(|| ProxySnapshot::new(next.proxy.clone()))
             .transpose()?;
         self.attach_storage_target(&mut next).await?;
-        let tg_changed = next.proxy != prev.proxy || next.api_base != prev.api_base
+        let tg_changed = next.proxy != prev.proxy
+            || next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
             || next.upload_bot_tokens != prev.upload_bot_tokens
             || next.chat_id != prev.chat_id;
@@ -795,7 +809,16 @@ mod tests {
         let mtproto = crate::mtproto::MtprotoConfig::from_values(db.clone(), "1", "test-hash")
             .unwrap()
             .unwrap();
-        let tg = Arc::new(TgRegistry::new(&[], None, vec![], Some(mtproto.clone()), ProxyConfig::default()).unwrap());
+        let tg = Arc::new(
+            TgRegistry::new(
+                &[],
+                None,
+                vec![],
+                Some(mtproto.clone()),
+                ProxyConfig::default(),
+            )
+            .unwrap(),
+        );
         let knobs = Arc::new(UploadKnobs::new(
             cfg.chunk_size,
             cfg.tmp_dir.clone(),

@@ -1,7 +1,7 @@
 import type { PlaywrightTestConfig } from '@playwright/test'
 
 export default {
-  testDir: '../apps/tests/browser',
+  testDir: './tests/apps',
   tsconfig: './playwright.apps.tsconfig.json',
   timeout: 90_000,
   expect: { timeout: 12_000 },
@@ -18,7 +18,7 @@ export default {
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: 'node ../apps/tests/browser/fixture.mjs',
+    command: 'node tests/apps/fixture.mjs',
     url: 'http://127.0.0.1:4187/__apps_fixture',
     reuseExistingServer: process.env.TGDRIVE_APPS_E2E_REUSE === '1',
     timeout: 180_000,

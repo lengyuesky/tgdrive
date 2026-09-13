@@ -35,6 +35,7 @@ pub struct AppState {
     pub attempts: crate::security::AttemptLimiter,
     pub tasks: crate::tasks::TaskManager,
     pub migration: crate::migration::StorageMigrationManager,
+    pub apps_catalog: Arc<crate::apps::CatalogManager>,
 }
 
 /// 就绪探针：数据库可用、存储目标已装载且关键后台任务仍有心跳。

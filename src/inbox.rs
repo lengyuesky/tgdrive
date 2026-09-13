@@ -151,13 +151,18 @@ pub async fn run(vfs: Vfs, rt: Arc<Runtime>, task: crate::tasks::TaskReporter) {
             continue;
         }
         let result = async {
-            if cached_http.as_ref().is_none_or(|(proxy, _)| *proxy != cfg.proxy) {
+            if cached_http
+                .as_ref()
+                .is_none_or(|(proxy, _)| *proxy != cfg.proxy)
+            {
                 // 代理变化后重建连接池；正在进行的一轮长轮询不被打断。
-                let http = inbox_http_client(&cfg.proxy, Duration::from_secs(POLL_TIMEOUT_SECS + 15))?;
+                let http =
+                    inbox_http_client(&cfg.proxy, Duration::from_secs(POLL_TIMEOUT_SECS + 15))?;
                 cached_http = Some((cfg.proxy.clone(), http));
             }
             poll_once(&cached_http.as_ref().unwrap().1, &vfs, &cfg).await
-        }.await;
+        }
+        .await;
         match result {
             Ok(()) => {
                 backoff = 5;
@@ -900,7 +905,11 @@ pub async fn seen_chats(db: &Db) -> AppResult<Vec<SeenChat>> {
 /// 用给定 token 快速拉一次待处理的 updates(不带 offset,不确认任何消息),
 /// 提取消息来源。收件轮询开着时消息多半已被它收走(并已记进 seen_chats),
 /// 此时这里拿到空结果甚至 409 冲突都正常,调用方应把错误当非致命处理。
-pub async fn probe_updates(api_base: &str, token: &str, proxy: &crate::proxy::ProxyConfig) -> AppResult<Vec<SeenChat>> {
+pub async fn probe_updates(
+    api_base: &str,
+    token: &str,
+    proxy: &crate::proxy::ProxyConfig,
+) -> AppResult<Vec<SeenChat>> {
     let http = inbox_http_client(proxy, Duration::from_secs(10))?;
     let url = format!("{}/bot{}/getUpdates", api_base.trim_end_matches('/'), token);
     let resp = http
@@ -940,8 +949,12 @@ pub async fn probe_updates(api_base: &str, token: &str, proxy: &crate::proxy::Pr
         .collect())
 }
 
-fn inbox_http_client(proxy: &crate::proxy::ProxyConfig, timeout: Duration) -> AppResult<reqwest::Client> {
-    proxy.http_builder()?
+fn inbox_http_client(
+    proxy: &crate::proxy::ProxyConfig,
+    timeout: Duration,
+) -> AppResult<reqwest::Client> {
+    proxy
+        .http_builder()?
         .connect_timeout(Duration::from_secs(15))
         .timeout(timeout)
         .build()
@@ -1037,8 +1050,14 @@ mod tests {
             .unwrap();
         let target_id = target.id;
         let tg = Arc::new(
-            crate::telegram::TgRegistry::new(&[target], Some(target_id), vec![target_id], None, crate::proxy::ProxyConfig::default())
-                .unwrap(),
+            crate::telegram::TgRegistry::new(
+                &[target],
+                Some(target_id),
+                vec![target_id],
+                None,
+                crate::proxy::ProxyConfig::default(),
+            )
+            .unwrap(),
         );
         let knobs = Arc::new(crate::engine::upload::UploadKnobs::new(
             1024,

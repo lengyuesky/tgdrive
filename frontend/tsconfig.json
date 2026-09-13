@@ -5,18 +5,13 @@
     "moduleResolution": "bundler",
     "baseUrl": ".",
     "paths": {
-      "@apps/*": ["../apps/frontend/*"],
+      "@apps/*": ["./src/apps/*"],
       "@drive/*": ["./src/*"],
       "vue": ["./node_modules/vue"],
       "vue-router": ["./node_modules/vue-router"],
       "element-plus": ["./node_modules/element-plus"],
       "@element-plus/icons-vue": ["./node_modules/@element-plus/icons-vue"],
-      "vitest": ["./node_modules/vitest"],
-      "mediabunny": ["./node_modules/mediabunny/dist/mediabunny.d.ts"],
-      "pdfjs-dist": ["./node_modules/pdfjs-dist/types/src/pdf.d.ts"],
-      "pdfjs-dist/*": ["./node_modules/pdfjs-dist/*"],
-      "dompurify": ["./node_modules/dompurify"],
-      "@zip.js/zip.js/*": ["./node_modules/@zip.js/zip.js/index.d.ts"]
+      "vitest": ["./node_modules/vitest"]
     },
     "strict": true,
     "jsx": "preserve",
@@ -25,5 +20,5 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.vue", "../apps/frontend/**/*.ts", "../apps/frontend/**/*.vue", "../apps/reader/**/*.ts", "../apps/books/**/*.ts", "../apps/comics/**/*.ts", "../apps/cinema/**/*.ts", "../apps/sdk/types.ts"]
+  "include": ["src/**/*.ts", "src/**/*.vue"]
 }

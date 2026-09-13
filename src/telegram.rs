@@ -693,7 +693,12 @@ impl FilePathCache {
 }
 
 impl TgClient {
-    pub fn new(api_base: &str, token: &str, chat_id: &str, proxy: ProxyConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        api_base: &str,
+        token: &str,
+        chat_id: &str,
+        proxy: ProxyConfig,
+    ) -> anyhow::Result<Self> {
         let network = Arc::new(ProxyClient::new(proxy)?);
         Self::build(api_base, token, chat_id, None, true, network)
     }
@@ -707,9 +712,14 @@ impl TgClient {
         restart_enabled: bool,
         network: Arc<ProxyClient>,
     ) -> anyhow::Result<Self> {
-        let mtproto = config.map(|config| Arc::new(MtprotoClient::new(
-            config, storage_target_id, token, network.clone(),
-        )));
+        let mtproto = config.map(|config| {
+            Arc::new(MtprotoClient::new(
+                config,
+                storage_target_id,
+                token,
+                network.clone(),
+            ))
+        });
         Self::build(api_base, token, chat_id, mtproto, restart_enabled, network)
     }
 

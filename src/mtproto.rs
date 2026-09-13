@@ -127,7 +127,12 @@ impl Drop for ClientState {
 }
 
 impl MtprotoClient {
-    pub fn new(config: MtprotoConfig, storage_target_id: i64, bot_token: &str, network: Arc<ProxyClient>) -> Self {
+    pub fn new(
+        config: MtprotoConfig,
+        storage_target_id: i64,
+        bot_token: &str,
+        network: Arc<ProxyClient>,
+    ) -> Self {
         let request_slots = config.request_slots(bot_token);
         Self {
             config,
@@ -158,13 +163,22 @@ impl MtprotoClient {
             handle,
             runner_task: tokio::spawn(runner.run()),
         });
-        let authorized = state.client.is_authorized().await
+        let authorized = state
+            .client
+            .is_authorized()
+            .await
             .map_err(|error| mtproto_error("检查登录状态失败", error))?;
         if !authorized {
-            state.client.bot_sign_in(&self.bot_token, &self.config.api_hash).await
+            state
+                .client
+                .bot_sign_in(&self.bot_token, &self.config.api_hash)
+                .await
                 .map_err(|error| mtproto_error("Bot 登录失败", error))?;
         }
-        tracing::info!(storage_target_id = self.storage_target_id, "MTProto 流式下载会话已就绪");
+        tracing::info!(
+            storage_target_id = self.storage_target_id,
+            "MTProto 流式下载会话已就绪"
+        );
         // 已打开的读取流持有旧会话，新代理只用于之后打开的流。
         *current = Some(state.clone());
         Ok(state)
@@ -209,7 +223,8 @@ impl MtprotoClient {
                 async move {
                     let skip_chunks = i32::try_from(part_offset / REQUEST_SIZE as u64)
                         .map_err(|_| AppError::Telegram("分块偏移过大".into()))?;
-                    let mut download = state.client
+                    let mut download = state
+                        .client
                         .iter_download(location.as_ref())
                         .chunk_size(REQUEST_SIZE)
                         .skip_chunks(skip_chunks);
@@ -598,7 +613,10 @@ impl Session for PersistentSession {
             // grammers 会把查询所得的 DC 地址连同新 auth_key 写回，必须还原真实地址。
             {
                 let tunnels = self.tunnels.lock().map_err(|_| SessionError::Poisoned)?;
-                if let Some((destination, _)) = tunnels.iter().find(|(_, tunnel)| tunnel.address == dc_option.ipv4) {
+                if let Some((destination, _)) = tunnels
+                    .iter()
+                    .find(|(_, tunnel)| tunnel.address == dc_option.ipv4)
+                {
                     dc_option.ipv4 = *destination;
                 }
             }
@@ -878,7 +896,9 @@ mod tests {
             .await
             .unwrap();
         let key = "test.proxy.session";
-        let mut session = PersistentSession::load(db.clone(), key.into()).await.unwrap();
+        let mut session = PersistentSession::load(db.clone(), key.into())
+            .await
+            .unwrap();
         let dc = session.home_dc_id().unwrap();
         let original = session.dc_option(dc).unwrap().unwrap();
         session.proxy = ProxyConfig::new(true, "http://proxy-test.invalid:7890").unwrap();

@@ -3,10 +3,9 @@
   "compilerOptions": {
     "types": ["node"],
     "paths": {
-      "@playwright/test": ["./node_modules/@playwright/test"],
-      "@apps/*": ["../apps/frontend/*"],
+      "@apps/*": ["./src/apps/*"],
       "@drive/*": ["./src/*"]
     }
   },
-  "include": ["../apps/tests/browser/**/*.ts", "../apps/tests/browser/**/*.mts", "./mobile-e2e/**/*.ts", "./playwright.mobile.config.ts"]
+  "include": ["./tests/apps/**/*.ts", "./tests/apps/**/*.mts", "./mobile-e2e/**/*.ts", "./playwright.mobile.config.ts"]
 }

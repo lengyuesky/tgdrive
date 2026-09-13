@@ -531,7 +531,12 @@ async fn enqueue_telegram_cleanup(vfs: &Vfs, messages: &[StoredMessage]) {
 
 // ---------- WebDAV ----------
 
-async fn backup_webdav(db: &Db, extras: &Extras, snapshot: &Snapshot, proxy: &crate::proxy::ProxyConfig) -> AppResult<()> {
+async fn backup_webdav(
+    db: &Db,
+    extras: &Extras,
+    snapshot: &Snapshot,
+    proxy: &crate::proxy::ProxyConfig,
+) -> AppResult<()> {
     let client = backup_http_client(proxy)?;
     let url = webdav_object_url(&extras.backup_webdav_url, &snapshot.name)?;
     let file = tokio::fs::File::open(&snapshot.path).await?;
@@ -628,7 +633,12 @@ fn webdav_identity(extras: &Extras) -> String {
 
 // ---------- S3 ----------
 
-async fn backup_s3(db: &Db, extras: &Extras, snapshot: &Snapshot, proxy: &crate::proxy::ProxyConfig) -> AppResult<()> {
+async fn backup_s3(
+    db: &Db,
+    extras: &Extras,
+    snapshot: &Snapshot,
+    proxy: &crate::proxy::ProxyConfig,
+) -> AppResult<()> {
     let client = backup_http_client(proxy)?;
     let key = s3_object_key(&extras.backup_s3_prefix, &snapshot.name);
     let url = s3_object_url(extras, &key)?;
@@ -900,7 +910,8 @@ async fn finish_remote_cleanup(
 }
 
 fn backup_http_client(proxy: &crate::proxy::ProxyConfig) -> AppResult<reqwest::Client> {
-    proxy.http_builder()?
+    proxy
+        .http_builder()?
         .connect_timeout(Duration::from_secs(15))
         .timeout(HTTP_TIMEOUT)
         // 带认证的 PUT 不跨主机自动跳转，避免凭据或签名被错误转发。
@@ -1149,7 +1160,14 @@ mod tests {
         extras.backup_webdav_password = "secret".into();
         let snapshot = test_snapshot(b"sqlite snapshot");
 
-        backup_webdav(&db, &extras, &snapshot, &crate::proxy::ProxyConfig::default()).await.unwrap();
+        backup_webdav(
+            &db,
+            &extras,
+            &snapshot,
+            &crate::proxy::ProxyConfig::default(),
+        )
+        .await
+        .unwrap();
         server.abort();
         {
             let requests = requests.lock().unwrap();
@@ -1182,7 +1200,14 @@ mod tests {
         extras.backup_s3_prefix = "tgdrive".into();
         let snapshot = test_snapshot(b"sqlite snapshot");
 
-        backup_s3(&db, &extras, &snapshot, &crate::proxy::ProxyConfig::default()).await.unwrap();
+        backup_s3(
+            &db,
+            &extras,
+            &snapshot,
+            &crate::proxy::ProxyConfig::default(),
+        )
+        .await
+        .unwrap();
         server.abort();
         {
             let requests = requests.lock().unwrap();
@@ -1222,16 +1247,29 @@ mod tests {
         extras.backup_webdav_password = "secret".into();
         extras.backup_s3_endpoint = "http://s3-proxy-test.invalid/api".into();
         let snapshot = test_snapshot(b"proxied snapshot");
-        backup_webdav(&db, &extras, &snapshot, &proxy).await.unwrap();
+        backup_webdav(&db, &extras, &snapshot, &proxy)
+            .await
+            .unwrap();
         backup_s3(&db, &extras, &snapshot, &proxy).await.unwrap();
         server.abort();
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].headers["authorization"], "Basic YWxpY2U6c2VjcmV0");
-        assert!(requests[1].headers["authorization"].to_str().unwrap().starts_with("AWS4-HMAC-SHA256"));
+        assert_eq!(
+            requests[0].headers["authorization"],
+            "Basic YWxpY2U6c2VjcmV0"
+        );
+        assert!(
+            requests[1].headers["authorization"]
+                .to_str()
+                .unwrap()
+                .starts_with("AWS4-HMAC-SHA256")
+        );
         for request in requests.iter() {
             assert_eq!(request.method, Method::PUT);
-            assert_eq!(request.headers["proxy-authorization"], "Basic cHJveHktdXNlcjpwcm94eS1wYXNz");
+            assert_eq!(
+                request.headers["proxy-authorization"],
+                "Basic cHJveHktdXNlcjpwcm94eS1wYXNz"
+            );
             assert_eq!(request.body, b"proxied snapshot");
         }
     }

@@ -1,15 +1,15 @@
 # 页面应用开发说明
 
 应用中心管理可独立发布的页面应用。主程序负责安装、权限、登录、设置和文件访问；应用包只包含
-编译好的 HTML、JavaScript、CSS 等资源，不在服务器上执行脚本。内置目录提供短视频（`apps/shorts/`）、
-图书（`apps/books/`）、漫画（`apps/comics/`）和影视（`apps/cinema/`）四个独立安装包；插件页面不依赖主站的 Vue 页面或内部组件。
+编译好的 HTML、JavaScript、CSS 等资源，不在服务器上执行脚本。
+官方插件（短视频、图书、漫画、影视）在独立仓库 `lengyuesky/tgdrive-app` 中开发与发布；宿主默认通过 HTTPS 获取 GitHub Release 目录，在用户确认后校验安装包的 SHA256、长度和完整清单。支持原子持久缓存（`app-catalog-cache/`）与精确摘要安装，也可通过 `TGDRIVE_APP_CATALOG_DIR` 指定本地包目录，或手动导入 `.tgapp` 插件包。插件页面不依赖主站的 Vue 页面或内部组件。
 图书、漫画只读取网盘文件，不接外部书源，也不修改文件页原有预览与菜单。
 
 ## 使用与生命周期
 
 在文件页侧边栏「分享管理」下方的应用区块打开「应用中心」，默认展示「已安装」。未安装任何应用时也保留此标签，
 可通过「浏览可安装应用」切换；整页重载重新选择已安装，页面内刷新保留当前选择。可以安装应用目录中的包，或选择「导入插件包」。确认安装前会展示作者、
-版本及全部权限；更新时另外标出新增权限。导入包的作者字段是包内声明，不表示官方认证。
+版本及全部权限；更新时另外标出新增权限。任何来源的作者字段都是包内声明；SHA256 仅证明内容完整性，不表示作者身份认证。
 
 新安装的应用立即启用，默认不固定入口。可在更多菜单中固定到侧边栏的应用区块，或停用、
 卸载。停用、更新和卸载都会废止旧页面的运行凭据；同一浏览器的其他标签页立即检查状态，
@@ -79,40 +79,53 @@ Vue、React 等框架可自行编译为静态资源；运行时不从 CDN 加载
 
 ## 打包与分发
 
-使用 Node.js 22.22 或更高版本：
+宿主平台位于 `src/apps/` 与 `frontend/src/apps/`，前端别名 `@apps` 只指向宿主应用中心代码；
+数据库迁移仍位于 `migrations/`。宿主构建和 Docker 镜像不依赖、编译、复制或下载插件源码与安装包。
+插件、SDK、打包工具和业务浏览器测试由独立仓库 [lengyuesky/tgdrive-app](https://github.com/lengyuesky/tgdrive-app) 维护，
+具有自己的 `package.json`、锁文件和依赖目录，不共享宿主 `node_modules`。
+
+在 **tgdrive-app 仓库根目录**使用 Node.js 22.22 或更高版本：
 
 ```bash
-node apps/package.mjs /绝对路径/我的应用/dist /绝对路径/输出目录
+npm ci
+npm run build
+# 对已编译的第三方静态应用单独打包：
+node package.mjs /绝对路径/我的应用/dist /绝对路径/输出目录
 ```
 
-工具会自动加入 `apps/sdk/tgdrive-sdk.js`，生成 `<ID>-<版本>.tgapp`。
-应用源目录不要再放同名 SDK 文件。后端安装时还会执行完整的包、清单及兼容性校验。
+工具加入插件仓库的 `sdk/tgdrive-sdk.js` 并生成 `<ID>-<版本>.tgapp`；源目录不要再放同名 SDK 文件。
+默认插件构建完成 TypeScript 编译、复制第三方许可及 PDF CMap/标准字体资源，再输出到 `.build/` 与 `catalog/`。
+不依赖服务器上的 PDF 转换服务或系统字体。构建包不等于安装包，任何部署都需要用户主动选择安装或升级，不自动固定入口。
 
-主项目默认构建四个插件，也保留传入独立静态目录的用法：
+### 目录配置与缓存
 
-```bash
-npm --prefix frontend run build:apps
-npm --prefix frontend run build:apps -- /绝对路径/我的应用/dist /绝对路径/输出目录
-```
+- 默认仓库为 `TGDRIVE_APP_GITHUB_REPO=lengyuesky/tgdrive-app`，只接受合法 GitHub `owner/repo`，不接受任意 URL、空白或 `.`/`..` 路径。
+- 默认入口为 `https://github.com/lengyuesky/tgdrive-app/releases/latest/download/catalog.json`。非空 `TGDRIVE_APP_CATALOG_DIR` 优先选择可信的本地 `.tgapp`/`.zip` 目录；空值视为未配置，不扫描当前工作目录。
+- 未指定本地目录时，`TGDRIVE_APP_CATALOG_REMOTE_ENABLED` 默认 `true`；设为 `false` 才依次发现工作目录中的 `app-catalog/`、`apps/catalog/`，均不存在则禁用目录。Docker 不预装这些目录；本地模式需自行挂载安装包目录。
+- 同一 ID 展示最高兼容语义版本，本地与远程目录都支持按确认摘要找到仍存在的历史包；找不到时返回 409，绝不自动换成新版。
+- 打开应用中心先展示已安装列表，再进行普通后台检查；手动刷新为强制检查。远程目录缓存有效期 5 分钟，联网至少间隔 30 秒并合并并发检查。失败保留上次成功快照（空目录也属于成功快照），标为 `stale`；没有好快照时为 `unavailable`，不阻止已安装应用运行。
+- 数据库旁的 `app-catalog-cache/` 按仓库隔离，原子保存目录与已验证包。重启后过期目录仍显示过期，损坏缓存不可信；包缓存采用 128 MiB LRU，清理中断写入的临时文件，不触碰数据库、已安装包或运行数据。
+- 请求使用后台当前出站代理，不读取系统代理或使用 GitHub token。目录总超时 10 秒、包总超时 120 秒（包括所有重定向与响应体），连接超时 10 秒。
 
-默认输出 `apps/catalog/`，可通过 `TGDRIVE_APP_BUILD_OUTPUT` 覆盖。图书和漫画的 TypeScript 源码需要先编译，
-默认构建会完成编译、复制依赖许可及 PDF CMap/标准字体资源，再分别打包。`.build/` 与 `catalog/` 都是生成产物。
-前端构建和 Docker 构建同样生成四份包，不依赖服务器上的解压、PDF 转换服务或系统字体。
+### 稳定 Release 目录协议
 
-App 的实现集中在根目录 `apps/`：`frontend/` 为应用中心、侧栏与运行页面，`backend/` 为安装、
-权限和持久化，`shorts/`、`books/`、`comics/`、`cinema/` 为四款插件，`reader/` 为共享阅读逻辑，
-`sdk/` 为插件 SDK，`tests/browser/` 为浏览器验证。
-前端通过 `@apps` 引用应用代码，应用通过 `@drive` 使用主站能力；后端通过模块路径接入，
-数据库迁移仍由主程序统一执行。
+目录为 `{schema_version:1, repository, release_tag, entries}`；每条记录包含完整 `manifest`、64 位小写十六进制 `sha256`、
+正整数压缩包 `size`、`url` 与 `release_tag`。目录最多 1 MiB、512 条，压缩包仍不超过 16 MiB。
+仓库级稳定标签必须是无前导零、预发布或构建后缀的 `vX.Y.Z`，应用 `version` 采用相同约束的 `X.Y.Z`。
+下载 URL 必须精确为 `https://github.com/<owner>/<repo>/releases/download/<entry.release_tag>/<id>-<version>.tgapp`，
+条目标签不能晚于目录标签；Release 页面链接使用 `/releases/tag/<tag>`，不是二进制下载链接。
 
-可以把包文件分发给用户，由用户在应用中心导入；更新时提高 `version` 后重新打包。
-宿主已支持目标接口版本时，主程序无需重新发布。默认应用目录包含随发行版提供的四款安装包，
-新部署及升级已有网盘都需要用户主动选择安装。
+发布目录必须完整保留历史记录，重复 ID/版本（即使摘要相同）或同版本元数据篡改均被拒绝。
+宿主要求每个已知兼容记录在后续目录中仍存在且完全相同；删除记录、把它改成不兼容版本以隐藏，或先删除再重引入，都不会替换旧快照或持久目录。
+这样原确认框的摘要不会被重新绑定到用户未确认的权限。初次空目录仍合法；已有历史后的非法空目录会标记 `stale`。
+宿主先验证每条记录的 ID、稳定版本、兼容性标记、摘要、大小和 Release 元数据；明确要求未来 API 或更高宿主版本的条目不参与安装，
+其未知清单扩展不会使兼容历史不可用。兼容条目仍严格拒绝未知清单字段、非法权限与设置；畸形目录不会替换上次好快照。
+下载和缓存命中都校验实际 SHA256、长度、完整清单与 ZIP 安全限制，再调用原安装事务，安装锁不覆盖网络等待。
 
-部署者也可以通过 `TGDRIVE_APP_CATALOG_DIR` 指向一个可信的服务器目录，把 `.tgapp` 文件放入其中，
-它们就会出现在可安装列表。同一 ID 展示最高兼容版本。默认查找工作目录中的 `app-catalog/`
-或 `apps/catalog/`；Docker 镜像中的默认目录为 `/app/app-catalog/`。
-第一版不提供公共在线市场服务，第三方包通过导入或部署者维护的目录分发。
+初始 URL 只允许指定仓库的 GitHub Release 下载路径，不含查询或片段。每跳重定向均验证，最多五次；仅允许 HTTPS/443、
+无用户信息的 `github.com`（仍限定本仓库合法 Release 下载路径）、`release-assets.githubusercontent.com`、`objects.githubusercontent.com`。
+只有 CDN 查询可以保留用于签名请求，错误与日志不回显下载 URL 或代理凭据。
+插件版本及发布流程以[插件发布说明](https://github.com/lengyuesky/tgdrive-app/blob/main/docs/release.md)为准。
 
 ## 权限与隔离
 
@@ -339,10 +352,11 @@ PDF 不使用浏览器内置 iframe，不启用 WASM、XFA 或自动整本预取
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/apps` | 可安装目录、已安装记录和接口版本 |
+| `GET /api/apps` | 已安装记录、目录快照、接口版本；远程模式不等待联网 |
 | `POST /api/apps/inspect` | 请求体为包字节，返回清单、SHA-256、已有版本、新增权限 |
 | `POST /api/apps/install?digest=...&expected_revision=...` | 请求体为原包字节；首次安装省略旧修订版 |
-| `GET /api/apps/catalog/:id/package` | 下载目录中的插件包 |
+| `POST /api/apps/catalog/refresh` | JSON `{ "force": false }` 为普通检查，`true` 为手动刷新；始终返回含目录状态的完整列表 |
+| `GET /api/apps/catalog/:id/package?digest=...` | 按可选摘要下载精确包；省略时选择最高兼容版本 |
 | `POST /api/apps/catalog/:id/install` | JSON 包含 `digest` 和可选 `expected_revision` |
 | `POST /api/apps/:id/state` | JSON 中设置 `enabled` 或 `pinned` |
 | `DELETE /api/apps/:id?purge_data=false` | 卸载，默认保留设置和私有数据；显式清除时一并删除阅读记录与书签 |
@@ -350,21 +364,37 @@ PDF 不使用浏览器内置 iframe，不启用 WASM、XFA 或自动整本预取
 | `POST /api/apps/:id/launch` | 为宿主创建受限运行会话 |
 | `POST /api/apps/:id/rpc` | 宿主能力网关，应用使用 SDK 调用 |
 
+目录状态 `catalog` 包含 `source`（`github`/`local`/`disabled`）、`repository`、`state`（`ready`/`stale`/`unavailable`/`disabled`）、
+`last_success_at`（Unix 毫秒或 null）和 `error`。可安装条目在原有 `manifest`、`digest`、`update_available` 外提供 `size`、`source`、`release_url`。
+远程失败只影响目录状态，列表仍返回已安装应用；目录查询、刷新、下载和安装全部要求主站登录。
 接口不会因为前端隐藏按钮就放行未安装、已停用或权限不足的应用。
 
 ## 验证
 
 ```bash
-CARGO_TARGET_DIR=/tmp/tgdrive-codex-target cargo test --locked
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+npm --prefix frontend ci
 npm --prefix frontend run check
 npm --prefix frontend test
 npm --prefix frontend run test:apps
 ```
 
-浏览器测试需要 ffmpeg 和 Playwright Chromium，会启动监听 `127.0.0.1:4187` 的独立测试网盘，
-使用临时数据库、合成视频/TXT/EPUB/PDF/漫画和内存 Telegram 实现，不加载项目 `.env` 或读取真实网盘。
-可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 指定本机 Chromium 或 Chrome 可执行文件，
-通过 `PLAYWRIGHT_APPS_OUTPUT_DIR` 保存截图和失败 trace。覆盖沙箱首次点击、实际阅读、跨浏览器同步/冲突、
-自然页序、手机触摸分页与浮层、横竖屏锚点、纯图片进度、旧宿主降级、归档拒绝和退出取消，短视频及 v1 生命周期同时回归。
-触摸模拟不能替代 iOS Safari／Android Chrome 的安全区、地址栏、软键盘、选字和双指缩放真机验收。
-中文 PDF 已附合成夹具；正常测试不依赖 Python，重新生成方法见 [apps/README.md](../apps/README.md)。
+宿主浏览器测试位于 `frontend/tests/apps/`，不需要插件仓库。需要 ffmpeg 和 Playwright Chromium，启动 `127.0.0.1:4187` 的独立测试网盘，
+仅使用临时数据库、合成插件/视频/文档与内存 Telegram，不加载 `.env`、生产目录配置或真实网盘。
+保留独立导入、权限确认、更新撤销、启停、侧栏、保留/清除数据卸载、手机设置/401 导航和 PWA 缓存回归。
+可用 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 指定已有浏览器，`PLAYWRIGHT_APPS_OUTPUT_DIR` 指定截图和失败 trace；
+若临时目录配额不足，可将 `TMPDIR` 与测试输出指向有空间的普通磁盘目录，不通过跳过断言解决。
+
+固定本机夹具命令为 `cargo test --locked apps::tests::browser_fixture -- --ignored --exact --nocapture`，仅在测试构建中存在。
+夹具身份接口 `/__apps_fixture` 返回 `{ "fixture": "tgdrive-apps-tests" }`，账号 `apps-test`、密码 `apps-test-only`；测试必须先核验身份再写入。
+`TGDRIVE_TEST_VIDEO` 接收合成 WebM；`TGDRIVE_TEST_FILES_DIR` 接收合成目录树（兼容旧名 `TGDRIVE_TEST_READERS`）；
+`TGDRIVE_APP_CATALOG_DIR` 必须显式指向绝对包目录。使用前先构建宿主 `frontend/dist`；没有目录输入时默认禁用目录。
+维护者发布后可单独设置 `TGDRIVE_TEST_GITHUB_REPO=lengyuesky/tgdrive-app`，在同一个临时数据库夹具内验证真实远程目录；
+若同时指定本地目录，则本地模式优先。该开关仅存在于 ignored 测试夹具，普通测试不读取这些环境变量，也不会默认联网。
+
+真实短视频、图书、漫画、影视的业务回归由插件仓库维护，本机通过显式 `TGDRIVE_HOST_DIR` 连接已构建的私有宿主完成集成验证，
+不能默认猜测相邻仓库。每次发布记录真实验证的完整宿主提交，不将宿主源码、产物或 trace 上传到公开插件 CI。
+没有私有宿主权限的贡献者可运行插件独立检查和单元测试，但不能将其宣称为跨仓库集成通过。
+触摸模拟不能替代 iOS Safari／Android Chrome 真机验收。插件测试夹具和业务验证说明见[插件仓库](https://github.com/lengyuesky/tgdrive-app)。

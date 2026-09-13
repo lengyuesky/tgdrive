@@ -4,7 +4,6 @@ WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
-COPY apps/ /apps/
 RUN npm run build
 
 # ---------- 阶段 2:构建后端 ----------
@@ -18,7 +17,6 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
     && rm -rf src
 COPY migrations ./migrations
 COPY src ./src
-COPY apps/backend ./apps/backend
 RUN touch src/main.rs && cargo build --release
 
 # ---------- 阶段 3:运行时 ----------
@@ -32,7 +30,6 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=backend /app/target/release/tgdrive /usr/local/bin/tgdrive
 COPY --from=frontend /frontend/dist /app/static
-COPY --from=frontend /apps/catalog /app/app-catalog
 ENV TGDRIVE_STATIC_DIR=/app/static \
     TGDRIVE_DB_PATH=/data/tgdrive.db \
     TGDRIVE_LOCAL_DATA_ROOT=/var/lib/telegram-bot-api \

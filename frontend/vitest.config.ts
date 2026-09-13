@@ -9,7 +9,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],
-    include: ['src/**/*.test.ts', '../apps/frontend/**/*.test.ts', '../apps/reader/**/*.test.ts', '../apps/books/**/*.test.ts', '../apps/comics/**/*.test.ts', '../apps/cinema/**/*.test.ts'],
+    include: ['src/**/*.test.ts'],
     restoreMocks: true,
   },
 })
