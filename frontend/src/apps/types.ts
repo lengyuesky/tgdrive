@@ -46,7 +46,7 @@ export interface CatalogApp {
   digest: string
   size: number
   source: 'github' | 'local'
-  release_url?: string | null
+  source_url?: string | null
   update_available: boolean
 }
 

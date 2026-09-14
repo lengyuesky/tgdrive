@@ -9,21 +9,19 @@ const REPOSITORY: &str = "lengyuesky/tgdrive-app";
 fn entry(manifest: Manifest, bytes: &[u8]) -> CatalogEntry {
     CatalogEntry {
         url: format!(
-            "https://github.com/{REPOSITORY}/releases/download/v1.0.0/{}-{}.tgapp",
+            "https://raw.githubusercontent.com/{REPOSITORY}/main/apps/{}-{}.tgapp",
             manifest.id, manifest.version
         ),
         manifest,
         sha256: crate::engine::upload::to_hex(&Sha256::digest(bytes)),
         size: bytes.len(),
-        release_tag: "v1.0.0".into(),
     }
 }
 
 fn payload(entry: CatalogEntry) -> Vec<u8> {
     serde_json::to_vec(&CatalogPayload {
-        schema_version: 1,
+        schema_version: 2,
         repository: REPOSITORY.into(),
-        release_tag: "v1.0.0".into(),
         entries: vec![entry],
     })
     .unwrap()
@@ -241,14 +239,19 @@ async fn old_confirmation_survives_history_removal_and_restart_without_granting_
             preview["available"][0]["manifest"]["permissions"],
             json!([])
         );
+        let mut rollback = hidden.clone();
+        rollback.manifest.version = "1.0.0".into();
+        rollback.url = format!(
+            "https://raw.githubusercontent.com/{REPOSITORY}/main/apps/{}-{}.tgapp",
+            rollback.manifest.id, rollback.manifest.version
+        );
         let intermediate = if filtered {
-            let mut future = hidden.clone();
-            future.manifest.api_version = package::API_VERSION + 1;
-            payload(future)
+            payload(rollback)
         } else {
-            serde_json::to_vec(&json!({"schema_version":1, "repository":REPOSITORY, "release_tag":"v1.0.0", "entries":[]})).unwrap()
+            // 同版本元数据篡改
+            payload(correct.clone())
         };
-        for catalog in [intermediate, payload(correct.clone())] {
+        for catalog in [intermediate] {
             // 每阶段重建管理器，同时验证持久目录不能被删除步骤覆盖。
             state.apps_catalog = manager(
                 &root,

@@ -169,8 +169,8 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 开发、打包和 SDK 用法见 [页面应用开发说明](docs/apps.md)。
 官方插件（短视频、图书、漫画、影视）已拆分至独立插件仓库 [lengyuesky/tgdrive-app](https://github.com/lengyuesky/tgdrive-app)。
-每次打开应用中心会在展示已安装列表后，后台检查 GitHub Release 目录；只有用户确认安装或更新时才下载对应摘要的包，并校验 SHA256、实际大小和完整清单。摘要只证明内容完整性，不认证清单中的作者。
-默认仓库为 `TGDRIVE_APP_GITHUB_REPO=lengyuesky/tgdrive-app`（仅接受合法 `owner/repo`），入口为该仓库最新稳定 Release 的 `catalog.json`。
+每次打开应用中心会在展示已安装列表后，后台检查 GitHub 仓库根目录的应用索引；只有用户确认安装或更新时才下载对应摘要的包，并校验 SHA256、实际大小和完整清单。摘要只证明内容完整性，不认证清单中的作者。
+默认仓库为 `TGDRIVE_APP_GITHUB_REPO=lengyuesky/tgdrive-app`（仅接受合法 `owner/repo`），入口为该仓库主分支的 `catalog.json`（`https://raw.githubusercontent.com/<repository>/main/catalog.json`）。
 非空 `TGDRIVE_APP_CATALOG_DIR` 优先切换为本地安装包目录；空值视为未设置。没有显式目录且 `TGDRIVE_APP_CATALOG_REMOTE_ENABLED=false` 时，仅发现旧本地 `app-catalog/` 或 `apps/catalog/`，否则禁用目录。关闭目录不影响导入或已安装应用。
 目录缓存有效期 5 分钟，手动刷新也遵守至少 30 秒联网间隔；离线保留上次成功目录并显示过期状态。数据库旁 `app-catalog-cache/` 按仓库隔离，已验证包采用 128 MiB LRU 缓存，独立于已安装包和用户数据。出站请求使用后台当前代理，不读取系统代理。
 宿主 Docker 仅编译宿主前端与后端，不编译、复制或下载插件。

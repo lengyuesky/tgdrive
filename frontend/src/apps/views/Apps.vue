@@ -62,7 +62,7 @@
           <div v-else-if="card.available" class="card-actions">
             <el-button type="primary" :disabled="!!busy" @click="previewCatalog(card.available)">安装</el-button>
             <a :href="api.apps.packageUrl(card.manifest.id, card.available.digest)" class="package-link">下载插件包</a>
-            <a v-if="card.available.release_url" :href="card.available.release_url" target="_blank" rel="noopener noreferrer" class="package-link">Release 页面</a>
+            <a v-if="card.available.source_url" :href="card.available.source_url" target="_blank" rel="noopener noreferrer" class="package-link">来源仓库</a>
           </div>
         </article>
       </div>

@@ -1,4 +1,4 @@
-//! 应用中心目录：支持从 GitHub Release 安全获取、校验、持久缓存及精确摘要安装插件包。
+//! 应用中心目录：安全读取 GitHub 仓库根目录索引，校验、缓存并按精确摘要安装插件包。
 
 use crate::apps::package::{API_VERSION, AppPackage, MAX_PACKAGE_SIZE, Manifest, valid_id};
 use crate::error::{AppError, AppResult};
@@ -103,7 +103,6 @@ pub fn is_valid_repo(repo: &str) -> bool {
 pub struct CatalogPayload {
     pub schema_version: u32,
     pub repository: String,
-    pub release_tag: String,
     pub entries: Vec<CatalogEntry>,
 }
 
@@ -114,7 +113,6 @@ pub struct CatalogEntry {
     pub sha256: String,
     pub size: usize,
     pub url: String,
-    pub release_tag: String,
 }
 
 #[derive(Deserialize)]
@@ -122,7 +120,6 @@ pub struct CatalogEntry {
 struct RawCatalogPayload {
     schema_version: u32,
     repository: String,
-    release_tag: String,
     entries: Vec<RawCatalogEntry>,
 }
 
@@ -133,7 +130,6 @@ struct RawCatalogEntry {
     sha256: String,
     size: usize,
     url: String,
-    release_tag: String,
 }
 
 #[derive(Deserialize)]
@@ -159,17 +155,13 @@ pub struct CatalogApp {
     pub digest: String,
     pub size: usize,
     pub source: CatalogSourceType,
-    pub release_url: Option<String>,
+    pub source_url: Option<String>,
     pub update_available: bool,
 }
 
 fn stable_version(value: &str) -> Option<semver::Version> {
     let version = semver::Version::parse(value).ok()?;
     (value.len() <= 80 && version.pre.is_empty() && version.build.is_empty()).then_some(version)
-}
-
-fn stable_release_tag(value: &str) -> Option<semver::Version> {
-    stable_version(value.strip_prefix('v')?)
 }
 
 fn valid_digest(digest: &str) -> bool {
@@ -179,10 +171,7 @@ fn valid_digest(digest: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn valid_release_asset(asset: &str) -> bool {
-    if asset == "catalog.json" {
-        return true;
-    }
+fn valid_package_asset(asset: &str) -> bool {
     asset
         .strip_suffix(".tgapp")
         .and_then(|name| name.rsplit_once('-'))
@@ -203,41 +192,33 @@ pub fn validate_redirect_url(url: &Url, expected_repo: &str) -> AppResult<()> {
             "链接仅支持 443 端口且不能含片段".into(),
         ));
     }
-    match url.host_str() {
-        Some("github.com") => {
-            let prefix = format!("/{expected_repo}/releases/");
-            let path = url.path().strip_prefix(&prefix);
-            let valid = path.is_some_and(|path| {
-                path == "latest/download/catalog.json"
-                    || path
-                        .strip_prefix("download/")
-                        .and_then(|download| download.split_once('/'))
-                        .is_some_and(|(tag, asset)| {
-                            stable_release_tag(tag).is_some() && valid_release_asset(asset)
-                        })
-            });
-            if !valid || url.query().is_some() {
-                return Err(AppError::BadRequest(
-                    "GitHub 链接必须是本仓库的合法 Release 下载路径且不能含查询参数".into(),
-                ));
-            }
-        }
-        Some("release-assets.githubusercontent.com" | "objects.githubusercontent.com") => {
-            // CDN 的签名查询仅用于请求，任何错误均不回显 URL。
-        }
-        _ => return Err(AppError::BadRequest("拒绝访问不受信任的下载主机".into())),
+    if url.query().is_some() {
+        return Err(AppError::BadRequest("链接禁止包含查询参数".into()));
+    }
+    if url.host_str() != Some("raw.githubusercontent.com") {
+        return Err(AppError::BadRequest("拒绝访问不受信任的下载主机".into()));
+    }
+    let prefix = format!("/{expected_repo}/main/");
+    let Some(relative_path) = url.path().strip_prefix(&prefix) else {
+        return Err(AppError::BadRequest(
+            "GitHub 下载路径必须属于指定仓库的主分支".into(),
+        ));
+    };
+    let valid = if relative_path == "catalog.json" {
+        true
+    } else if let Some(asset) = relative_path.strip_prefix("apps/") {
+        valid_package_asset(asset)
+    } else {
+        false
+    };
+    if !valid {
+        return Err(AppError::BadRequest("GitHub 下载路径格式无效".into()));
     }
     Ok(())
 }
 
 fn validate_initial_url(url: &Url, expected_repo: &str) -> AppResult<()> {
-    validate_redirect_url(url, expected_repo)?;
-    if url.host_str() != Some("github.com") {
-        return Err(AppError::BadRequest(
-            "初始下载地址必须属于指定 GitHub 仓库".into(),
-        ));
-    }
-    Ok(())
+    validate_redirect_url(url, expected_repo)
 }
 
 #[async_trait::async_trait]
@@ -547,7 +528,7 @@ impl CatalogManager {
                                 );
                             }
                             Err(err) => {
-                                tracing::warn!(%err, "持久缓存目录损坏，将在联网时重新获取");
+                                tracing::warn!(%err, "持久缓存目录损坏或为旧协议版本，将在联网时重新获取");
                                 let _ = std::fs::remove_file(&catalog_path);
                             }
                         },
@@ -599,19 +580,17 @@ impl CatalogManager {
         }
         let payload: RawCatalogPayload = serde_json::from_slice(bytes)
             .map_err(|_| AppError::BadRequest("目录 JSON 或字段格式无效".into()))?;
-        if payload.schema_version != 1
+        if payload.schema_version != 2
             || !is_valid_repo(expected_repo)
             || payload.repository != expected_repo
         {
             return Err(AppError::BadRequest("目录协议版本或仓库名不符".into()));
         }
-        let release = stable_release_tag(&payload.release_tag)
-            .ok_or_else(|| AppError::BadRequest("目录 Release 标签必须为稳定的 vX.Y.Z".into()))?;
         if payload.entries.len() > MAX_ENTRIES {
             return Err(AppError::BadRequest("目录条目数量超过 512 上限".into()));
         }
         let host = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("主程序版本合法");
-        let mut seen = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
         let mut validated_entries = Vec::with_capacity(payload.entries.len());
         for entry in payload.entries {
             let header: CatalogCompatibility = serde_json::from_value(entry.manifest.clone())
@@ -625,38 +604,25 @@ impl CatalogManager {
                     "目录清单 ID、稳定版本或接口版本无效".into(),
                 ));
             }
+            if !seen.insert(header.id.clone()) {
+                return Err(AppError::BadRequest("目录包含重复的应用记录".into()));
+            }
             let minimum = semver::Version::parse(&header.min_host_version)
                 .map_err(|_| AppError::BadRequest("目录清单的最低宿主版本无效".into()))?;
             if !valid_digest(&entry.sha256) || entry.size == 0 || entry.size > MAX_PACKAGE_SIZE {
                 return Err(AppError::BadRequest("目录安装包摘要或大小无效".into()));
             }
-            if stable_release_tag(&entry.release_tag).is_none_or(|tag| tag > release) {
-                return Err(AppError::BadRequest(
-                    "条目 Release 标签必须稳定且不晚于目录标签".into(),
-                ));
-            }
             let expected_url = format!(
-                "https://github.com/{expected_repo}/releases/download/{}/{}-{}.tgapp",
-                entry.release_tag, header.id, header.version
+                "https://raw.githubusercontent.com/{expected_repo}/main/apps/{}-{}.tgapp",
+                header.id, header.version
             );
             if entry.url != expected_url {
                 return Err(AppError::BadRequest(
-                    "条目下载地址与仓库、Release 标签或包名不符".into(),
-                ));
-            }
-            let key = (header.id, header.version);
-            if let Some(previous) = seen.insert(key, entry.sha256.clone()) {
-                return Err(AppError::BadRequest(
-                    if previous == entry.sha256 {
-                        "目录包含重复的应用版本记录"
-                    } else {
-                        "目录同一应用版本包含不同摘要"
-                    }
-                    .into(),
+                    "条目下载地址与仓库、分支或包名不符".into(),
                 ));
             }
             // 仅明确声明未来接口或更高宿主版本的条目可以跳过；它们绝不参与下载或安装。
-            // 身份、摘要、大小和 Release 元数据仍须合法，兼容条目继续采用严格完整清单。
+            // 身份、摘要、大小元数据仍须合法，兼容条目继续采用严格完整清单。
             if header.api_version > API_VERSION || minimum > host {
                 continue;
             }
@@ -687,25 +653,46 @@ impl CatalogManager {
                 sha256: entry.sha256,
                 size: entry.size,
                 url: entry.url,
-                release_tag: entry.release_tag,
             });
         }
         Ok(CatalogPayload {
             schema_version: payload.schema_version,
             repository: payload.repository,
-            release_tag: payload.release_tag,
             entries: validated_entries,
         })
     }
 
     async fn validate_history(&self, payload: CatalogPayload) -> AppResult<CatalogPayload> {
         let snapshot = self.snapshot.read().await;
-        // 稳定目录必须保留全部已知历史，不能通过先删除再重引入来绕过旧确认的清单绑定。
-        for old in &snapshot.entries {
-            if !payload.entries.iter().any(|next| next == old) {
-                return Err(AppError::BadRequest(
-                    "远程目录删除或更改了已知应用版本的摘要或元数据".into(),
-                ));
+        let old_by_id: HashMap<&str, &CatalogEntry> = snapshot
+            .entries
+            .iter()
+            .map(|e| (e.manifest.id.as_str(), e))
+            .collect();
+
+        for new_entry in &payload.entries {
+            if let Some(old_entry) = old_by_id.get(new_entry.manifest.id.as_str()) {
+                let old_ver = semver::Version::parse(&old_entry.manifest.version)
+                    .map_err(|_| AppError::BadRequest("快照中的插件版本格式无效".into()))?;
+                let new_ver = semver::Version::parse(&new_entry.manifest.version)
+                    .map_err(|_| AppError::BadRequest("新目录中的插件版本格式无效".into()))?;
+
+                if new_ver < old_ver {
+                    return Err(AppError::BadRequest(format!(
+                        "远程目录应用 {} 版本倒退（{} -> {}）",
+                        new_entry.manifest.id, old_ver, new_ver
+                    )));
+                }
+                if new_ver == old_ver
+                    && (new_entry.sha256 != old_entry.sha256
+                        || new_entry.size != old_entry.size
+                        || new_entry.manifest != old_entry.manifest)
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "远程目录更改了已知应用 {} 版本 {} 的摘要或元数据",
+                        new_entry.manifest.id, old_ver
+                    )));
+                }
             }
         }
         Ok(payload)
@@ -759,7 +746,7 @@ impl CatalogManager {
                 }
 
                 let catalog_url =
-                    format!("https://github.com/{repo}/releases/latest/download/catalog.json");
+                    format!("https://raw.githubusercontent.com/{repo}/main/catalog.json");
                 let proxy = (self.proxy_provider)();
                 let fetch_result = self
                     .transport
@@ -856,7 +843,7 @@ impl CatalogManager {
                                 digest: pkg.digest,
                                 size: pkg.archive.len(),
                                 source: CatalogSourceType::Local,
-                                release_url: None,
+                                source_url: None,
                                 update_available,
                             },
                         );
@@ -894,21 +881,7 @@ impl CatalogManager {
                     if !entry.manifest.is_compatible() {
                         continue;
                     }
-                    let candidate_ver = semver::Version::parse(&entry.manifest.version).ok();
-                    if candidate_ver.is_none() {
-                        continue;
-                    }
-                    let old = best_by_id.get(&entry.manifest.id);
-                    let should_replace = match old {
-                        None => true,
-                        Some(old_entry) => {
-                            let old_ver = semver::Version::parse(&old_entry.manifest.version).ok();
-                            candidate_ver > old_ver
-                        }
-                    };
-                    if should_replace {
-                        best_by_id.insert(entry.manifest.id.clone(), entry.clone());
-                    }
+                    best_by_id.insert(entry.manifest.id.clone(), entry.clone());
                 }
                 let available = best_by_id
                     .into_values()
@@ -925,10 +898,7 @@ impl CatalogManager {
                             digest: entry.sha256,
                             size: entry.size,
                             source: CatalogSourceType::Github,
-                            release_url: Some(format!(
-                                "https://github.com/{repo}/releases/tag/{}",
-                                entry.release_tag
-                            )),
+                            source_url: Some(format!("https://github.com/{repo}/tree/main/apps")),
                             update_available,
                         }
                     })
@@ -1006,16 +976,10 @@ impl CatalogManager {
                                 AppError::Conflict("插件包已经变化，请重新查看安装信息".into())
                             })?
                     } else {
-                        // 寻找兼容的最高版本
-                        let mut matching: Vec<_> = snap
-                            .entries
+                        // 寻找兼容的最新版本
+                        snap.entries
                             .iter()
-                            .filter(|e| e.manifest.id == id && e.manifest.is_compatible())
-                            .collect();
-                        matching.sort_by_key(|e| semver::Version::parse(&e.manifest.version).ok());
-                        matching
-                            .last()
-                            .cloned()
+                            .find(|e| e.manifest.id == id && e.manifest.is_compatible())
                             .cloned()
                             .ok_or(AppError::NotFound)?
                     }

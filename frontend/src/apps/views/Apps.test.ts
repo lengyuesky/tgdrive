@@ -25,7 +25,7 @@ const installed: InstalledApp = {
 const available: CatalogApp = {
   manifest: { ...manifest, version: '1.1.0', permissions: ['files.read'] }, digest: 'b'.repeat(64),
   size: 1024, source: 'github', update_available: true,
-  release_url: 'https://github.com/lengyuesky/tgdrive-app/releases/tag/v1.0.0',
+  source_url: 'https://github.com/lengyuesky/tgdrive-app/tree/main/apps',
 }
 let snapshot: AppIndex
 let wrapper: ReturnType<typeof shallowMount> | undefined
@@ -138,13 +138,13 @@ describe('应用中心远程目录', () => {
     expect(mocks.refreshCatalog).toHaveBeenLastCalledWith(true)
   })
 
-  it('可安装卡片显示 GitHub、Release 页面与精确摘要下载链接', async () => {
+  it('可安装卡片显示 GitHub、来源仓库与精确摘要下载链接', async () => {
     snapshot.installed = []
     const view = await render()
     await showAvailable()
     expect(view.text()).toContain('GitHub (lengyuesky/tgdrive-app)')
     const links = view.findAll('a')
-    expect(links.find((item) => item.text() === 'Release 页面')!.attributes('href')).toBe(available.release_url)
+    expect(links.find((item) => item.text() === '来源仓库')!.attributes('href')).toBe(available.source_url)
     expect(links.find((item) => item.text() === '下载插件包')!.attributes('href')).toContain(`digest=${available.digest}`)
     await button('安装')
     expect(mocks.installCatalog).not.toHaveBeenCalled()

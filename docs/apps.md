@@ -2,7 +2,7 @@
 
 应用中心管理可独立发布的页面应用。主程序负责安装、权限、登录、设置和文件访问；应用包只包含
 编译好的 HTML、JavaScript、CSS 等资源，不在服务器上执行脚本。
-官方插件（短视频、图书、漫画、影视）在独立仓库 `lengyuesky/tgdrive-app` 中开发与发布；宿主默认通过 HTTPS 获取 GitHub Release 目录，在用户确认后校验安装包的 SHA256、长度和完整清单。支持原子持久缓存（`app-catalog-cache/`）与精确摘要安装，也可通过 `TGDRIVE_APP_CATALOG_DIR` 指定本地包目录，或手动导入 `.tgapp` 插件包。插件页面不依赖主站的 Vue 页面或内部组件。
+官方插件（短视频、图书、漫画、影视）在独立仓库 `lengyuesky/tgdrive-app` 中开发与发布；宿主默认通过 HTTPS 获取 GitHub 目录（schema_version: 2），在用户确认后校验安装包的 SHA256、长度和完整清单。支持原子持久缓存（`app-catalog-cache/`）与精确摘要安装，也可通过 `TGDRIVE_APP_CATALOG_DIR` 指定本地包目录，或手动导入 `.tgapp` 插件包。插件页面不依赖主站的 Vue 页面或内部组件。
 图书、漫画只读取网盘文件，不接外部书源，也不修改文件页原有预览与菜单。
 
 ## 使用与生命周期
@@ -94,37 +94,32 @@ node package.mjs /绝对路径/我的应用/dist /绝对路径/输出目录
 ```
 
 工具加入插件仓库的 `sdk/tgdrive-sdk.js` 并生成 `<ID>-<版本>.tgapp`；源目录不要再放同名 SDK 文件。
-默认插件构建完成 TypeScript 编译、复制第三方许可及 PDF CMap/标准字体资源，再输出到 `.build/` 与 `catalog/`。
+默认插件构建完成 TypeScript 编译、复制第三方许可及 PDF CMap/标准字体资源，再输出到 `.build/` 与 `apps/`，并在插件仓库根目录生成 `catalog.json` 与 `SHA256SUMS`。
 不依赖服务器上的 PDF 转换服务或系统字体。构建包不等于安装包，任何部署都需要用户主动选择安装或升级，不自动固定入口。
 
 ### 目录配置与缓存
 
 - 默认仓库为 `TGDRIVE_APP_GITHUB_REPO=lengyuesky/tgdrive-app`，只接受合法 GitHub `owner/repo`，不接受任意 URL、空白或 `.`/`..` 路径。
-- 默认入口为 `https://github.com/lengyuesky/tgdrive-app/releases/latest/download/catalog.json`。非空 `TGDRIVE_APP_CATALOG_DIR` 优先选择可信的本地 `.tgapp`/`.zip` 目录；空值视为未配置，不扫描当前工作目录。
+- 默认入口为 `https://raw.githubusercontent.com/lengyuesky/tgdrive-app/main/catalog.json`。非空 `TGDRIVE_APP_CATALOG_DIR` 优先选择可信的本地 `.tgapp`/`.zip` 目录；空值视为未配置，不扫描当前工作目录。
 - 未指定本地目录时，`TGDRIVE_APP_CATALOG_REMOTE_ENABLED` 默认 `true`；设为 `false` 才依次发现工作目录中的 `app-catalog/`、`apps/catalog/`，均不存在则禁用目录。Docker 不预装这些目录；本地模式需自行挂载安装包目录。
 - 同一 ID 展示最高兼容语义版本，本地与远程目录都支持按确认摘要找到仍存在的历史包；找不到时返回 409，绝不自动换成新版。
 - 打开应用中心先展示已安装列表，再进行普通后台检查；手动刷新为强制检查。远程目录缓存有效期 5 分钟，联网至少间隔 30 秒并合并并发检查。失败保留上次成功快照（空目录也属于成功快照），标为 `stale`；没有好快照时为 `unavailable`，不阻止已安装应用运行。
 - 数据库旁的 `app-catalog-cache/` 按仓库隔离，原子保存目录与已验证包。重启后过期目录仍显示过期，损坏缓存不可信；包缓存采用 128 MiB LRU，清理中断写入的临时文件，不触碰数据库、已安装包或运行数据。
 - 请求使用后台当前出站代理，不读取系统代理或使用 GitHub token。目录总超时 10 秒、包总超时 120 秒（包括所有重定向与响应体），连接超时 10 秒。
 
-### 稳定 Release 目录协议
+### 稳定主分支目录协议（schema_version: 2）
 
-目录为 `{schema_version:1, repository, release_tag, entries}`；每条记录包含完整 `manifest`、64 位小写十六进制 `sha256`、
-正整数压缩包 `size`、`url` 与 `release_tag`。目录最多 1 MiB、512 条，压缩包仍不超过 16 MiB。
-仓库级稳定标签必须是无前导零、预发布或构建后缀的 `vX.Y.Z`，应用 `version` 采用相同约束的 `X.Y.Z`。
-下载 URL 必须精确为 `https://github.com/<owner>/<repo>/releases/download/<entry.release_tag>/<id>-<version>.tgapp`，
-条目标签不能晚于目录标签；Release 页面链接使用 `/releases/tag/<tag>`，不是二进制下载链接。
+目录为 `{schema_version:2, repository, entries}`；顶层仅包含 `schema_version`、`repository` 和 `entries`，entry 仅包含完整 `manifest`、64 位小写十六进制 `sha256`、正整数压缩包 `size` 与 `url`。不再使用 `release_tag`，不增加 `branch`/`ref` 字段。目录最多 1 MiB、512 条，每个应用 ID 最多一条最新版记录，压缩包不超过 16 MiB。
+应用 `version` 必须是无前导零、预发布或构建后缀的稳定 SemVer `X.Y.Z`。
+安装包下载 URL 必须精确为 `https://raw.githubusercontent.com/<repository>/main/apps/<id>-<version>.tgapp`；来源仓库链接 `source_url` 使用 `https://github.com/<repository>/tree/main/apps`。
 
-发布目录必须完整保留历史记录，重复 ID/版本（即使摘要相同）或同版本元数据篡改均被拒绝。
-宿主要求每个已知兼容记录在后续目录中仍存在且完全相同；删除记录、把它改成不兼容版本以隐藏，或先删除再重引入，都不会替换旧快照或持久目录。
-这样原确认框的摘要不会被重新绑定到用户未确认的权限。初次空目录仍合法；已有历史后的非法空目录会标记 `stale`。
-宿主先验证每条记录的 ID、稳定版本、兼容性标记、摘要、大小和 Release 元数据；明确要求未来 API 或更高宿主版本的条目不参与安装，
-其未知清单扩展不会使兼容历史不可用。兼容条目仍严格拒绝未知清单字段、非法权限与设置；畸形目录不会替换上次好快照。
+目录仅包含每个 ID 的最新兼容版本，不再要求保留所有历史。更新时允许新版本替换旧版本，也允许目录移除插件，但严格禁止同 ID 倒退版本。对快照中相同 id/version 的条目，保留内容不可篡改的保护，严格校验 digest/manifest/size。
+用户确认安装或更新时绑定对应条目的完整清单与摘要；若在此期间目录刷新导致该摘要不再存在，安装接口返回 409 Conflict，绝不因分支可变而跳过摘要校验。旧缓存若为 schema 1 协议会被安全忽略并刷新为新协议。
+宿主先验证每条记录的 ID、稳定版本、兼容性标记、摘要、大小和 URL 格式；明确要求未来 API 或更高宿主版本的条目不参与安装，其未知清单扩展不会使兼容应用不可用。兼容条目仍严格拒绝未知清单字段、非法权限与设置；畸形目录不会替换上次好快照。
 下载和缓存命中都校验实际 SHA256、长度、完整清单与 ZIP 安全限制，再调用原安装事务，安装锁不覆盖网络等待。
 
-初始 URL 只允许指定仓库的 GitHub Release 下载路径，不含查询或片段。每跳重定向均验证，最多五次；仅允许 HTTPS/443、
-无用户信息的 `github.com`（仍限定本仓库合法 Release 下载路径）、`release-assets.githubusercontent.com`、`objects.githubusercontent.com`。
-只有 CDN 查询可以保留用于签名请求，错误与日志不回显下载 URL 或代理凭据。
+初始 URL 与每跳重定向严格限制在 `raw.githubusercontent.com` 的同一仓库主分支合法路径（`/<repo>/main/catalog.json` 或 `/<repo>/main/apps/<id>-<version>.tgapp`），重定向最多 5 次；必须为 HTTPS/443、无用户信息且禁止携带任何查询参数或片段。
+错误与日志不回显下载 URL 或代理凭据。
 插件版本及发布流程以[插件发布说明](https://github.com/lengyuesky/tgdrive-app/blob/main/docs/release.md)为准。
 
 ## 权限与隔离
@@ -365,7 +360,7 @@ PDF 不使用浏览器内置 iframe，不启用 WASM、XFA 或自动整本预取
 | `POST /api/apps/:id/rpc` | 宿主能力网关，应用使用 SDK 调用 |
 
 目录状态 `catalog` 包含 `source`（`github`/`local`/`disabled`）、`repository`、`state`（`ready`/`stale`/`unavailable`/`disabled`）、
-`last_success_at`（Unix 毫秒或 null）和 `error`。可安装条目在原有 `manifest`、`digest`、`update_available` 外提供 `size`、`source`、`release_url`。
+`last_success_at`（Unix 毫秒或 null）和 `error`。可安装条目在原有 `manifest`、`digest`、`update_available` 外提供 `size`、`source`、`source_url`。
 远程失败只影响目录状态，列表仍返回已安装应用；目录查询、刷新、下载和安装全部要求主站登录。
 接口不会因为前端隐藏按钮就放行未安装、已停用或权限不足的应用。
 
