@@ -82,12 +82,12 @@ export function makeZip(files) {
   return Buffer.concat([...localChunks, ...cdChunks, eocd])
 }
 
-// 预置合成应用以支持目录列表验证
-const sampleApp = makeZip({
+// 预置合成应用以支持目录列表与一键更新验证：同 ID 提供两个版本，目录只展示最高版
+const booksPackage = (version) => makeZip({
   'app.json': JSON.stringify({
     id: 'books',
     name: '图书',
-    version: '1.0.0',
+    version,
     api_version: 2,
     min_host_version: '0.1.0',
     description: '自包含合成测试图书应用',
@@ -98,7 +98,8 @@ const sampleApp = makeZip({
   }),
   'index.html': '<!doctype html><html><body><h1>Books</h1></body></html>',
 })
-await writeFile(`${catalogDir}/books-1.0.0.tgapp`, sampleApp)
+await writeFile(`${catalogDir}/books-1.0.0.tgapp`, booksPackage('1.0.0'))
+await writeFile(`${catalogDir}/books-1.0.1.tgapp`, booksPackage('1.0.1'))
 
 function runCmd(command, args, options = {}) {
   return new Promise((resolve, reject) => {

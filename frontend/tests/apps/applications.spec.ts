@@ -485,3 +485,38 @@ test('资源按修订不可变缓存与压缩，包内图标正常渲染', async
   await page.screenshot({ path: testInfo.outputPath('应用图标与缓存.png'), fullPage: true })
   await cdp.detach()
 })
+
+test('一键更新聚合全部可更新应用，单次确认后逐个安装', async ({ page }) => {
+  // 导入旧版 books 包制造更新场景：目录中的 1.0.1 成为可更新目标。
+  const legacy = makeZip({
+    'app.json': JSON.stringify({
+      id: 'books', name: '图书', version: '0.9.0', api_version: 2, min_host_version: '0.1.0',
+      description: '旧版合成图书应用', author: '测试夹具', entry: 'index.html', permissions: [], settings: [],
+    }),
+    'index.html': '<!doctype html><html><body><h1>Legacy Books</h1></body></html>',
+  })
+  const legacyPath = `${temporary}/books-legacy-0.9.0.tgapp`
+  await writeFile(legacyPath, legacy)
+  await page.goto('/apps')
+  await (await importApp(page, legacyPath)).getByRole('button', { name: '同意并安装' }).click()
+  await page.getByRole('tab', { name: /应用设置/ }).click()
+  const row = page.locator('[data-app-id="books"].manage-row')
+  await expect(row).toBeVisible()
+  await expect(row).toContainText('v0.9.0')
+  await expect(row).toContainText('有新版本 v1.0.1')
+
+  // 工具栏出现一键更新入口；弹窗单次确认版本变化与新增权限后逐个安装。
+  const batchButton = page.getByRole('button', { name: '一键更新' })
+  await expect(batchButton).toBeVisible()
+  await batchButton.click()
+  const dialog = page.getByRole('dialog', { name: '一键更新', exact: true })
+  await expect(dialog).toBeVisible()
+  await expect(dialog).toContainText('v0.9.0 → v1.0.1')
+  await expect(dialog).toContainText('搜索文件与读取文件信息')
+  await dialog.getByRole('button', { name: '全部更新' }).click()
+  await expect(dialog).not.toBeVisible()
+  await expect(row).toContainText('v1.0.1')
+  await expect(row).toContainText('应用目录')
+  // 更新完成后入口消失。
+  await expect(page.getByRole('button', { name: '一键更新' })).toHaveCount(0)
+})

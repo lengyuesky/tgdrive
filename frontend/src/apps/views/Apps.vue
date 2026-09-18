@@ -30,7 +30,10 @@
             应用设置 <span v-if="updateCount" class="update-count">{{ updateCount }}</span>
           </button>
         </div>
-        <el-input v-model="query" class="app-search" :prefix-icon="Search" placeholder="搜索应用" clearable />
+        <div class="tools-side">
+          <el-input v-model="query" class="app-search" :prefix-icon="Search" placeholder="搜索应用" clearable />
+          <el-button v-if="updateCount" type="primary" :icon="Download" class="batch-update" @click="openBatchUpdate">一键更新（{{ updateCount }}）</el-button>
+        </div>
       </div>
       <div v-if="tab !== 'settings'" v-loading="loading" class="apps-grid">
         <article v-for="card in cards" :key="card.manifest.id" class="app-tile"
@@ -135,6 +138,37 @@
         <el-button type="danger" :loading="!!busy" @click="confirmUninstall">卸载</el-button>
       </template>
     </ResponsivePanel>
+    <ResponsivePanel v-model="batchVisible" title="一键更新" width="min(560px, 94vw)" align-center
+      :close-on-click-modal="!batchRunning" :close-on-press-escape="!batchRunning" :show-close="!batchRunning">
+      <p class="batch-summary">将逐个下载并安装以下 {{ batchTargets.length }} 个应用的新版本；更新保留配置、启停状态与应用数据，失败不影响其余应用。</p>
+      <ul class="batch-list">
+        <li v-for="target in batchTargets" :key="target.app.manifest.id" class="batch-item">
+          <span class="batch-icon" aria-hidden="true"><AppIcon :manifest="target.app.manifest" :revision="target.app.revision" /></span>
+          <div class="batch-info">
+            <div class="batch-title">
+              <strong>{{ target.app.manifest.name }}</strong>
+              <span class="batch-version">v{{ target.app.manifest.version }} → v{{ target.update.manifest.version }}</span>
+            </div>
+            <p v-if="target.added.length" class="batch-perms">
+              新增权限：<el-tag v-for="permission in target.added" :key="permission" type="warning" size="small">{{ permissionLabels[permission] ?? permission }}</el-tag>
+            </p>
+            <p class="batch-status" :class="target.status">
+              <template v-if="target.status === 'running'"><el-icon class="is-loading"><Loading /></el-icon>正在下载并安装…</template>
+              <template v-else-if="target.status === 'done'">已更新</template>
+              <template v-else-if="target.status === 'failed'">更新失败：{{ target.message }}</template>
+              <template v-else>等待更新</template>
+            </p>
+          </div>
+        </li>
+      </ul>
+      <template #footer>
+        <el-button :disabled="batchRunning" @click="batchVisible = false">取消</el-button>
+        <el-button type="primary" :loading="batchRunning" @click="onBatchAction">
+          {{ batchRunning ? `正在更新 ${batchDone}/${batchTargets.length}` : batchFinished ? '完成' : `全部更新（${batchTargets.length}）` }}
+        </el-button>
+      </template>
+    </ResponsivePanel>
+
     <AppSettingsDialog v-model="settingsVisible" :app="settingsApp" @scope-saved="load" />
   </main>
 </template>
@@ -144,7 +178,7 @@ import ResponsivePanel from '@drive/components/ResponsivePanel.vue'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, MoreFilled, Refresh, Search, StarFilled, Upload } from '@element-plus/icons-vue'
+import { ArrowLeft, Download, Loading, MoreFilled, Refresh, Search, StarFilled, Upload } from '@element-plus/icons-vue'
 import { api, errMsg } from '@drive/api'
 import { notifyAppsChanged, permissionLabels, type AppIndex, type AppManifest, type AppPreview, type CatalogApp, type InstalledApp } from '../types'
 import { prefetchLaunch } from '../prefetch'
@@ -291,6 +325,68 @@ async function confirmInstall() {
   } catch (e) { installError.value = errMsg(e) }
   finally { installing.value = false }
 }
+/** 一键更新：单次确认后逐个安装目录包；每个应用独立原子提交，失败不影响其余。 */
+type BatchStatus = 'pending' | 'running' | 'done' | 'failed'
+interface BatchTarget {
+  app: InstalledApp
+  update: CatalogApp
+  added: string[]
+  status: BatchStatus
+  message: string
+}
+const batchVisible = ref(false)
+const batchRunning = ref(false)
+const batchFinished = ref(false)
+const batchDone = ref(0)
+const batchTargets = ref<BatchTarget[]>([])
+
+function openBatchUpdate() {
+  const rows = manageRows.value.filter((row) => row.update)
+  if (!rows.length || batchRunning.value) return
+  const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+  batchTargets.value = rows.map(({ app, update }) => ({
+    app: clone(app),
+    update: clone(update!),
+    added: update!.manifest.permissions.filter((permission) => !app.manifest.permissions.includes(permission)),
+    status: 'pending',
+    message: '',
+  }))
+  batchFinished.value = false
+  batchDone.value = 0
+  batchVisible.value = true
+}
+function onBatchAction() {
+  if (batchFinished.value) { batchVisible.value = false; return }
+  void runBatchUpdate()
+}
+async function runBatchUpdate() {
+  if (batchRunning.value) return
+  batchRunning.value = true
+  let failed = 0
+  for (const target of batchTargets.value) {
+    target.status = 'running'
+    try {
+      await api.apps.installCatalog(target.app.manifest.id, target.update.digest, target.app.revision)
+      target.status = 'done'
+      batchDone.value++
+    } catch (e) {
+      target.status = 'failed'
+      target.message = errMsg(e)
+      failed++
+    }
+  }
+  batchRunning.value = false
+  batchFinished.value = true
+  notifyAppsChanged()
+  await load()
+  if (!failed) {
+    ElMessage.success(`已更新 ${batchTargets.value.length} 个应用`)
+    batchVisible.value = false
+  } else {
+    ElMessage.warning(`更新完成：成功 ${batchTargets.value.length - failed} 个，失败 ${failed} 个`)
+  }
+}
+
 async function command(action: string, app: InstalledApp) {
   if (action === 'uninstall') {
     uninstallTarget.value = app; purgeData.value = false; uninstallVisible.value = true
@@ -335,6 +431,8 @@ async function confirmUninstall() {
 .apps-tabs span { font-size: 12px; margin-left: 5px; }
 .apps-tabs .update-count { color: #ef4444; font-weight: 600; }
 .app-search { max-width: 260px; }
+.tools-side { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.batch-update { flex-shrink: 0; margin: 0; }
 /* 手机桌面式图标网格 */
 .apps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); gap: 16px; min-height: 90px; }
 .app-tile { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 18px 12px 16px; border: 1px solid transparent; border-radius: 20px; transition: background-color .2s, border-color .2s; }
@@ -375,6 +473,20 @@ async function confirmUninstall() {
 .manage-meta .update-hint { margin: 0; }
 .manage-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .manage-actions .el-button { margin: 0; }
+/* 一键更新弹窗：逐个安装的实时状态清单 */
+.batch-summary { margin: 0 0 14px; font-size: 13px; line-height: 1.7; color: var(--el-text-color-secondary); }
+.batch-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; max-height: min(50vh, 420px); overflow: auto; }
+.batch-item { display: flex; gap: 12px; padding: 12px; border: 1px solid var(--glass-border); border-radius: 12px; }
+.batch-icon { flex-shrink: 0; display: block; width: 40px; height: 40px; border-radius: 12px; overflow: hidden; }
+.batch-info { flex: 1; min-width: 0; }
+.batch-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 14px; }
+.batch-title strong { word-break: break-word; }
+.batch-version { font-size: 12px; color: var(--el-text-color-secondary); word-break: break-word; }
+.batch-perms { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 6px 0 0; font-size: 12px; color: var(--el-text-color-secondary); }
+.batch-status { display: flex; align-items: center; gap: 6px; margin: 6px 0 0; font-size: 12px; color: var(--el-text-color-secondary); }
+.batch-status.done { color: var(--el-color-success); }
+.batch-status.failed { color: var(--el-color-danger); overflow-wrap: anywhere; }
+.batch-status .el-icon { font-size: 14px; }
 .package-link { color: var(--el-color-primary); text-decoration: none; font-size: 12px; }
 .package-link:hover { text-decoration: underline; }
 .apps-help { margin: 28px 0 0; text-align: center; color: var(--el-text-color-secondary); font-size: 12px; }
@@ -397,6 +509,7 @@ async function confirmUninstall() {
   .header-actions { width: 100%; display: flex; justify-content: flex-end; gap: 8px; }
   .apps-content { padding: 16px 12px; }
   .apps-tools { flex-wrap: wrap; gap: 12px; }
+  .tools-side { width: 100%; }
   .apps-tabs { width: 100%; overflow: auto; gap: 4px; }
   .apps-tabs button { min-height: 44px; padding: 10px; }
   .app-search { max-width: none; }

@@ -258,3 +258,66 @@ describe('应用设置管理列表', () => {
     expect(view.findAll('[role="tab"]')[1]!.attributes('aria-selected')).toBe('true')
   })
 })
+
+describe('一键更新', () => {
+  const demoInstalled: InstalledApp = {
+    manifest: { ...manifest, id: 'demo', name: '演示应用', version: '2.0.0' },
+    digest: 'd'.repeat(64), revision: 'demo-revision', enabled: true, pinned: false,
+    source: 'import', installed_at: 2, updated_at: 2, scope: [],
+  }
+  const demoAvailable: CatalogApp = {
+    manifest: { ...manifest, id: 'demo', name: '演示应用', version: '2.1.0', permissions: ['files.read', 'favorites.write'] },
+    digest: 'e'.repeat(64), size: 2048, source: 'github', update_available: true,
+  }
+
+  function batchDialog() {
+    return wrapper!.find('[role="dialog"][aria-label="一键更新"]')
+  }
+
+  it('无更新时不显示一键更新入口', async () => {
+    snapshot.available[0]!.update_available = false
+    const view = await render()
+    expect(view.text()).not.toContain('一键更新')
+  })
+
+  it('单次确认后逐个安装并自动关闭，正确携带摘要与旧修订', async () => {
+    snapshot.installed.push(structuredClone(demoInstalled))
+    snapshot.available.push(structuredClone(demoAvailable))
+    const view = await render()
+    await button('一键更新（2）')
+    const dialog = batchDialog()
+    expect(dialog.exists()).toBe(true)
+    expect(dialog.text()).toContain('测试应用')
+    expect(dialog.text()).toContain('v1.0.0 → v1.1.0')
+    expect(dialog.text()).toContain('演示应用')
+    expect(dialog.text()).toContain('v2.0.0 → v2.1.0')
+    // 新增权限在弹窗中逐项展示。
+    expect(dialog.text()).toContain('搜索文件与读取文件信息')
+    expect(dialog.text()).toContain('添加或取消收藏')
+    const lists = mocks.list.mock.calls.length
+    await button('全部更新（2）')
+    expect(mocks.installCatalog.mock.calls.map((call) => call[0])).toEqual(['sample', 'demo'])
+    expect(mocks.installCatalog).toHaveBeenNthCalledWith(1, 'sample', available.digest, installed.revision)
+    expect(mocks.installCatalog).toHaveBeenNthCalledWith(2, 'demo', demoAvailable.digest, demoInstalled.revision)
+    // 列表刷新且弹窗自动关闭。
+    expect(mocks.list.mock.calls.length).toBeGreaterThan(lists)
+    expect(batchDialog().exists()).toBe(false)
+  })
+
+  it('单个应用失败不影响其余：保留清单与原因，完成后可关闭', async () => {
+    snapshot.installed.push(structuredClone(demoInstalled))
+    snapshot.available.push(structuredClone(demoAvailable))
+    await render()
+    await button('一键更新（2）')
+    mocks.installCatalog.mockRejectedValueOnce(new Error('插件包已经变化，请重新查看安装信息'))
+    await button('全部更新（2）')
+    const dialog = batchDialog()
+    expect(dialog.exists()).toBe(true)
+    expect(dialog.text()).toContain('更新失败：插件包已经变化，请重新查看安装信息')
+    expect(dialog.text()).toContain('已更新')
+    // 失败后不再重复调用同一应用。
+    expect(mocks.installCatalog).toHaveBeenCalledTimes(2)
+    await button('完成')
+    expect(batchDialog().exists()).toBe(false)
+  })
+})
