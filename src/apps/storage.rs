@@ -94,6 +94,10 @@ pub(super) async fn invoke(
                     q.expected_revision.as_deref(),
                 )
                 .await?;
+            crate::events::emit(
+                &state.events,
+                crate::events::HostEvent::app("app.storage", &app.manifest.id, Some(q.key.clone())),
+            );
             record
                 .map(|r| r.json())
                 .transpose()

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt as _;
+use tokio::sync::broadcast;
 use tokio_util::io::ReaderStream;
 
 mod entries;
@@ -36,6 +37,10 @@ pub struct AppState {
     pub tasks: crate::tasks::TaskManager,
     pub migration: crate::migration::StorageMigrationManager,
     pub apps_catalog: Arc<crate::apps::CatalogManager>,
+    /// 进程内事件总线；SSE 向浏览器转发应用与文件树粗粒度变更。
+    pub events: crate::events::EventBus,
+    /// 应用媒体端点的共享小范围字节缓存（仅内存）。
+    pub range_cache: Arc<std::sync::Mutex<crate::apps::RangeCache>>,
 }
 
 /// 就绪探针：数据库可用、存储目标已装载且关键后台任务仍有心跳。
@@ -74,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::apps::protected_router())
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/events", get(events_sse))
         .route("/fs/list", get(list))
         .route("/fs/entries", get(entries::entries_get))
         .route("/fs/properties", get(properties_get))
@@ -168,6 +174,51 @@ pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: 
 }
 
 // ---------- 认证 ----------
+
+// ---------- 事件流 (SSE) ----------
+
+/// 单用户事件流：应用数据、设置、目录范围与文件树的粗粒度变更。
+/// 只携带标识不携带内容；重连由 EventSource 自动完成，断档由客户端全量重拉弥补。
+async fn events_sse(State(state): State<AppState>) -> Response {
+    let receiver = state.events.subscribe();
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive.tick().await; // 跳过立即触发的首次 tick
+    let stream = futures_util::stream::once(async {
+        Ok::<_, std::io::Error>("retry: 5000\n\n".to_string())
+    })
+    .chain(futures_util::stream::unfold(
+        (receiver, keepalive),
+        |(mut receiver, mut keepalive)| async move {
+            loop {
+                tokio::select! {
+                    event = receiver.recv() => match event {
+                        Ok(event) => {
+                            let Ok(json) = serde_json::to_string(&event) else { continue };
+                            return Some((
+                                Ok(format!("event: {}\ndata: {json}\n\n", event.kind)),
+                                (receiver, keepalive),
+                            ));
+                        }
+                        // 落后只丢失通知，不影响正确性；继续等待下一事件。
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    },
+                    _ = keepalive.tick() => {
+                        return Some((Ok(": keepalive\n\n".to_string()), (receiver, keepalive)));
+                    }
+                }
+            }
+        },
+    ));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        // 反向代理（nginx 等）默认缓冲响应体会让 SSE 卡住。
+        .header("x-accel-buffering", "no")
+        .body(axum::body::Body::from_stream(stream))
+        .expect("构造事件流失败")
+}
 
 fn peer_key(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
     addr.ip().to_string()
@@ -304,6 +355,7 @@ async fn mkdir(
     Json(b): Json<PathBody>,
 ) -> AppResult<Json<serde_json::Value>> {
     let node = state.vfs.mkdir_p(&b.path).await?;
+    crate::events::emit(&state.events, crate::events::HostEvent::files());
     Ok(Json(serde_json::json!({ "ok": true, "name": node.name })))
 }
 
@@ -613,6 +665,7 @@ async fn upload_complete(
     let node = state.vfs.db.complete_upload_session(&id).await?;
     // 覆盖旧文件时，删除任务已在事务内持久化；立即唤醒处理器。
     state.vfs.uploader.process_pending_deletes();
+    crate::events::emit(&state.events, crate::events::HostEvent::files());
     Ok(Json(serde_json::json!({
         "ok": true,
         "entry": Entry::from(&node),
@@ -804,7 +857,7 @@ pub(crate) async fn thumbnail_for_node(
 }
 
 /// 解析单个 Range;None=无 Range,Err=不可满足
-fn parse_range(headers: &HeaderMap, total: u64) -> Result<Option<(u64, u64)>, ()> {
+pub(crate) fn parse_range(headers: &HeaderMap, total: u64) -> Result<Option<(u64, u64)>, ()> {
     let Some(h) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
         return Ok(None);
     };
@@ -952,6 +1005,7 @@ async fn rename(
     Json(b): Json<FromTo>,
 ) -> AppResult<Json<serde_json::Value>> {
     state.vfs.rename(&b.from, &b.to).await?;
+    crate::events::emit(&state.events, crate::events::HostEvent::files());
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -960,6 +1014,7 @@ async fn copy_entry(
     Json(b): Json<FromTo>,
 ) -> AppResult<Json<serde_json::Value>> {
     state.vfs.copy(&b.from, &b.to).await?;
+    crate::events::emit(&state.events, crate::events::HostEvent::files());
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -991,6 +1046,9 @@ async fn delete(
             Ok(()) => deleted += 1,
             Err(e) => failed.push(serde_json::json!({ "path": p, "error": e.to_string() })),
         }
+    }
+    if deleted > 0 {
+        crate::events::emit(&state.events, crate::events::HostEvent::files());
     }
     Ok(Json(
         serde_json::json!({ "deleted": deleted, "failed": failed }),
@@ -1401,7 +1459,7 @@ pub(crate) struct SearchQuery {
     favorite: bool,
     /// 只在该目录子树内搜索；缺省或 `/` 表示整库。
     #[serde(default)]
-    under: Option<String>,
+    pub(crate) under: Option<String>,
     #[serde(default)]
     sort: Option<String>,
     #[serde(default)]
@@ -1511,7 +1569,7 @@ pub(crate) async fn search(
 
 #[derive(Deserialize)]
 pub(crate) struct FavoriteBody {
-    path: String,
+    pub(crate) path: String,
     favorite: bool,
 }
 
@@ -1568,6 +1626,7 @@ async fn instant(
         Some((id, freed)) => {
             state.vfs.uploader.delete_messages_best_effort(freed);
             let node = state.vfs.db.node(id).await?;
+            crate::events::emit(&state.events, crate::events::HostEvent::files());
             Ok(Json(serde_json::json!({
                 "linked": true,
                 "pending": false,
@@ -1643,6 +1702,9 @@ async fn trash_restore(
             Err(e) => failed.push(serde_json::json!({ "id": id, "error": e.to_string() })),
         }
     }
+    if !restored.is_empty() {
+        crate::events::emit(&state.events, crate::events::HostEvent::files());
+    }
     Ok(Json(
         serde_json::json!({ "restored": restored, "failed": failed }),
     ))
@@ -1657,6 +1719,9 @@ async fn trash_purge(
         let freed = state.vfs.db.delete_node(id).await?;
         state.vfs.uploader.delete_messages_best_effort(freed);
         purged += 1;
+    }
+    if purged > 0 {
+        crate::events::emit(&state.events, crate::events::HostEvent::files());
     }
     Ok(Json(serde_json::json!({ "purged": purged })))
 }

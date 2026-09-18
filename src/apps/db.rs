@@ -18,6 +18,8 @@ pub struct AppRecord {
     pub pinned: bool,
     pub installed_at: i64,
     pub updated_at: i64,
+    /// JSON 路径数组；空数组表示全盘。
+    pub scope_paths: String,
 }
 
 pub struct AppInstall<'a> {
@@ -32,16 +34,30 @@ pub struct AppInstall<'a> {
 
 impl Db {
     pub async fn apps(&self) -> AppResult<Vec<AppRecord>> {
-        Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at FROM apps ORDER BY installed_at, id")
+        Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths FROM apps ORDER BY installed_at, id")
             .fetch_all(&self.pool)
             .await?)
     }
 
     pub async fn app(&self, id: &str) -> AppResult<Option<AppRecord>> {
-        Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at FROM apps WHERE id = ?")
+        Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths FROM apps WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    /// 只更新目录范围；不轮换修订版，避免打断正在运行的页面（逐次调用强制校验）。
+    pub async fn set_app_scope(&self, id: &str, paths: &str) -> AppResult<()> {
+        let changed = sqlx::query("UPDATE apps SET scope_paths = ?, updated_at = ? WHERE id = ?")
+            .bind(paths)
+            .bind(now_ts())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if changed.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+        Ok(())
     }
 
     pub async fn app_package(&self, id: &str, digest: &str) -> AppResult<Vec<u8>> {

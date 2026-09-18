@@ -25,6 +25,7 @@ fn manifest() -> Manifest {
         description: "自包含测试应用".into(),
         author: "测试作者".into(),
         entry: "index.html".into(),
+        icon: None,
         permissions: vec!["files.read".into()],
         settings: vec![
             SettingField {
@@ -159,6 +160,70 @@ fn materializes_complete_package_without_touching_siblings() {
     assert_eq!(
         std::fs::read_to_string(root.path().join("keep")).unwrap(),
         "保留"
+    );
+}
+
+#[test]
+fn icon_field_accepts_bundled_svg_and_rejects_invalid_declarations() {
+    let mut valid = manifest();
+    valid.icon = Some("icon.svg".into());
+    let metadata = serde_json::to_vec(&valid).unwrap();
+    let package = AppPackage::parse(archive(&[
+        ("app.json", &metadata),
+        ("index.html", b"test"),
+        (
+            "icon.svg",
+            b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(package.manifest.icon.as_deref(), Some("icon.svg"));
+    assert!(package.files.contains_key("icon.svg"));
+
+    // 图标缺文件时必须拒绝。
+    assert!(
+        AppPackage::parse(archive(&[
+            ("app.json", metadata.as_slice()),
+            ("index.html", b"test"),
+        ]))
+        .is_err()
+    );
+
+    // 非 SVG 后缀由清单校验拒绝。
+    let mut wrong_type = manifest();
+    wrong_type.icon = Some("icon.png".into());
+    let wrong_type = serde_json::to_vec(&wrong_type).unwrap();
+    assert!(
+        AppPackage::parse(archive(&[
+            ("app.json", wrong_type.as_slice()),
+            ("index.html", b"test"),
+            ("icon.png", b"x"),
+        ]))
+        .is_err()
+    );
+
+    // 超过 256 KiB 的图标拒绝。
+    let mut oversize = manifest();
+    oversize.icon = Some("icon.svg".into());
+    let oversize = serde_json::to_vec(&oversize).unwrap();
+    let huge = vec![b' '; 256 * 1024 + 1];
+    assert!(
+        AppPackage::parse(archive(&[
+            ("app.json", oversize.as_slice()),
+            ("index.html", b"test"),
+            ("icon.svg", &huge),
+        ]))
+        .is_err()
+    );
+
+    // 未声明 icon 的旧包继续可用。
+    let legacy = serde_json::to_vec(&manifest()).unwrap();
+    assert!(
+        AppPackage::parse(archive(&[
+            ("app.json", legacy.as_slice()),
+            ("index.html", b"test"),
+        ]))
+        .is_ok()
     );
 }
 

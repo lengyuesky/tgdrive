@@ -14,6 +14,12 @@ pub enum AppError {
     Conflict(String),
     #[error("阅读记录已被另一页面更新，请选择使用已保存进度或从当前页继续")]
     AppDataConflict,
+    /// 应用运行会话过期；宿主前端凭 `session_expired` 码静默续签后重试。
+    #[error("应用会话已过期，请重新打开")]
+    SessionExpired,
+    /// 应用停用、卸载或更新导致修订轮换；宿主凭 `app_changed` 码提示重开。
+    #[error("应用已停用、卸载或更新，请重新打开")]
+    AppChanged,
     #[error("非法路径: {0}")]
     InvalidPath(String),
     #[error("目标是目录")]
@@ -55,6 +61,8 @@ impl AppError {
             AppError::IsDirectory | AppError::NotDirectory => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AppError::SessionExpired => StatusCode::FORBIDDEN,
+            AppError::AppChanged => StatusCode::CONFLICT,
             AppError::Telegram(_)
             | AppError::TelegramRejected(_)
             | AppError::TelegramUncertain(_) => StatusCode::BAD_GATEWAY,
@@ -93,6 +101,8 @@ impl IntoResponse for AppError {
         let code = match &self {
             AppError::UploadInterrupted => Some("upload_interrupted"),
             AppError::AppDataConflict => Some("storage_conflict"),
+            AppError::SessionExpired => Some("session_expired"),
+            AppError::AppChanged => Some("app_changed"),
             _ => None,
         };
         let mut response = (

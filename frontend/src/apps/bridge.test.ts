@@ -31,9 +31,9 @@ describe('应用能力通道', () => {
     const complete: (() => void)[] = []
     const invoke = vi.fn(() => new Promise((resolve) => complete.push(() => resolve({ ok: true }))))
     const disconnect = connectAppBridge(port as unknown as MessagePort, invoke, String)
-    const pending = Array.from({ length: 17 }, (_, index) => send({ type: 'request', id: index + 1, method: 'app.ping', params: {} }))
-    expect(invoke).toHaveBeenCalledTimes(16)
-    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ id: 17, error: expect.any(String) }))
+    const pending = Array.from({ length: 33 }, (_, index) => send({ type: 'request', id: index + 1, method: 'app.ping', params: {} }))
+    expect(invoke).toHaveBeenCalledTimes(32)
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ id: 33, error: expect.any(String) }))
     complete.forEach((finish) => finish())
     await Promise.all(pending)
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ id: 1, result: { ok: true } }))

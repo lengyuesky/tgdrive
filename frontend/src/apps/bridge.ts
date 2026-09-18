@@ -2,7 +2,7 @@
 const METHODS = new Set([
   'app.ping', 'files.search', 'media.url', 'favorites.set', 'settings.get', 'settings.patch',
   'ui.pickDirectory', 'ui.openSettings', 'ui.download', 'ui.close', 'ui.setImmersive',
-  'files.list', 'files.searchPage', 'files.stat', 'files.readRange', 'assets.read',
+  'files.list', 'files.searchPage', 'files.stat', 'files.readRange', 'files.readRanges', 'assets.read',
   'storage.get', 'storage.set', 'storage.list', 'storage.delete',
 ])
 export interface AppRequest { type: 'request'; id: number; method: string; params: Record<string, unknown> }
@@ -37,7 +37,9 @@ export function connectAppBridge(port: MessagePort, invoke: (method: string, par
       }
     }
     if (Date.now() - windowAt > 10_000) { windowAt = Date.now(); count = 0 }
-    if (++count > 120 || pending.size >= 16) { reply({ error: '应用请求过于频繁，请稍后重试', code: 'rate_limited' }); return }
+    // 阅读馆首次安装会对每个文件做多轮身份校验（stat/roots），突发可达每秒数十次；
+    // 窗口限流只拦截失控重试风暴，不限制正常扫描。
+    if (++count > 960 || pending.size >= 32) { reply({ error: '应用请求过于频繁，请稍后重试', code: 'rate_limited' }); return }
     if (!isAppRequest(raw)) { reply({ error: '不支持的应用请求或参数过大' }); return }
     if (pending.has(raw.id)) { reply({ error: '应用请求编号重复' }); return }
     const controller = new AbortController()
@@ -48,6 +50,10 @@ export function connectAppBridge(port: MessagePort, invoke: (method: string, par
         if (result instanceof Uint8Array) {
           const bytes = result.slice()
           reply({ result: bytes }, [bytes.buffer])
+        } else if (Array.isArray(result) && result.every((item) => item instanceof Uint8Array)) {
+          // 批量段读：所有分块一次性零拷贝转移进沙箱。
+          const blocks = result.map((item: Uint8Array) => item.slice())
+          reply({ result: blocks }, blocks.map((item: Uint8Array) => item.buffer))
         } else reply({ result })
       }
     } catch (error) {

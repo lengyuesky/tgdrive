@@ -3,8 +3,12 @@
 pub mod catalog;
 mod files;
 mod package;
+mod range_cache;
 mod runtime;
+mod scope;
 mod storage;
+
+pub use range_cache::RangeCache;
 
 pub use catalog::CatalogManager;
 
@@ -16,7 +20,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Router, middleware};
 use package::{AppPackage, Manifest};
 use serde::{Deserialize, Serialize};
@@ -37,6 +41,8 @@ pub struct InstalledApp {
     pub source: String,
     pub installed_at: i64,
     pub updated_at: i64,
+    /// 目录范围；空数组表示全盘。
+    pub scope: Vec<String>,
 }
 
 impl InstalledApp {
@@ -51,6 +57,7 @@ impl InstalledApp {
             source: record.source,
             installed_at: record.installed_at,
             updated_at: record.updated_at,
+            scope: serde_json::from_str(&record.scope_paths).unwrap_or_default(),
         })
     }
 }
@@ -71,6 +78,7 @@ pub fn protected_router() -> Router<AppState> {
         .route("/apps/catalog/{id}/install", post(catalog_install))
         .route("/apps/{id}", get(detail).delete(uninstall))
         .route("/apps/{id}/state", post(set_state))
+        .route("/apps/{id}/scope", patch(scope_patch))
         .route(
             "/apps/{id}/settings",
             get(settings_get).patch(settings_patch),
@@ -84,9 +92,14 @@ pub fn public_router() -> Router<AppState> {
     Router::new()
         .route(
             "/apps/runtime/{id}/{revision}/{*resource}",
-            get(runtime::asset),
+            // 静态包内资源可安全压缩（默认谓词跳过 image/SSE/小响应）；
+            // 媒体流式响应与预检绝不压缩，因此只挂在本路由。
+            get(runtime::asset).layer(tower_http::compression::CompressionLayer::new()),
         )
-        .route("/apps/media/{ticket}", get(runtime::media))
+        .route(
+            "/apps/media/{ticket}",
+            get(runtime::media).options(runtime::media_preflight),
+        )
 }
 
 async fn no_store(request: axum::extract::Request, next: middleware::Next) -> Response {
@@ -219,6 +232,35 @@ struct InstallOptions {
     expected_revision: Option<String>,
 }
 
+/// 安装成功后清理同应用旧摘要的运行缓存目录；旧修订页面已因修订轮换不可用。
+async fn prune_sibling_digests(directory: &std::path::Path, keep: &str) {
+    let mut entries = match tokio::fs::read_dir(directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, directory = %directory.display(), "读取运行缓存目录失败");
+            return;
+        }
+    };
+    loop {
+        let Ok(Some(entry)) = entries.next_entry().await else {
+            break;
+        };
+        let name = entry.file_name();
+        if name != keep
+            && entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            && !name.to_string_lossy().starts_with('.')
+            && let Err(error) = tokio::fs::remove_dir_all(entry.path()).await
+        {
+            tracing::warn!(%error, path = %entry.path().display(), "清理旧版本运行缓存失败");
+        }
+    }
+}
+
 async fn install_package(
     state: &AppState,
     package: AppPackage,
@@ -243,7 +285,7 @@ async fn install_package(
     };
     let manifest =
         serde_json::to_string(&package.manifest).map_err(|e| AppError::Internal(e.into()))?;
-    state
+    let install = state
         .vfs
         .db
         .install_app(AppInstall {
@@ -255,7 +297,15 @@ async fn install_package(
             source,
             expected_revision: options.expected_revision.as_deref(),
         })
-        .await?;
+        .await;
+    {
+        // 以数据库当前安装摘要为准清理：成功更新回收旧版本，失败尝试也回收刚物化的孤儿目录。
+        let _cache_guard = CACHE_LOCK.lock().await;
+        if let Ok(Some(record)) = state.vfs.db.app(&id).await {
+            prune_sibling_digests(&cache_root(state).join(&id), &record.digest).await;
+        }
+    }
+    install?;
     installed(state, &id).await
 }
 
@@ -346,6 +396,42 @@ async fn set_state(
     Ok(Json(installed(&state, &id).await?))
 }
 
+#[derive(Deserialize)]
+struct ScopePatch {
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+/// 目录范围白名单：空数组表示全盘；逐条规范化并去重后落库。
+async fn scope_patch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(patch): Json<ScopePatch>,
+) -> AppResult<Json<InstalledApp>> {
+    let app = installed(&state, &id).await?;
+    let mut scope = Vec::new();
+    if patch.paths.len() > 32 {
+        return Err(AppError::BadRequest("目录范围最多 32 个根目录".into()));
+    }
+    for path in &patch.paths {
+        if path.len() > 4096 {
+            return Err(AppError::BadRequest("目录范围路径过长".into()));
+        }
+        let joined = format!("/{}", crate::vfs::normalize(path)?.join("/"));
+        if !scope.contains(&joined) {
+            scope.push(joined);
+        }
+    }
+    scope.sort();
+    let encoded = serde_json::to_string(&scope).map_err(|e| AppError::Internal(e.into()))?;
+    state.vfs.db.set_app_scope(&id, &encoded).await?;
+    crate::events::emit(
+        &state.events,
+        crate::events::HostEvent::app("app.scope", &app.manifest.id, None),
+    );
+    Ok(Json(installed(&state, &id).await?))
+}
+
 #[derive(Default, Deserialize)]
 struct UninstallOptions {
     #[serde(default)]
@@ -383,6 +469,10 @@ async fn save_settings(state: &AppState, app: &InstalledApp, values: Value) -> A
         .db
         .patch_app_settings(&app.manifest.id, &app.revision, &encoded)
         .await?;
+    crate::events::emit(
+        &state.events,
+        crate::events::HostEvent::app("app.settings", &app.manifest.id, None),
+    );
     read_settings(state, app).await
 }
 

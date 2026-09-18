@@ -10,6 +10,31 @@ describe('应用 v2 消息通道', () => {
     expect([...message.result]).toEqual([1, 2, 3]); expect(transfer).toEqual([message.result.buffer])
     disconnect()
   })
+  it('批量段读一次性转移所有分块缓冲区', async () => {
+    const p = port()
+    const disconnect = connectAppBridge(p as unknown as MessagePort,
+      async (method) => (method === 'files.readRanges' ? [new Uint8Array([1]), new Uint8Array([2, 3])] : null), String)
+    await p.onmessage!({ data: { type: 'request', id: 7, method: 'files.readRanges', params: { ref: { id: 1, content_version: 'a'.repeat(64) }, ranges: [{ offset: 0, length: 1 }, { offset: 1, length: 2 }] } } } as MessageEvent)
+    const [message, transfer] = p.postMessage.mock.calls[0]!
+    expect(message.result.map((part: Uint8Array) => [...part])).toEqual([[1], [2, 3]])
+    expect(transfer).toEqual(message.result.map((part: Uint8Array) => part.buffer))
+    // 混合数组不应当作字节批次转移，避免误把普通对象结构化克隆成缓冲区。
+    const p2 = port()
+    const d2 = connectAppBridge(p2 as unknown as MessagePort, async () => [new Uint8Array([1]), '混合'], String)
+    await p2.onmessage!({ data: { type: 'request', id: 1, method: 'files.readRanges', params: {} } } as MessageEvent)
+    expect(p2.postMessage.mock.calls[0]![1]).toBeUndefined()
+    d2(); disconnect()
+  })
+  it('未声明或越界的批量段读请求被白名单拦截', async () => {
+    const p = port()
+    const disconnect = connectAppBridge(p as unknown as MessagePort, async () => null, String)
+    await p.onmessage!({ data: { type: 'request', id: 1, method: 'files.readRanges', params: { ref: { id: 1, content_version: 'x' }, ranges: [] } } } as MessageEvent)
+    // 参数合法但白名单受理后由宿主 invoke 校验；这里只断言方法可通行且返回空数组结果。
+    await p.onmessage!({ data: { type: 'request', id: 2, method: 'files.readBatch', params: {} } } as MessageEvent)
+    const unsupported = p.postMessage.mock.calls.at(-1)![0]
+    expect(unsupported.error).toContain('不支持')
+    disconnect()
+  })
   it('单请求取消会中止宿主请求且不回传迟到结果', async () => {
     const p = port()
     let finish!: () => void

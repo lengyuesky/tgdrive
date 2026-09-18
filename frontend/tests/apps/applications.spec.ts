@@ -96,7 +96,7 @@ function makeZip(files: Record<string, string | Uint8Array>): Buffer {
   return Buffer.concat([...localChunks, ...cdChunks, eocd])
 }
 
-async function packagePath(version: string, permissions: string[]) {
+async function packagePath(version: string, permissions: string[], icon = false) {
   const jsContent = `
     let port = null;
     let reqId = 0;
@@ -151,6 +151,7 @@ async function packagePath(version: string, permissions: string[]) {
       description: '验证独立导入和版本更新。',
       author: '测试夹具',
       entry: 'index.html',
+      ...(icon ? { icon: 'icon.svg' } : {}),
       permissions,
       settings: [
         {
@@ -165,6 +166,12 @@ async function packagePath(version: string, permissions: string[]) {
     'index.html':
       '<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><script defer src="./app.js"></script></head><body><h1 id="version"></h1><p id="note"></p><p id="permission"></p></body></html>',
     'app.js': jsContent,
+    ...(icon
+      ? {
+          'icon.svg':
+            '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="10" fill="#6366f1"/></svg>',
+        }
+      : {}),
   })
   const dest = `${temporary}/sample-viewer-${version}.tgapp`
   await writeFile(dest, zip)
@@ -198,7 +205,19 @@ async function importApp(page: Page, path: string, update = false) {
   return dialog
 }
 
+/** 卡片与管理行共用 data-app-id，按标签页切换后同一选择器分别命中图标卡片或设置行。 */
+async function openSettingsTab(page: Page) {
+  await page.getByRole('tab', { name: /应用设置/ }).click()
+  await expect(page.locator('[data-app-id="sample-viewer"].manage-row')).toBeVisible()
+}
+
+async function openInstalledTab(page: Page) {
+  await page.getByRole('tab', { name: /已安装/ }).click()
+  await expect(page.locator('[data-app-id="sample-viewer"].app-tile')).toBeVisible()
+}
+
 async function uninstallApp(page: Page, purge: boolean) {
+  await openSettingsTab(page)
   await page
     .locator('[data-app-id="sample-viewer"]')
     .getByRole('button', { name: '更多应用操作' })
@@ -224,9 +243,13 @@ test('应用中心默认已安装，空状态不自动跳转，列表刷新保�
   await page.goto('/apps')
   const installed = page.getByRole('tab', { name: /已安装/ })
   const available = page.getByRole('tab', { name: /可安装/ })
+  const settings = page.getByRole('tab', { name: /应用设置/ })
   await expect(installed).toHaveAttribute('aria-selected', 'true')
   await expect(page.getByText('还没有安装应用', { exact: true })).toBeVisible()
   await expect(page.locator('[data-app-id]')).toHaveCount(0)
+  await settings.click()
+  await expect(settings).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByText('还没有安装应用', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: '浏览可安装应用' }).click()
   await expect(available).toHaveAttribute('aria-selected', 'true')
   await page.getByRole('button', { name: '刷新', exact: true }).click()
@@ -254,6 +277,7 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
   await page.goto('/apps')
   await (await importApp(page, first)).getByRole('button', { name: '同意并安装' }).click()
   const card = page.locator('[data-app-id="sample-viewer"]')
+  await openSettingsTab(page)
   await expect(card).toContainText('已启用')
   await card.getByRole('button', { name: '设置', exact: true }).click()
   const settings = page.getByRole('dialog', { name: '独立测试应用设置' })
@@ -275,6 +299,7 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
   await expect(update).toContainText('新增')
   await update.getByRole('button', { name: '同意并更新' }).click()
   await expect(update).not.toBeVisible()
+  await openSettingsTab(page)
   await expect(card).toContainText('v1.1.0')
   await expect(oldPage.locator('iframe')).toHaveCount(0)
   await expect(oldPage.locator('body')).toContainText('更新')
@@ -289,8 +314,10 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
   await card.getByRole('button', { name: '更多应用操作' }).click()
   await page.getByRole('menuitem', { name: '停用应用', exact: true }).click()
   await expect(card).toContainText('已停用')
-  await expect(card.getByRole('button', { name: '打开', exact: true })).toBeDisabled()
   await expect(oldPage.locator('iframe')).toHaveCount(0)
+  await openInstalledTab(page)
+  await expect(card.getByRole('button', { name: '打开独立测试应用' })).toBeDisabled()
+  await openSettingsTab(page)
 
   await card.getByRole('button', { name: '更多应用操作' }).click()
   await page.getByRole('menuitem', { name: '启用应用', exact: true }).click()
@@ -298,7 +325,7 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
 
   await card.getByRole('button', { name: '更多应用操作' }).click()
   await page.getByRole('menuitem', { name: '固定到侧边栏', exact: true }).click()
-  await expect(card).toContainText('已固定')
+  await expect(card.getByLabel('已固定')).toBeVisible()
 
   await page.getByRole('button', { name: '返回文件', exact: true }).click()
   const sidebar = await fileSidebar(page)
@@ -344,8 +371,16 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
     fullPage: true,
   })
 
+  await openSettingsTab(page)
+  await page.screenshot({
+    path: testInfo.outputPath('应用设置手机.png'),
+    fullPage: true,
+    animations: 'disabled',
+  })
+
   await uninstallApp(page, false)
   await (await importApp(page, first)).getByRole('button', { name: '同意并安装' }).click()
+  await openSettingsTab(page)
   await expect(card).toContainText('v1.0.0')
   await card.getByRole('button', { name: '设置', exact: true }).click()
   await expect(settings.locator('#app-setting-note')).toHaveValue('保留的配置')
@@ -353,6 +388,7 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
 
   await uninstallApp(page, true)
   await (await importApp(page, first)).getByRole('button', { name: '同意并安装' }).click()
+  await openSettingsTab(page)
   await card.getByRole('button', { name: '设置', exact: true }).click()
   await expect(settings.locator('#app-setting-note')).toHaveValue('初始值')
   await settings.getByRole('button', { name: '取消', exact: true }).click()
@@ -363,4 +399,89 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
   await expect(page.getByRole('alert').filter({ hasText: '不是有效的 ZIP' })).toBeVisible()
   await expect(card).toContainText('已启用')
   await oldPage.close()
+})
+
+test('资源按修订不可变缓存与压缩，包内图标正常渲染', async (
+  { page },
+  testInfo
+) => {
+  const pkg = await packagePath('1.0.0', [], true)
+  await page.goto('/apps')
+  await (await importApp(page, pkg)).getByRole('button', { name: '同意并安装' }).click()
+  const card = page.locator('[data-app-id="sample-viewer"]')
+  await expect(card).toBeVisible()
+
+  // 安装后的应用中心卡片渲染包内 SVG 图标（img 上下文，不执行脚本）。
+  const iconImg = card.locator('.tile-icon img')
+  await expect(iconImg).toBeVisible()
+  await expect(iconImg).toHaveAttribute(
+    'src',
+    /\/api\/apps\/runtime\/sample-viewer\/[^/]+\/icon\.svg$/
+  )
+
+  const runtimeUrls: string[] = []
+  page.on('request', (request) => {
+    if (request.url().includes('/api/apps/runtime/')) runtimeUrls.push(request.url())
+  })
+  const encodings = new Map<string, string | undefined>()
+  page.on('response', (response) => {
+    const url = response.url()
+    if (url.includes('/api/apps/runtime/'))
+      encodings.set(url, response.headers()['content-encoding'])
+  })
+  // CDP 真值：requestServedFromCache 才是缓存命中信号（fromDiskCache 字段在此版本不可靠）。
+  const runtimeRequests = new Map<string, string>()
+  const cacheServed = new Set<string>()
+  const served: Array<{ url: string; fromCache: boolean; status: number }> = []
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Network.enable')
+  cdp.on('Network.requestWillBeSent', (params: { requestId: string; request: { url: string } }) => {
+    if (params.request.url.includes('/api/apps/runtime/'))
+      runtimeRequests.set(params.requestId, params.request.url)
+  })
+  cdp.on('Network.requestServedFromCache', (params: { requestId: string }) => {
+    if (runtimeRequests.has(params.requestId)) cacheServed.add(params.requestId)
+  })
+  cdp.on('Network.responseReceived', (params: { requestId: string; response: { url: string; status: number } }) => {
+    const url = params.response.url
+    if (url.includes('/api/apps/runtime/'))
+      served.push({
+        url,
+        fromCache: cacheServed.has(params.requestId),
+        status: params.response.status,
+      })
+  })
+
+  // 首次打开：沙箱页面完整加载，文本资源经压缩传输。
+  await card.getByRole('button', { name: '打开独立测试应用' }).click()
+  await expect(page.frameLocator('iframe').locator('#version')).toHaveText('独立运行 1.0.0')
+  expect(runtimeUrls.length).toBeGreaterThan(0)
+  const jsUrl = runtimeUrls.find((url) => url.endsWith('/app.js'))
+  expect(jsUrl).toBeDefined()
+  expect(encodings.get(jsUrl!)).toBeTruthy()
+
+  // 返回文件页后再次打开：主框架分区的图标命中磁盘缓存；沙箱不透明源在 Chromium 的
+  // 缓存分区下会重取入口与子资源，但均经压缩传输（压缩断言在首次打开已验证）。
+  runtimeUrls.length = 0
+  served.length = 0
+  encodings.clear()
+  await page.getByRole('button', { name: '返回文件', exact: true }).click()
+  await expect(page).not.toHaveURL(/\/apps\/sample-viewer/)
+  await page.goto('/apps/sample-viewer')
+  await expect(page.frameLocator('iframe').locator('#version')).toHaveText('独立运行 1.0.0')
+  const iconHit = served.find((hit) => hit.url.endsWith('/icon.svg'))
+  expect(iconHit, `重开时工具栏图标应命中缓存：${JSON.stringify(served)}`).toBeTruthy()
+  expect(iconHit!.fromCache).toBe(true)
+  // 任何重开的载荷请求都保持压缩：即使 Chromium 分区导致重取，流量也只有原文的 1/3 左右。
+  for (const hit of served) {
+    expect(
+      encodings.get(hit.url) || hit.fromCache,
+      `重开的网络响应应命中缓存或压缩：${hit.url}`
+    ).toBeTruthy()
+  }
+
+  // 宿主工具栏同样展示包内图标。
+  await expect(page.locator('.host-toolbar .host-icon img')).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('应用图标与缓存.png'), fullPage: true })
+  await cdp.detach()
 })

@@ -6,8 +6,8 @@
       <span>应用中心</span>
     </button>
     <button v-for="app in pinned" :key="app.manifest.id" class="app-entry"
-      :aria-label="app.manifest.name" :title="app.manifest.name" @click="openApp(app.manifest.id)">
-      <span class="app-icon" aria-hidden="true">{{ Array.from(app.manifest.name)[0] }}</span>
+      :aria-label="app.manifest.name" :title="app.manifest.name" @click="openApp(app.manifest.id)" @pointerenter="prefetchLaunch(app.manifest.id)">
+      <span class="app-icon" aria-hidden="true"><AppIcon :manifest="app.manifest" :revision="app.revision" /></span>
       <span class="app-name">{{ app.manifest.name }}</span>
     </button>
   </section>
@@ -19,6 +19,8 @@ import { useRouter } from 'vue-router'
 import { Menu } from '@element-plus/icons-vue'
 import { api } from '@drive/api'
 import { APPS_CHANGED, type InstalledApp } from '../types'
+import { prefetchLaunch } from '../prefetch'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{ from: string }>()
 const emit = defineEmits<{ navigate: [] }>()
@@ -55,7 +57,7 @@ onUnmounted(() => {
 .app-entry:hover { background: var(--tile-bg-hover); }
 .app-entry:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
 .center-icon { width: 22px; color: var(--el-color-primary); font-size: 18px; flex-shrink: 0; }
-.app-icon { display: grid; place-items: center; flex-shrink: 0; width: 22px; height: 22px; border-radius: 7px; color: #fff; background: linear-gradient(135deg, #6366f1, #0ea5e9); font-size: 12px; }
+.app-icon { display: block; flex-shrink: 0; width: 22px; height: 22px; border-radius: 7px; color: #fff; font-size: 12px; }
 .app-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (pointer: coarse), (max-width: 767px) { .app-entry { min-height: 44px; } }
 </style>

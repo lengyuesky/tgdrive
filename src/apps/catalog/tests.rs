@@ -44,6 +44,7 @@ fn test_manifest(id: &str, version: &str, api_version: u32, min_host: &str) -> M
         description: "测试应用描述".into(),
         author: "测试作者".into(),
         entry: "index.html".into(),
+        icon: None,
         permissions: vec!["files.read".into()],
         settings: vec![],
     }

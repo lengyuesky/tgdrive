@@ -18,8 +18,12 @@ use zip::write::SimpleFileOptions;
 
 #[path = "catalog_api_tests.rs"]
 mod catalog_api;
+#[path = "media_tests.rs"]
+mod media;
 #[path = "reader_tests.rs"]
 mod readers;
+#[path = "scope_tests.rs"]
+mod scopes;
 
 #[derive(Default)]
 struct MemoryMedia {
@@ -170,6 +174,8 @@ async fn state_at(path: &std::path::Path, media: Arc<MemoryMedia>) -> AppState {
         tasks: crate::tasks::TaskManager::new(),
         migration: crate::migration::StorageMigrationManager::new(db, tg),
         apps_catalog,
+        events: crate::events::bus(),
+        range_cache: std::sync::Arc::new(std::sync::Mutex::new(crate::apps::RangeCache::default())),
     }
 }
 
@@ -202,6 +208,7 @@ fn manifest() -> Manifest {
         description: "自包含测试应用".into(),
         author: "测试作者".into(),
         entry: "index.html".into(),
+        icon: None,
         permissions: vec![
             "files.read".into(),
             "media.read".into(),
@@ -497,6 +504,15 @@ async fn update_is_atomic_and_requires_reviewed_digest_revision_and_newer_versio
         installed(&state, "shorts").await.unwrap().manifest.version,
         "1.1.0"
     );
+    // 更新成功后旧摘要运行缓存被清理：目录中只保留当前版本。
+    let cache = cache_root(&state).join("shorts");
+    let mut names: Vec<String> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec![second.digest.clone()]);
+    assert!(cache.join(&second.digest).join(".complete").is_file());
 }
 
 #[tokio::test]
@@ -904,6 +920,204 @@ fn browser_catalog_requires_explicit_test_inputs() {
             path: directory.path().into()
         }
     );
+}
+
+async fn asset_request(
+    state: &AppState,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut builder = Request::builder().uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    router(state)
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// 资源响应可长期不可变缓存并支持 ETag 再验证；文本资源按需压缩，SVG 图标不压缩。
+#[tokio::test]
+async fn runtime_assets_cache_immutably_compress_and_revalidate() {
+    let (state, _, _dir) = fixture().await;
+    let mut icon_manifest = manifest();
+    icon_manifest.icon = Some("icon.svg".into());
+    let metadata = serde_json::to_vec(&icon_manifest).unwrap();
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, bytes) in [
+        ("app.json", metadata.as_slice()),
+        (
+            "index.html",
+            b"<!DOCTYPE html><html><body>Icon</body></html>".as_slice(),
+        ),
+        ("app.js", "console.log('shorts'); console.log('tgdrive-app-runtime'); console.log('assets'); console.log('end');".as_bytes()),
+        (
+            "icon.svg",
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'></svg>".as_slice(),
+        ),
+    ] {
+        zip.start_file(
+            name,
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    let package = AppPackage::parse(zip.finish().unwrap().into_inner()).unwrap();
+    let digest = package.digest.clone();
+    let app = install_package(
+        &state,
+        package,
+        InstallOptions {
+            digest,
+            expected_revision: None,
+        },
+        "import",
+    )
+    .await
+    .unwrap();
+    let base = format!("/api/apps/runtime/shorts/{}", app.revision);
+
+    let response = asset_request(&state, &format!("{base}/app.js"), &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
+    assert_eq!(response.headers()[header::VARY], "accept-encoding");
+    let etag = response.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(etag, format!("\"{}:app.js\"", app.digest));
+    let plain = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        &plain[..],
+        "console.log('shorts'); console.log('tgdrive-app-runtime'); console.log('assets'); console.log('end');".as_bytes()
+    );
+
+    // 未声明压缩能力的客户端拿到原始字节。
+    let response = asset_request(&state, &format!("{base}/app.js"), &[]).await;
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+
+    // 声明 gzip 时文本资源压缩传输，体积小于原文且 ETag 不变。
+    let response = asset_request(
+        &state,
+        &format!("{base}/app.js"),
+        &[("accept-encoding", "gzip")],
+    )
+    .await;
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+    assert_eq!(response.headers()[header::ETAG], etag);
+    let compressed = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(compressed.len() < plain.len());
+
+    // If-None-Match 命中返回 304：无正文但保留沙箱与缓存语义。
+    let response = asset_request(
+        &state,
+        &format!("{base}/app.js"),
+        &[("if-none-match", etag.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .is_some()
+    );
+    assert_eq!(response.headers()[header::ETAG], etag);
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
+    assert!(to_bytes(response.into_body(), 64).await.unwrap().is_empty());
+
+    // SVG 是文本型资源，压缩谓词将其作为 image/* 的例外正常压缩。
+    let response = asset_request(
+        &state,
+        &format!("{base}/icon.svg"),
+        &[("accept-encoding", "gzip, br")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_some());
+    assert_eq!(response.headers()[header::VARY], "accept-encoding");
+
+    // 修订不匹配的资源一律 404，停用/更新后不再暴露。
+    let response = asset_request(
+        &state,
+        "/api/apps/runtime/shorts/stale-revision/app.js",
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// 过期会话与修订轮换返回稳定的机器码，宿主凭码静默续签或提示重开。
+#[tokio::test]
+async fn session_expiry_and_rotation_return_stable_error_codes() {
+    let (state, _, _dir) = fixture().await;
+    let app = add_app(&state, &manifest(), None).await;
+    let active = launch_app(&state, "shorts").await;
+    assert_eq!(
+        rpc_call(
+            &state,
+            "shorts",
+            active["session"].as_str().unwrap(),
+            "app.ping",
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+
+    // 过期会话：session_expired 码允许宿主前端静默续签重试。
+    let claims = json!({"purpose": "session", "app_id": "shorts", "revision": app.revision, "expires_at": 0});
+    let expired = state.auth.sign_app_claims(&claims.to_string());
+    let (status, body) = rpc_call(&state, "shorts", &expired, "app.ping", json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "session_expired");
+    assert_eq!(body["error"], "应用会话已过期，请重新打开");
+
+    // 停用轮换修订后：app_changed 码代表应用状态变化而非网络故障。
+    state
+        .vfs
+        .db
+        .set_app_state("shorts", Some(false), None)
+        .await
+        .unwrap();
+    let (status, body) = rpc_call(
+        &state,
+        "shorts",
+        active["session"].as_str().unwrap(),
+        "app.ping",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "app_changed");
+    assert_eq!(body["error"], "应用已停用、卸载或更新，请重新打开");
+
+    // 重新启用会再次轮换修订；旧会话仍应被拒绝。
+    state
+        .vfs
+        .db
+        .set_app_state("shorts", Some(true), None)
+        .await
+        .unwrap();
+    let (status, body) = rpc_call(
+        &state,
+        "shorts",
+        active["session"].as_str().unwrap(),
+        "app.ping",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "app_changed");
 }
 
 /// 为浏览器测试提供独立网盘和内存媒体，不读取真实账号、数据库或 Telegram。

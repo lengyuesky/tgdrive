@@ -1,4 +1,5 @@
-//! API v2 的文件元数据能力；节点引用不能绕过当前可见性检查。
+//! API v2 的文件元数据能力；节点引用不能绕过当前可见性检查，且需落在目录范围内。
+use super::{InstalledApp, scope};
 use crate::db::apps::FileSearch;
 use crate::db::entries::{Kind, Options, Order, Sort};
 use crate::{
@@ -72,10 +73,16 @@ struct ListQuery {
     limit: Option<u16>,
 }
 
-pub(super) async fn invoke(state: &AppState, method: &str, params: Value) -> AppResult<Value> {
+pub(super) async fn invoke(
+    state: &AppState,
+    app: &InstalledApp,
+    method: &str,
+    params: Value,
+) -> AppResult<Value> {
     match method {
         "files.stat" => {
             let (node, path) = resolve(state, &parse(params)?).await?;
+            scope::check(state, app, &path).await?;
             Ok(metadata(&node, &path))
         }
         "files.list" => {
@@ -92,6 +99,7 @@ pub(super) async fn invoke(state: &AppState, method: &str, params: Value) -> App
             if !node.is_dir {
                 return Err(AppError::NotDirectory);
             }
+            scope::check(state, app, &path).await?;
             let options = Options {
                 limit: q.limit.unwrap_or(200),
                 sort: Sort::Name,
@@ -148,6 +156,7 @@ pub(super) async fn invoke(state: &AppState, method: &str, params: Value) -> App
             if !node.is_dir {
                 return Err(AppError::NotDirectory);
             }
+            scope::check(state, app, &path).await?;
             q.under = path.clone();
             let (nodes, next) = state.vfs.db.app_search_page(node.id, &path, &q).await?;
             let results: Vec<_> = nodes

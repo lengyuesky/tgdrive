@@ -481,6 +481,8 @@ async fn app_fixture(
         tasks: crate::tasks::TaskManager::new(),
         migration: crate::migration::StorageMigrationManager::new(db, tg),
         apps_catalog: Arc::new(crate::apps::CatalogManager::disabled()),
+        events: crate::events::bus(),
+        range_cache: Arc::new(std::sync::Mutex::new(crate::apps::RangeCache::default())),
     };
     (state, dir)
 }

@@ -123,7 +123,12 @@ struct PhotoSize {
     file_size: Option<i64>,
 }
 
-pub async fn run(vfs: Vfs, rt: Arc<Runtime>, task: crate::tasks::TaskReporter) {
+pub async fn run(
+    vfs: Vfs,
+    rt: Arc<Runtime>,
+    events: crate::events::EventBus,
+    task: crate::tasks::TaskReporter,
+) {
     let mut cached_http: Option<(crate::proxy::ProxyConfig, reqwest::Client)> = None;
     let mut backoff = 5u64;
     loop {
@@ -161,12 +166,12 @@ pub async fn run(vfs: Vfs, rt: Arc<Runtime>, task: crate::tasks::TaskReporter) {
                 cached_http = Some((cfg.proxy.clone(), http));
             }
             poll_once(&cached_http.as_ref().unwrap().1, &vfs, &cfg).await
-        }
-        .await;
-        match result {
-            Ok(()) => {
+        };
+        let ingested = match result.await {
+            Ok(ingested) => {
                 backoff = 5;
                 task.clear_error();
+                ingested
             }
             Err(e) => {
                 task.report_error(&e.to_string());
@@ -175,12 +180,16 @@ pub async fn run(vfs: Vfs, rt: Arc<Runtime>, task: crate::tasks::TaskReporter) {
                     return;
                 }
                 backoff = (backoff * 2).min(300);
+                0
             }
+        };
+        if ingested > 0 {
+            crate::events::emit(&events, crate::events::HostEvent::files());
         }
     }
 }
 
-async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppResult<()> {
+async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppResult<usize> {
     let offset: i64 = vfs
         .db
         .setting_get(OFFSET_KEY)
@@ -229,12 +238,14 @@ async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppRe
     }
     // 长轮询最多等待 25 秒，返回后重新读取设置，避免继续使用关闭开关前的配置。
     let mut ex = crate::extras::load(&vfs.db).await?;
+    let mut ingested = 0usize;
     for up in &updates {
         // 一批私聊转存可能较慢，两个开关还要在每条消息开始前重新检查。
         (ex.inbox_bot_enabled, ex.inbox_channel_enabled) =
             crate::extras::load_inbox_switches(&vfs.db).await?;
         match handle_update(http, vfs, cfg, &ex, up).await {
-            Ok(()) => {
+            Ok(count) => {
+                ingested += count;
                 // 每条成功后立即推进，后续消息失败或进程退出都不会让已完成消息重复转存。
                 vfs.db
                     .setting_set(OFFSET_KEY, &(up.update_id + 1).to_string())
@@ -264,7 +275,7 @@ async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppRe
             }
         }
     }
-    Ok(())
+    Ok(ingested)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -304,7 +315,7 @@ async fn handle_update(
     cfg: &RuntimeCfg,
     ex: &crate::extras::Extras,
     up: &Update,
-) -> AppResult<()> {
+) -> AppResult<usize> {
     // 存储频道里的直发文件:零流量登记
     if let Some(post) = &up.channel_post {
         if ex.inbox_channel_enabled && is_storage_chat(&cfg.chat_id, &post.chat) {
@@ -314,7 +325,7 @@ async fn handle_update(
                     .has_stored_message_in_chat(&cfg.chat_id, post.chat.id, post.message_id)
                     .await?
             {
-                return Ok(());
+                return Ok(0);
             }
             if let Some(file) = pick_file(post) {
                 let path = ingest(
@@ -332,19 +343,20 @@ async fn handle_update(
                 )
                 .await?;
                 tracing::info!("收件:频道文件已入库 {path}");
+                return Ok(1);
             } else if has_supported_media(post) {
                 tracing::warn!("收件:频道消息 {} 缺少有效文件大小，已跳过", post.message_id);
             }
         }
-        return Ok(());
+        return Ok(0);
     }
 
     // 私聊:白名单内的媒体转存到频道再登记
     let Some(msg) = &up.message else {
-        return Ok(());
+        return Ok(0);
     };
     if !ex.inbox_bot_enabled || msg.chat.kind != "private" {
-        return Ok(());
+        return Ok(0);
     }
     let allowed: Vec<i64> = ex
         .inbox_allowed_chats
@@ -352,7 +364,7 @@ async fn handle_update(
         .filter_map(|s| s.trim().parse().ok())
         .collect();
     if !allowed.contains(&msg.chat.id) {
-        return Ok(()); // 陌生人消息静默忽略,不暴露 bot 用途
+        return Ok(0); // 陌生人消息静默忽略,不暴露 bot 用途
     }
 
     if let Some(file) = pick_file(msg) {
@@ -396,6 +408,7 @@ async fn handle_update(
             }
         };
         reply(http, cfg, msg, &format!("✅ 已存入 {path}")).await;
+        return Ok(1);
     } else if has_supported_media(msg) {
         reply(
             http,
@@ -405,7 +418,7 @@ async fn handle_update(
         )
         .await;
     }
-    Ok(())
+    Ok(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

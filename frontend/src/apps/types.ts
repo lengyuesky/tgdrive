@@ -18,6 +18,8 @@ export interface AppManifest {
   description: string
   author: string
   entry: string
+  /** 包内可选 SVG 图标路径；安装后由宿主展示。 */
+  icon?: string
   permissions: string[]
   settings: AppSetting[]
 }
@@ -31,6 +33,8 @@ export interface InstalledApp {
   source: 'catalog' | 'import'
   installed_at: number
   updated_at: number
+  /** 目录范围；空数组表示全盘。 */
+  scope: string[]
 }
 
 export interface CatalogStatus {
@@ -80,6 +84,15 @@ export const permissionLabels: Record<string, string> = {
 }
 
 export const APPS_CHANGED = 'tgdrive-apps-changed'
+
+/** 目录范围判定：空范围即全盘；否则路径需等于或位于某个根之下。 */
+export function pathInScope(scope: string[] | undefined, path: string): boolean {
+  if (!scope?.length) return true
+  return scope.some((root) => {
+    const trimmed = root.endsWith('/') && root !== '/' ? root.slice(0, -1) : root
+    return trimmed === '/' || path === trimmed || path.startsWith(`${trimmed}/`)
+  })
+}
 
 /** 通知当前页面和其他标签页刷新应用入口、检查运行状态。 */
 export function notifyAppsChanged() {

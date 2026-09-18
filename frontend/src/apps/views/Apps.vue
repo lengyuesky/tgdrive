@@ -26,48 +26,72 @@
           <button role="tab" :aria-selected="tab === 'available'" :class="{ active: tab === 'available' }" @click="tab = 'available'">
             可安装 <span>{{ availableCount }}</span>
           </button>
+          <button role="tab" :aria-selected="tab === 'settings'" :class="{ active: tab === 'settings' }" @click="tab = 'settings'">
+            应用设置 <span v-if="updateCount" class="update-count">{{ updateCount }}</span>
+          </button>
         </div>
         <el-input v-model="query" class="app-search" :prefix-icon="Search" placeholder="搜索应用" clearable />
       </div>
-      <div v-loading="loading" class="apps-grid">
-        <article v-for="card in cards" :key="card.manifest.id" class="app-card glass"
-          :class="{ highlighted: route.query.app === card.manifest.id }" :data-app-id="card.manifest.id">
-          <div class="card-heading">
-            <span class="app-mark">{{ card.manifest.name.slice(0, 1) }}</span>
-            <div><h2>{{ card.manifest.name }}</h2><span class="app-version">v{{ card.manifest.version }} · {{ card.manifest.author }}</span></div>
-            <el-tag v-if="card.installed" :type="card.installed.enabled ? 'success' : 'info'" size="small">
-              {{ card.installed.enabled ? '已启用' : '已停用' }}
-            </el-tag>
+      <div v-if="tab !== 'settings'" v-loading="loading" class="apps-grid">
+        <article v-for="card in cards" :key="card.manifest.id" class="app-tile"
+          :class="{ highlighted: route.query.app === card.manifest.id, off: !!card.installed && !card.installed.enabled }"
+          :data-app-id="card.manifest.id">
+          <button type="button" class="tile-launch" :aria-label="`${card.installed ? '打开' : '安装'}${card.manifest.name}`"
+            :disabled="!!card.installed && !card.installed.enabled" @click="launch(card)" @pointerenter="hoverPrefetch(card)">
+            <span class="tile-icon" aria-hidden="true"><AppIcon :manifest="card.manifest" :revision="card.installed?.revision" /></span>
+            <span v-if="card.available?.update_available" class="tile-badge-dot" aria-hidden="true" />
+            <span v-if="card.installed?.pinned" class="tile-badge-pin" aria-hidden="true"><el-icon><StarFilled /></el-icon></span>
+          </button>
+          <h2 class="tile-name" :title="card.manifest.description">{{ card.manifest.name }}</h2>
+          <template v-if="!card.installed && card.available">
+            <p class="tile-line">v{{ card.manifest.version }} · {{ card.manifest.author }}</p>
+            <p class="tile-desc">{{ card.manifest.description }}</p>
+            <p class="app-source">
+              <span>{{ card.available.source === 'github' ? `GitHub (${data.catalog?.repository || 'lengyuesky/tgdrive-app'})` : '应用目录' }}</span>
+              <span v-if="card.available.size" class="size-hint"> · {{ formatBytes(card.available.size) }}</span>
+            </p>
+            <div class="tile-actions">
+              <el-button type="primary" size="small" :disabled="!!busy" @click="previewCatalog(card.available)">安装</el-button>
+            </div>
+            <div class="tile-links">
+              <a :href="api.apps.packageUrl(card.manifest.id, card.available.digest)" class="package-link">下载插件包</a>
+              <a v-if="card.available.source_url" :href="card.available.source_url" target="_blank" rel="noopener noreferrer" class="package-link">来源仓库</a>
+            </div>
+          </template>
+        </article>
+      </div>
+      <div v-else v-loading="loading" class="manage-list">
+        <article v-for="row in manageRows" :key="row.app.manifest.id" class="manage-row"
+          :class="{ highlighted: route.query.app === row.app.manifest.id, off: !row.app.enabled }" :data-app-id="row.app.manifest.id">
+          <span class="manage-icon" aria-hidden="true"><AppIcon :manifest="row.app.manifest" :revision="row.app.revision" /></span>
+          <div class="manage-info">
+            <div class="manage-title">
+              <strong>{{ row.app.manifest.name }}</strong>
+              <span class="app-version">v{{ row.app.manifest.version }}</span>
+              <el-tag :type="row.app.enabled ? 'success' : 'info'" size="small">{{ row.app.enabled ? '已启用' : '已停用' }}</el-tag>
+              <el-icon v-if="row.app.pinned" class="manage-pin" aria-label="已固定"><StarFilled /></el-icon>
+            </div>
+            <p class="manage-meta">
+              <span>{{ row.app.source === 'import' ? '本地导入' : '应用目录' }}</span>
+              <span v-if="row.update" class="update-hint">有新版本 v{{ row.update!.manifest.version }}</span>
+            </p>
           </div>
-          <p class="app-description">{{ card.manifest.description }}</p>
-          <p class="app-source">
-            <span>{{ card.installed ? (card.installed.source === 'import' ? '本地导入' : '应用目录') : (card.available?.source === 'github' ? `GitHub (${data.catalog?.repository || 'lengyuesky/tgdrive-app'})` : '应用目录') }}</span>
-            <span v-if="card.available?.size" class="size-hint"> · {{ formatBytes(card.available.size) }}</span>
-            <span v-if="card.available?.update_available" class="update-hint">有新版本 v{{ card.available.manifest.version }}</span>
-          </p>
-          <div v-if="card.installed" class="card-actions">
-            <el-button type="primary" :disabled="!card.installed.enabled || !!busy" @click="openApp(card.manifest.id)">打开</el-button>
-            <el-button v-if="card.manifest.settings.length" :disabled="!!busy" @click="openSettings(card.installed)">设置</el-button>
-            <el-button v-if="card.available?.update_available" :disabled="!!busy" @click="previewCatalog(card.available)">更新</el-button>
-            <el-dropdown trigger="click" :disabled="!!busy" @command="command($event, card.installed!)">
-              <el-button :icon="MoreFilled" :loading="busy === card.manifest.id" aria-label="更多应用操作" />
+          <div class="manage-actions">
+            <el-button v-if="row.update" type="primary" size="small" :disabled="!!busy" @click="previewCatalog(row.update!)">更新</el-button>
+            <el-button v-if="row.app.manifest.settings.length || row.app.manifest.permissions.includes('files.read')" size="small" :disabled="!!busy" @click="openSettings(row.app)">设置</el-button>
+            <el-dropdown trigger="click" :disabled="!!busy" @command="command($event, row.app)">
+              <el-button :icon="MoreFilled" size="small" :loading="busy === row.app.manifest.id" aria-label="更多应用操作" />
               <template #dropdown><el-dropdown-menu>
-                <el-dropdown-item command="pin">{{ card.installed.pinned ? '取消固定入口' : '固定到侧边栏' }}</el-dropdown-item>
-                <el-dropdown-item command="enable">{{ card.installed.enabled ? '停用应用' : '启用应用' }}</el-dropdown-item>
+                <el-dropdown-item command="pin">{{ row.app.pinned ? '取消固定入口' : '固定到侧边栏' }}</el-dropdown-item>
+                <el-dropdown-item command="enable">{{ row.app.enabled ? '停用应用' : '启用应用' }}</el-dropdown-item>
                 <el-dropdown-item divided command="uninstall">卸载应用</el-dropdown-item>
               </el-dropdown-menu></template>
             </el-dropdown>
-            <span v-if="card.installed.pinned" class="pinned-label"><el-icon><StarFilled /></el-icon> 已固定</span>
-          </div>
-          <div v-else-if="card.available" class="card-actions">
-            <el-button type="primary" :disabled="!!busy" @click="previewCatalog(card.available)">安装</el-button>
-            <a :href="api.apps.packageUrl(card.manifest.id, card.available.digest)" class="package-link">下载插件包</a>
-            <a v-if="card.available.source_url" :href="card.available.source_url" target="_blank" rel="noopener noreferrer" class="package-link">来源仓库</a>
           </div>
         </article>
       </div>
-      <el-empty v-if="!loading && !cards.length" :description="emptyDescription">
-        <el-button v-if="tab === 'installed' && !query" @click="tab = 'available'">浏览可安装应用</el-button>
+      <el-empty v-if="!loading && !(tab === 'settings' ? manageRows.length : cards.length)" :description="emptyDescription">
+        <el-button v-if="tab !== 'available' && !query" @click="tab = 'available'">浏览可安装应用</el-button>
         <el-button v-else-if="tab === 'available' && !query && data.catalog?.state === 'unavailable'" @click="refreshAll">重试连接</el-button>
       </el-empty>
       <p class="apps-help">支持导入 .tgapp 或 .zip 插件包；已有应用可通过导入新版本更新。</p>
@@ -88,6 +112,9 @@
             </li>
           </ul>
           <p v-else>仅访问自身设置和应用数据，不读取网盘文件。</p>
+          <p v-if="preview.manifest.permissions.includes('files.read')" class="scope-note">
+            含「读取文件信息」的应用默认可访问整个网盘；安装后可在「应用设置 → 目录范围」收窄到指定目录。
+          </p>
         </div>
         <p class="install-meta">作者：{{ preview.manifest.author }} · 来源：{{ importFile ? '本地导入' : '应用目录' }}</p>
         <p class="install-digest">摘要：<code>{{ preview.digest.slice(0, 16) }}…</code></p>
@@ -108,7 +135,7 @@
         <el-button type="danger" :loading="!!busy" @click="confirmUninstall">卸载</el-button>
       </template>
     </ResponsivePanel>
-    <AppSettingsDialog v-model="settingsVisible" :app="settingsApp" />
+    <AppSettingsDialog v-model="settingsVisible" :app="settingsApp" @scope-saved="load" />
   </main>
 </template>
 
@@ -120,6 +147,8 @@ import { ElMessage } from 'element-plus'
 import { ArrowLeft, MoreFilled, Refresh, Search, StarFilled, Upload } from '@element-plus/icons-vue'
 import { api, errMsg } from '@drive/api'
 import { notifyAppsChanged, permissionLabels, type AppIndex, type AppManifest, type AppPreview, type CatalogApp, type InstalledApp } from '../types'
+import { prefetchLaunch } from '../prefetch'
+import AppIcon from '../components/AppIcon.vue'
 import AppSettingsDialog from '../components/AppSettingsDialog.vue'
 
 const router = useRouter()
@@ -128,7 +157,7 @@ const data = ref<AppIndex>({ installed: [], available: [], api_version: 1, host_
 const loading = ref(true)
 const refreshingCatalog = ref(false)
 const error = ref('')
-const tab = ref<'available' | 'installed'>('installed')
+const tab = ref<'available' | 'installed' | 'settings'>('installed')
 const query = ref('')
 const busy = ref('')
 const fileInput = ref<HTMLInputElement>()
@@ -147,6 +176,16 @@ const from = computed(() => typeof route.query.from === 'string' && route.query.
 const availableCount = computed(() => data.value.available.filter((app) => !data.value.installed.some((item) => item.manifest.id === app.manifest.id)).length)
 
 type Card = { manifest: AppManifest; installed?: InstalledApp; available?: CatalogApp }
+type ManageRow = { app: InstalledApp; update?: CatalogApp }
+/** 应用设置标签：已安装应用的行式管理列表，同样支持搜索过滤。 */
+const manageRows = computed<ManageRow[]>(() => {
+  const q = query.value.trim().toLocaleLowerCase()
+  return data.value.installed
+    .map((app) => ({ app, update: data.value.available.find((item) => item.manifest.id === app.manifest.id && item.update_available) }))
+    .filter(({ app }) => !q || `${app.manifest.name} ${app.manifest.description} ${app.manifest.id}`.toLocaleLowerCase().includes(q))
+})
+/** 待更新应用数，作为「应用设置」标签徽标；无更新时不显示。 */
+const updateCount = computed(() => manageRows.value.filter((row) => row.update).length)
 const cards = computed<Card[]>(() => {
   const all: Card[] = tab.value === 'installed'
     ? data.value.installed.map((app) => ({ manifest: app.manifest, installed: app, available: data.value.available.find((item) => item.manifest.id === app.manifest.id) }))
@@ -157,7 +196,7 @@ const cards = computed<Card[]>(() => {
 
 const emptyDescription = computed(() => {
   if (query.value.trim()) return '没有匹配的应用'
-  if (tab.value === 'installed') return '还没有安装应用'
+  if (tab.value !== 'available') return '还没有安装应用'
   if (data.value.catalog?.state === 'disabled') return '应用目录已禁用'
   if (refreshingCatalog.value && !data.value.available.length) return '正在检查应用目录'
   if (data.value.catalog?.state === 'unavailable') return '应用目录暂不可用'
@@ -203,6 +242,15 @@ onMounted(async () => {
 function back() { router.push('/files' + from.value) }
 function openApp(id: string) { router.push({ path: `/apps/${id}`, query: { from: from.value } }) }
 function openSettings(app: InstalledApp) { settingsApp.value = app; settingsVisible.value = true }
+/** 桌面端悬停预取：仅对已启用应用发起；launch 无副作用，点击后由 AppHost 复用。 */
+function hoverPrefetch(card: Card) {
+  if (card.installed?.enabled) prefetchLaunch(card.manifest.id)
+}
+/** 手机桌面式交互：点击图标即打开应用（可安装则进入安装预览）。 */
+function launch(card: Card) {
+  if (card.installed) openApp(card.manifest.id)
+  else if (card.available) previewCatalog(card.available)
+}
 
 function previewCatalog(app: CatalogApp) {
   const existing = data.value.installed.find((item) => item.manifest.id === app.manifest.id) ?? null
@@ -279,28 +327,56 @@ async function confirmUninstall() {
 .apps-title p { margin: 6px 0 0; color: var(--el-text-color-secondary); font-size: 13px; }
 .header-actions { display: flex; gap: 8px; }
 .header-actions .el-button { margin: 0; }
-.apps-content { max-width: 1160px; margin: 0 auto; padding: 32px 24px; }
+.apps-content { max-width: 1020px; margin: 0 auto; padding: 32px 24px; }
 .apps-tools { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin: 0 0 24px; }
 .apps-tabs { display: flex; gap: 8px; }
 .apps-tabs button { font: inherit; color: var(--el-text-color-secondary); background: transparent; padding: 11px 16px; border: 1px solid transparent; border-radius: 12px; cursor: pointer; white-space: nowrap; }
 .apps-tabs button.active { color: var(--el-color-primary); background: var(--glass-bg-heavy); border-color: var(--glass-border); }
 .apps-tabs span { font-size: 12px; margin-left: 5px; }
+.apps-tabs .update-count { color: #ef4444; font-weight: 600; }
 .app-search { max-width: 260px; }
-.apps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 20px; min-height: 90px; }
-.app-card { border-radius: 20px; padding: 24px; display: flex; flex-direction: column; }
-.app-card.highlighted { border-color: var(--el-color-primary); }
-.card-heading { display: flex; align-items: center; gap: 12px; }
-.card-heading > div { flex: 1; min-width: 0; }
-.app-mark { background: linear-gradient(135deg, #6366f1, #0ea5e9); color: white; display: grid; place-items: center; width: 48px; height: 48px; border-radius: 15px; font-size: 23px; flex-shrink: 0; }
-.card-heading h2 { margin: 0 0 5px; font-size: 18px; word-break: break-word; }
-.app-version, .app-source { font-size: 12px; color: var(--el-text-color-secondary); word-break: break-word; }
-.app-description { font-size: 14px; line-height: 1.8; margin: 20px 0 8px; flex: 1; overflow-wrap: anywhere; }
-.app-source { margin: 8px 0 20px; }
-.update-hint { display: block; margin-top: 8px; color: var(--el-color-primary); }
-.card-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.card-actions .el-button { margin: 0; }
-.pinned-label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-soft); }
-.package-link { color: var(--el-color-primary); text-decoration: none; font-size: 13px; padding: 8px; }
+/* 手机桌面式图标网格 */
+.apps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); gap: 16px; min-height: 90px; }
+.app-tile { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 18px 12px 16px; border: 1px solid transparent; border-radius: 20px; transition: background-color .2s, border-color .2s; }
+.app-tile:hover { background: var(--glass-bg); border-color: var(--glass-border); }
+.app-tile.highlighted { background: var(--glass-bg); border-color: var(--el-color-primary); box-shadow: 0 0 0 3px rgba(64, 158, 255, 0.18); }
+.app-tile.off { opacity: 0.78; }
+.app-tile.off .tile-icon { filter: grayscale(0.85); }
+.tile-launch { position: relative; display: block; padding: 0; border: 0; background: transparent; line-height: 0; cursor: pointer; }
+.tile-launch:disabled { cursor: default; }
+.tile-launch:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 4px; border-radius: 26px; }
+.tile-icon { display: grid; place-items: center; width: 72px; height: 72px; border-radius: 22px; color: #fff; font-size: 32px; font-weight: 600; line-height: 1; text-transform: uppercase; box-shadow: 0 10px 22px rgba(15, 23, 42, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.35); transition: transform .2s ease; }
+.app-tile:hover .tile-icon { transform: translateY(-2px) scale(1.04); }
+.tile-badge-dot { position: absolute; top: -4px; right: -4px; width: 14px; height: 14px; border-radius: 50%; background: #ef4444; border: 2px solid #fff; animation: tile-badge-pulse 2s ease-out infinite; }
+@keyframes tile-badge-pulse { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.45); } 70%, 100% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); } }
+.tile-badge-pin { position: absolute; top: -6px; left: -6px; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-size: 12px; background: #f59e0b; border: 2px solid #fff; box-shadow: 0 2px 6px rgba(245, 158, 11, 0.5); }
+.tile-name { margin: 12px 0 0; font-size: 14px; line-height: 1.4; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.app-version { font-size: 12px; color: var(--el-text-color-secondary); word-break: break-word; }
+.update-hint { margin: 6px 0 0; font-size: 12px; color: var(--el-color-primary); }
+.tile-line { margin: 6px 0 0; font-size: 12px; color: var(--el-text-color-secondary); word-break: break-word; }
+.tile-desc { margin: 6px 0 0; font-size: 12px; line-height: 1.5; color: var(--el-text-color-secondary); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; max-width: 100%; }
+.app-source { margin: 6px 0 0; font-size: 11px; color: var(--el-text-color-placeholder); overflow-wrap: anywhere; }
+.size-hint { font-size: 11px; color: var(--el-text-color-placeholder); }
+.tile-actions { display: flex; align-items: center; justify-content: center; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+.tile-actions .el-button { margin: 0; }
+.tile-links { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 8px; }
+/* 应用设置：行式管理列表 */
+.manage-list { display: flex; flex-direction: column; gap: 8px; min-height: 90px; }
+.manage-row { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--glass-border); border-radius: 16px; transition: background-color .2s, border-color .2s; }
+.manage-row:hover { background: var(--glass-bg); }
+.manage-row.highlighted { border-color: var(--el-color-primary); box-shadow: 0 0 0 3px rgba(64, 158, 255, 0.18); }
+.manage-row.off .manage-icon { filter: grayscale(0.85); }
+.manage-icon { display: grid; place-items: center; flex-shrink: 0; width: 44px; height: 44px; border-radius: 13px; color: #fff; font-size: 20px; font-weight: 600; line-height: 1; text-transform: uppercase; box-shadow: 0 4px 10px rgba(15, 23, 42, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.35); }
+.manage-info { flex: 1; min-width: 0; }
+.manage-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.manage-title strong { font-size: 14px; word-break: break-word; }
+.manage-pin { color: #f59e0b; font-size: 14px; flex-shrink: 0; }
+.manage-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 4px 0 0; font-size: 12px; color: var(--el-text-color-secondary); }
+.manage-meta .update-hint { margin: 0; }
+.manage-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.manage-actions .el-button { margin: 0; }
+.package-link { color: var(--el-color-primary); text-decoration: none; font-size: 12px; }
+.package-link:hover { text-decoration: underline; }
 .apps-help { margin: 28px 0 0; text-align: center; color: var(--el-text-color-secondary); font-size: 12px; }
 .install-name { margin: 0 0 14px; }
 .install-name span { font-size: 13px; font-weight: normal; color: var(--el-text-color-secondary); }
@@ -308,22 +384,32 @@ async function confirmUninstall() {
 .permissions-box { background: var(--tile-bg); border: 1px solid var(--tile-border); border-radius: 12px; padding: 16px; margin: 18px 0; }
 .permissions-box ul { padding-left: 20px; margin-bottom: 0; }
 .permissions-box li { margin: 10px 0; line-height: 1.5; }
+.scope-note { font-size: 12px; color: var(--el-text-color-secondary); margin: 10px 0 0; }
 .install-meta, .install-digest { font-size: 12px; color: var(--el-text-color-secondary); }
 .install-digest code { font-family: monospace; background: var(--tile-bg); padding: 2px 6px; border-radius: 4px; }
-.size-hint { font-size: 11px; color: var(--el-text-color-placeholder); }
 .el-alert { margin-bottom: 18px; }
-@media (max-width: 650px) {
-  .apps-header { gap: 14px; padding: 16px; flex-wrap: wrap; }
-  .apps-title p { display: none; }
-  .header-actions { width: 100%; justify-content: flex-end; }
-  .apps-content { padding: 22px 14px; }
-  .apps-tools { flex-wrap: wrap; gap: 14px; }
-  .app-search { max-width: none; }
-  .apps-grid { grid-template-columns: minmax(0, 1fr); }
-}
 @media (max-width: 767px) {
-  .apps-page { min-height: 0; }.apps-header { gap: 8px; padding: 12px; flex-wrap: wrap; }.apps-title { min-width: 0; }.header-actions { flex-wrap: wrap; }
-  .apps-content { padding: 16px 12px; }.apps-tools { flex-wrap: wrap; gap: 12px; }.apps-tabs { width: 100%; overflow: auto; gap: 4px; }.apps-tabs button { min-height: 44px; padding: 10px; }
-  .apps-grid { grid-template-columns: minmax(0, 1fr); gap: 14px; }.app-card { padding: 18px; }.app-search { max-width: none; }
+  .apps-page { min-height: 0; }
+  .apps-header { gap: 10px; padding: 12px 16px; flex-wrap: wrap; }
+  .apps-title { min-width: 0; }
+  .apps-title h1 { font-size: 18px; white-space: nowrap; }
+  .apps-title p { display: none; }
+  .header-actions { width: 100%; display: flex; justify-content: flex-end; gap: 8px; }
+  .apps-content { padding: 16px 12px; }
+  .apps-tools { flex-wrap: wrap; gap: 12px; }
+  .apps-tabs { width: 100%; overflow: auto; gap: 4px; }
+  .apps-tabs button { min-height: 44px; padding: 10px; }
+  .app-search { max-width: none; }
+  .apps-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .app-tile { padding: 14px 8px 12px; }
+  .tile-icon { width: 64px; height: 64px; border-radius: 19px; font-size: 28px; }
+  .manage-list { gap: 6px; }
+  .manage-row { flex-wrap: wrap; gap: 10px; padding: 12px; }
+  .manage-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tile-badge-dot { animation: none; }
+  .tile-icon { transition: none; }
+  .app-tile:hover .tile-icon { transform: none; }
 }
 </style>

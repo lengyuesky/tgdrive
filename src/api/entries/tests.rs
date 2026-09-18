@@ -86,6 +86,8 @@ async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         tasks: crate::tasks::TaskManager::new(),
         migration: crate::migration::StorageMigrationManager::new(db, tg),
         apps_catalog: Arc::new(crate::apps::CatalogManager::disabled()),
+        events: crate::events::bus(),
+        range_cache: Arc::new(std::sync::Mutex::new(crate::apps::RangeCache::default())),
     };
     let app = Router::new()
         .nest("/api", crate::api::router(state.clone()))

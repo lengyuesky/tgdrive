@@ -10,6 +10,7 @@ mod dav;
 mod db;
 mod engine;
 mod error;
+mod events;
 mod extras;
 mod housekeeping;
 mod inbox;
@@ -168,6 +169,7 @@ async fn serve() -> anyhow::Result<()> {
         auth.clone(),
     ));
     let dav_handler = dav::build_handler(vfs.clone());
+    let events = crate::events::bus();
     let tasks = crate::tasks::TaskManager::new();
     let catalog_cache_dir = std::path::Path::new(&env_cfg.db_path)
         .parent()
@@ -186,6 +188,8 @@ async fn serve() -> anyhow::Result<()> {
         tasks: tasks.clone(),
         migration: migration.clone(),
         apps_catalog,
+        events,
+        range_cache: Arc::new(std::sync::Mutex::new(crate::apps::RangeCache::default())),
     };
     if let Err(error) = db
         .append_backend_log("info", "系统", "tgdrive 服务已启动")
@@ -197,13 +201,25 @@ async fn serve() -> anyhow::Result<()> {
     // 后台任务:回收站超期清理 + 自动备份;Bot 收件轮询
     let housekeeping_vfs = state.vfs.clone();
     let housekeeping_rt = state.rt.clone();
+    let housekeeping_events = state.events.clone();
     tasks.supervise("housekeeping", move |reporter| {
-        housekeeping::run(housekeeping_vfs.clone(), housekeeping_rt.clone(), reporter)
+        housekeeping::run(
+            housekeeping_vfs.clone(),
+            housekeeping_rt.clone(),
+            housekeeping_events.clone(),
+            reporter,
+        )
     });
     let inbox_vfs = state.vfs.clone();
     let inbox_rt = state.rt.clone();
+    let inbox_events = state.events.clone();
     tasks.supervise("inbox", move |reporter| {
-        inbox::run(inbox_vfs.clone(), inbox_rt.clone(), reporter)
+        inbox::run(
+            inbox_vfs.clone(),
+            inbox_rt.clone(),
+            inbox_events.clone(),
+            reporter,
+        )
     });
 
     let mut app = axum::Router::new()

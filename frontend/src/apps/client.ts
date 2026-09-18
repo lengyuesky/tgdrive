@@ -20,6 +20,7 @@ export const appApi = {
     http.delete(`/apps/${encodeURIComponent(id)}`, { params: { purge_data: purgeData } }),
   settings: (id: string) => http.get<SettingValues>(`/apps/${encodeURIComponent(id)}/settings`),
   saveSettings: (id: string, values: SettingValues) => http.patch<SettingValues>(`/apps/${encodeURIComponent(id)}/settings`, values),
+  saveScope: (id: string, paths: string[]) => http.patch<InstalledApp>(`/apps/${encodeURIComponent(id)}/scope`, { paths }),
   launch: (id: string, signal?: AbortSignal) => http.post<AppLaunch>(`/apps/${encodeURIComponent(id)}/launch`, {}, { signal }),
   rpc: (id: string, session: string, method: string, params: unknown = {}, signal?: AbortSignal) =>
     http.post(`/apps/${encodeURIComponent(id)}/rpc`, { session, method, params }, { signal }),

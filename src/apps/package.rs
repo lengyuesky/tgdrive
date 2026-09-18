@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 pub const MAX_PACKAGE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_EXPANDED_SIZE: usize = 32 * 1024 * 1024;
 const MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
+const MAX_ICON_SIZE: usize = 256 * 1024;
 pub const API_VERSION: u32 = 2;
 pub const PERMISSIONS: &[&str] = &["files.read", "media.read", "favorites.write"];
 
@@ -37,6 +38,9 @@ pub struct Manifest {
     pub description: String,
     pub author: String,
     pub entry: String,
+    /// 可选图标：包内 SVG 资源路径；仅安装后由宿主展示，目录中未安装应用仍用字母图标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
     #[serde(default)]
@@ -127,6 +131,11 @@ impl Manifest {
             .map_err(|_| invalid("主程序最低版本格式无效"))?;
         if !valid_resource(&self.entry) || !self.entry.ends_with(".html") {
             return Err(invalid("应用入口必须是包内的 HTML 文件"));
+        }
+        if let Some(icon) = &self.icon
+            && !(valid_resource(icon) && icon.ends_with(".svg"))
+        {
+            return Err(invalid("应用图标必须是包内的 SVG 文件"));
         }
         Ok(())
     }
@@ -281,6 +290,13 @@ impl AppPackage {
         manifest.validate()?;
         if !files.contains_key(&manifest.entry) {
             return Err(invalid("应用入口文件不存在"));
+        }
+        if let Some(icon) = &manifest.icon
+            && !files
+                .get(icon)
+                .is_some_and(|raw| !raw.is_empty() && raw.len() <= MAX_ICON_SIZE)
+        {
+            return Err(invalid("应用图标必须是包内不超过 256 KiB 的非空 SVG 文件"));
         }
         drop(zip);
         let digest = crate::engine::upload::to_hex(&Sha256::digest(&archive));

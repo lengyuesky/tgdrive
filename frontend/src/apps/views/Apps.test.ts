@@ -20,7 +20,7 @@ const manifest: AppManifest = {
 }
 const installed: InstalledApp = {
   manifest, digest: 'a'.repeat(64), revision: 'reviewed-revision', enabled: true, pinned: false,
-  source: 'catalog', installed_at: 1, updated_at: 1,
+  source: 'catalog', installed_at: 1, updated_at: 1, scope: [],
 }
 const available: CatalogApp = {
   manifest: { ...manifest, version: '1.1.0', permissions: ['files.read'] }, digest: 'b'.repeat(64),
@@ -70,6 +70,11 @@ async function showAvailable() {
   await flushPromises()
 }
 
+async function showSettings() {
+  await wrapper!.findAll('[role="tab"]')[2]!.trigger('click')
+  await flushPromises()
+}
+
 function emptyText() { return wrapper!.findComponent({ name: 'ElEmpty' }).props('description') }
 function alertTitles() { return wrapper!.findAllComponents({ name: 'ElAlert' }).map((item) => item.props('title')).join(' ') }
 
@@ -81,7 +86,7 @@ describe('应用中心远程目录', () => {
     expect(mocks.refreshCatalog).toHaveBeenCalledExactlyOnceWith(false)
     expect(view.find('[role="tab"]').attributes('aria-selected')).toBe('true')
     expect(view.find('[data-app-id="sample"]').exists()).toBe(true)
-    await button('打开')
+    await view.find('[data-app-id="sample"] .tile-launch').trigger('click')
     expect(mocks.push).toHaveBeenCalledWith({ path: '/apps/sample', query: { from: '/' } })
     expect(mocks.installCatalog).not.toHaveBeenCalled()
     snapshot.catalog!.state = 'stale'
@@ -101,9 +106,9 @@ describe('应用中心远程目录', () => {
     mocks.refreshCatalog.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
     await button('刷新')
     expect(view.find('[data-app-id="sample"]').exists()).toBe(true)
-    const open = view.findAllComponents({ name: 'ElButton' }).find((item) => item.text() === '打开')!
-    expect(open.props('disabled')).toBe(false)
-    await button('打开')
+    const launch = view.find('[data-app-id="sample"] .tile-launch')
+    expect(launch.attributes('disabled')).toBeUndefined()
+    await launch.trigger('click')
     expect(mocks.push).toHaveBeenCalledTimes(1)
     finish({ data: structuredClone(snapshot) })
     await flushPromises()
@@ -156,6 +161,7 @@ describe('应用中心远程目录', () => {
 
   it('升级权限经过明确确认，确认后的摘要不会被刷新目录悄悄替换', async () => {
     const view = await render()
+    await showSettings()
     await button('更新')
     const preview = view.find('[role="dialog"]')
     expect(preview.text()).toContain('新增')
@@ -170,5 +176,85 @@ describe('应用中心远程目录', () => {
     expect(view.find('[role="dialog"]').exists()).toBe(true)
     expect(alertTitles()).toContain('插件包已经变化')
     expect(view.find('[data-app-id="sample"]').text()).toContain('v1.0.0')
+  })
+})
+
+describe('桌面式图标卡片', () => {
+  it('已安装卡片只留图标与名称：无操作按钮与文字信息，更新红点保留', async () => {
+    const view = await render()
+    const tile = view.find('[data-app-id="sample"]')
+    expect(tile.find('.tile-launch').exists()).toBe(true)
+    expect(tile.find('.tile-badge-dot').exists()).toBe(true)
+    expect(tile.text()).toContain('测试应用')
+    expect(tile.text()).not.toContain('v1.0.0')
+    expect(tile.text()).not.toContain('已启用')
+    expect(tile.text()).not.toContain('应用目录')
+    expect(tile.findComponent({ name: 'ElButton' }).exists()).toBe(false)
+    expect(tile.findComponent({ name: 'ElDropdown' }).exists()).toBe(false)
+  })
+
+  it('停用的应用卡片置灰且点击禁用', async () => {
+    snapshot.installed[0]!.enabled = false
+    const view = await render()
+    const tile = view.find('[data-app-id="sample"]')
+    expect(tile.classes()).toContain('off')
+    const launch = tile.find('.tile-launch')
+    expect(launch.attributes('disabled')).toBeDefined()
+    await launch.trigger('click')
+    expect(mocks.push).not.toHaveBeenCalled()
+  })
+})
+
+describe('应用设置管理列表', () => {
+  it('标签徽标计数待更新应用，列表集中更新、启停、固定与卸载', async () => {
+    snapshot.installed[0]!.manifest.settings = [
+      { key: 'note', label: '说明文字', description: '', type: 'string', default: '初始值' },
+    ]
+    const view = await render()
+    const tabs = view.findAll('[role="tab"]')
+    expect(tabs[2]!.text()).toContain('应用设置')
+    expect(tabs[2]!.text()).toContain('1')
+    await showSettings()
+    const row = view.find('[data-app-id="sample"]')
+    expect(row.text()).toContain('测试应用')
+    expect(row.text()).toContain('v1.0.0')
+    expect(row.text()).toContain('已启用')
+    expect(row.text()).toContain('有新版本 v1.1.0')
+    await button('更新')
+    expect(view.find('[role="dialog"]').attributes('aria-label')).toBe('更新应用')
+    await button('取消')
+    view.findComponent({ name: 'ElDropdown' }).vm.$emit('command', 'enable')
+    await flushPromises()
+    expect(mocks.state).toHaveBeenCalledExactlyOnceWith('sample', { enabled: false })
+    view.findComponent({ name: 'ElDropdown' }).vm.$emit('command', 'pin')
+    await flushPromises()
+    expect(mocks.state).toHaveBeenLastCalledWith('sample', { pinned: true })
+    view.findComponent({ name: 'ElDropdown' }).vm.$emit('command', 'uninstall')
+    await flushPromises()
+    expect(view.find('[role="dialog"][aria-label="卸载应用"]').exists()).toBe(true)
+    await button('卸载')
+    expect(mocks.uninstall).toHaveBeenCalledExactlyOnceWith('sample', false)
+  })
+
+  it('无设置字段且无目录范围的应用不显示设置按钮，含 files.read 权限即可进入设置', async () => {
+    const view = await render()
+    await showSettings()
+    expect(view.findAllComponents({ name: 'ElButton' }).some((item) => item.text().trim() === '设置')).toBe(false)
+    snapshot.installed[0]!.manifest.permissions = ['files.read']
+    await button('刷新')
+    await showSettings()
+    await button('设置')
+    const dialog = view.findComponent({ name: 'AppSettingsDialog' })
+    expect(dialog.props('modelValue')).toBe(true)
+    expect(dialog.props('app').manifest.id).toBe('sample')
+  })
+
+  it('无安装应用时空状态引导浏览可安装', async () => {
+    snapshot.installed = []
+    const view = await render()
+    await showSettings()
+    expect(emptyText()).toBe('还没有安装应用')
+    await button('浏览可安装应用')
+    expect(view.findAll('[role="tab"]')[1]!.attributes('aria-selected')).toBe('true')
   })
 })
