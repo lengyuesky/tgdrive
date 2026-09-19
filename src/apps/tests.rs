@@ -1190,6 +1190,7 @@ async fn browser_fixture() {
     }
     let stats = media.clone();
     let control = media.clone();
+    let fixture_range_cache = state.range_cache.clone();
     let app = router(&state)
         .route(
             "/__apps_fixture",
@@ -1215,6 +1216,7 @@ async fn browser_fixture() {
             })
             .post(move |Json(input): Json<Value>| {
                 let control = control.clone();
+                let range_cache = fixture_range_cache.clone();
                 async move {
                     control.slow.store(
                         input["enabled"].as_bool().unwrap_or(false),
@@ -1222,6 +1224,9 @@ async fn browser_fixture() {
                     );
                     control.bytes_sent.store(0, Ordering::SeqCst);
                     control.ranges.lock().unwrap().clear();
+                    if let Ok(mut cache) = range_cache.lock() {
+                        *cache = crate::apps::RangeCache::default();
+                    }
                     Json(json!({"ok": true}))
                 }
             }),
