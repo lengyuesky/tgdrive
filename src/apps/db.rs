@@ -1,10 +1,54 @@
 //! 应用安装记录与配置；安装、更新、卸载均在短事务内提交。
+//! 安装记录另有进程内缓存：运行页面的每次 RPC、资源与媒体请求都要核对启用状态和修订，
+//! 命中缓存后不再占用数据库连接；本模块是 `apps` 表唯一的写入者，写入后同步失效。
 
 use super::{Db, now_ts, random_token};
 use crate::error::{AppError, AppResult};
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 
 mod data;
 pub use data::*;
+
+/// 已安装记录缓存。代次计数保证"查库期间发生写入"的读者不会把陈旧行写回：
+/// 读者在查库前记下代次，回填时代次已变则放弃；写入者提交后先递增代次再移除条目。
+#[derive(Default)]
+pub struct AppCache {
+    inner: Mutex<AppCacheInner>,
+}
+
+#[derive(Default)]
+struct AppCacheInner {
+    generation: u64,
+    records: HashMap<String, AppRecord>,
+}
+
+impl AppCache {
+    fn lock(&self) -> MutexGuard<'_, AppCacheInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 命中返回记录；未命中返回当前代次，供回填时校验。
+    fn lookup(&self, id: &str) -> Result<AppRecord, u64> {
+        let inner = self.lock();
+        inner.records.get(id).cloned().ok_or(inner.generation)
+    }
+
+    fn store(&self, generation: u64, record: AppRecord) {
+        let mut inner = self.lock();
+        if inner.generation == generation {
+            inner.records.insert(record.id.clone(), record);
+        }
+    }
+
+    fn invalidate(&self, id: &str) {
+        let mut inner = self.lock();
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.records.remove(id);
+    }
+}
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct AppRecord {
@@ -40,10 +84,19 @@ impl Db {
     }
 
     pub async fn app(&self, id: &str) -> AppResult<Option<AppRecord>> {
-        Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths FROM apps WHERE id = ?")
+        let generation = match self.apps_cache.lookup(id) {
+            Ok(record) => return Ok(Some(record)),
+            Err(generation) => generation,
+        };
+        let record: Option<AppRecord> = sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths FROM apps WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
-            .await?)
+            .await?;
+        // 未安装不做负缓存：安装后第一次访问必须看到新记录。
+        if let Some(record) = &record {
+            self.apps_cache.store(generation, record.clone());
+        }
+        Ok(record)
     }
 
     /// 只更新目录范围；不轮换修订版，避免打断正在运行的页面（逐次调用强制校验）。
@@ -54,6 +107,7 @@ impl Db {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.apps_cache.invalidate(id);
         if changed.rows_affected() == 0 {
             return Err(AppError::NotFound);
         }
@@ -109,6 +163,7 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.apps_cache.invalidate(input.id);
         Ok(())
     }
 
@@ -131,6 +186,7 @@ impl Db {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        self.apps_cache.invalidate(id);
         if changed.rows_affected() == 0 {
             return Err(AppError::NotFound);
         }
@@ -157,6 +213,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
+        self.apps_cache.invalidate(id);
         Ok(())
     }
 

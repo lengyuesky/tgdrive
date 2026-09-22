@@ -8,9 +8,11 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
+brotli = "8.0.4"
 bytes = "1.12.1"
 dav-server = "0.11.0"
 dotenvy = "0.15.7"
+flate2 = "1.1.9"
 futures-util = "0.3.34"
 grammers-client = { version = "0.10.0", default-features = false }
 grammers-mtsender = "0.10.0"
@@ -39,3 +41,15 @@ tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzi
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
+
+# 预压缩在安装时运行：压缩库在 dev 构建也按优化编译，浏览器测试夹具安装真实插件包不至于慢几十倍。
+[profile.dev.package.brotli]
+opt-level = 3
+[profile.dev.package.brotli-decompressor]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3

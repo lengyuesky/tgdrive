@@ -74,6 +74,34 @@ impl AppError {
     }
 }
 
+impl AppError {
+    /// 面向客户端的稳定错误信息与机器码。数据库、IO 与网络错误可能携带本地路径或
+    /// 上游 URL：详细信息只进服务端日志，客户端拿到不泄密的提示。
+    pub fn public_parts(&self) -> (String, Option<&'static str>) {
+        let status = self.status();
+        let message = if matches!(self, AppError::UploadInterrupted) {
+            "上传服务已重启，正在重试".to_string()
+        } else if status.is_server_error() {
+            match self {
+                AppError::Telegram(_)
+                | AppError::TelegramRejected(_)
+                | AppError::TelegramUncertain(_) => "上游存储暂时不可用".to_string(),
+                _ => "服务内部错误".to_string(),
+            }
+        } else {
+            self.to_string()
+        };
+        let code = match self {
+            AppError::UploadInterrupted => Some("upload_interrupted"),
+            AppError::AppDataConflict => Some("storage_conflict"),
+            AppError::SessionExpired => Some("session_expired"),
+            AppError::AppChanged => Some("app_changed"),
+            _ => None,
+        };
+        (message, code)
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
@@ -84,27 +112,7 @@ impl IntoResponse for AppError {
         if status.is_server_error() {
             tracing::error!(error = %self, "请求处理失败");
         }
-        // 数据库、IO 与网络错误可能携带本地路径或上游 URL；详细信息只进服务端
-        // 日志，HTTP 客户端拿到稳定且不泄密的提示。
-        let public_error = if matches!(&self, AppError::UploadInterrupted) {
-            "上传服务已重启，正在重试".to_string()
-        } else if status.is_server_error() {
-            match &self {
-                AppError::Telegram(_)
-                | AppError::TelegramRejected(_)
-                | AppError::TelegramUncertain(_) => "上游存储暂时不可用".to_string(),
-                _ => "服务内部错误".to_string(),
-            }
-        } else {
-            self.to_string()
-        };
-        let code = match &self {
-            AppError::UploadInterrupted => Some("upload_interrupted"),
-            AppError::AppDataConflict => Some("storage_conflict"),
-            AppError::SessionExpired => Some("session_expired"),
-            AppError::AppChanged => Some("app_changed"),
-            _ => None,
-        };
+        let (public_error, code) = self.public_parts();
         let mut response = (
             status,
             Json(serde_json::json!({ "error": public_error, "code": code })),

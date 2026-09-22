@@ -36,8 +36,9 @@ import { connectAppBridge, type AppBridge } from '../bridge'
 import { afterHostPaint } from '../paint'
 import { HostImmersion } from '../immersive'
 import { takeLaunch } from '../prefetch'
-import { assetPath, boundedBytes, rangeInput, rangesInput, RANGE_LIMIT } from '../bytes'
-import { APPS_CHANGED, pathInScope, type AppLaunch, type InstalledApp, type SettingValues } from '../types'
+import { assetPath, boundedBytes, mapLimit, rangeInput, rangesInput, RANGE_LIMIT, RANGE_PARALLEL } from '../bytes'
+import { batchInput } from '../batch'
+import { APPS_CHANGED, filesChangeAffectsScope, pathInScope, type AppLaunch, type InstalledApp, type SettingValues } from '../types'
 import { onHostEvent } from '../events'
 import { isDark } from '@drive/theme'
 import { closeTopOverlay } from '@drive/mobile/overlays'
@@ -206,20 +207,27 @@ async function invoke(method: string, params: Record<string, unknown>, requestSi
         const response = await fetch(url, { signal, credentials: 'omit', redirect: 'error' })
         return await boundedBytes(response, 8 * RANGE_LIMIT, signal)
       }
-      const fetchRange = async (ref: { id: number; content_version: string }, offset: number, length: number) => {
-        const url = await grantUrl(ref)
-        const response = await fetch(url, { signal, credentials: 'omit', redirect: 'error', headers: { Range: `bytes=${offset}-${offset + length - 1}` } })
-        return await boundedBytes(response, RANGE_LIMIT, signal, { offset, length })
+      const fetchAt = async (url: string, offset: number, length: number, rangeSignal: AbortSignal) => {
+        const response = await fetch(url, { signal: rangeSignal, credentials: 'omit', redirect: 'error', headers: { Range: `bytes=${offset}-${offset + length - 1}` } })
+        return await boundedBytes(response, RANGE_LIMIT, rangeSignal, { offset, length })
       }
       if (method === 'files.readRanges') {
         const batch = rangesInput(params)
-        const blocks: Uint8Array[] = []
-        for (const range of batch.ranges) blocks.push(await fetchRange(batch.ref, range.offset, range.length))
-        return blocks
+        // 票据只申请一次，各段限 4 路并行；任一段失败即取消同批其余在途请求。
+        const url = await grantUrl(batch.ref)
+        const local = new AbortController()
+        const localSignal = AbortSignal.any([signal, local.signal])
+        try {
+          return await mapLimit(batch.ranges, RANGE_PARALLEL, (range) => fetchAt(url, range.offset, range.length, localSignal))
+        } catch (error) { local.abort(); throw error }
       }
       const range = rangeInput(params)
-      return await fetchRange(range.ref, range.offset, range.length)
+      return await fetchAt(await grantUrl(range.ref), range.offset, range.length, signal)
     } finally { reads-- }
+  }
+  if (method === 'rpc.batch') {
+    if (active.app.manifest.api_version < 2) throw new Error('此能力需要应用 API v2')
+    return request('rpc.batch', batchInput(params))
   }
   if (!method.startsWith('ui.')) return request(method)
   if (method === 'ui.setImmersive') {
@@ -272,7 +280,7 @@ function onReady(event: MessageEvent) {
     if (current !== generation || !frame.value?.contentWindow) { channel.port2.close(); return }
     frame.value.contentWindow.postMessage({ channel: 'tgdrive-app-v1', type: 'connect',
       context: { id: active.app.manifest.id, name: active.app.manifest.name, version: active.app.manifest.version, api_version: active.app.manifest.api_version, dark: isDark.value,
-        capabilities: active.app.manifest.api_version >= 2 ? ['ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope'] : [] } }, '*', [channel.port2])
+        capabilities: active.app.manifest.api_version >= 2 ? ['ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope', 'rpc.batch'] : [] } }, '*', [channel.port2])
   }).catch((error) => {
     channel.port2.close()
     if (current === generation && !signal.aborted) fail(errMsg(error))
@@ -285,9 +293,14 @@ function onScopeSaved(paths: string[]) {
   if (app.value) app.value = { ...app.value, scope: paths }
 }
 /** 服务端事件流转发：只发标识不发明文值，插件自行按需重拉。 */
-function forwardHostEvents(event: { kind: string; app_id?: string; key?: string }) {
+function forwardHostEvents(event: { kind: string; app_id?: string; key?: string; paths?: string[] }) {
   if (!port || !app.value) return
-  if (event.kind === 'files') { port.postMessage({ type: 'event', name: 'files.changed' }); return }
+  if (event.kind === 'files') {
+    // 已知变更目录且与应用目录范围无关时不转发，批量上传不会让无关插件全量重扫。
+    if (!filesChangeAffectsScope(app.value.scope, event.paths)) return
+    port.postMessage({ type: 'event', name: 'files.changed', value: event.paths ? { paths: event.paths } : undefined })
+    return
+  }
   if (event.kind === 'sync.hint') { port.postMessage({ type: 'event', name: 'sync.hint' }); return }
   if (event.app_id !== app.value.manifest.id) return
   if (event.kind === 'app.storage') port.postMessage({ type: 'event', name: 'storage.changed', value: { key: event.key } })

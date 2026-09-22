@@ -62,8 +62,8 @@ beforeEach(() => {
 })
 afterEach(() => { wrapper?.unmount(); wrapper = undefined; vi.useRealTimers() })
 
-async function render() {
-  wrapper = shallowMount(AppHost, { global: {
+async function render(attach = false) {
+  wrapper = shallowMount(AppHost, { attachTo: attach ? document.body : undefined, global: {
     plugins: [ElementPlus],
     stubs: {
       AppSettingsDialog: true,
@@ -158,5 +158,81 @@ describe('应用宿主会话续签', () => {
     await vi.advanceTimersByTimeAsync(15_000)
     expect(view.findComponent({ name: 'ElEmpty' }).props('description'))
       .toBe('应用已卸载，请前往应用中心重新安装')
+  })
+})
+
+describe('应用宿主数据面、批量信封与事件转发', () => {
+  it('批量段读只申请一次票据、最多 4 路并行、结果按顺序返回', async () => {
+    await render()
+    await connectSandbox()
+    mocks.rpc.mockReset().mockResolvedValue({ data: { url: '/api/apps/media/ticket-1' } })
+    const inflight: Array<{ range: string; resolve: (response: Response) => void }> = []
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => new Promise<Response>((resolve) => {
+      inflight.push({ range: (init.headers as Record<string, string>).Range!, resolve })
+    })))
+    const ref = { id: 7, content_version: 'c'.repeat(64) }
+    const ranges = Array.from({ length: 6 }, (_, index) => ({ offset: index * 100, length: 3 }))
+    const result = capturedInvoke!('files.readRanges', { ref, ranges }, new AbortController().signal) as Promise<Uint8Array[]>
+    await flushPromises()
+    expect(mocks.rpc).toHaveBeenCalledTimes(1)
+    expect(mocks.rpc.mock.calls[0]![2]).toBe('media.url')
+    expect(inflight.map((item) => item.range)).toEqual(['bytes=0-2', 'bytes=100-102', 'bytes=200-202', 'bytes=300-302'])
+    const respond = (index: number) => {
+      const range = ranges[index]!
+      inflight[index]!.resolve(new Response(String(index).repeat(3), {
+        status: 206, headers: { 'Content-Length': '3', 'Content-Range': `bytes ${range.offset}-${range.offset + 2}/1000` },
+      }))
+    }
+    // 第 4 段先完成：空出的并发槽立即取第 5 段，顺序不受完成先后影响。
+    respond(3)
+    await flushPromises()
+    expect(inflight).toHaveLength(5)
+    respond(0); respond(1); respond(2); respond(4)
+    await flushPromises()
+    expect(inflight).toHaveLength(6)
+    respond(5)
+    const blocks = await result
+    expect(blocks.map((block) => new TextDecoder().decode(block))).toEqual(['000', '111', '222', '333', '444', '555'])
+    expect(mocks.rpc).toHaveBeenCalledTimes(1)
+  })
+
+  it('批量信封经校验后整体转发，非法内容不发请求；能力声明包含 rpc.batch', async () => {
+    // 挂到文档上让 jsdom 为 iframe 创建窗口，才能观察握手消息。
+    await render(true)
+    const frame = wrapper!.find('iframe').element as HTMLIFrameElement
+    const posted = vi.spyOn(frame.contentWindow!, 'postMessage')
+    await connectSandbox()
+    const connect = posted.mock.calls.map((call) => call[0] as { type?: string; context?: { capabilities?: string[] } }).find((data) => data?.type === 'connect')
+    expect(connect?.context?.capabilities).toContain('rpc.batch')
+    mocks.rpc.mockReset().mockResolvedValue({ data: { results: [{ result: { ok: true } }] } })
+    const result = await capturedInvoke!('rpc.batch', { calls: [{ method: 'files.stat', params: { id: 1 } }, { method: 'app.ping' }] }, new AbortController().signal)
+    expect(result).toEqual({ results: [{ result: { ok: true } }] })
+    expect(mocks.rpc).toHaveBeenCalledWith('sample', 's1', 'rpc.batch',
+      { calls: [{ method: 'files.stat', params: { id: 1 } }, { method: 'app.ping', params: {} }] }, expect.anything())
+    await expect(capturedInvoke!('rpc.batch', { calls: [{ method: 'ui.close' }] }, new AbortController().signal)).rejects.toThrow('不支持')
+    await expect(capturedInvoke!('rpc.batch', { calls: [] }, new AbortController().signal)).rejects.toThrow('1 到 16')
+    expect(mocks.rpc).toHaveBeenCalledTimes(1)
+  })
+
+  it('文件事件按应用目录范围过滤后再转发；范围未知的事件照常转发', async () => {
+    const port1 = { postMessage: vi.fn(), close: vi.fn(), start: vi.fn() }
+    vi.stubGlobal('MessageChannel', class { port1 = port1; port2 = { close: vi.fn() } })
+    const data = launchData()
+    data.app = { ...data.app, scope: ['/书'] }
+    mocks.launch.mockReset().mockResolvedValue({ data })
+    await render()
+    await connectSandbox()
+    const forward = mocks.onHostEvent.mock.calls[0]![0] as (event: Record<string, unknown>) => void
+    forward({ kind: 'files', paths: ['/影片', '/书籍'] })
+    expect(port1.postMessage).not.toHaveBeenCalled()
+    forward({ kind: 'files', paths: ['/书/子目录'] })
+    expect(port1.postMessage).toHaveBeenLastCalledWith({ type: 'event', name: 'files.changed', value: { paths: ['/书/子目录'] } })
+    forward({ kind: 'files' })
+    expect(port1.postMessage).toHaveBeenLastCalledWith({ type: 'event', name: 'files.changed', value: undefined })
+    // 其他应用的事件不转发，本应用的存储事件带键名。
+    forward({ kind: 'app.storage', app_id: 'other', key: 'k' })
+    expect(port1.postMessage).toHaveBeenCalledTimes(2)
+    forward({ kind: 'app.storage', app_id: 'sample', key: 'progress:1' })
+    expect(port1.postMessage).toHaveBeenLastCalledWith({ type: 'event', name: 'storage.changed', value: { key: 'progress:1' } })
   })
 })

@@ -94,6 +94,20 @@ export function pathInScope(scope: string[] | undefined, path: string): boolean 
   })
 }
 
+/**
+ * 文件事件是否与目录范围相关：无范围或范围未知时一律相关；否则任一变更目录落在某个根之下，
+ * 或者是某个根的祖先（根本身可能被新增、改名或删除）。
+ */
+export function filesChangeAffectsScope(scope: string[] | undefined, paths: string[] | undefined): boolean {
+  if (!paths) return true
+  if (!paths.length) return false // 空列表表示可见树没有变化
+  if (!scope?.length) return true
+  return paths.some((path) => scope.some((root) => {
+    const trimmed = root.endsWith('/') && root !== '/' ? root.slice(0, -1) : root
+    return trimmed === '/' || path === '/' || path === trimmed || path.startsWith(`${trimmed}/`) || trimmed.startsWith(`${path}/`)
+  }))
+}
+
 /** 通知当前页面和其他标签页刷新应用入口、检查运行状态。 */
 export function notifyAppsChanged() {
   window.dispatchEvent(new Event(APPS_CHANGED))

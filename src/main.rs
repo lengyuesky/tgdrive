@@ -201,14 +201,8 @@ async fn serve() -> anyhow::Result<()> {
     // 后台任务:回收站超期清理 + 自动备份;Bot 收件轮询
     let housekeeping_vfs = state.vfs.clone();
     let housekeeping_rt = state.rt.clone();
-    let housekeeping_events = state.events.clone();
     tasks.supervise("housekeeping", move |reporter| {
-        housekeeping::run(
-            housekeeping_vfs.clone(),
-            housekeeping_rt.clone(),
-            housekeeping_events.clone(),
-            reporter,
-        )
+        housekeeping::run(housekeeping_vfs.clone(), housekeeping_rt.clone(), reporter)
     });
     let inbox_vfs = state.vfs.clone();
     let inbox_rt = state.rt.clone();

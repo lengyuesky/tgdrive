@@ -179,6 +179,86 @@ pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: 
 
 /// 单用户事件流：应用数据、设置、目录范围与文件树的粗粒度变更。
 /// 只携带标识不携带内容；重连由 EventSource 自动完成，断档由客户端全量重拉弥补。
+/// 广播已知目录的文件树变更；空列表表示可见树无变化。
+fn emit_files(state: &AppState, paths: Vec<String>) {
+    crate::events::emit(&state.events, crate::events::HostEvent::files_at(paths));
+}
+
+/// 广播某目录列表变更；目录不可见（并发删除）时退化为范围未知。
+async fn emit_files_in_parent(state: &AppState, parent_id: Option<i64>) {
+    let path = match parent_id {
+        Some(id) => state.vfs.db.full_path_if_visible(id).await.ok().flatten(),
+        None => None,
+    };
+    let event = match path {
+        Some(path) => crate::events::HostEvent::files_at(vec![path]),
+        None => crate::events::HostEvent::files(),
+    };
+    crate::events::emit(&state.events, event);
+}
+
+/// 文件事件静默此时长后下发；批量上传时每个文件完成都会发一次，合并后每连接只发一条。
+const FILES_EVENT_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+/// 连续变更不断时最多延迟这么久，保证进度可见。
+const FILES_EVENT_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// 一条 SSE 连接上待合并的文件事件。
+struct PendingFiles {
+    first: tokio::time::Instant,
+    last: tokio::time::Instant,
+    /// `None` 表示合并结果范围未知。
+    paths: Option<Vec<String>>,
+}
+
+impl PendingFiles {
+    fn merge(pending: &mut Option<Self>, paths: Option<Vec<String>>) {
+        let now = tokio::time::Instant::now();
+        match pending {
+            None => {
+                *pending = Some(Self {
+                    first: now,
+                    last: now,
+                    paths,
+                })
+            }
+            Some(existing) => {
+                existing.last = now;
+                match (&mut existing.paths, paths) {
+                    (Some(merged), Some(incoming)) => {
+                        for path in incoming {
+                            if !merged.contains(&path) {
+                                merged.push(path);
+                            }
+                        }
+                        if merged.len() > crate::events::MAX_EVENT_PATHS {
+                            existing.paths = None;
+                        }
+                    }
+                    (merged, _) => *merged = None,
+                }
+            }
+        }
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        (self.last + FILES_EVENT_QUIET).min(self.first + FILES_EVENT_MAX_DELAY)
+    }
+
+    fn frame(self) -> String {
+        let mut event = crate::events::HostEvent::files();
+        event.paths = self.paths.map(|mut paths| {
+            paths.sort();
+            paths
+        });
+        sse_frame(&event)
+    }
+}
+
+fn sse_frame(event: &crate::events::HostEvent) -> String {
+    let json = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
+    format!("event: {}\ndata: {json}\n\n", event.kind)
+}
+
 async fn events_sse(State(state): State<AppState>) -> Response {
     let receiver = state.events.subscribe();
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -187,24 +267,37 @@ async fn events_sse(State(state): State<AppState>) -> Response {
         Ok::<_, std::io::Error>("retry: 5000\n\n".to_string())
     })
     .chain(futures_util::stream::unfold(
-        (receiver, keepalive),
-        |(mut receiver, mut keepalive)| async move {
+        (receiver, keepalive, None::<PendingFiles>),
+        |(mut receiver, mut keepalive, mut pending)| async move {
             loop {
+                // 文件事件在本连接内合并去抖；其他事件立即下发，不受待合并事件阻塞。
+                let deadline = pending.as_ref().map(PendingFiles::deadline);
+                let far = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
                 tokio::select! {
                     event = receiver.recv() => match event {
-                        Ok(event) => {
-                            let Ok(json) = serde_json::to_string(&event) else { continue };
-                            return Some((
-                                Ok(format!("event: {}\ndata: {json}\n\n", event.kind)),
-                                (receiver, keepalive),
-                            ));
+                        Ok(event) if event.kind == "files" => {
+                            PendingFiles::merge(&mut pending, event.paths);
+                            continue;
                         }
-                        // 落后只丢失通知，不影响正确性；继续等待下一事件。
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return None,
+                        Ok(event) => {
+                            return Some((Ok(sse_frame(&event)), (receiver, keepalive, pending)));
+                        }
+                        // 落后丢失的通知里可能有文件变更：合并为一次范围未知的刷新。
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            PendingFiles::merge(&mut pending, None);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return pending.take().map(|files| (Ok(files.frame()), (receiver, keepalive, None)));
+                        }
                     },
+                    _ = tokio::time::sleep_until(deadline.unwrap_or(far)), if deadline.is_some() => {
+                        if let Some(files) = pending.take() {
+                            return Some((Ok(files.frame()), (receiver, keepalive, None)));
+                        }
+                    }
                     _ = keepalive.tick() => {
-                        return Some((Ok(": keepalive\n\n".to_string()), (receiver, keepalive)));
+                        return Some((Ok(": keepalive\n\n".to_string()), (receiver, keepalive, pending)));
                     }
                 }
             }
@@ -354,8 +447,10 @@ async fn mkdir(
     State(state): State<AppState>,
     Json(b): Json<PathBody>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let node = state.vfs.mkdir_p(&b.path).await?;
-    crate::events::emit(&state.events, crate::events::HostEvent::files());
+    let canon = crate::vfs::canonical(&b.path)?;
+    let node = state.vfs.mkdir_p(&canon).await?;
+    // 逐级创建时更上层目录也可能新增；父目录加"祖先也相关"的前端规则已覆盖所有受影响范围。
+    emit_files(&state, vec![crate::vfs::parent_dir(&canon)]);
     Ok(Json(serde_json::json!({ "ok": true, "name": node.name })))
 }
 
@@ -665,7 +760,7 @@ async fn upload_complete(
     let node = state.vfs.db.complete_upload_session(&id).await?;
     // 覆盖旧文件时，删除任务已在事务内持久化；立即唤醒处理器。
     state.vfs.uploader.process_pending_deletes();
-    crate::events::emit(&state.events, crate::events::HostEvent::files());
+    emit_files_in_parent(&state, node.parent_id).await;
     Ok(Json(serde_json::json!({
         "ok": true,
         "entry": Entry::from(&node),
@@ -1004,8 +1099,15 @@ async fn rename(
     State(state): State<AppState>,
     Json(b): Json<FromTo>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.vfs.rename(&b.from, &b.to).await?;
-    crate::events::emit(&state.events, crate::events::HostEvent::files());
+    let (from, to) = (
+        crate::vfs::canonical(&b.from)?,
+        crate::vfs::canonical(&b.to)?,
+    );
+    state.vfs.rename(&from, &to).await?;
+    emit_files(
+        &state,
+        vec![crate::vfs::parent_dir(&from), crate::vfs::parent_dir(&to)],
+    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1013,8 +1115,9 @@ async fn copy_entry(
     State(state): State<AppState>,
     Json(b): Json<FromTo>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.vfs.copy(&b.from, &b.to).await?;
-    crate::events::emit(&state.events, crate::events::HostEvent::files());
+    let to = crate::vfs::canonical(&b.to)?;
+    state.vfs.copy(&b.from, &to).await?;
+    emit_files(&state, vec![crate::vfs::parent_dir(&to)]);
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1032,6 +1135,7 @@ async fn delete(
 ) -> AppResult<Json<serde_json::Value>> {
     let mut failed = Vec::new();
     let mut deleted = 0;
+    let mut changed = Vec::new();
     for p in &b.paths {
         let result = if b.permanent {
             state
@@ -1043,12 +1147,17 @@ async fn delete(
             state.vfs.delete(p).await
         };
         match result {
-            Ok(()) => deleted += 1,
+            Ok(()) => {
+                deleted += 1;
+                if let Ok(canon) = crate::vfs::canonical(p) {
+                    changed.push(crate::vfs::parent_dir(&canon));
+                }
+            }
             Err(e) => failed.push(serde_json::json!({ "path": p, "error": e.to_string() })),
         }
     }
     if deleted > 0 {
-        crate::events::emit(&state.events, crate::events::HostEvent::files());
+        emit_files(&state, changed);
     }
     Ok(Json(
         serde_json::json!({ "deleted": deleted, "failed": failed }),
@@ -1613,7 +1722,8 @@ async fn instant(
     if b.size < 0 {
         return Err(AppError::BadRequest("大小无效".into()));
     }
-    let dir = state.vfs.resolve(&b.dir).await?;
+    let dir_path = crate::vfs::canonical(&b.dir)?;
+    let dir = state.vfs.resolve(&dir_path).await?;
     if !dir.is_dir {
         return Err(AppError::NotDirectory);
     }
@@ -1626,7 +1736,7 @@ async fn instant(
         Some((id, freed)) => {
             state.vfs.uploader.delete_messages_best_effort(freed);
             let node = state.vfs.db.node(id).await?;
-            crate::events::emit(&state.events, crate::events::HostEvent::files());
+            emit_files(&state, vec![dir_path]);
             Ok(Json(serde_json::json!({
                 "linked": true,
                 "pending": false,
@@ -1696,14 +1806,18 @@ async fn trash_restore(
 ) -> AppResult<Json<serde_json::Value>> {
     let mut restored = Vec::new();
     let mut failed = Vec::new();
+    let mut changed = Vec::new();
     for id in trash_targets(&state, &b).await? {
         match state.vfs.db.trash_restore(id).await {
-            Ok(path) => restored.push(serde_json::json!({ "id": id, "path": path })),
+            Ok(path) => {
+                changed.push(crate::vfs::parent_dir(&path));
+                restored.push(serde_json::json!({ "id": id, "path": path }));
+            }
             Err(e) => failed.push(serde_json::json!({ "id": id, "error": e.to_string() })),
         }
     }
     if !restored.is_empty() {
-        crate::events::emit(&state.events, crate::events::HostEvent::files());
+        emit_files(&state, changed);
     }
     Ok(Json(
         serde_json::json!({ "restored": restored, "failed": failed }),
@@ -1720,9 +1834,7 @@ async fn trash_purge(
         state.vfs.uploader.delete_messages_best_effort(freed);
         purged += 1;
     }
-    if purged > 0 {
-        crate::events::emit(&state.events, crate::events::HostEvent::files());
-    }
+    // 彻底删除的是回收站里本就不可见的节点：可见树没有变化，不惊动插件重扫。
     Ok(Json(serde_json::json!({ "purged": purged })))
 }
 

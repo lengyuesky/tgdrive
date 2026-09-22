@@ -305,6 +305,8 @@ pub fn now_ts() -> i64 {
 #[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
+    /// 已安装应用记录的进程内缓存；`apps` 表的每条写入路径都会使其失效（见 apps/db.rs）。
+    apps_cache: std::sync::Arc<apps::AppCache>,
 }
 
 impl Db {
@@ -324,7 +326,10 @@ impl Db {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Db { pool })
+        Ok(Db {
+            pool,
+            apps_cache: Default::default(),
+        })
     }
 
     pub async fn ping(&self) -> AppResult<()> {
@@ -1667,26 +1672,45 @@ impl Db {
     // ---------- 分享 ----------
 
     /// 节点的完整路径;自身或任一祖先不是 ready(回收站/上传中)时返回 None
+    ///
+    /// 一条递归查询取回节点到根的整条祖先链（depth 0 为节点自身，自下而上），
+    /// 深目录也只有一次往返；应用媒体与元数据请求每次都经过这里。
     pub async fn full_path_if_visible(&self, id: i64) -> AppResult<Option<String>> {
-        let n = self.node(id).await?;
-        if n.id == ROOT_ID {
-            return Ok(Some("/".into()));
+        let chain: Vec<(i64, Option<i64>, String, String)> = sqlx::query_as(
+            "WITH RECURSIVE chain(id, parent_id, name, status, depth) AS (
+               SELECT id, parent_id, name, status, 0 FROM nodes WHERE id = ?
+               UNION ALL
+               SELECT n.id, n.parent_id, n.name, n.status, c.depth + 1
+               FROM nodes n JOIN chain c ON n.id = c.parent_id
+               WHERE c.depth < 4096
+             )
+             SELECT id, parent_id, name, status FROM chain ORDER BY depth",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        if chain.is_empty() {
+            return Err(AppError::NotFound);
         }
-        if n.status != "ready" {
-            return Ok(None);
-        }
-        let mut parts = vec![n.name.clone()];
-        let mut cur = n.parent_id;
-        while let Some(pid) = cur {
-            let p = self.node(pid).await?;
-            if p.id == ROOT_ID {
+        let mut parts = Vec::with_capacity(chain.len());
+        let mut reached_top = false;
+        for (node_id, parent_id, name, status) in &chain {
+            if *node_id == ROOT_ID {
+                reached_top = true;
                 break;
             }
-            if p.status != "ready" {
+            if status != "ready" {
                 return Ok(None);
             }
-            parts.push(p.name.clone());
-            cur = p.parent_id;
+            parts.push(name.as_str());
+            if parent_id.is_none() {
+                reached_top = true;
+                break;
+            }
+        }
+        if !reached_top {
+            // 祖先链断裂（父节点缺失或超出深度上限）：与逐级查询遇到缺失父节点时一致
+            return Err(AppError::NotFound);
         }
         parts.reverse();
         Ok(Some(format!("/{}", parts.join("/"))))
@@ -2569,6 +2593,34 @@ mod tests {
             .unwrap();
         db.finalize_upload(up, 4, Some(sha)).await.unwrap();
         up
+    }
+
+    #[tokio::test]
+    async fn full_path_walks_ancestors_in_one_query_and_hides_trashed_chains() {
+        let (db, _g) = test_db().await;
+        let a = db.mkdir(ROOT_ID, "a").await.unwrap();
+        let b = db.mkdir(a.id, "b").await.unwrap();
+        let f = mk_file(&db, b.id, "f.txt", 1, "sha").await;
+        assert_eq!(
+            db.full_path_if_visible(ROOT_ID).await.unwrap().as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            db.full_path_if_visible(f).await.unwrap().as_deref(),
+            Some("/a/b/f.txt")
+        );
+        assert_eq!(
+            db.full_path_if_visible(b.id).await.unwrap().as_deref(),
+            Some("/a/b")
+        );
+        // 祖先进回收站后整条链不可见，自身仍是 ready 的子节点也一样
+        db.trash_node(a.id, "/a").await.unwrap();
+        assert_eq!(db.full_path_if_visible(f).await.unwrap(), None);
+        assert_eq!(db.full_path_if_visible(a.id).await.unwrap(), None);
+        assert!(matches!(
+            db.full_path_if_visible(999_999).await,
+            Err(AppError::NotFound)
+        ));
     }
 
     #[tokio::test]

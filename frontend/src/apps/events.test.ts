@@ -23,9 +23,16 @@ describe('宿主事件流', () => {
     const source = FakeEventSource.instances[0]
     source.emit('app.storage', { kind: 'app.storage', app_id: 'books', key: 'progress:1' })
     source.emit('files', { kind: 'files' })
+    source.emit('files', { kind: 'files', paths: ['/上传', '/书'] })
+    // 畸形或超限的路径列表退化为范围未知。
+    source.emit('files', { kind: 'files', paths: ['/a', 1] })
+    source.emit('files', { kind: 'files', paths: Array.from({ length: 65 }, (_, i) => `/d${i}`) })
     source.emit('app.storage', '不是对象')
     expect(seen).toEqual([
       { kind: 'app.storage', app_id: 'books', key: 'progress:1' },
+      { kind: 'files', app_id: undefined, key: undefined },
+      { kind: 'files', app_id: undefined, key: undefined, paths: ['/上传', '/书'] },
+      { kind: 'files', app_id: undefined, key: undefined },
       { kind: 'files', app_id: undefined, key: undefined },
     ])
     off()

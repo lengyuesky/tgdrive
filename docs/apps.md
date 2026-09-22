@@ -151,11 +151,17 @@ node package.mjs /绝对路径/我的应用/dist /绝对路径/输出目录
 ### 运行时资源与会话
 
 - 资源 URL 按修订定址、内容按包摘要物化后不可变：响应携带 `Cache-Control: private, max-age=31536000, immutable`、
-  `Vary: Accept-Encoding` 与强 ETag（`"摘要:路径"`），支持 If-None-Match 304 再验证；停用、更新、卸载都会轮换修订，
+  `Vary: Accept-Encoding` 与强 ETag（原文 `"摘要:路径"`，压缩变体 `"摘要:路径:br"`/`"摘要:路径:gzip"`），
+  支持 If-None-Match 304 再验证；内容不可变，客户端持有任一编码变体的 ETag 都算命中。停用、更新、卸载都会轮换修订，
   不存在陈旧命中。已缓存旧资源拿不到有效会话令牌，无法调用任何能力。
-- 资源路由按 Accept-Encoding 提供 brotli/gzip 压缩（小响应跳过；SVG 作为文本例外仍压缩）。Chromium 对沙箱
-  不透明源的缓存分区会导致重开时重取入口与子资源，压缩使重开流量约为原文 1/3；WebKit/Firefox 分区策略下可
+- 压缩在安装（物化）时一次完成：摘要目录旁生成 `.enc/br/`、`.enc/gz/` 旁文件（brotli 质量 9、gzip 最高级），
+  只为 64 字节以上且至少省 10% 的资源保留变体；图片（SVG 除外）、音视频、归档和 WOFF 字体不压缩。
+  运行时按 Accept-Encoding（含 `q=0` 排除与 `*`）直接发送已有变体，不再逐请求压缩，也不占用 CPU；
+  旧版宿主留下的只有原文的缓存目录在首次打开时于锁内补齐变体，不重新解包。Chromium 对沙箱
+  不透明源的缓存分区会导致重开时重取入口与子资源，压缩使重开流量约为原文 1/2；WebKit/Firefox 分区策略下可
   直接命中缓存。应用中心、侧边栏和宿主工具栏的图标请求在主框架分区，重开命中磁盘缓存。
+- 已安装记录（清单、修订、启停、目录范围）在进程内缓存：运行页面的每次 RPC、资源与媒体请求只核对内存副本，
+  安装、更新、启停、改范围、卸载后立即失效。节点可见路径由一条递归查询取得，目录深度不再增加数据库往返。
 - 桌面端悬停已启用应用的图标会预取 launch 响应（60 秒内有效）；launch 只读不写，预取无副作用，移动端不预取。
 - 运行会话默认 6 小时：宿主在临期 15 分钟内自动续签，原地替换会话令牌且不重建 iframe；休眠唤醒等过期场景，
   RPC 遇 `session_expired` 时宿主静默续签并重放一次。修订轮换（更新、停用）返回 `app_changed`（409），
@@ -207,7 +213,7 @@ if (results.length) {
 | `on('settings.changed', callback)` | 宿主设置窗口保存后的通知；返回取消订阅函数 |
 | `on('theme.changed', callback)` | 主站主题变化通知，参数 `{ dark }` |
 
-每个页面最多 16 个同时处理的调用、每 10 秒最多 120 次调用，单次参数最多 64 KiB。
+每个页面最多 32 个同时处理的请求、每 10 秒最多 960 次请求（批量信封算一次请求），单次参数最多 64 KiB。
 普通请求超时为 30 秒，目录选择等界面交互为 5 分钟。6 小时运行会话过期后需要重新打开应用。
 
 ### v2：网页内沉浸（可选能力）
@@ -242,6 +248,8 @@ v1、非法参数、失效会话都会被拒绝。宿主在布局完成后确认
 | `files.searchPage({ under, q, kind, extensions, cursor, limit }, options)` | 子树搜索 `{ results, next_cursor, has_more }`；默认 200、最多 500 项，`extensions` 为字符串数组 |
 | `files.stat({ id, content_version? } 或 { path }, options)` | 当前可见节点；不能同时传 ID 和路径 |
 | `files.readRange(ref, offset, length, options)` | `Uint8Array`，偏移从 0 开始；单次 1 字节至 1 MiB |
+| `files.readRanges(ref, ranges, options)` | `Uint8Array[]`，1～8 段、每段最多 1 MiB、合计最多 4 MiB；宿主只申请一次票据，各段最多 4 路并行，结果按请求顺序返回（能力 `files.readRanges`） |
+| `media.bytes(ref, options)` | `{ url, expires_at }` 字节数据面票据：插件可凭它直接 `fetch` + Range 读取，小段响应经服务端共享缓存并支持 ETag 304（能力 `media.bytes`） |
 | `assets.read(path, options)` | 当前插件包内资源的 `Uint8Array`，单资源最多 8 MiB，不接受 URL |
 
 `options` 可传 `{ signal: AbortSignal }`。节点包含 `id`、`content_version`、`path`、`name`、`is_dir`、`size`、
@@ -306,6 +314,48 @@ try {
 清除数据卸载才删除。自带阅读器仅在恢复位置完成后允许保存；正常阅读最多每 5 秒保存，
 翻页、书签操作、切书与主动退出及时保存。冲突不简单取最大页码，用户可以主动回读。
 强制关闭浏览器只保证最近一次成功保存，不承诺离线同步或关闭后继续上传。
+
+### v2：批量调用（能力 `rpc.batch`）
+
+打开一个文件往往要连续做多次元数据核对（来源根目录 stat、目标文件 stat、再核对一遍），每次都是一次
+HTTP 往返加一次会话校验。宿主声明 `rpc.batch` 时，插件可用 `drive.batch(calls, options)` 把最多 16 项
+服务端能力放进一个信封：宿主只校验一次会话，逐项执行，逐项返回 `{ result }` 或
+`{ error, code, status }`（`error` 为 `Error`，带 `code` 与 HTTP `status`），一项失败不影响其余。
+
+```js
+if (drive.can('rpc.batch')) {
+  const [root, file] = await drive.batch([
+    { method: 'files.stat', params: { id: rootId } },
+    { method: 'files.stat', params: { id: fileId } },
+  ])
+  if ('error' in file) throw file.error
+}
+```
+
+可批量的能力：`app.ping`、`settings.get/patch`、`files.search/list/stat/searchPage`、`favorites.set`、
+`media.url`、`storage.get/set/list/delete`。界面交互（`ui.*`）、字节与资源读取和批量本身不能进入信封。
+权限与目录范围逐项检查；批量算一次请求计入页面限流（往返少了，同样的核对工作不会更早撞上配额）；只有 v2 应用可用。
+
+### v2：服务端事件
+
+`on(name, callback)` 可订阅以下宿主转发的事件；除 `settings.changed`（宿主设置窗口保存时带最新值）外
+只携带标识，不携带明文值，插件按需重拉。事件通过单条 SSE 连接送达同一浏览器的所有视图，
+断线重连后会先收到 `sync.hint`。
+
+| 事件 | 触发与参数 |
+|---|---|
+| `files.changed` | 网盘可见文件树变化；参数为 `{ paths }` 或 `undefined`。`paths` 是发生变化的目录列表（新增、删除、改名、复制、恢复所在的父目录，规范化绝对路径），`undefined` 表示范围未知，应整体重扫 |
+| `storage.changed` | 本应用私有存储的某键被写入或删除，参数 `{ key }`；`storage.wroteRecently(key)` 可判定是否本页刚写过 |
+| `settings.changed` | 应用设置变化；来自宿主设置窗口时带最新设置值 |
+| `scope.changed` | 目录范围被修改；后续调用按新范围校验，插件应重新核对来源 |
+| `theme.changed` | 主站主题变化，参数 `{ dark }` |
+| `sync.hint` | 事件流断线重连；期间可能漏事件，应做一次轻量同步 |
+| `beforeClose` | 宿主主动离开前等待保存，最多 2 秒 |
+
+服务端对每条连接的文件事件做合并去抖：静默 250 毫秒后下发一条，连续变更时最多延迟 1 秒，
+路径取并集（超过 64 个目录退化为范围未知）；批量上传上百个文件只会收到寥寥几条事件。
+宿主页再按应用的目录范围过滤：变更目录不在范围内、也不是范围根的祖先时不转发；范围未知的事件一律转发。
+清理回收站只删除本已不可见的节点，不产生文件事件。
 
 ## 图书的移动阅读与更新
 

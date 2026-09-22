@@ -26,6 +26,21 @@ describe('应用能力通道', () => {
     expect(port.close).toHaveBeenCalledOnce()
   })
 
+  it('批量信封算一次请求计入窗口配额', async () => {
+    const { port, send } = channel()
+    const invoke = vi.fn(async () => ({ results: [] }))
+    const disconnect = connectAppBridge(port as unknown as MessagePort, invoke, String)
+    expect(isAppRequest({ type: 'request', id: 1, method: 'rpc.batch', params: { calls: [] } })).toBe(true)
+    // 960 个 16 项批量全部放行；第 961 个请求才被限流。
+    const calls = Array.from({ length: 16 }, () => ({ method: 'app.ping' }))
+    for (let index = 1; index <= 960; index++) await send({ type: 'request', id: index, method: 'rpc.batch', params: { calls } })
+    expect(invoke).toHaveBeenCalledTimes(960)
+    await send({ type: 'request', id: 961, method: 'app.ping', params: {} })
+    expect(invoke).toHaveBeenCalledTimes(960)
+    expect(port.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ id: 961, code: 'rate_limited' }))
+    disconnect()
+  })
+
   it('限制并发并保留已发出的请求', async () => {
     const { port, send } = channel()
     const complete: (() => void)[] = []

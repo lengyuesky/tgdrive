@@ -4,6 +4,9 @@
 use serde::Serialize;
 use tokio::sync::broadcast;
 
+/// 单个文件事件最多携带的目录数；超过则退化为范围未知（整体重扫）。
+pub const MAX_EVENT_PATHS: usize = 64;
+
 /// 变更事件。`kind` 为稳定协议名，前端按 `kind` 过滤转发。
 #[derive(Clone, Debug, Serialize)]
 pub struct HostEvent {
@@ -12,6 +15,10 @@ pub struct HostEvent {
     pub app_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// 文件树事件涉及的目录（发生变化的列表所在目录，规范化绝对路径）。
+    /// `None` 表示范围未知：宿主页无法按应用目录范围过滤，插件应整体重扫。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
 }
 
 impl HostEvent {
@@ -21,6 +28,17 @@ impl HostEvent {
             kind: "files",
             app_id: None,
             key: None,
+            paths: None,
+        }
+    }
+
+    /// 已知变更目录的文件树事件；宿主页据此只转发给目录范围相关的应用。
+    pub fn files_at(mut paths: Vec<String>) -> Self {
+        paths.sort();
+        paths.dedup();
+        Self {
+            paths: (paths.len() <= MAX_EVENT_PATHS).then_some(paths),
+            ..Self::files()
         }
     }
 
@@ -29,6 +47,7 @@ impl HostEvent {
             kind,
             app_id: Some(app_id.into()),
             key,
+            paths: None,
         }
     }
 }

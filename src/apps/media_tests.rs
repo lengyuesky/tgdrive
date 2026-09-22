@@ -305,3 +305,293 @@ async fn sse_stream_broadcasts_storage_settings_and_files_events() {
     );
     let _ = media;
 }
+
+/// 文件事件在每条连接内合并去抖：批量变更只下发一条带并集路径的事件；
+/// 其他事件不受待合并事件阻塞；路径未知或超过上限时退化为整体刷新。
+#[tokio::test]
+async fn sse_coalesces_file_event_bursts_and_merges_paths() {
+    let (state, _media, _dir) = fixture().await;
+    let credentials = base64::engine::general_purpose::STANDARD.encode("apps-test:apps-test-only");
+    let response = router(&state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/events")
+                .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    async fn read_until(
+        stream: &mut (impl futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Unpin),
+        seen: &mut String,
+        expected: &str,
+    ) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !seen.contains(expected) {
+                let Some(chunk) = stream.next().await else {
+                    break;
+                };
+                seen.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "事件流应在超时前送达 {expected}: {seen}");
+    }
+
+    // 一次突发 50 条已知目录的事件（3 个目录反复出现）→ 合并为 1 条，路径为排序后的并集。
+    let started = tokio::time::Instant::now();
+    for i in 0..50 {
+        crate::events::emit(
+            &state.events,
+            crate::events::HostEvent::files_at(vec![format!("/上传/{}", i % 3)]),
+        );
+    }
+    // 突发中途到达的应用事件立即下发，不等文件事件静默。
+    crate::events::emit(
+        &state.events,
+        crate::events::HostEvent::app("app.scope", "books", None),
+    );
+    read_until(&mut stream, &mut seen, "event: app.scope").await;
+    assert!(
+        !seen.contains("event: files"),
+        "文件事件不应先于静默期结束下发: {seen}"
+    );
+    read_until(&mut stream, &mut seen, "event: files").await;
+    assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+    assert_eq!(seen.matches("event: files").count(), 1, "{seen}");
+    assert!(
+        seen.contains(r#""paths":["/上传/0","/上传/1","/上传/2"]"#),
+        "{seen}"
+    );
+
+    // 混入范围未知的事件后，合并结果不带 paths（整体刷新）。
+    seen.clear();
+    crate::events::emit(
+        &state.events,
+        crate::events::HostEvent::files_at(vec!["/a".into()]),
+    );
+    crate::events::emit(&state.events, crate::events::HostEvent::files());
+    crate::events::emit(
+        &state.events,
+        crate::events::HostEvent::files_at(vec!["/b".into()]),
+    );
+    read_until(&mut stream, &mut seen, "event: files").await;
+    assert_eq!(seen.matches("event: files").count(), 1, "{seen}");
+    assert!(!seen.contains("paths"), "{seen}");
+
+    // 目录数超过上限同样退化为整体刷新。
+    seen.clear();
+    for i in 0..(crate::events::MAX_EVENT_PATHS + 1) {
+        crate::events::emit(
+            &state.events,
+            crate::events::HostEvent::files_at(vec![format!("/d{i}")]),
+        );
+    }
+    read_until(&mut stream, &mut seen, "event: files").await;
+    assert_eq!(seen.matches("event: files").count(), 1, "{seen}");
+    assert!(!seen.contains("paths"), "{seen}");
+}
+
+/// 文件接口按变更目录广播：上传完成、改名、复制、删除、恢复都带上受影响目录的父目录；
+/// 彻底清理回收站不广播。
+#[tokio::test]
+async fn file_apis_emit_scoped_file_events() {
+    let (state, media, _dir) = fixture().await;
+    let mut receiver = state.events.subscribe();
+    let next_paths = |receiver: &mut tokio::sync::broadcast::Receiver<crate::events::HostEvent>| {
+        let event = receiver.try_recv().expect("应有文件事件");
+        assert_eq!(event.kind, "files");
+        event.paths
+    };
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/api/fs/mkdir",
+        json!({"path": "/影片/2026/"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next_paths(&mut receiver), Some(vec!["/影片".into()]));
+
+    seed_file(&state, &media, "/影片/2026/a.mp4", b"abcdef", 3).await;
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/api/fs/rename",
+        json!({"from": "/影片/2026/a.mp4", "to": "/影片/b.mp4"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        next_paths(&mut receiver),
+        Some(vec!["/影片".into(), "/影片/2026".into()])
+    );
+
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/api/fs/copy",
+        json!({"from": "/影片/b.mp4", "to": "/影片/2026/c.mp4"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next_paths(&mut receiver), Some(vec!["/影片/2026".into()]));
+
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/fs/delete",
+        json!({"paths": ["/影片/b.mp4", "/影片/2026/c.mp4", "/不存在"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        next_paths(&mut receiver),
+        Some(vec!["/影片".into(), "/影片/2026".into()])
+    );
+
+    let (status, body) = call(&state, "POST", "/api/trash/restore", json!({"all": true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["restored"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        next_paths(&mut receiver),
+        Some(vec!["/影片".into(), "/影片/2026".into()])
+    );
+
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/api/fs/delete",
+        json!({"paths": ["/影片/2026/c.mp4"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next_paths(&mut receiver), Some(vec!["/影片/2026".into()]));
+    let (status, body) = call(&state, "POST", "/api/trash/purge", json!({"all": true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        receiver.try_recv().is_err(),
+        "清理回收站不改变可见树，不应广播"
+    );
+}
+
+/// 批量信封：一次会话校验执行多项能力，逐项独立返回，权限与目录范围逐项生效；
+/// 界面、字节读取与嵌套批量不可进入批量，数量与接口版本受限。
+#[tokio::test]
+async fn rpc_batch_executes_calls_independently_with_per_call_errors() {
+    let (state, media, _dir) = fixture().await;
+    let session = media_app(&state).await;
+    state.vfs.mkdir("/书").await.unwrap();
+    let inside = seed_file(&state, &media, "/书/a.txt", b"abc", 2).await;
+    let (status, body) = rpc_call(
+        &state,
+        "books",
+        &session,
+        "rpc.batch",
+        json!({"calls": [
+            {"method": "files.stat", "params": {"id": inside}},
+            {"method": "files.stat", "params": {"id": 424242}},
+            {"method": "app.ping"},
+            {"method": "storage.get", "params": {"key": "missing"}},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0]["result"]["path"], "/书/a.txt");
+    assert_eq!(results[1]["status"], 404);
+    assert!(results[1]["error"].is_string());
+    assert_eq!(results[2]["result"]["ok"], true);
+    assert!(results[3]["result"].is_null());
+
+    // 目录范围逐项生效：范围外的节点在批量里同样 403。
+    let (status, _) = call(
+        &state,
+        "PATCH",
+        "/api/apps/books/scope",
+        json!({"paths": ["/别处"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = rpc_call(
+        &state,
+        "books",
+        &session,
+        "rpc.batch",
+        json!({"calls": [{"method": "files.stat", "params": {"id": inside}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["status"], 403);
+
+    for calls in [
+        json!([]),
+        json!([{"method": "ui.close"}]),
+        json!([{"method": "files.readRange", "params": {}}]),
+        json!([{"method": "rpc.batch", "params": {"calls": []}}]),
+        json!(vec![json!({"method": "app.ping"}); 17]),
+    ] {
+        let (status, body) = rpc_call(
+            &state,
+            "books",
+            &session,
+            "rpc.batch",
+            json!({"calls": calls}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{calls} => {body}");
+    }
+
+    // v1 应用没有批量能力。
+    let mut legacy = manifest();
+    legacy.id = "legacy".into();
+    legacy.api_version = 1;
+    add_app(&state, &legacy, None).await;
+    let launch = launch_app(&state, "legacy").await;
+    let (status, _) = rpc_call(
+        &state,
+        "legacy",
+        launch["session"].as_str().unwrap(),
+        "rpc.batch",
+        json!({"calls": [{"method": "app.ping"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// 已安装记录缓存：重复读取不再查库，且每种写入（启停、范围、更新、卸载）后立即可见。
+#[tokio::test]
+async fn installed_record_cache_reflects_every_write() {
+    let (state, _media, _dir) = fixture().await;
+    let first = add_app(&state, &manifest(), None).await;
+    let db = &state.vfs.db;
+    let cached = db.app("shorts").await.unwrap().unwrap();
+    assert_eq!(cached.revision, first.revision);
+    db.set_app_state("shorts", Some(false), None).await.unwrap();
+    let disabled = db.app("shorts").await.unwrap().unwrap();
+    assert!(!disabled.enabled);
+    assert_ne!(disabled.revision, first.revision, "停用应轮换修订");
+    db.set_app_scope("shorts", r#"["/x"]"#).await.unwrap();
+    assert_eq!(
+        db.app("shorts").await.unwrap().unwrap().scope_paths,
+        r#"["/x"]"#
+    );
+    let mut newer = manifest();
+    newer.version = "1.0.1".into();
+    let updated = add_app(&state, &newer, Some(disabled.revision.clone())).await;
+    assert_eq!(
+        db.app("shorts").await.unwrap().unwrap().digest,
+        updated.digest
+    );
+    db.uninstall_app("shorts", false).await.unwrap();
+    assert!(db.app("shorts").await.unwrap().is_none());
+    assert!(matches!(
+        installed(&state, "shorts").await,
+        Err(AppError::NotFound)
+    ));
+}

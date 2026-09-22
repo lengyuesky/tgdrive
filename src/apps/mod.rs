@@ -90,11 +90,11 @@ pub fn protected_router() -> Router<AppState> {
 
 pub fn public_router() -> Router<AppState> {
     Router::new()
+        // 包内资源在安装时已生成 brotli/gzip 旁文件，由处理器按 Accept-Encoding 直接发送；
+        // 运行时不再压缩，媒体流式响应与预检也从不压缩。
         .route(
             "/apps/runtime/{id}/{revision}/{*resource}",
-            // 静态包内资源可安全压缩（默认谓词跳过 image/SSE/小响应）；
-            // 媒体流式响应与预检绝不压缩，因此只挂在本路由。
-            get(runtime::asset).layer(tower_http::compression::CompressionLayer::new()),
+            get(runtime::asset),
         )
         .route(
             "/apps/media/{ticket}",
@@ -129,14 +129,33 @@ fn cache_root(state: &AppState) -> PathBuf {
         .join("apps")
 }
 
+/// 摘要目录与预压缩目录都带完成标记才算可用（异步版 `package::is_materialized`）。
+async fn materialized(target: &std::path::Path) -> AppResult<bool> {
+    Ok(
+        tokio::fs::try_exists(target.join(package::COMPLETE_MARK)).await?
+            && tokio::fs::try_exists(
+                target
+                    .join(package::ENCODED_DIR)
+                    .join(package::COMPLETE_MARK),
+            )
+            .await?,
+    )
+}
+
 async fn cache_dir(state: &AppState, app: &InstalledApp) -> AppResult<PathBuf> {
     let root = cache_root(state);
     let target = root.join(&app.manifest.id).join(&app.digest);
-    if tokio::fs::try_exists(target.join(".complete")).await? {
+    if materialized(&target).await? {
         return Ok(target);
     }
     let _guard = CACHE_LOCK.lock().await;
-    if tokio::fs::try_exists(target.join(".complete")).await? {
+    if materialized(&target).await? {
+        return Ok(target);
+    }
+    if tokio::fs::try_exists(target.join(package::COMPLETE_MARK)).await? {
+        // 旧版宿主物化的缓存没有预压缩变体：首次打开时原地补齐，不重新解包。
+        let directory = target.clone();
+        blocking(move || package::precompress(&directory)).await?;
         return Ok(target);
     }
     // 数据库恢复到新机器后，第一次打开应用时从备份中的安装包重建缓存。

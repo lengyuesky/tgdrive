@@ -142,10 +142,13 @@ fn checks_compatibility_permissions_and_settings() {
 #[test]
 fn materializes_complete_package_without_touching_siblings() {
     let metadata = serde_json::to_vec(&manifest()).unwrap();
+    let script = "export const answer = 42; // tgdrive package test\n".repeat(32);
     let package = AppPackage::parse(archive(&[
         ("app.json", &metadata),
         ("index.html", b"test"),
         ("assets/main.js", b"42"),
+        ("assets/vendor.js", script.as_bytes()),
+        ("assets/photo.jpg", &[0u8; 2048]),
     ]))
     .unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -155,11 +158,37 @@ fn materializes_complete_package_without_touching_siblings() {
         std::fs::read(destination.join("assets/main.js")).unwrap(),
         b"42"
     );
-    assert!(destination.join(".complete").is_file());
+    assert!(destination.join(COMPLETE_MARK).is_file());
+    assert!(is_materialized(&destination));
     assert_eq!(package.materialize(root.path()).unwrap(), destination);
     assert_eq!(
         std::fs::read_to_string(root.path().join("keep")).unwrap(),
         "保留"
+    );
+    // 可压缩的大文件同时生成 brotli 与 gzip 变体，解压后与原文一致；
+    // 过小的文件与已压缩的图片不生成变体。
+    let encoded = destination.join(ENCODED_DIR);
+    let gz = std::fs::read(encoded.join("gz/assets/vendor.js")).unwrap();
+    assert!(gz.len() * 10 <= script.len() * 9);
+    let mut inflated = Vec::new();
+    Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut inflated).unwrap();
+    assert_eq!(inflated, script.as_bytes());
+    let br = std::fs::read(encoded.join("br/assets/vendor.js")).unwrap();
+    let mut decoded = Vec::new();
+    brotli::BrotliDecompress(&mut &br[..], &mut decoded).unwrap();
+    assert_eq!(decoded, script.as_bytes());
+    assert!(!encoded.join("gz/assets/main.js").exists());
+    assert!(!encoded.join("br/assets/photo.jpg").exists());
+    assert!(!encoded.join("gz/index.html").exists());
+
+    // 旧目录只缺变体时原地补齐，不重新解包。
+    std::fs::remove_dir_all(&encoded).unwrap();
+    std::fs::write(destination.join("assets/main.js"), b"43").unwrap();
+    assert_eq!(package.materialize(root.path()).unwrap(), destination);
+    assert!(is_materialized(&destination));
+    assert_eq!(
+        std::fs::read(destination.join("assets/main.js")).unwrap(),
+        b"43"
     );
 }
 

@@ -29,6 +29,19 @@ pub fn normalize(path: &str) -> AppResult<Vec<String>> {
     Ok(out)
 }
 
+/// 规范化为绝对路径：`a//b/./c` → `/a/b/c`，根目录为 `/`
+pub fn canonical(path: &str) -> AppResult<String> {
+    Ok(format!("/{}", normalize(path)?.join("/")))
+}
+
+/// 规范化路径所在的目录：`/a/b/c` → `/a/b`，根下直接子项与根本身 → `/`
+pub fn parent_dir(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) | None => "/".into(),
+        Some(idx) => path[..idx].to_string(),
+    }
+}
+
 #[derive(Clone)]
 pub struct Vfs {
     pub db: Db,

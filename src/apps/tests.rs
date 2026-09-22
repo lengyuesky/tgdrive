@@ -937,13 +937,21 @@ async fn asset_request(
         .unwrap()
 }
 
-/// 资源响应可长期不可变缓存并支持 ETag 再验证；文本资源按需压缩，SVG 图标不压缩。
+/// 资源响应可长期不可变缓存并支持 ETag 再验证；文本资源以安装时生成的预压缩变体传输，
+/// 图片等已压缩类型与过小资源发原文，SVG 作为文本例外仍压缩。
 #[tokio::test]
 async fn runtime_assets_cache_immutably_compress_and_revalidate() {
     let (state, _, _dir) = fixture().await;
     let mut icon_manifest = manifest();
     icon_manifest.icon = Some("icon.svg".into());
     let metadata = serde_json::to_vec(&icon_manifest).unwrap();
+    let script =
+        "console.log('shorts'); console.log('tgdrive-app-runtime'); console.log('assets');\n"
+            .repeat(48);
+    let icon = format!(
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'>{}</svg>",
+        "<path d='M3 3h18v18H3z' fill='none' stroke='currentColor'/>".repeat(12)
+    );
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in [
         ("app.json", metadata.as_slice()),
@@ -951,11 +959,9 @@ async fn runtime_assets_cache_immutably_compress_and_revalidate() {
             "index.html",
             b"<!DOCTYPE html><html><body>Icon</body></html>".as_slice(),
         ),
-        ("app.js", "console.log('shorts'); console.log('tgdrive-app-runtime'); console.log('assets'); console.log('end');".as_bytes()),
-        (
-            "icon.svg",
-            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'></svg>".as_slice(),
-        ),
+        ("app.js", script.as_bytes()),
+        ("icon.svg", icon.as_bytes()),
+        ("logo.png", vec![0u8; 4096].as_slice()),
     ] {
         zip.start_file(
             name,
@@ -991,17 +997,12 @@ async fn runtime_assets_cache_immutably_compress_and_revalidate() {
         .unwrap()
         .to_string();
     assert_eq!(etag, format!("\"{}:app.js\"", app.digest));
-    let plain = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert_eq!(
-        &plain[..],
-        "console.log('shorts'); console.log('tgdrive-app-runtime'); console.log('assets'); console.log('end');".as_bytes()
-    );
-
     // 未声明压缩能力的客户端拿到原始字节。
-    let response = asset_request(&state, &format!("{base}/app.js"), &[]).await;
     assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    let plain = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(&plain[..], script.as_bytes());
 
-    // 声明 gzip 时文本资源压缩传输，体积小于原文且 ETag 不变。
+    // 声明 gzip 时发送安装时生成的 gzip 变体：体积小于原文，ETag 按编码区分。
     let response = asset_request(
         &state,
         &format!("{base}/app.js"),
@@ -1009,11 +1010,52 @@ async fn runtime_assets_cache_immutably_compress_and_revalidate() {
     )
     .await;
     assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
-    assert_eq!(response.headers()[header::ETAG], etag);
+    let gzip_etag = format!("\"{}:app.js:gzip\"", app.digest);
+    assert_eq!(response.headers()[header::ETAG], gzip_etag);
     let compressed = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert!(compressed.len() < plain.len());
+    let mut inflated = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(&compressed[..]),
+        &mut inflated,
+    )
+    .unwrap();
+    assert_eq!(inflated, plain);
 
-    // If-None-Match 命中返回 304：无正文但保留沙箱与缓存语义。
+    // 同时接受 gzip 与 br 时优先 brotli；q=0 显式拒绝 br 则退回 gzip；只接受 identity 发原文。
+    let response = asset_request(
+        &state,
+        &format!("{base}/app.js"),
+        &[("accept-encoding", "gzip, deflate, br, zstd")],
+    )
+    .await;
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "br");
+    assert_eq!(
+        response.headers()[header::ETAG],
+        format!("\"{}:app.js:br\"", app.digest)
+    );
+    let brotli_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let mut decoded = Vec::new();
+    brotli::BrotliDecompress(&mut &brotli_body[..], &mut decoded).unwrap();
+    assert_eq!(decoded, plain);
+    let response = asset_request(
+        &state,
+        &format!("{base}/app.js"),
+        &[("accept-encoding", "br;q=0, gzip;q=0.5")],
+    )
+    .await;
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+    let response = asset_request(
+        &state,
+        &format!("{base}/app.js"),
+        &[("accept-encoding", "identity")],
+    )
+    .await;
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    assert_eq!(response.headers()[header::ETAG], etag);
+
+    // If-None-Match 命中返回 304：无正文但保留沙箱与缓存语义；
+    // 内容不可变，客户端缓存的任一编码变体都算命中并回显其 ETag。
     let response = asset_request(
         &state,
         &format!("{base}/app.js"),
@@ -1033,8 +1075,19 @@ async fn runtime_assets_cache_immutably_compress_and_revalidate() {
         "private, max-age=31536000, immutable"
     );
     assert!(to_bytes(response.into_body(), 64).await.unwrap().is_empty());
+    let response = asset_request(
+        &state,
+        &format!("{base}/app.js"),
+        &[
+            ("if-none-match", gzip_etag.as_str()),
+            ("accept-encoding", "gzip, br"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers()[header::ETAG], gzip_etag);
 
-    // SVG 是文本型资源，压缩谓词将其作为 image/* 的例外正常压缩。
+    // SVG 是文本型资源，作为 image/* 的例外照常压缩；PNG 等已压缩类型不生成变体。
     let response = asset_request(
         &state,
         &format!("{base}/icon.svg"),
@@ -1042,8 +1095,36 @@ async fn runtime_assets_cache_immutably_compress_and_revalidate() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get(header::CONTENT_ENCODING).is_some());
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "br");
     assert_eq!(response.headers()[header::VARY], "accept-encoding");
+    let response = asset_request(
+        &state,
+        &format!("{base}/logo.png"),
+        &[("accept-encoding", "gzip, br")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    assert_eq!(
+        to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .len(),
+        4096
+    );
+    // 过小的入口文件不压缩：省下的字节抵不过解码开销。
+    let response = asset_request(
+        &state,
+        &format!("{base}/index.html"),
+        &[("accept-encoding", "gzip, br")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+
+    // 变体目录不能作为资源路径直接访问。
+    let response = asset_request(&state, &format!("{base}/.enc/gz/app.js"), &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     // 修订不匹配的资源一律 404，停用/更新后不再暴露。
     let response = asset_request(
@@ -1053,6 +1134,61 @@ async fn runtime_assets_cache_immutably_compress_and_revalidate() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// 旧版宿主物化的缓存只有原文：首次访问时在锁内补齐预压缩变体，不重新解包，之后照常命中。
+#[tokio::test]
+async fn legacy_asset_cache_gains_precompressed_variants_lazily() {
+    let (state, _, _dir) = fixture().await;
+    let mut m = manifest();
+    m.id = "legacy".into();
+    let app = add_app(&state, &m, None).await;
+    let cache = cache_root(&state).join("legacy").join(&app.digest);
+    assert!(
+        cache
+            .join(package::ENCODED_DIR)
+            .join(package::COMPLETE_MARK)
+            .is_file()
+    );
+    // 模拟旧版本宿主留下的目录：只有原文与完成标记。
+    std::fs::remove_dir_all(cache.join(package::ENCODED_DIR)).unwrap();
+    // 让脚本足够大以生成变体。
+    let script = "console.log('legacy cache');\n".repeat(64);
+    std::fs::write(cache.join("app.js"), &script).unwrap();
+    let base = format!("/api/apps/runtime/legacy/{}", app.revision);
+    let response = asset_request(
+        &state,
+        &format!("{base}/app.js"),
+        &[("accept-encoding", "br")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "br");
+    assert!(
+        cache
+            .join(package::ENCODED_DIR)
+            .join(package::COMPLETE_MARK)
+            .is_file()
+    );
+    assert!(
+        cache
+            .join(package::ENCODED_DIR)
+            .join("br")
+            .join("app.js")
+            .is_file()
+    );
+    assert!(
+        cache
+            .join(package::ENCODED_DIR)
+            .join("gz")
+            .join("app.js")
+            .is_file()
+    );
+    // 原文未被重新解包覆盖。
+    assert_eq!(
+        std::fs::read_to_string(cache.join("app.js")).unwrap(),
+        script
+    );
 }
 
 /// 过期会话与修订轮换返回稳定的机器码，宿主凭码静默续签或提示重开。

@@ -102,20 +102,64 @@ pub(super) async fn launch(
 
 /// 资源 URL 按修订定址、内容按包摘要物化到不可变目录：同一 URL 的响应永不变化，
 /// 因此可长期缓存；ETag 绑定包摘要，作为不支持缓存的浏览器环境的兑底再验证。
-fn etag_for(digest: &str, resource: &str) -> String {
-    format!("\"{digest}:{resource}\"")
+/// 不同内容编码是不同表示，强 ETag 按编码区分（`"摘要:路径:gzip"`）。
+fn etag_for(digest: &str, resource: &str, encoding: Option<&str>) -> String {
+    match encoding {
+        Some(encoding) => format!("\"{digest}:{resource}:{encoding}\""),
+        None => format!("\"{digest}:{resource}\""),
+    }
 }
 
-fn if_none_match_hits(request_headers: &HeaderMap, etag: &str) -> bool {
-    request_headers
-        .get(header::IF_NONE_MATCH)
+/// If-None-Match 命中任一候选 ETag 时返回该值：内容不可变，客户端持有的任何编码变体都仍然新鲜。
+fn if_none_match_hits(request_headers: &HeaderMap, candidates: &[String]) -> Option<String> {
+    let value = request_headers.get(header::IF_NONE_MATCH)?.to_str().ok()?;
+    value.split(',').map(str::trim).find_map(|tag| {
+        if tag == "*" {
+            return candidates.first().cloned();
+        }
+        candidates
+            .iter()
+            .find(|candidate| candidate.as_str() == tag)
+            .cloned()
+    })
+}
+
+/// 解析 Accept-Encoding，返回可用的预压缩变体（`(编码名, 子目录)`），brotli 优先于 gzip；
+/// `q=0` 视为显式拒绝，`*` 覆盖未单独列出的编码，`x-gzip` 等价于 `gzip`。
+fn accepted_encodings(request_headers: &HeaderMap) -> Vec<(&'static str, &'static str)> {
+    let Some(value) = request_headers
+        .get(header::ACCEPT_ENCODING)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.split(',').any(|tag| {
-                let tag = tag.trim();
-                tag == etag || tag == "*"
+    else {
+        return Vec::new();
+    };
+    let (mut br, mut gzip, mut any) = (None, None, None);
+    for item in value.split(',') {
+        let mut parts = item.split(';');
+        let name = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let allowed = parts
+            .find_map(|part| {
+                part.trim()
+                    .strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f32>().ok())
             })
+            .unwrap_or(1.0)
+            > 0.0;
+        match name.as_str() {
+            "br" => br = Some(allowed),
+            "gzip" | "x-gzip" => gzip = Some(allowed),
+            "*" => any = Some(allowed),
+            _ => {}
+        }
+    }
+    package::ENCODINGS
+        .iter()
+        .copied()
+        .filter(|(name, _)| {
+            let listed = if *name == "br" { br } else { gzip };
+            listed.or(any).unwrap_or(false)
         })
+        .collect()
 }
 
 /// 沙箱资源响应公共头：200 与 304 保持一致的安全与缓存校验语义。
@@ -161,8 +205,12 @@ pub(super) async fn asset(
     if !app.enabled || app.revision != revision {
         return Err(AppError::NotFound);
     }
-    let etag = etag_for(&app.digest, &resource);
-    if if_none_match_hits(&request_headers, &etag) {
+    // 再验证不碰文件系统：任一编码变体的 ETag 命中都返回 304。
+    let candidates: Vec<String> = std::iter::once(None)
+        .chain(package::ENCODINGS.iter().map(|(name, _)| Some(*name)))
+        .map(|encoding| etag_for(&app.digest, &resource, encoding))
+        .collect();
+    if let Some(etag) = if_none_match_hits(&request_headers, &candidates) {
         let mut response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())
@@ -171,19 +219,49 @@ pub(super) async fn asset(
         return Ok(response);
     }
     let directory = cache_dir(&state, &app).await?;
-    let bytes = tokio::fs::read(directory.join(&resource))
+    // 安装时已生成的压缩变体按客户端偏好直接发送；没有变体（不可压缩或收益太小）时发原文。
+    let mut encoding = None;
+    let mut bytes = None;
+    for (name, subdir) in accepted_encodings(&request_headers) {
+        match tokio::fs::read(
+            directory
+                .join(package::ENCODED_DIR)
+                .join(subdir)
+                .join(&resource),
+        )
         .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                AppError::NotFound
-            } else {
-                error.into()
+        {
+            Ok(data) => {
+                encoding = Some(name);
+                bytes = Some(data);
+                break;
             }
-        })?;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let bytes = match bytes {
+        Some(bytes) => bytes,
+        None => tokio::fs::read(directory.join(&resource))
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AppError::NotFound
+                } else {
+                    error.into()
+                }
+            })?,
+    };
+    let etag = etag_for(&app.digest, &resource, encoding);
     let mime = mime_guess::from_path(&resource)
         .first_or_octet_stream()
         .to_string();
     let mut response = ([(header::CONTENT_TYPE, mime)], bytes).into_response();
+    if let Some(encoding) = encoding {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
+    }
     // 即使用户直接打开资源地址，响应级 sandbox 也不会授予主站同源权限。
     sandbox_asset_headers(response.headers_mut(), &request_headers, &etag);
     Ok(response)
@@ -210,6 +288,44 @@ fn preview_kind() -> String {
     "preview".into()
 }
 
+/// 一次批量调用最多包含的能力数；宿主页限流按此权重计数。
+const BATCH_LIMIT: usize = 16;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchRequest {
+    calls: Vec<BatchCall>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchCall {
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+/// 可进入批量信封的能力：只含服务端即可完成的元数据、存储与票据操作，
+/// 不含界面交互、字节读取与批量本身。
+fn batchable(method: &str) -> bool {
+    matches!(
+        method,
+        "app.ping"
+            | "settings.get"
+            | "settings.patch"
+            | "files.search"
+            | "files.list"
+            | "files.stat"
+            | "files.searchPage"
+            | "favorites.set"
+            | "media.url"
+            | "storage.get"
+            | "storage.set"
+            | "storage.list"
+            | "storage.delete"
+    )
+}
+
 pub(super) async fn rpc(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -219,8 +335,56 @@ pub(super) async fn rpc(
     if claims.purpose != "session" || claims.app_id != id || claims.node_id.is_some() {
         return Err(AppError::Forbidden("应用凭据用途不匹配".into()));
     }
+    if request.method != "rpc.batch" {
+        return Ok(Json(
+            dispatch(&state, &claims, &app, &request.method, request.params).await?,
+        ));
+    }
+    // 批量信封：一次会话校验、多次执行，逐项独立返回结果或错误，互不影响。
+    if app.manifest.api_version < 2 {
+        return Err(AppError::BadRequest("此能力需要应用 API v2".into()));
+    }
+    let batch: BatchRequest = serde_json::from_value(request.params)
+        .map_err(|_| AppError::BadRequest("批量调用参数无效".into()))?;
+    if batch.calls.is_empty() || batch.calls.len() > BATCH_LIMIT {
+        return Err(AppError::BadRequest(format!(
+            "批量调用需包含 1 到 {BATCH_LIMIT} 项能力"
+        )));
+    }
+    if let Some(call) = batch.calls.iter().find(|call| !batchable(&call.method)) {
+        return Err(AppError::BadRequest(format!(
+            "能力 {} 不支持批量调用",
+            call.method
+        )));
+    }
+    let mut results = Vec::with_capacity(batch.calls.len());
+    for call in batch.calls {
+        results.push(
+            match dispatch(&state, &claims, &app, &call.method, call.params).await {
+                Ok(result) => json!({"result": result}),
+                Err(error) => {
+                    let status = error.status();
+                    if status.is_server_error() {
+                        tracing::error!(error = %error, method = %call.method, "批量应用能力调用失败");
+                    }
+                    let (message, code) = error.public_parts();
+                    json!({"error": message, "code": code, "status": status.as_u16()})
+                }
+            },
+        );
+    }
+    Ok(Json(json!({"results": results})))
+}
+
+async fn dispatch(
+    state: &AppState,
+    claims: &Claims,
+    app: &InstalledApp,
+    method: &str,
+    params: Value,
+) -> AppResult<Value> {
     if !matches!(
-        request.method.as_str(),
+        method,
         "app.ping"
             | "settings.get"
             | "settings.patch"
@@ -231,25 +395,25 @@ pub(super) async fn rpc(
     {
         return Err(AppError::BadRequest("此能力需要应用 API v2".into()));
     }
-    let result = match request.method.as_str() {
+    let result = match method {
         "files.list" | "files.stat" | "files.searchPage" => {
             app.manifest.require("files.read")?;
-            files::invoke(&state, &app, &request.method, request.params).await?
+            files::invoke(state, app, method, params).await?
         }
         "storage.get" | "storage.set" | "storage.list" | "storage.delete" => {
-            storage::invoke(&state, &app, &request.method, request.params).await?
+            storage::invoke(state, app, method, params).await?
         }
         "app.ping" => json!({"ok": true, "revision": app.revision}),
-        "settings.get" => read_settings(&state, &app).await?,
-        "settings.patch" => save_settings(&state, &app, request.params).await?,
+        "settings.get" => read_settings(state, app).await?,
+        "settings.patch" => save_settings(state, app, params).await?,
         "files.search" => {
             app.manifest.require("files.read")?;
-            let query: crate::api::SearchQuery = serde_json::from_value(request.params)
+            let query: crate::api::SearchQuery = serde_json::from_value(params)
                 .map_err(|_| AppError::BadRequest("搜索参数无效".into()))?;
             if !app.scope.is_empty() {
                 let base = query.under.clone().unwrap_or_else(|| "/".into());
-                let normalized = format!("/{}", crate::vfs::normalize(&base)?.join("/"));
-                scope::check(&state, &app, &normalized).await?;
+                let normalized = crate::vfs::canonical(&base)?;
+                scope::check(state, app, &normalized).await?;
             }
             crate::api::search(State(state.clone()), Query(query))
                 .await?
@@ -257,17 +421,17 @@ pub(super) async fn rpc(
         }
         "favorites.set" => {
             app.manifest.require("favorites.write")?;
-            let body: crate::api::FavoriteBody = serde_json::from_value(request.params)
+            let body: crate::api::FavoriteBody = serde_json::from_value(params)
                 .map_err(|_| AppError::BadRequest("收藏参数无效".into()))?;
-            let normalized = format!("/{}", crate::vfs::normalize(&body.path)?.join("/"));
-            scope::check(&state, &app, &normalized).await?;
+            let normalized = crate::vfs::canonical(&body.path)?;
+            scope::check(state, app, &normalized).await?;
             crate::api::favorite_set(State(state.clone()), Json(body))
                 .await?
                 .0
         }
         "media.url" => {
             app.manifest.require("media.read")?;
-            let media: MediaRequest = serde_json::from_value(request.params)
+            let media: MediaRequest = serde_json::from_value(params)
                 .map_err(|_| AppError::BadRequest("媒体参数无效".into()))?;
             if !matches!(
                 media.kind.as_str(),
@@ -283,7 +447,7 @@ pub(super) async fn rpc(
                 ));
             }
             let (node, path) = files::resolve(
-                &state,
+                state,
                 &files::Reference {
                     id: media.id,
                     path: media.path,
@@ -291,24 +455,24 @@ pub(super) async fn rpc(
                 },
             )
             .await?;
-            scope::check(&state, &app, &path).await?;
+            scope::check(state, app, &path).await?;
             if node.is_dir {
                 return Err(AppError::IsDirectory);
             }
             let ticket = sign(
-                &state,
+                state,
                 &Claims {
                     purpose: media.kind,
                     node_id: Some(node.id),
                     content_version: Some(files::version(&node)),
-                    ..claims
+                    ..claims.clone()
                 },
             )?;
             json!({"url": format!("/api/apps/media/{ticket}"), "expires_at": claims.expires_at})
         }
         _ => return Err(AppError::BadRequest("不支持的应用能力".into())),
     };
-    Ok(Json(result))
+    Ok(result)
 }
 
 /// CORS 预检兑底：Range 已属安全头，现代浏览器不会预检，仍应答 OPTIONS 保险。

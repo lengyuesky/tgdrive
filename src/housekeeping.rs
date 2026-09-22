@@ -16,18 +16,13 @@ async fn record_log(vfs: &Vfs, level: &str, category: &str, message: &str) {
     }
 }
 
-pub async fn run(
-    vfs: Vfs,
-    runtime: Arc<Runtime>,
-    events: crate::events::EventBus,
-    task: crate::tasks::TaskReporter,
-) {
+pub async fn run(vfs: Vfs, runtime: Arc<Runtime>, task: crate::tasks::TaskReporter) {
     loop {
         if task.is_cancelled() {
             return;
         }
         task.heartbeat();
-        match tick(&vfs, &runtime, &events).await {
+        match tick(&vfs, &runtime).await {
             Ok(()) => task.clear_error(),
             Err(error) => {
                 task.report_error(&error.to_string());
@@ -47,7 +42,7 @@ pub async fn run(
     }
 }
 
-async fn tick(vfs: &Vfs, runtime: &Runtime, events: &crate::events::EventBus) -> AppResult<()> {
+async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
     vfs.uploader.process_pending_deletes();
     let extras = crate::extras::load(&vfs.db).await?;
 
@@ -81,8 +76,8 @@ async fn tick(vfs: &Vfs, runtime: &Runtime, events: &crate::events::EventBus) ->
                 &format!("回收站超期清理：释放 {} 条消息", freed.len()),
             )
             .await;
+            // 清理的是回收站里本就不可见的节点：可见树没有变化，不广播文件事件。
             vfs.uploader.delete_messages_best_effort(freed);
-            crate::events::emit(events, crate::events::HostEvent::files());
         }
     }
 
