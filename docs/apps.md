@@ -168,6 +168,8 @@ node package.mjs /绝对路径/我的应用/dist /绝对路径/输出目录
   宿主提示重新打开而不是误判为网络故障。续签前已签发的媒体票据仍按原过期时间失效，重新请求 `media.url` 即获得新票据。
 - 安装更新成功或失败后，数据库旁 `apps/<应用 ID>/` 内的旧摘要与孤儿缓存目录自动清理，只保留当前安装摘要；
   卸载仍删除整个应用目录。
+- 应用封面缓存存于数据库旁的独立文件 `<主库名>-covers.db`（默认 `/data/tgdrive-covers.db`）：可随时清空重建，
+  不走主库迁移，也不进入数据库快照与自动备份；恢复备份后首次浏览会重新生成封面。
 
 ## SDK
 
@@ -315,6 +317,27 @@ try {
 翻页、书签操作、切书与主动退出及时保存。冲突不简单取最大页码，用户可以主动回读。
 强制关闭浏览器只保证最近一次成功保存，不承诺离线同步或关闭后继续上传。
 
+### v2：封面缓存（能力 `covers`）
+
+书架、漫画墙和海报墙的封面要从原图、归档或 PDF 首页生成，逐次重做既费流量又慢。宿主声明 `covers` 时，
+插件把生成好的小图存进服务器封面库，下次打开直接取用：
+
+| 调用 | 返回或行为 |
+|---|---|
+| `covers.get(keys, options)` | `{ covers: [{ key, data, meta, updated_at }] }`，1～16 个键，只返回命中项；`data` 为 `data:image/…;base64,…` |
+| `covers.put(key, data, meta = null, options)` | `{ ok, bytes, evicted }`；同键覆盖，`evicted` 为本次因超限淘汰的张数 |
+| `covers.delete(keys, options)` | `{ ok, deleted }`，1～16 个键 |
+| `covers.stats(options)` | `{ entries, bytes, limit_bytes, limit_entries }` |
+
+键规则与私有存储相同（英文字母、数字、冒号、短横线、下划线，最多 128 字节），自动绑定当前应用。
+`data` 只接受 WebP、JPEG、PNG 的 base64 data URL，解码后最多 256 KiB，文件头必须与声明一致；`meta` 为可选 JSON，
+最多 4 KiB，供插件记录内容版本等核验信息。宿主不解读 `meta`，封面是否过期由插件判断，过期时重新生成并覆盖。
+
+每个应用最多 256 MiB、50000 张，超出时按最近访问时间淘汰到上限的 90%，刚写入的封面不会被淘汰；读取最多每天
+刷新一次访问时间。封面能力不需要额外权限、不发事件、不进入批量信封；`covers.put` 的消息参数单独放宽到 400 KiB，
+其余能力仍为 64 KiB。应用中心「设置」显示每个应用的封面占用并可一键清理；卸载应用时无论是否清除应用数据，
+封面都一并删除。旧宿主没有该能力，插件应退回仅内存缓存。
+
 ### v2：批量调用（能力 `rpc.batch`）
 
 打开一个文件往往要连续做多次元数据核对（来源根目录 stat、目标文件 stat、再核对一遍），每次都是一次
@@ -425,8 +448,10 @@ PDF 不使用浏览器内置 iframe，不启用 WASM、XFA 或自动整本预取
 | `GET /api/apps/catalog/:id/package?digest=...` | 按可选摘要下载精确包；省略时选择最高兼容版本 |
 | `POST /api/apps/catalog/:id/install` | JSON 包含 `digest` 和可选 `expected_revision` |
 | `POST /api/apps/:id/state` | JSON 中设置 `enabled` 或 `pinned` |
-| `DELETE /api/apps/:id?purge_data=false` | 卸载，默认保留设置和私有数据；显式清除时一并删除阅读记录与书签 |
+| `DELETE /api/apps/:id?purge_data=false` | 卸载，默认保留设置和私有数据；显式清除时一并删除阅读记录与书签；封面缓存总是删除 |
 | `GET/PATCH /api/apps/:id/settings` | 获取或部分更新应用设置 |
+| `GET /api/apps/:id/covers` | 封面缓存占用 `{ entries, bytes, limit_bytes, limit_entries }` |
+| `DELETE /api/apps/:id/covers` | 清空该应用的封面缓存并归还磁盘空间，返回 `{ ok, removed }` |
 | `POST /api/apps/:id/launch` | 为宿主创建受限运行会话 |
 | `POST /api/apps/:id/rpc` | 宿主能力网关，应用使用 SDK 调用 |
 

@@ -2,7 +2,7 @@
 //! 控制面走 RPC；二进制数据面由应用凭票据直连本模块的媒体端点。
 
 use super::{
-    InstalledApp, cache_dir, files, installed, package,
+    InstalledApp, cache_dir, covers, files, installed, package,
     range_cache::{CachedRange, RANGE_CACHE_ENTRY, RangeKey},
     read_settings, save_settings, scope, storage,
 };
@@ -402,6 +402,9 @@ async fn dispatch(
         }
         "storage.get" | "storage.set" | "storage.list" | "storage.delete" => {
             storage::invoke(state, app, method, params).await?
+        }
+        "covers.get" | "covers.put" | "covers.delete" | "covers.stats" => {
+            covers::invoke(state, app, method, params).await?
         }
         "app.ping" => json!({"ok": true, "revision": app.revision}),
         "settings.get" => read_settings(state, app).await?,

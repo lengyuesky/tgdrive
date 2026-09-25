@@ -27,7 +27,7 @@ struct List {
     cursor: Option<String>,
     limit: Option<u16>,
 }
-fn valid(key: &str, prefix: bool) -> AppResult<()> {
+pub(super) fn valid(key: &str, prefix: bool) -> AppResult<()> {
     if (!prefix && key.is_empty())
         || key.len() > 128
         || !key

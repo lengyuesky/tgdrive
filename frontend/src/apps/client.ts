@@ -1,5 +1,5 @@
 import { http } from '@drive/http'
-import type { AppIndex, AppLaunch, AppPreview, InstalledApp, SettingValues } from './types'
+import type { AppIndex, AppLaunch, AppPreview, CoverStats, InstalledApp, SettingValues } from './types'
 
 export const appApi = {
   list: () => http.get<AppIndex>('/apps'),
@@ -21,6 +21,8 @@ export const appApi = {
   settings: (id: string) => http.get<SettingValues>(`/apps/${encodeURIComponent(id)}/settings`),
   saveSettings: (id: string, values: SettingValues) => http.patch<SettingValues>(`/apps/${encodeURIComponent(id)}/settings`, values),
   saveScope: (id: string, paths: string[]) => http.patch<InstalledApp>(`/apps/${encodeURIComponent(id)}/scope`, { paths }),
+  coverStats: (id: string) => http.get<CoverStats>(`/apps/${encodeURIComponent(id)}/covers`),
+  clearCovers: (id: string) => http.delete<{ ok: boolean; removed: number }>(`/apps/${encodeURIComponent(id)}/covers`),
   launch: (id: string, signal?: AbortSignal) => http.post<AppLaunch>(`/apps/${encodeURIComponent(id)}/launch`, {}, { signal }),
   rpc: (id: string, session: string, method: string, params: unknown = {}, signal?: AbortSignal) =>
     http.post(`/apps/${encodeURIComponent(id)}/rpc`, { session, method, params }, { signal }),

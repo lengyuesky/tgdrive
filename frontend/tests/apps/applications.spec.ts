@@ -195,6 +195,52 @@ async function fileSidebar(page: Page) {
   return sidebar
 }
 
+/** v2 媒体类合成应用：连接后写入并读回一张封面，把能力声明与命中结果写进页面。 */
+async function coverPackagePath() {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+  const jsContent = `
+    let port = null, reqId = 0;
+    const pending = new Map();
+    const invoke = (method, params = {}) => new Promise((resolve, reject) => {
+      const id = ++reqId; pending.set(id, { resolve, reject });
+      port.postMessage({ type: 'request', id, method, params });
+    });
+    window.addEventListener('message', async (e) => {
+      if (e.data?.type !== 'connect' || !e.ports?.[0]) return;
+      clearInterval(timer); port = e.ports[0];
+      port.onmessage = (msg) => {
+        const res = msg.data;
+        if (res?.type === 'response' && pending.has(res.id)) {
+          const { resolve, reject } = pending.get(res.id); pending.delete(res.id);
+          res.error ? reject(new Error(res.error)) : resolve(res.result);
+        }
+      };
+      document.getElementById('capability').textContent = (e.data.context.capabilities || []).includes('covers') ? '支持封面库' : '不支持封面库';
+      try {
+        await invoke('covers.put', { key: 'unit:1', data: 'data:image/png;base64,${png}', meta: { v: 'v1' } });
+        const hits = await invoke('covers.get', { keys: ['unit:1', 'unit:2'] });
+        document.getElementById('cover').textContent = '命中 ' + hits.covers.length + ' 张 ' + hits.covers[0].meta.v;
+      } catch (err) { document.getElementById('cover').textContent = err.message; }
+    });
+    const announce = () => parent.postMessage({ channel: 'tgdrive-app-v1', type: 'ready' }, '*');
+    const timer = setInterval(announce, 300);
+    announce();
+  `
+  const zip = makeZip({
+    'app.json': JSON.stringify({
+      id: 'cover-viewer', name: '封面测试应用', version: '1.0.0', api_version: 2, min_host_version: '0.2.0',
+      description: '验证封面缓存与清理。', author: '测试夹具', entry: 'index.html',
+      permissions: ['files.read', 'media.read'], settings: [],
+    }),
+    'index.html':
+      '<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><script defer src="./app.js"></script></head><body><p id="capability"></p><p id="cover"></p></body></html>',
+    'app.js': jsContent,
+  })
+  const dest = `${temporary}/cover-viewer-1.0.0.tgapp`
+  await writeFile(dest, zip)
+  return dest
+}
+
 async function importApp(page: Page, path: string, update = false) {
   await page.locator('input[type="file"][accept=".tgapp,.zip"]').setInputFiles(path)
   const dialog = page.getByRole('dialog', {
@@ -519,4 +565,28 @@ test('一键更新聚合全部可更新应用，单次确认后逐个安装', as
   await expect(row).toContainText('应用目录')
   // 更新完成后入口消失。
   await expect(page.getByRole('button', { name: '一键更新' })).toHaveCount(0)
+})
+
+test('封面缓存经沙箱写入服务器封面库，应用设置显示占用并可一键清理', async ({ page }) => {
+  await page.goto('/apps')
+  await (await importApp(page, await coverPackagePath())).getByRole('button', { name: '同意并安装' }).click()
+  const appPage = await page.context().newPage()
+  await appPage.goto('/apps/cover-viewer')
+  const frame = appPage.frameLocator('iframe')
+  await expect(frame.locator('#capability')).toHaveText('支持封面库')
+  await expect(frame.locator('#cover')).toHaveText('命中 1 张 v1')
+  expect(await (await page.request.get('/api/apps/cover-viewer/covers')).json()).toMatchObject({ entries: 1 })
+
+  await page.getByRole('tab', { name: /应用设置/ }).click()
+  const row = page.locator('[data-app-id="cover-viewer"].manage-row')
+  await row.getByRole('button', { name: '设置', exact: true }).click()
+  const settings = page.getByRole('dialog', { name: '封面测试应用设置' })
+  await expect(settings).toContainText('已缓存 1 张')
+  await settings.getByRole('button', { name: '清理封面缓存' }).click()
+  const confirm = page.getByRole('dialog', { name: '清理封面缓存' })
+  await confirm.getByRole('button', { name: '清理', exact: true }).click()
+  await expect(settings).toContainText('已缓存 0 张')
+  await expect(settings.getByRole('button', { name: '清理封面缓存' })).toBeDisabled()
+  expect(await (await page.request.get('/api/apps/cover-viewer/covers')).json()).toMatchObject({ entries: 0, bytes: 0 })
+  await appPage.close()
 })

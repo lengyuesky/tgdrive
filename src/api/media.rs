@@ -81,7 +81,7 @@ pub(super) fn validate_thumbnail_upload(declared: &str, data: &[u8]) -> AppResul
     Ok(())
 }
 
-pub(super) fn downloaded_thumbnail_mime(data: &[u8]) -> Option<&'static str> {
+pub(crate) fn downloaded_thumbnail_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
     } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {

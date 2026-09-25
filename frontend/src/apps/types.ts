@@ -37,6 +37,14 @@ export interface InstalledApp {
   scope: string[]
 }
 
+/** 应用封面缓存占用；封面存于独立封面库，可随时清理后重新生成。 */
+export interface CoverStats {
+  entries: number
+  bytes: number
+  limit_bytes: number
+  limit_entries: number
+}
+
 export interface CatalogStatus {
   source: 'github' | 'local' | 'disabled'
   repository: string | null

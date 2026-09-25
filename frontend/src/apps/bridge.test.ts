@@ -13,6 +13,14 @@ describe('应用能力通道', () => {
     expect(isAppRequest({ type: 'request', id: 1, method: 'files.search', params: [] })).toBe(false)
   })
 
+  it('封面写入单独放宽参数上限，其他能力仍限 64 KiB', () => {
+    for (const method of ['covers.get', 'covers.put', 'covers.delete', 'covers.stats']) expect(isAppRequest({ type: 'request', id: 1, method, params: {} })).toBe(true)
+    const data = `data:image/webp;base64,${'A'.repeat(300 * 1024)}`
+    expect(isAppRequest({ type: 'request', id: 1, method: 'covers.put', params: { key: 'unit:1', data } })).toBe(true)
+    expect(isAppRequest({ type: 'request', id: 1, method: 'covers.put', params: { key: 'unit:1', data: data + 'A'.repeat(120 * 1024) } })).toBe(false)
+    expect(isAppRequest({ type: 'request', id: 1, method: 'storage.set', params: { key: 'unit:1', value: data } })).toBe(false)
+  })
+
   it('关闭应用后忽略在途调用结果', async () => {
     const { port, send } = channel()
     let finish!: (value: unknown) => void

@@ -204,6 +204,7 @@ describe('应用宿主数据面、批量信封与事件转发', () => {
     await connectSandbox()
     const connect = posted.mock.calls.map((call) => call[0] as { type?: string; context?: { capabilities?: string[] } }).find((data) => data?.type === 'connect')
     expect(connect?.context?.capabilities).toContain('rpc.batch')
+    expect(connect?.context?.capabilities).toContain('covers')
     mocks.rpc.mockReset().mockResolvedValue({ data: { results: [{ result: { ok: true } }] } })
     const result = await capturedInvoke!('rpc.batch', { calls: [{ method: 'files.stat', params: { id: 1 } }, { method: 'app.ping' }] }, new AbortController().signal)
     expect(result).toEqual({ results: [{ result: { ok: true } }] })

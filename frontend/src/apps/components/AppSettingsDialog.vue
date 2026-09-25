@@ -3,7 +3,7 @@
     align-center append-to-body @update:model-value="emit('update:modelValue', $event)">
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
     <div v-loading="loading" class="settings-fields">
-      <el-empty v-if="!loading && !app?.manifest.settings.length && !scoped" description="此应用没有可配置项" />
+      <el-empty v-if="!loading && !app?.manifest.settings.length && !scoped && !showCovers" description="此应用没有可配置项" />
       <div v-for="field in app?.manifest.settings ?? []" :key="field.key" class="app-field">
         <label :for="`app-setting-${field.key}`">{{ field.label }}</label>
         <el-switch v-if="field.type === 'boolean'" :id="`app-setting-${field.key}`"
@@ -31,6 +31,12 @@
           <p class="scope-hint">留空保存等同全盘；应用只能列出、搜索和读取这些目录之内的文件。</p>
         </div>
       </div>
+      <div v-if="showCovers && coverStats" class="app-field cover-field">
+        <label>封面缓存</label>
+        <p class="cover-usage">已缓存 {{ coverStats.entries }} 张 · {{ fmtSize(coverStats.bytes) }}（上限 {{ fmtSize(coverStats.limit_bytes) }}）</p>
+        <p>封面生成一次后保存在服务器封面库，下次打开直接显示；超出上限时自动淘汰最久没看的封面。清理不影响设置、进度和书签。</p>
+        <el-button :icon="Delete" :loading="clearing" :disabled="!coverStats.entries" @click="clearCovers">清理封面缓存</el-button>
+      </div>
     </div>
     <template #footer>
       <el-button @click="emit('update:modelValue', false)">取消</el-button>
@@ -45,8 +51,9 @@ import ResponsivePanel from '@drive/components/ResponsivePanel.vue'
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Delete, FolderAdd } from '@element-plus/icons-vue'
-import { api, errMsg } from '@drive/api'
-import type { InstalledApp, SettingValues } from '../types'
+import { api, errMsg, fmtSize } from '@drive/api'
+import { appConfirm } from '@drive/dialog'
+import type { CoverStats, InstalledApp, SettingValues } from '../types'
 import DirPicker from '@drive/components/DirPicker.vue'
 
 const props = defineProps<{ modelValue: boolean; app: InstalledApp | null }>()
@@ -59,15 +66,23 @@ const scopePaths = ref<string[]>([])
 const fullDrive = ref(true)
 const picker = ref<InstanceType<typeof DirPicker>>()
 const scoped = computed(() => !!props.app?.manifest.permissions.includes('files.read'))
+const coverStats = ref<CoverStats | null>(null)
+const clearing = ref(false)
+// 封面缓存只对 v2 媒体类应用有意义；已有缓存时始终显示，便于清理。
+const showCovers = computed(() => !!coverStats.value && (coverStats.value.entries > 0
+  || (props.app?.manifest.api_version ?? 1) >= 2 && !!props.app?.manifest.permissions.includes('media.read')))
 let original: SettingValues = {}
 let originalScope: string[] = []
 let generation = 0
 watch(() => [props.modelValue, props.app?.revision], async () => {
   const current = ++generation
   saving.value = false
+  clearing.value = false
   if (!props.modelValue || !props.app) return
   loading.value = true
   error.value = ''
+  coverStats.value = null
+  void loadCoverStats(current)
   try {
     const { data } = await api.apps.settings(props.app.manifest.id)
     if (current !== generation) return
@@ -80,6 +95,29 @@ watch(() => [props.modelValue, props.app?.revision], async () => {
   finally { if (current === generation) loading.value = false }
 }, { immediate: true })
 onUnmounted(() => { generation++ })
+async function loadCoverStats(current: number) {
+  if (!props.app) return
+  try {
+    const { data } = await api.apps.coverStats(props.app.manifest.id)
+    if (current === generation) coverStats.value = data
+  } catch { /* 统计失败时隐藏封面缓存一栏，不影响设置保存。 */ }
+}
+async function clearCovers() {
+  if (!props.app || clearing.value) return
+  const current = generation
+  try {
+    await appConfirm({ title: '清理封面缓存', message: `清理「${props.app.manifest.name}」的全部封面缓存？下次浏览时会重新生成封面，不影响设置、进度和书签。`, kind: 'warning', confirmText: '清理' })
+  } catch { return }
+  if (current !== generation || !props.app) return
+  clearing.value = true
+  try {
+    const { data } = await api.apps.clearCovers(props.app.manifest.id)
+    if (current !== generation) return
+    ElMessage.success(`已清理 ${data.removed} 张封面`)
+    await loadCoverStats(current)
+  } catch (e) { if (current === generation) ElMessage.error(errMsg(e)) }
+  finally { if (current === generation) clearing.value = false }
+}
 async function chooseDirectory(key: string, label: string) {
   const current = generation
   const result = await picker.value?.open(`选择${label}`, String(values.value[key] ?? '/'))
@@ -124,4 +162,6 @@ async function save() {
 .scope-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; }
 .scope-row code { word-break: break-all; }
 .scope-hint { color: var(--el-text-color-secondary); font-size: 12px; margin: 0; }
+.cover-field { border-top: 1px solid var(--glass-border); padding-top: 18px; }
+.app-field p.cover-usage { color: var(--el-text-color-primary); font-size: 14px; }
 </style>

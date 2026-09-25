@@ -18,6 +18,8 @@ use zip::write::SimpleFileOptions;
 
 #[path = "catalog_api_tests.rs"]
 mod catalog_api;
+#[path = "covers_tests.rs"]
+mod cover_cache;
 #[path = "media_tests.rs"]
 mod media;
 #[path = "reader_tests.rs"]

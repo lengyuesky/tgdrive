@@ -7,7 +7,9 @@ use crate::error::{AppError, AppResult};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+mod covers_db;
 mod data;
+pub use covers_db::*;
 pub use data::*;
 
 /// 已安装记录缓存。代次计数保证"查库期间发生写入"的读者不会把陈旧行写回：

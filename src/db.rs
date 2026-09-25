@@ -325,6 +325,8 @@ pub struct Db {
     pool: SqlitePool,
     /// 已安装应用记录的进程内缓存；`apps` 表的每条写入路径都会使其失效（见 apps/db.rs）。
     apps_cache: std::sync::Arc<apps::AppCache>,
+    /// 应用封面缓存库（主库旁的独立文件，见 apps/covers_db.rs）。
+    covers: SqlitePool,
 }
 
 /// 有待执行迁移的既有库先做一份一致性快照：部分迁移会删表重建，无法回退。
@@ -383,9 +385,11 @@ impl Db {
         let migrator = sqlx::migrate!("./migrations");
         snapshot_before_migration(&pool, &migrator, db_path).await?;
         migrator.run(&pool).await?;
+        let covers = apps::open_covers(db_path).await?;
         Ok(Db {
             pool,
             apps_cache: Default::default(),
+            covers,
         })
     }
 

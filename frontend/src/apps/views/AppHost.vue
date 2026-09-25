@@ -278,7 +278,7 @@ function onReady(event: MessageEvent) {
     if (current !== generation || !frame.value?.contentWindow) { channel.port2.close(); return }
     frame.value.contentWindow.postMessage({ channel: 'tgdrive-app-v1', type: 'connect',
       context: { id: active.app.manifest.id, name: active.app.manifest.name, version: active.app.manifest.version, api_version: active.app.manifest.api_version, dark: isDark.value,
-        capabilities: active.app.manifest.api_version >= 2 ? ['ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope', 'rpc.batch'] : [] } }, '*', [channel.port2])
+        capabilities: active.app.manifest.api_version >= 2 ? ['ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope', 'rpc.batch', 'covers'] : [] } }, '*', [channel.port2])
   }).catch((error) => {
     channel.port2.close()
     if (current === generation && !signal.aborted) fail(errMsg(error))

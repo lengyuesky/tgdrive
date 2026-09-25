@@ -4,7 +4,11 @@ const METHODS = new Set([
   'ui.pickDirectory', 'ui.openSettings', 'ui.download', 'ui.close', 'ui.setImmersive',
   'files.list', 'files.searchPage', 'files.stat', 'files.readRange', 'files.readRanges', 'assets.read',
   'storage.get', 'storage.set', 'storage.list', 'storage.delete', 'rpc.batch',
+  'covers.get', 'covers.put', 'covers.delete', 'covers.stats',
 ])
+/** 普通能力参数最多 64 KiB；封面写入携带 base64 小图（宿主上限 256 KiB 原图），单独放宽。 */
+const PARAM_LIMIT = 64 * 1024
+const COVER_PARAM_LIMIT = 400 * 1024
 export interface AppRequest { type: 'request'; id: number; method: string; params: Record<string, unknown> }
 export function isAppRequest(value: unknown): value is AppRequest {
   if (!value || typeof value !== 'object') return false
@@ -12,7 +16,8 @@ export function isAppRequest(value: unknown): value is AppRequest {
   if (request.type !== 'request' || !Number.isSafeInteger(request.id) || Number(request.id) < 1
     || typeof request.method !== 'string' || !METHODS.has(request.method)
     || !request.params || typeof request.params !== 'object' || Array.isArray(request.params)) return false
-  try { return new TextEncoder().encode(JSON.stringify(request.params)).length <= 64 * 1024 } catch { return false }
+  const limit = request.method === 'covers.put' ? COVER_PARAM_LIMIT : PARAM_LIMIT
+  try { return new TextEncoder().encode(JSON.stringify(request.params)).length <= limit } catch { return false }
 }
 export type AppBridge = (() => void) & { beforeClose: () => Promise<void> }
 export function connectAppBridge(port: MessagePort, invoke: (method: string, params: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>, message: (error: unknown) => string): AppBridge {

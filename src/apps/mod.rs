@@ -1,6 +1,7 @@
 //! 应用中心：独立插件包、安装生命周期与权限受限的页面运行环境。
 
 pub mod catalog;
+mod covers;
 mod files;
 mod package;
 mod range_cache;
@@ -79,6 +80,7 @@ pub fn protected_router() -> Router<AppState> {
         .route("/apps/{id}", get(detail).delete(uninstall))
         .route("/apps/{id}/state", post(set_state))
         .route("/apps/{id}/scope", patch(scope_patch))
+        .route("/apps/{id}/covers", get(covers_stats).delete(covers_clear))
         .route(
             "/apps/{id}/settings",
             get(settings_get).patch(settings_patch),
@@ -465,6 +467,10 @@ async fn uninstall(
     let _guard = INSTALL_LOCK.lock().await;
     let app = installed(&state, &id).await?;
     state.vfs.db.uninstall_app(&id, options.purge_data).await?;
+    // 封面是可再生缓存：无论是否清除应用数据，卸载都一并删除。
+    if let Err(error) = state.vfs.db.cover_clear(&id).await {
+        tracing::warn!(app_id = %id, %error, "应用已卸载，封面缓存清理失败");
+    }
     let _cache_guard = CACHE_LOCK.lock().await;
     let path = cache_root(&state).join(&app.manifest.id);
     if let Err(error) = tokio::fs::remove_dir_all(path).await
@@ -473,6 +479,25 @@ async fn uninstall(
         tracing::warn!(app_id = %id, %error, "应用已卸载，运行缓存稍后可手动清理");
     }
     Ok(Json(json!({"ok": true})))
+}
+
+async fn covers_stats(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    installed(&state, &id).await?;
+    Ok(Json(covers::stats_json(
+        state.vfs.db.cover_stats(&id).await?,
+    )))
+}
+
+async fn covers_clear(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    installed(&state, &id).await?;
+    let removed = state.vfs.db.cover_clear(&id).await?;
+    Ok(Json(json!({"ok": true, "removed": removed})))
 }
 
 async fn read_settings(state: &AppState, app: &InstalledApp) -> AppResult<Value> {

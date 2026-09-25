@@ -131,7 +131,7 @@
     </ResponsivePanel>
 
     <ResponsivePanel v-model="uninstallVisible" title="卸载应用" width="min(460px, 94vw)" align-center :close-on-click-modal="!busy">
-      <p>卸载「{{ uninstallTarget?.manifest.name }}」后，其运行页面将关闭，网盘文件和收藏继续保留。</p>
+      <p>卸载「{{ uninstallTarget?.manifest.name }}」后，其运行页面将关闭，网盘文件和收藏继续保留，封面缓存一并删除。</p>
       <el-checkbox v-model="purgeData">同时清除这个应用的数据（设置、阅读记录和书签）</el-checkbox>
       <template #footer>
         <el-button :disabled="!!busy" @click="uninstallVisible = false">取消</el-button>

@@ -24,7 +24,9 @@ use tokio::sync::broadcast;
 use tokio_util::io::ReaderStream;
 
 mod entries;
-pub(crate) use self::media::{inline_mime_allowed, parse_range, stream_node, thumbnail_for_node};
+pub(crate) use self::media::{
+    downloaded_thumbnail_mime, inline_mime_allowed, parse_range, stream_node, thumbnail_for_node,
+};
 pub(crate) use self::search::{FavoriteBody, SearchQuery, favorite_set, search};
 mod admin;
 mod events;
