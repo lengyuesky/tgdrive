@@ -93,6 +93,8 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 配置有三层,**后台修改 > 环境变量(`.env`)> 内置默认**。`.env` 里只有账号密码是必填的,其余留空就在网页「系统设置」里配。
 
+回收站保留天数、备份渠道、Bot 收件规则、消息自动清理等维护设置没有对应的环境变量,只能在后台修改,保存在数据库里并随数据库备份。环境变量只在启动时读取一次,改 `.env` 后需重启容器。
+
 | 变量 | 必填 | 默认 | 可在后台改 | 说明 |
 |---|---|---|---|---|
 | `TGDRIVE_USERNAME` / `TGDRIVE_PASSWORD` | ✔ | — | ✔ | Web 与 WebDAV 的账号密码;唯一必填项(没有它就没法登录后台配其余部分) |
@@ -115,6 +117,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_DB_PATH` | | `/data/tgdrive.db`(镜像内) | | SQLite 路径(设置本身存在这个库里) |
 | `TGDRIVE_SECRET` | | 自动生成并存库 | | cookie 签名密钥,**仅首次启动时作为初始值**,之后以库中值为准 |
 | `TGDRIVE_COOKIE_SECURE` | | `false` | | 通过 HTTPS(含反向代理)访问时设为 `true`,为 Cookie 启用 Secure 并发送 HSTS 响应头;修改需重启 |
+| `TGDRIVE_TRUSTED_PROXIES` | | 空 | | 反向代理的 IP 或 CIDR(逗号分隔)。仅来自这些地址的 `X-Forwarded-For` 会被采信,用于登录与提取码限速;不配置时反代后所有人共用一个限速额度;修改需重启 |
 | `TGDRIVE_STATIC_DIR` | | `/app/static`(镜像内) | | 前端静态文件目录 |
 | `RUST_LOG` | | `info` | | 日志级别 |
 
@@ -289,6 +292,9 @@ HTTP 探针:
 
 - `GET /healthz`:存活探针,HTTP 服务能响应即返回 `200`
 - `GET /readyz`:就绪探针,检查 SQLite、当前存储目标和关键后台任务心跳;异常时返回 `503` 及各项 JSON 状态
+- `GET /api/metrics`:Prometheus 文本格式指标(请求数按状态码类别、累计耗时、慢请求、文件/目录/容量、待删消息、后台任务状态),需登录;Prometheus 用 `basic_auth` 抓取即可
+
+运行时镜像基于 distroless(无 shell),排查问题请用 `docker compose logs` 或 `docker cp`,不能 `docker exec sh`。
 
 ## 大目录元数据接口
 

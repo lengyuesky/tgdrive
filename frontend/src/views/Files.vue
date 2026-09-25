@@ -293,8 +293,10 @@
           </div>
           <div v-if="batchProgress" class="directory-notice" role="status">{{ batchProgress }}</div>
           <DirectoryViewport ref="directoryViewport" :active="pageActive" :entries="entries" :count="entries.length" :mode="viewMode" :generation="generation"
-            :revision="revision" :index-of="directory.indexOf" @near-end="loadNextBatch"
-            @scroll="rememberScroll">
+            :revision="revision" :index-of="directory.indexOf" :focus-id="keyNav.focusId.value" :selected-ids="selectedIds"
+            role="listbox" aria-label="目录内容" aria-multiselectable="true" :tabindex="mobile ? undefined : 0"
+            :aria-activedescendant="keyNav.focusId.value !== undefined && directory.indexOf(keyNav.focusId.value) !== undefined ? `entry-${keyNav.focusId.value}` : undefined"
+            @keydown="onListKey" @near-end="loadNextBatch" @scroll="rememberScroll">
             <template #header>
               <div class="list-row list-heading">
                 <input type="checkbox" aria-label="全选已加载项目" :checked="allSelected" @change="toggleSelectAll" />
@@ -307,7 +309,7 @@
             <template #default="{ entry: row, mode, mediaKey, generation: mediaGeneration }">
               <div :class="mode === 'list' ? 'list-row' : ['tile', 'tile-' + mode, { sel: isSelected(row), img: !row.is_dir && (isImage(row.name) || isVideo(row.name)) }]"
                 :data-media-generation="mediaGeneration" :data-media-key="mediaKey"
-                @contextmenu.prevent.stop="openCtxMenu($event, row)">
+                @pointerdown="mobile || keyNav.pointAt(row)" @contextmenu.prevent.stop="openCtxMenu($event, row)">
                 <label v-if="!mobile || selecting" class="entry-check-target"><input class="entry-check" type="checkbox" :aria-label="`选择 ${row.name}`"
                   :checked="isSelected(row)" @click.stop @change="toggleSelect(row)" /></label>
                 <div :class="mode === 'list' ? 'name-cell clickable' : 'tile-content'" @click="mobile && selecting ? toggleSelect(row) : openEntry(row)">
@@ -376,16 +378,16 @@
     <BoundedImagePreview v-if="viewerShow" v-model:index="viewerIndex"
       :entries="displayEntries" :count="displayEntries.length" :base="cur" @close="viewerShow = false" />
 
-    <PreviewDialog ref="preview" />
-    <DirPicker ref="dirPicker" />
-    <ShareDialog ref="shareDlg" />
+    <component :is="previewComponent" v-if="previewComponent" ref="preview" />
+    <component :is="dirPickerComponent" v-if="dirPickerComponent" ref="dirPicker" />
+    <component :is="shareDlgComponent" v-if="shareDlgComponent" ref="shareDlg" />
     <el-drawer v-if="narrowScreen" v-model="sidebarVisible" :lock-scroll="false" title="导航" direction="ltr" size="min(340px, 92vw)" destroy-on-close>
       <FilesSidebar drawer :current="cur" :tree-key="treeKey" :file-count="info?.files"
         :favorites-active="searchMode && searchView === 'favorites'" @navigate="navigateSidebar" @mkdir="mkdirFromSidebar"
         @refresh="treeKey++" @action="sidebarAction" @app-navigate="sidebarVisible = false" />
     </el-drawer>
-    <ShareManager ref="shareMgr" />
-    <TrashPanel ref="trashPanel" @changed="onTrashChanged" />
+    <component :is="shareMgrComponent" v-if="shareMgrComponent" ref="shareMgr" />
+    <component :is="trashPanelComponent" v-if="trashPanelComponent" ref="trashPanel" @changed="onTrashChanged" />
 
     <ResponsivePanel
       v-model="advancedVisible"
@@ -590,16 +592,18 @@ import {
 import { isDark, toggleDark } from '../theme'
 import FilesSidebar from '../components/FilesSidebar.vue'
 import { useTransfers, useUploadIntake } from '../transfers/context'
-import PreviewDialog from '../components/PreviewDialog.vue'
+import type PreviewDialog from '../components/PreviewDialog.vue'
 import DirectoryMedia from '../components/DirectoryMedia.vue'
 import BoundedImagePreview from '../components/BoundedImagePreview.vue'
 import DirectoryViewport from '../components/DirectoryViewport.vue'
+import { lazyDialog } from '../lazyDialog'
 import { createDirectoryController } from '../directory/controller'
+import { useKeyboardNav } from '../directory/keyboardNav'
 import { deleteBatches, freezeTargets, moveSerial, type OperationProgress } from '../directory/operations'
-import DirPicker from '../components/DirPicker.vue'
-import ShareDialog from '../components/ShareDialog.vue'
-import ShareManager from '../components/ShareManager.vue'
-import TrashPanel from '../components/TrashPanel.vue'
+import type DirPicker from '../components/DirPicker.vue'
+import type ShareDialog from '../components/ShareDialog.vue'
+import type ShareManager from '../components/ShareManager.vue'
+import type TrashPanel from '../components/TrashPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -623,11 +627,21 @@ const fileInput = { click: () => intake.pickFiles(cur.value) }
 function pickDirectory() { intake.targetDirectory.value = cur.value; return intake.pickDirectory() }
 function onDrop(event: DragEvent) { intake.targetDirectory.value = cur.value; return intake.onDrop(event) }
 function onPaste(event: ClipboardEvent) { intake.targetDirectory.value = cur.value; intake.onPaste(event) }
-const preview = ref<InstanceType<typeof PreviewDialog>>()
-const dirPicker = ref<InstanceType<typeof DirPicker>>()
-const shareDlg = ref<InstanceType<typeof ShareDialog>>()
-const shareMgr = ref<InstanceType<typeof ShareManager>>()
-const trashPanel = ref<InstanceType<typeof TrashPanel>>()
+const previewLazy = lazyDialog<InstanceType<typeof PreviewDialog>>(() => import('../components/PreviewDialog.vue'))
+const preview = previewLazy.instance
+const previewComponent = previewLazy.component
+const dirPickerLazy = lazyDialog<InstanceType<typeof DirPicker>>(() => import('../components/DirPicker.vue'))
+const dirPicker = dirPickerLazy.instance
+const dirPickerComponent = dirPickerLazy.component
+const shareDlgLazy = lazyDialog<InstanceType<typeof ShareDialog>>(() => import('../components/ShareDialog.vue'))
+const shareDlg = shareDlgLazy.instance
+const shareDlgComponent = shareDlgLazy.component
+const shareMgrLazy = lazyDialog<InstanceType<typeof ShareManager>>(() => import('../components/ShareManager.vue'))
+const shareMgr = shareMgrLazy.instance
+const shareMgrComponent = shareMgrLazy.component
+const trashPanelLazy = lazyDialog<InstanceType<typeof TrashPanel>>(() => import('../components/TrashPanel.vue'))
+const trashPanel = trashPanelLazy.instance
+const trashPanelComponent = trashPanelLazy.component
 const narrowScreen = compact
 const sidebarVisible = ref(false)
 
@@ -637,8 +651,8 @@ function mkdirFromSidebar() { sidebarVisible.value = false; void mkdir() }
 function sidebarAction(action: 'favorites' | 'trash' | 'shares') {
   sidebarVisible.value = false
   if (action === 'favorites') showFavorites()
-  else if (action === 'trash') trashPanel.value?.open()
-  else shareMgr.value?.open()
+  else if (action === 'trash') void trashPanelLazy.ensure().then((dialog) => dialog.open())
+  else void shareMgrLazy.ensure().then((dialog) => dialog.open())
 }
 const selecting = ref(false)
 const searchOpen = ref(false)
@@ -1069,6 +1083,29 @@ function onGlobalKey(e: KeyboardEvent) {
   }
 }
 
+// ---- 列表键盘操作：仅在列表容器（或其内复选框/按钮）获得焦点时生效，弹窗与输入框自然不受影响。 ----
+const keyNav = useKeyboardNav({
+  entries,
+  indexOf: directory.indexOf,
+  layout: () => directoryViewport.value?.navLayout(),
+  reveal: (index) => directoryViewport.value?.reveal(index),
+  setSelection: directory.setSelection,
+  toggle: directory.toggle,
+  clearSelection: () => setAllSelected(false),
+  open: openEntry,
+  up: () => { if (cur.value !== '/') goto(parentOf(cur.value)) },
+  // 焦点项在多选集合内时删除整个选择，否则只删焦点项；两者都走原有删除确认。
+  remove: (row) => { if (selected.value.length > 1 && isSelected(row)) void removeSelected(); else void onRowCmd('delete', row) },
+  rename: (row) => void rename(row),
+})
+function onListKey(e: KeyboardEvent) {
+  if (mobile.value || searchMode.value) return
+  // 内部按钮/复选框上的回车和空格保留原生行为。
+  const inner = e.target !== e.currentTarget && (e.target as HTMLElement).closest('button, a, input, [role="button"]')
+  if (inner && (e.key === 'Enter' || e.key === ' ')) return
+  keyNav.onKeydown(e)
+}
+
 // ---- 图片预览：只在已加载元数据内导航，最多挂载三张原图。 ----
 const viewerShow = ref(false)
 const viewerIndex = ref(0)
@@ -1153,6 +1190,7 @@ watch(query, () => {
   queryTimer = setTimeout(() => { queryTimer = undefined; void directory.loadMore() }, 250)
 }, { flush: 'sync' })
 watch(cur, () => {
+  keyNav.reset()
   query.value = ''
   finishSelection()
   exitSearch()
@@ -1182,9 +1220,9 @@ function openEntry(row: Entry) {
     const list = displayEntries.value
       .filter((e) => !e.is_dir && isVideo(e.name))
       .map((e) => joinPath(cur.value, e.name))
-    preview.value?.open(joinPath(cur.value, row.name), list)
+    void previewLazy.ensure().then((dialog) => dialog.open(joinPath(cur.value, row.name), list))
   } else {
-    preview.value?.open(joinPath(cur.value, row.name))
+    void previewLazy.ensure().then((dialog) => dialog.open(joinPath(cur.value, row.name)))
   }
 }
 
@@ -1257,16 +1295,16 @@ async function onRowCmd(cmd: string, row: Entry) {
   }
   try {
     if (cmd === 'share') {
-      shareDlg.value?.open(src, row.name)
+      void shareDlgLazy.ensure().then((dialog) => dialog.open(src, row.name))
     } else if (cmd === 'move') {
-      const target = await dirPicker.value!.open(`移动「${row.name}」到`, base)
+      const target = await (await dirPickerLazy.ensure()).open(`移动「${row.name}」到`, base)
       if (target === null || target === base) return
       await api.rename(src, joinPath(target, row.name))
       if (row.is_dir) treeKey.value++
       ElMessage.success(`已移动到 ${target}`)
       refreshAfterMutation(base, version)
     } else if (cmd === 'copy') {
-      const target = await dirPicker.value!.open(`复制「${row.name}」到`, base)
+      const target = await (await dirPickerLazy.ensure()).open(`复制「${row.name}」到`, base)
       if (target === null) return
       const { value } = await appPrompt({
         title: '复制为',
@@ -1304,7 +1342,7 @@ async function moveSelected() {
   if (!targets.length) return
   batchBusy = true
   try {
-    const target = await dirPicker.value!.open(`移动 ${targets.length} 项到`, base)
+    const target = await (await dirPickerLazy.ensure()).open(`移动 ${targets.length} 项到`, base)
     if (target === null || target === base) return
     showBatchProgress({ completed: 0, total: targets.length, failed: 0 })
     const failed = await moveSerial(targets, target, api.rename, showBatchProgress)

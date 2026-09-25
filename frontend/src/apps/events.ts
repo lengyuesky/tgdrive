@@ -14,6 +14,11 @@ const MAX_EVENT_PATHS = 64
 const listeners = new Set<(event: HostEventPayload) => void>()
 let source: EventSource | null = null
 let wasConnected = false
+/** 浏览器只对网络中断自动重连；服务端回 401/502 等状态时连接直接关闭，需要自行退避重连。 */
+const RETRY_MIN_MS = 1_000
+const RETRY_MAX_MS = 30_000
+let retryDelay = RETRY_MIN_MS
+let retryTimer: ReturnType<typeof setTimeout> | undefined
 
 function dispatch(event: HostEventPayload) {
   for (const listener of [...listeners]) {
@@ -22,12 +27,22 @@ function dispatch(event: HostEventPayload) {
 }
 
 function connect() {
-  if (source || typeof EventSource === 'undefined') return
+  if (source || retryTimer || typeof EventSource === 'undefined') return
   const stream = new EventSource('/api/events')
   source = stream
   stream.onopen = () => {
+    retryDelay = RETRY_MIN_MS
     if (wasConnected) dispatch({ kind: 'sync.hint' })
     wasConnected = true
+  }
+  stream.onerror = () => {
+    if (stream.readyState !== EventSource.CLOSED || source !== stream) return
+    source = null
+    // 断开期间可能漏掉事件，重连成功后由 onopen 发 sync.hint 让订阅方整体刷新。
+    wasConnected = true
+    clearTimeout(retryTimer)
+    retryTimer = setTimeout(() => { retryTimer = undefined; if (listeners.size) connect() }, retryDelay)
+    retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS)
   }
   for (const name of ['app.storage', 'app.settings', 'app.scope', 'files'] as const) {
     stream.addEventListener(name, (event) => {

@@ -73,7 +73,8 @@ async function render() {
   wrapper = shallowMount(Admin, { global: {
     plugins: [ElementPlus], renderStubDefaultSlot: true,
     // 不展开无关弹窗的表格作用域插槽，只检查设置页本身。
-    stubs: { ResponsivePanel: { template: '<div />' } },
+    // 分区子组件是页面本身的一部分，需要真实渲染。
+    stubs: { ResponsivePanel: { template: '<div />' }, OverviewSection: false, QueuesSection: false, LogsSection: false, TelegramSection: false, ProxySection: false, StreamSection: false, AccountSection: false, BackupSection: false, InboxSection: false, AdvancedSection: false },
   } })
   await flushPromises()
   return wrapper

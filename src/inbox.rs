@@ -645,7 +645,38 @@ fn inbox_dir_for<'a>(ex: &'a crate::extras::Extras, name: &str) -> &'a str {
     }
 }
 
-/// 把频道里的一条文件消息登记为网盘单块文件(同名覆盖,与上传语义一致)
+/// 收件目录里同名文件很常见(比如手机发来的 `image.jpg`),依次尝试的编号上限
+const MAX_NAME_SUFFIX: u32 = 999;
+
+/// `image.jpg` → `image (n).jpg`;无扩展名或隐藏文件(`.bashrc`)直接在末尾编号
+fn numbered_name(name: &str, n: u32) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => format!("{} ({n}){}", &name[..dot], &name[dot..]),
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// 在目录里为收件文件占一个不与已有文件、目录或上传中文件重名的上传占位。
+async fn create_unique_uploading(vfs: &Vfs, dir_id: i64, name: &str) -> AppResult<(i64, String)> {
+    for n in 0..=MAX_NAME_SUFFIX {
+        let candidate = if n == 0 {
+            name.to_string()
+        } else {
+            numbered_name(name, n)
+        };
+        if vfs.db.child(dir_id, &candidate).await?.is_some() {
+            continue;
+        }
+        match vfs.db.create_uploading(dir_id, &candidate).await {
+            Ok(node_id) => return Ok((node_id, candidate)),
+            Err(AppError::AlreadyExists | AppError::IsDirectory) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(AppError::AlreadyExists)
+}
+
+/// 把频道里的一条文件消息登记为网盘单块文件;同名时自动编号,不覆盖已有文件
 #[allow(clippy::too_many_arguments)]
 async fn ingest(
     vfs: &Vfs,
@@ -677,7 +708,7 @@ async fn ingest(
 
     let target_dir = inbox_dir_for(ex, &name);
     let dir = vfs.mkdir_p(target_dir).await?;
-    let node_id = vfs.db.create_uploading(dir.id, &name).await?;
+    let (node_id, name) = create_unique_uploading(vfs, dir.id, &name).await?;
     let result = async {
         vfs.db.record_inbox_source(node_id, source).await?;
         vfs.db
@@ -1157,6 +1188,50 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    #[test]
+    fn numbered_name_keeps_extension() {
+        assert_eq!(numbered_name("image.jpg", 1), "image (1).jpg");
+        assert_eq!(numbered_name("a.tar.gz", 2), "a.tar (2).gz");
+        assert_eq!(numbered_name("README", 3), "README (3)");
+        assert_eq!(numbered_name(".bashrc", 1), ".bashrc (1)");
+    }
+
+    #[tokio::test]
+    async fn same_name_files_are_numbered_instead_of_overwritten() {
+        let (vfs, cfg, _mock, _pool, server, _dir) = test_vfs().await;
+        let mut ex = extras();
+        ex.inbox_channel_enabled = true;
+        // 目标目录里已有同名目录:收件文件既不能覆盖它,也不能因此失败
+        let dir = vfs.mkdir_p("/阅读").await.unwrap();
+        vfs.db.mkdir(dir.id, "channel (2).pdf").await.unwrap();
+        for message_id in [7, 8, 9] {
+            let mut raw = channel_update();
+            raw["update_id"] = json!(100 + message_id);
+            raw["channel_post"]["message_id"] = json!(message_id);
+            raw["channel_post"]["document"]["file_id"] = json!(format!("file-{message_id}"));
+            handle_update(
+                &reqwest::Client::new(),
+                &vfs,
+                &cfg,
+                &ex,
+                &serde_json::from_value(raw).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        for (path, msg) in [
+            ("/阅读/channel.pdf", 7),
+            ("/阅读/channel (1).pdf", 8),
+            ("/阅读/channel (3).pdf", 9),
+        ] {
+            let node = vfs.resolve(path).await.unwrap();
+            let chunks = vfs.db.chunks_of(node.id).await.unwrap();
+            assert_eq!(chunks[0].tg_message_id, msg, "{path}");
+        }
+        assert!(vfs.resolve("/阅读/channel (2).pdf").await.unwrap().is_dir);
+        server.abort();
     }
 
     #[tokio::test]

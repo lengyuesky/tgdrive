@@ -45,12 +45,64 @@ pub struct Config {
     pub secret: Option<String>,
     /// 由 HTTPS 提供服务时给认证 Cookie 加上 Secure 属性。
     pub cookie_secure: bool,
+    /// 可信反向代理（IP 或 CIDR）；只有来自这些地址的 `X-Forwarded-For` 才被采信。
+    pub trusted_proxies: Vec<crate::security::IpCidr>,
     /// Telegram 应用凭据：tgdrive 用于 MTProto Range 下载，compose 中的
     /// telegram-bot-api 服务也会读取；改动后需重启/重建两个服务。
     pub telegram_api_id: String,
     pub telegram_api_hash: String,
     /// 单块以内的视频文件改用 sendVideo 发送,在 Telegram 里可直接播放
     pub send_video: bool,
+}
+
+// ---------- 进程级环境变量 ----------
+//
+// 配置来源与优先级（全项目统一）：
+// 1. 环境变量（.env）：启动参数与各项默认值，只在这里读取；
+// 2. settings 表 `cfg.*`：后台保存的 Telegram/上传/账号配置，覆盖同名环境变量；
+// 3. settings 表 `extra.*`：只能在后台修改的维护设置，没有对应环境变量。
+// 下面这些只在启动时生效、不进 `Config` 的项（健康检查等不需要完整配置的入口也要用）
+// 也统一从这里读，调用方不直接访问 `std::env`。
+
+/// 自建 Bot API 本地文件根目录（`--local` 返回的绝对路径只能从这里读）。
+pub fn local_data_root() -> PathBuf {
+    env_opt("TGDRIVE_LOCAL_DATA_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCAL_DATA_ROOT))
+}
+
+/// 与 telegram-bot-api 容器约定的重启信号文件。
+pub fn bot_api_restart_file() -> Option<PathBuf> {
+    env_opt("TGDRIVE_BOT_API_RESTART_FILE").map(PathBuf::from)
+}
+
+/// 显式指定的静态前端目录；未设置时自动探测。
+pub fn static_dir() -> Option<String> {
+    env_opt("TGDRIVE_STATIC_DIR")
+}
+
+/// 监听地址原文；健康检查子命令不加载完整配置，只需要端口。
+pub fn listen_raw() -> String {
+    env_opt("TGDRIVE_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into())
+}
+
+/// 日志过滤表达式（仅展示用，实际由 tracing 读取）。
+pub fn log_filter() -> Option<String> {
+    env_opt("RUST_LOG")
+}
+
+/// 应用目录来源：(本地目录, 是否启用远程, GitHub 仓库)。
+pub fn app_catalog_env() -> (Option<PathBuf>, Option<String>, Option<String>) {
+    (
+        env_opt("TGDRIVE_APP_CATALOG_DIR").map(PathBuf::from),
+        env_opt("TGDRIVE_APP_CATALOG_REMOTE_ENABLED"),
+        env_opt("TGDRIVE_APP_GITHUB_REPO"),
+    )
+}
+
+/// 环境变量是否设置了非空值；后台据此标注每项配置来自 .env 还是数据库。
+pub fn env_present(key: &str) -> bool {
+    env_opt(key).is_some()
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -211,9 +263,7 @@ impl Config {
             tmp_dir: env_opt("TGDRIVE_TMP_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir),
-            local_data_root: env_opt("TGDRIVE_LOCAL_DATA_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCAL_DATA_ROOT)),
+            local_data_root: local_data_root(),
             // 账号是唯一必填项:没有它就没法登录后台去配其余部分
             username: env_required("TGDRIVE_USERNAME")?,
             password: env_required("TGDRIVE_PASSWORD")?,
@@ -223,6 +273,11 @@ impl Config {
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("TGDRIVE_COOKIE_SECURE 无效: {e}"))?
                 .unwrap_or(false),
+            trusted_proxies: env_opt("TGDRIVE_TRUSTED_PROXIES")
+                .map(|v| crate::security::parse_trusted_proxies(&v))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("TGDRIVE_TRUSTED_PROXIES 无效: {e}"))?
+                .unwrap_or_default(),
             telegram_api_id: env_opt("TELEGRAM_API_ID").unwrap_or_default(),
             telegram_api_hash: env_opt("TELEGRAM_API_HASH").unwrap_or_default(),
             send_video,

@@ -21,6 +21,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 const FILE_PATH_TTL: Duration = Duration::from_secs(30 * 60);
 const FILE_PATH_CACHE_CAPACITY: usize = 4096;
 const MAX_RETRIES: u32 = 5;
+/// 小型 Bot API 调用（删除消息、探测）的整体超时；卡住的请求不能拖住整个删除队列。
+const API_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Telegram 建议同一聊天不要持续超过每秒一条消息。这里只错开发送请求的
 /// 起始时间，大文件仍可并行传输，不会把上传并发重新退化成串行。
 const MEDIA_SEND_INTERVAL: Duration = Duration::from_millis(1100);
@@ -735,23 +737,15 @@ impl TgClient {
         Ok(TgClient {
             network,
             bot_api_restart_file: (restart_enabled && !crate::config::is_official(&api_base))
-                .then(|| std::env::var("TGDRIVE_BOT_API_RESTART_FILE").ok())
-                .flatten()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(Into::into),
+                .then(crate::config::bot_api_restart_file)
+                .flatten(),
             bot_api_restart_enabled: AtomicBool::new(restart_enabled),
             api_base,
             token: token.to_string(),
             chat_id: chat_id.to_string(),
             path_cache: Mutex::new(FilePathCache::default()),
             media_throttle: MediaSendThrottle::new(MEDIA_SEND_INTERVAL),
-            local_data_root: std::env::var("TGDRIVE_LOCAL_DATA_ROOT")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(Into::into)
-                .unwrap_or_else(|| crate::config::DEFAULT_LOCAL_DATA_ROOT.into()),
+            local_data_root: crate::config::local_data_root(),
             mtproto,
         })
     }
@@ -770,8 +764,10 @@ impl TgClient {
 
     async fn raw_me(&self) -> AppResult<RawUser> {
         let url = self.method_url("getMe");
-        self.call_with_retry("getMe", || self.http().get(&url).send())
-            .await
+        self.call_with_retry("getMe", || {
+            self.http().get(&url).timeout(API_CALL_TIMEOUT).send()
+        })
+        .await
     }
 
     /// 验证 Bot 身份、目标会话以及频道/群组内的发消息和删除权限。
@@ -792,6 +788,7 @@ impl TgClient {
                 self.http()
                     .post(&get_chat_url)
                     .json(&serde_json::json!({ "chat_id": self.chat_id }))
+                    .timeout(API_CALL_TIMEOUT)
                     .send()
             })
             .await?;
@@ -806,6 +803,7 @@ impl TgClient {
                             "chat_id": self.chat_id,
                             "user_id": user.id,
                         }))
+                        .timeout(API_CALL_TIMEOUT)
                         .send()
                 })
                 .await?;
@@ -1279,6 +1277,7 @@ impl TgApi for TgClient {
                         "chat_id": self.chat_id,
                         "message_id": message_id,
                     }))
+                    .timeout(API_CALL_TIMEOUT)
                     .send()
             })
             .await;

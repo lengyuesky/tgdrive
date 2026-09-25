@@ -700,3 +700,68 @@ pub(super) async fn media(
     }
     Ok(response)
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    fn headers(name: header::HeaderName, value: &str) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        map.insert(name, value.parse().unwrap());
+        map
+    }
+
+    #[test]
+    fn accept_encoding_prefers_brotli_and_honours_q_zero() {
+        let names = |value: &str| -> Vec<&str> {
+            accepted_encodings(&headers(header::ACCEPT_ENCODING, value))
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+        assert_eq!(names("gzip, br"), ["br", "gzip"]);
+        assert_eq!(names("br;q=0, gzip"), ["gzip"]);
+        assert_eq!(names("x-gzip"), ["gzip"]);
+        assert_eq!(names("*"), ["br", "gzip"]);
+        assert_eq!(names("*, gzip;q=0"), ["br"]);
+        assert_eq!(names("identity"), Vec::<&str>::new());
+        assert!(accepted_encodings(&HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn etag_matching_covers_lists_and_wildcard() {
+        let plain = etag_for("d", "app.js", None);
+        let gzip = etag_for("d", "app.js", Some("gzip"));
+        assert_eq!(plain, "\"d:app.js\"");
+        assert_eq!(gzip, "\"d:app.js:gzip\"");
+        let candidates = [plain.clone(), gzip.clone()];
+        let hit =
+            |value: &str| if_none_match_hits(&headers(header::IF_NONE_MATCH, value), &candidates);
+        assert_eq!(hit("\"x\", \"d:app.js:gzip\""), Some(gzip));
+        assert_eq!(hit("*"), Some(plain));
+        assert_eq!(hit("\"other\""), None);
+    }
+
+    #[test]
+    fn sandbox_csp_only_echoes_safe_hosts() {
+        let safe = HeaderValue::from_static("pan.example:8080");
+        let csp = sandbox_csp(Some(&safe));
+        assert!(csp.starts_with("sandbox allow-scripts;"));
+        assert!(
+            csp.contains("connect-src 'self' http://pan.example:8080 https://pan.example:8080;")
+        );
+        // 带引号或分号的 Host 可能注入额外指令，必须退回不带主机的策略。
+        let evil = HeaderValue::from_static("evil.example; script-src *");
+        let fallback = sandbox_csp(Some(&evil));
+        assert!(!fallback.contains("evil"));
+        assert_eq!(fallback, sandbox_csp(None));
+    }
+
+    #[test]
+    fn batch_excludes_interactive_and_byte_methods() {
+        assert!(batchable("files.list"));
+        assert!(batchable("settings.get"));
+        assert!(!batchable("batch"));
+        assert!(!batchable("files.read"));
+    }
+}

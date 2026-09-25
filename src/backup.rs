@@ -339,6 +339,7 @@ async fn create_snapshot(vfs: &Vfs, runtime: &Runtime) -> AppResult<Snapshot> {
         .to_str()
         .ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
     vfs.db.vacuum_into(path_str).await?;
+    scrub_snapshot(path_str).await?;
     let len = tokio::fs::metadata(&path).await?.len();
     let ts = now_ts();
     Ok(Snapshot {
@@ -348,6 +349,37 @@ async fn create_snapshot(vfs: &Vfs, runtime: &Runtime) -> AppResult<Snapshot> {
         name: format!("tgdrive-backup-{}.db", fmt_compact_utc8(ts)),
         ts,
     })
+}
+
+/// 快照会离开本机，恢复时用不到的凭据一律删掉。
+/// Bot Token 必须保留：分块的 file_id 只能由对应 Bot 下载。
+const SCRUBBED_SETTINGS: &[&str] = &[
+    crate::auth::SECRET_KEY,
+    "cfg.password",
+    "cfg.telegram_api_hash",
+    "extra.backup_webdav_password",
+    "extra.backup_s3_secret_key",
+    "extra.backup_s3_session_token",
+];
+
+async fn scrub_snapshot(path: &str) -> AppResult<()> {
+    use sqlx::Connection;
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(path);
+    let mut conn = sqlx::SqliteConnection::connect_with(&opts).await?;
+    for key in SCRUBBED_SETTINGS {
+        sqlx::query("DELETE FROM settings WHERE k = ?")
+            .bind(key)
+            .execute(&mut conn)
+            .await?;
+    }
+    // MTProto 会话等同登录凭据，恢复后会用 Bot Token 重新登录。
+    sqlx::query("DELETE FROM settings WHERE k LIKE 'mtproto.session.%'")
+        .execute(&mut conn)
+        .await?;
+    // 重写文件，确保被删的值不残留在空闲页里。
+    sqlx::query("VACUUM").execute(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
 }
 
 async fn mark_success(db: &Db, destination: Destination, ts: i64) -> AppResult<()> {
@@ -1077,6 +1109,46 @@ mod tests {
             inbox_rules: Vec::new(),
             auto_delete_message: false,
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_scrub_removes_credentials_but_keeps_bot_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.db");
+        let path = path.to_str().unwrap();
+        {
+            use sqlx::Connection;
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(true);
+            let mut conn = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
+            sqlx::query("CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            for (k, v) in [
+                ("secret", "sign-key-XYZ"),
+                ("cfg.password", "hunter2-XYZ"),
+                ("cfg.bot_token", "123:bot"),
+                ("mtproto.session.1", "authkey-XYZ"),
+                ("extra.backup_s3_secret_key", "s3-XYZ"),
+            ] {
+                sqlx::query("INSERT INTO settings (k, v) VALUES (?, ?)")
+                    .bind(k)
+                    .bind(v)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            conn.close().await.unwrap();
+        }
+        scrub_snapshot(path).await.unwrap();
+        let raw = std::fs::read(path).unwrap();
+        assert!(
+            !raw.windows(4).any(|w| w == b"-XYZ"),
+            "凭据残留在快照文件里"
+        );
+        assert!(raw.windows(7).any(|w| w == b"123:bot"));
     }
 
     #[test]

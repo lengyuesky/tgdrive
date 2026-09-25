@@ -184,7 +184,9 @@ async fn serve() -> anyhow::Result<()> {
         auth,
         rt,
         dav: dav_handler,
-        attempts: crate::security::AttemptLimiter::default(),
+        attempts: crate::security::AttemptLimiter::with_trusted_proxies(
+            env_cfg.trusted_proxies.clone(),
+        ),
         tasks: tasks.clone(),
         migration: migration.clone(),
         apps_catalog,
@@ -235,8 +237,7 @@ async fn serve() -> anyhow::Result<()> {
         .nest("/api", api::router(state.clone()));
 
     // 前端静态文件(SPA fallback 到 index.html);候选目录都不存在则只提供 API
-    let static_dir = std::env::var("TGDRIVE_STATIC_DIR")
-        .ok()
+    let static_dir = crate::config::static_dir()
         .into_iter()
         .chain(["static".to_string(), "frontend/dist".to_string()])
         .find(|d| std::path::Path::new(d).is_dir());
@@ -257,7 +258,7 @@ async fn serve() -> anyhow::Result<()> {
             cookie_secure,
             crate::security::response_headers,
         ))
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(axum::middleware::from_fn(crate::security::access_log));
 
     tracing::info!(
         listen = %listen,
@@ -361,7 +362,7 @@ async fn check() -> anyhow::Result<()> {
 
 /// 容器 HEALTHCHECK:只依赖 TGDRIVE_LISTEN,不需要完整配置
 async fn healthcheck() -> anyhow::Result<()> {
-    let listen = std::env::var("TGDRIVE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let listen = crate::config::listen_raw();
     let port = listen.rsplit(':').next().unwrap_or("8080");
     let url = format!("http://127.0.0.1:{port}/healthz");
     let resp = reqwest::Client::builder()

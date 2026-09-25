@@ -132,30 +132,11 @@ impl Vfs {
             if self.db.is_ancestor(src.id, dst_parent.id).await? {
                 return Err(AppError::BadRequest("不能把目录复制到自己内部".into()));
             }
-            self.copy_dir(src.id, dst_parent.id, &dst_name).await
+            self.db.copy_tree(src.id, dst_parent.id, &dst_name).await
         } else {
             self.db.copy_file(src.id, dst_parent.id, &dst_name).await?;
             Ok(())
         }
-    }
-
-    fn copy_dir<'a>(
-        &'a self,
-        src_id: i64,
-        dst_parent: i64,
-        dst_name: &'a str,
-    ) -> futures_util::future::BoxFuture<'a, AppResult<()>> {
-        Box::pin(async move {
-            let new_dir = self.db.mkdir(dst_parent, dst_name).await?;
-            for child in self.db.list_children(src_id).await? {
-                if child.is_dir {
-                    self.copy_dir(child.id, new_dir.id, &child.name).await?;
-                } else {
-                    self.db.copy_file(child.id, new_dir.id, &child.name).await?;
-                }
-            }
-            Ok(())
-        })
     }
 
     /// 打开文件读取流,start 为文件内起始偏移

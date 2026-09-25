@@ -37,12 +37,17 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "fs", "trace"] }
+tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # 预压缩在安装时运行：压缩库在 dev 构建也按优化编译，浏览器测试夹具安装真实插件包不至于慢几十倍。
+[profile.release]
+# 单二进制服务：瘦 LTO 与去符号换更小的镜像，编译时间增加有限。
+lto = "thin"
+strip = true
+
 [profile.dev.package.brotli]
 opt-level = 3
 [profile.dev.package.brotli-decompressor]

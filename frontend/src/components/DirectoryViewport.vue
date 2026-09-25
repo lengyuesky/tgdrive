@@ -8,7 +8,9 @@
         {{ row(index).group!.label }} · 已加载 {{ row(index).group!.count }} 项
       </div>
       <div v-else class="directory-row" :class="mode" :style="{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }">
-        <div v-for="entry in rowEntries(index)" :key="entry.id" class="directory-cell" :data-entry-id="entry.id">
+        <div v-for="entry in rowEntries(index)" :id="`entry-${entry.id}`" :key="entry.id" class="directory-cell"
+          :class="{ 'kb-focus': entry.id === focusId }" role="option" :aria-selected="selectedIds?.has(entry.id) ?? false"
+          :data-entry-id="entry.id">
           <slot :entry="entry" :mode="mode" :generation="generation"
             :media-key="`${entry.id}:${entry.modified_at}:${entry.size}:${entry.sha256 ?? ''}`" />
         </div>
@@ -22,6 +24,7 @@
 import { computed, nextTick, ref, shallowRef, triggerRef, watch } from 'vue'
 import type { DirectoryEntry } from '../api'
 import { TimelineRows, type DirectoryRow, type DirectoryView } from '../directory/layout'
+import type { NavLayout } from '../directory/keyboardNav'
 import VirtualViewport from './VirtualViewport.vue'
 import { mobile } from '../mobile/viewport'
 const props = withDefaults(defineProps<{
@@ -32,7 +35,10 @@ const props = withDefaults(defineProps<{
   generation: number
   revision: number
   indexOf: (id: number) => number | undefined
-}>(), { active: true })
+  /** 键盘焦点条目 id，仅用于描边样式。 */
+  focusId?: number
+  selectedIds?: ReadonlySet<number>
+}>(), { active: true, focusId: undefined, selectedIds: undefined })
 defineEmits<{ nearEnd: []; scroll: [offset: number] }>()
 const viewport = ref<InstanceType<typeof VirtualViewport>>()
 const width = ref(800)
@@ -87,12 +93,32 @@ async function resize(nextWidth: number) {
     if (index !== undefined) viewport.value?.scrollToIndex(props.mode === 'timeline' ? timeline.value.rowOf(index) : Math.floor(index / columns.value))
   }
 }
-defineExpose({ restoreOffset: (offset: number) => viewport.value?.restoreOffset(offset) })
+/** 键盘导航用的行布局（与渲染同源，时间线含分组标题行）。 */
+function navLayout(): NavLayout {
+  return {
+    count: props.entries.length, rowCount: rowCount.value, columns: props.mode === 'list' ? 1 : columns.value,
+    pageRows: Math.max(1, Math.floor((viewport.value?.viewportHeight() ?? 600) / rowHeight.value)),
+    rowOf: (index) => props.mode === 'timeline' ? timeline.value.rowOf(index) : Math.floor(index / columns.value),
+    row: (index) => index >= 0 && index < rowCount.value ? row(index) : undefined,
+  }
+}
+/** 把条目所在虚拟行滚到可见（已可见则不动）。 */
+function reveal(index: number) {
+  const layout = navLayout()
+  const rowIndex = layout.rowOf(index)
+  // 时间线首行前是日期标题，一并露出。
+  const target = props.mode === 'timeline' && rowIndex > 0 && row(rowIndex - 1)?.group ? rowIndex - 1 : rowIndex
+  viewport.value?.scrollToIndex(target, 'auto')
+}
+defineExpose({ restoreOffset: (offset: number) => viewport.value?.restoreOffset(offset), navLayout, reveal })
 </script>
 
 <style scoped>
 .directory-row { display: grid; gap: 12px; height: 100%; padding: 4px 0 8px; box-sizing: border-box; }
 .directory-row.list { padding: 0; gap: 0; }
-.directory-cell { min-width: 0; overflow: hidden; }
+.directory-cell { min-width: 0; overflow: hidden; border-radius: 8px; }
+/* 键盘焦点：仅在列表容器获得键盘焦点时显示，内描边避免被 overflow 裁掉；暗色主题下主色依旧清晰。 */
+.virtual-viewport:focus-visible .directory-cell.kb-focus,
+.virtual-viewport:focus .directory-cell.kb-focus { outline: 2px solid var(--el-color-primary); outline-offset: -2px; box-shadow: inset 0 0 0 4px color-mix(in srgb, var(--el-color-primary) 22%, transparent); }
 .timeline-heading { font-weight: 600; line-height: 36px; padding-left: 6px; }
 </style>

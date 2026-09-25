@@ -133,6 +133,7 @@ async fn state_at(path: &std::path::Path, media: Arc<MemoryMedia>) -> AppState {
         password: "apps-test-only".into(),
         secret: None,
         cookie_secure: false,
+        trusted_proxies: Vec::new(),
         telegram_api_id: String::new(),
         telegram_api_hash: String::new(),
         send_video: false,

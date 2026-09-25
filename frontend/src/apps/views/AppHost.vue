@@ -88,8 +88,6 @@ function dispose() {
   port = undefined
   clearTimeout(timeout)
   clearInterval(poll)
-  offHostEvents?.()
-  offHostEvents = undefined
   connected.value = false
   launch.value = null
 }
@@ -333,6 +331,8 @@ onMounted(() => {
 })
 onUnmounted(() => {
   dispose()
+  offHostEvents?.()
+  offHostEvents = undefined
   window.removeEventListener('message', onReady)
   window.removeEventListener(APPS_CHANGED, checkState)
   window.removeEventListener('storage', onStorage)

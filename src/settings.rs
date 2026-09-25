@@ -225,11 +225,7 @@ impl RuntimeCfg {
     }
 }
 
-fn env_present(key: &str) -> bool {
-    std::env::var(key)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-}
+use crate::config::env_present;
 
 /// 前端提交的改动;`None` 表示该项不动
 #[derive(Deserialize, Default)]
@@ -678,11 +674,11 @@ impl Runtime {
             ("cookie_secure", self.env.cookie_secure.to_string()),
             (
                 "static_dir",
-                std::env::var("TGDRIVE_STATIC_DIR").unwrap_or_else(|_| "(自动探测)".into()),
+                crate::config::static_dir().unwrap_or_else(|| "(自动探测)".into()),
             ),
             (
                 "log_level",
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+                crate::config::log_filter().unwrap_or_else(|| "info".into()),
             ),
         ]
     }
@@ -760,6 +756,7 @@ mod tests {
             password: "envpass".into(),
             secret: None,
             cookie_secure: false,
+            trusted_proxies: Vec::new(),
             telegram_api_id: String::new(),
             telegram_api_hash: String::new(),
             send_video: false,

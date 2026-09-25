@@ -150,8 +150,20 @@ const errorCount = computed(() => statusCounts.error)
 const needsFileCount = computed(() => statusCounts.needs_file)
 const cancellingCount = computed(() => statusCounts.cancelling)
 const resumableCount = pausedCount
-const retryableCount = errorCount
+/** 无需重新选择文件即可重试：仍持有文件，或分块已全部上传只差收尾。 */
+function canRetryWithoutPrompt(item: Item) {
+  return item.status === 'error' && !item.cancelled && (
+    Boolean(item.file)
+    || Boolean(item.session && item.session.uploaded_parts.length === item.session.part_count)
+  )
+}
+// 与「全部重试」实际处理的任务保持一致；需要重新选择文件的失败项单独逐个处理。
+const retryableCount = computed(() => (
+  errorCount.value ? items.value.filter(canRetryWithoutPrompt).length : 0
+))
 
+/** 分块请求体连续这么久没有上传进度即中止，交给失败重试处理。 */
+const PART_STALL_MS = 120_000
 const MAX_BUFFERED_FILES = /Firefox\//i.test(navigator.userAgent) ? 100 : 600
 let capacityClosed = false
 const sessionController = new AbortController()
@@ -181,8 +193,9 @@ function wakeCapacityWaiters() {
   for (const resolve of capacityWaiters.splice(0)) resolve()
 }
 
-function setDeferredFileCount(count: number) {
-  if (!capacityClosed) deferredFileCount.value = Math.max(0, Math.floor(count))
+/** 多个扫描可并行登记各自尚未读取的文件数，计数累加。 */
+function addDeferredFiles(count: number) {
+  if (!capacityClosed) deferredFileCount.value += Math.max(0, Math.floor(count))
 }
 
 function consumeDeferredFiles(count: number) {
@@ -237,7 +250,7 @@ function tone(item: Item): 'ok' | 'err' | 'run' | 'idle' {
 }
 
 let seq = 0
-let busy = false
+let fileWorkers = 0
 let defaultConcurrency = 1
 let uploadLimit = 1
 let activeUploads = 0
@@ -353,6 +366,7 @@ function setUploadConcurrency(value: number, botCount?: number) {
   uploadLimit = normalized
   drainUploadSlots()
   wakeUploadGate()
+  pump()
 }
 
 /** 数组只追加、游标只前进，避免 shift/includes 在万级队列上退化为 O(n²)。 */
@@ -803,7 +817,7 @@ function resumeAll() {
 
 function retryAll() {
   if (batchBusy.value) return
-  const targets = items.value.filter((item) => item.status === 'error' && Boolean(item.file))
+  const targets = items.value.filter(canRetryWithoutPrompt)
   targets.forEach(retry)
   if (targets.length) ElMessage.success(`已重新排队 ${targets.length} 个失败任务`)
 }
@@ -1179,12 +1193,26 @@ async function uploadMissingParts(item: Item, generation: number) {
         item.controllers.add(controller)
         activeBytes.set(index, 0)
         let retryInterrupted = false
+        // 请求体发送阶段长时间没有进度视为停滞；发完后服务端还要转传 Telegram，不计时。
+        let sentBytes = 0
+        let lastProgressAt = Date.now()
+        let stalled = false
+        const stallTimer = window.setInterval(() => {
+          if (sentBytes < data.size && Date.now() - lastProgressAt > PART_STALL_MS) {
+            stalled = true
+            controller.abort()
+          }
+        }, 5000)
         try {
           await api.uploads.part(
             session.id,
             index,
             data,
             (loaded) => {
+              if (loaded > sentBytes) {
+                sentBytes = loaded
+                lastProgressAt = Date.now()
+              }
               if (!isCurrent(item, generation)) return
               activeBytes.set(index, Math.min(loaded, data.size))
               updateProgress()
@@ -1196,8 +1224,9 @@ async function uploadMissingParts(item: Item, generation: number) {
           activeBytes.delete(index)
           item.error = undefined
           updateProgress(true)
-        } catch (error) {
+        } catch (caught) {
           activeBytes.delete(index)
+          const error = stalled ? new Error('分块上传停滞，网络长时间无进度') : caught
           if (
             isUploadInterrupted(error) &&
             restartRetries < 5 &&
@@ -1216,6 +1245,7 @@ async function uploadMissingParts(item: Item, generation: number) {
             for (const active of item.controllers) active.abort()
           }
         } finally {
+          window.clearInterval(stallTimer)
           item.controllers.delete(controller)
           release()
         }
@@ -1359,37 +1389,42 @@ async function processItem(item: Item) {
   await uploadMissingParts(item, generation)
 }
 
-async function pump() {
-  if (capacityClosed || busy) return
-  busy = true
-  const fileWorker = async () => {
-    while (queueHead < queue.length) {
-      const itemId = queue[queueHead++]!
-      if (!queuedIds.delete(itemId)) continue
-      const item = itemById.get(itemId)
-      if (!item || item.cancelled) continue
-      const generation = item.generation
-      try {
-        await processItem(item)
-      } catch (error) {
-        if (isCurrent(item, generation) && !item.pauseRequested) {
-          setItemStatus(item, 'error')
-          item.error = errMsg(error)
-        }
+/** 文件管线目标数随并发动态变化；运行中调高并发会立即补开管线。 */
+function fileWorkerTarget() {
+  return Math.max(1, Math.min(defaultConcurrency, MAX_ACTIVE_FILES))
+}
+
+async function fileWorker() {
+  while (!capacityClosed && queueHead < queue.length && fileWorkers <= fileWorkerTarget()) {
+    const itemId = queue[queueHead++]!
+    if (!queuedIds.delete(itemId)) continue
+    const item = itemById.get(itemId)
+    if (!item || item.cancelled) continue
+    const generation = item.generation
+    try {
+      await processItem(item)
+    } catch (error) {
+      if (isCurrent(item, generation) && !item.pauseRequested) {
+        setItemStatus(item, 'error')
+        item.error = errMsg(error)
       }
     }
   }
-  try {
-    const workerCount = Math.max(1, Math.min(defaultConcurrency, MAX_ACTIVE_FILES))
-    await Promise.all(Array.from({ length: workerCount }, () => fileWorker()))
-  } finally {
-    busy = false
-    if (queueHead >= queue.length) {
-      queue.length = 0
-      queueHead = 0
-    }
-    // worker 刚退出时若又有任务入队，主动开启下一轮，避免任务滞留。
-    if (queueHead < queue.length) void pump()
+}
+
+function pump() {
+  if (capacityClosed) return
+  while (fileWorkers < fileWorkerTarget() && queueHead < queue.length) {
+    fileWorkers += 1
+    void fileWorker().finally(() => {
+      fileWorkers -= 1
+      if (fileWorkers === 0 && queueHead >= queue.length) {
+        queue.length = 0
+        queueHead = 0
+      }
+      // 管线退出时若又有任务入队，主动补开，避免任务滞留。
+      if (queueHead < queue.length) pump()
+    })
   }
 }
 
@@ -1572,6 +1607,6 @@ function dispose() {
 const stopInvalidation = onSessionInvalidated(dispose)
 onBeforeUnmount(() => { stopInvalidation(); dispose() })
 
-return { signal: sessionController.signal, reconcile, syncError, syncing, visible, batchBusy, totalCount, successCount, skippedCount, errorCount, recentSuccessCount, uploadedCount, instantCount, activeCount, pausedCount, needsFileCount, cancellingCount, pendingCount, pauseableCount, resumableCount, retryableCount, preparingFileCount, chunkedExclusiveBusy, hiddenTaskCount, DISPLAY_PENDING_LIMIT, displayedItems, finishedExists, clearFinished, pauseAll, resumeAll, retryAll, cancelAll, tone, displayName, isDone, telegramWaitSeconds, isPauseable, pause, chooseFile, resume, retry, cancelItem, conflictVisible, conflictTotal, conflictNames, onConflictClose, resolveConflict, enqueue, open, resolveUploadConflicts, waitForCapacity, setDeferredFileCount, clearDeferredFiles, onUploaded, onCancelled }
+return { signal: sessionController.signal, reconcile, syncError, syncing, visible, batchBusy, totalCount, successCount, skippedCount, errorCount, recentSuccessCount, uploadedCount, instantCount, activeCount, pausedCount, needsFileCount, cancellingCount, pendingCount, pauseableCount, resumableCount, retryableCount, preparingFileCount, chunkedExclusiveBusy, hiddenTaskCount, DISPLAY_PENDING_LIMIT, displayedItems, finishedExists, clearFinished, pauseAll, resumeAll, retryAll, cancelAll, tone, displayName, isDone, telegramWaitSeconds, isPauseable, pause, chooseFile, resume, retry, cancelItem, conflictVisible, conflictTotal, conflictNames, onConflictClose, resolveConflict, enqueue, open, resolveUploadConflicts, waitForCapacity, addDeferredFiles, releaseDeferredFiles: consumeDeferredFiles, clearDeferredFiles, onUploaded, onCancelled }
 }
 export type TransferController = ReturnType<typeof createTransferController>

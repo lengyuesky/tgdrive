@@ -39,12 +39,11 @@ pub enum CatalogSourceConfig {
 
 impl CatalogSourceConfig {
     pub fn from_env() -> Self {
+        let (directory, remote_enabled, repository) = crate::config::app_catalog_env();
         Self::from_values(
-            std::env::var_os("TGDRIVE_APP_CATALOG_DIR").map(PathBuf::from),
-            std::env::var("TGDRIVE_APP_CATALOG_REMOTE_ENABLED")
-                .ok()
-                .as_deref(),
-            std::env::var("TGDRIVE_APP_GITHUB_REPO").ok().as_deref(),
+            directory,
+            remote_enabled.as_deref(),
+            repository.as_deref(),
             || {
                 ["app-catalog", "apps/catalog"]
                     .into_iter()

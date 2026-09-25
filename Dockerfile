@@ -13,20 +13,19 @@ WORKDIR /app
 # 先编译一个空 main 缓存依赖层,源码变更时无需重编全部依赖
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release \
+    && cargo build --release --locked \
     && rm -rf src
 COPY migrations ./migrations
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked \
+    && mkdir /app/empty-data
 
 # ---------- 阶段 3:运行时 ----------
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && groupadd --gid 1000 tgdrive \
-    && useradd --uid 1000 --gid tgdrive --create-home --shell /usr/sbin/nologin tgdrive \
-    && install -d -o tgdrive -g tgdrive /data \
-    && rm -rf /var/lib/apt/lists/*
+# distroless:无 shell 与包管理器,自带 glibc 与 CA 证书(与构建阶段同为 bookworm)。
+# 镜像内无法 mkdir/chown,/data 由构建阶段建好后以 1000:1000 复制进来,
+# 这样新建的命名卷也继承正确属主。
+FROM gcr.io/distroless/cc-debian12
+COPY --from=backend --chown=1000:1000 /app/empty-data /data
 WORKDIR /app
 COPY --from=backend /app/target/release/tgdrive /usr/local/bin/tgdrive
 COPY --from=frontend /frontend/dist /app/static
@@ -36,7 +35,7 @@ ENV TGDRIVE_STATIC_DIR=/app/static \
     TGDRIVE_LISTEN=0.0.0.0:8080
 VOLUME /data
 EXPOSE 8080
-USER tgdrive
+USER 1000:1000
 # 健康检查用二进制自带子命令,无需安装 curl
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s CMD ["tgdrive", "healthcheck"]
 ENTRYPOINT ["tgdrive"]

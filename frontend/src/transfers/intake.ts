@@ -23,7 +23,9 @@ interface PickerDirectoryHandle {
 const isFirefoxBrowser = /Firefox\//i.test(navigator.userAgent)
 const DIRECTORY_BATCH_SIZE = isFirefoxBrowser ? 25 : 200
 const MAX_SAFE_FIREFOX_DROP_ITEMS = 1000
-let directoryScanGeneration = 0
+let nextScanId = 0
+/** 进行中的扫描 → 该扫描尚未入队的延迟文件数。各扫描互不影响，新选择不会让旧扫描失效。 */
+const activeScans = new Map<number, number>()
 let disposed = false
 const dragging = ref(false)
 let dragDepth = 0
@@ -39,14 +41,30 @@ function onDragLeave() {
   if (dragDepth === 0) dragging.value = false
 }
 
+/** 取消全部扫描（用户取消全部上传或页面卸载）。 */
 function cancelDirectoryScan() {
-  directoryScanGeneration += 1
+  activeScans.clear()
   queue.clearDeferredFiles()
 }
 
 function beginDirectoryScan() {
-  cancelDirectoryScan()
-  return directoryScanGeneration
+  nextScanId += 1
+  activeScans.set(nextScanId, 0)
+  return nextScanId
+}
+
+/** 结束单个扫描，归还它尚未入队的延迟计数。 */
+function endDirectoryScan(scan: number) {
+  const rest = activeScans.get(scan)
+  if (rest === undefined) return
+  activeScans.delete(scan)
+  if (rest > 0) queue.releaseDeferredFiles(rest)
+}
+
+function deferScanFiles(scan: number, count: number) {
+  if (!activeScans.has(scan)) return
+  activeScans.set(scan, count)
+  queue.addDeferredFiles(count)
 }
 
 /**
@@ -64,7 +82,7 @@ async function consumeUploadStream(
   let conflictAction: StreamConflictAction = initialConflictAction
 
   const flush = async () => {
-    if (disposed || generation !== directoryScanGeneration) { batch = []; return false }
+    if (disposed || !activeScans.has(generation)) { batch = []; return false }
     if (!batch.length) return true
     const current = batch
     batch = []
@@ -74,27 +92,32 @@ async function consumeUploadStream(
       conflictAction,
       fromDeferredSource,
     )
-    if (disposed || generation !== directoryScanGeneration) return false
+    // 队列已按本批数量扣减延迟计数，这里同步扣减本扫描的剩余额度。
+    const rest = activeScans.get(generation)
+    if (fromDeferredSource && rest !== undefined) {
+      activeScans.set(generation, Math.max(0, rest - current.length))
+    }
+    if (disposed || !activeScans.has(generation)) return false
     if (selected === 'cancel') {
-      cancelDirectoryScan()
+      endDirectoryScan(generation)
       return false
     }
     if (selected === 'overwrite' || selected === 'skip') conflictAction = selected
-    return generation === directoryScanGeneration
+    return activeScans.has(generation)
   }
 
   const push = async (file: File, rel: string) => {
-    if (disposed || generation !== directoryScanGeneration) return false
+    if (disposed || !activeScans.has(generation)) return false
     if (batch.length === 0) {
       const available = await queue.waitForCapacity(DIRECTORY_BATCH_SIZE)
-      if (!available || generation !== directoryScanGeneration) return false
+      if (!available || !activeScans.has(generation)) return false
     }
     batch.push({ file, rel })
     return batch.length < DIRECTORY_BATCH_SIZE || flush()
   }
 
   await produce(push)
-  if (generation === directoryScanGeneration) await flush()
+  if (activeScans.has(generation)) await flush()
 }
 
 async function walkDirectoryHandle(
@@ -103,9 +126,9 @@ async function walkDirectoryHandle(
   push: (file: File, rel: string) => Promise<boolean>,
   generation: number,
 ): Promise<boolean> {
-  if (disposed || generation !== directoryScanGeneration) return false
+  if (disposed || !activeScans.has(generation)) return false
   for await (const child of handle.values()) {
-    if (disposed || generation !== directoryScanGeneration) return false
+    if (disposed || !activeScans.has(generation)) return false
     if (child.kind === 'file') {
       if (!(await push(await child.getFile(), rel))) return false
       continue
@@ -139,11 +162,10 @@ function fileRelativeDir(file: File) {
   return path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
 }
 
-async function candidatesFromFileList(files: FileList, withRelativePath: boolean) {
+async function candidatesFromFileList(files: FileList, withRelativePath: boolean, generation: number) {
   const candidates: UploadCandidate[] = []
-  const generation = directoryScanGeneration
   for (let index = 0; index < files.length; index += 1) {
-    if (disposed || generation !== directoryScanGeneration) return []
+    if (disposed || !activeScans.has(generation)) return []
     const file = files[index]!
     candidates.push({ name: file.name, rel: withRelativePath ? fileRelativeDir(file) : '' })
     if (index > 0 && index % 500 === 0) {
@@ -158,12 +180,12 @@ async function chooseConflictPolicy(
   candidates: UploadCandidate[],
   generation: number,
 ): Promise<StreamConflictAction | null> {
-  if (disposed || generation !== directoryScanGeneration) return null
+  if (disposed || !activeScans.has(generation)) return null
   const selected = await queue.resolveUploadConflicts(target, candidates)
   // 旧扫描的迟到结果不能取消用户刚开始的新扫描。
-  if (disposed || generation !== directoryScanGeneration) return null
+  if (disposed || !activeScans.has(generation)) return null
   if (!selected || selected === 'cancel') {
-    cancelDirectoryScan()
+    endDirectoryScan(generation)
     return null
   }
   return selected
@@ -201,12 +223,12 @@ async function pickDirectory() {
       root,
       root.name,
       candidates,
-      () => generation === directoryScanGeneration,
+      () => activeScans.has(generation),
     )
-    if (generation !== directoryScanGeneration) return
+    if (!activeScans.has(generation)) return
     const conflictAction = await chooseConflictPolicy(target, candidates, generation)
     if (!conflictAction) return
-    queue.setDeferredFileCount(candidates.length)
+    deferScanFiles(generation, candidates.length)
     try {
       await consumeUploadStream(
         target,
@@ -218,7 +240,7 @@ async function pickDirectory() {
         true,
       )
     } finally {
-      if (generation === directoryScanGeneration) queue.clearDeferredFiles()
+      endDirectoryScan(generation)
     }
   } catch (error) {
     if (!disposed && (error as { name?: string }).name !== 'AbortError') {
@@ -234,13 +256,13 @@ async function onPick(ev: globalThis.Event) {
   if (files?.length) {
     const target = targetDirectory.value
     const generation = beginDirectoryScan()
-    const candidates = await candidatesFromFileList(files, false)
+    const candidates = await candidatesFromFileList(files, false, generation)
     const conflictAction = await chooseConflictPolicy(target, candidates, generation)
     if (!conflictAction) {
       input.value = ''
       return
     }
-    queue.setDeferredFileCount(candidates.length)
+    deferScanFiles(generation, candidates.length)
     try {
       await consumeUploadStream(
         target,
@@ -254,7 +276,7 @@ async function onPick(ev: globalThis.Event) {
         true,
       )
     } finally {
-      if (generation === directoryScanGeneration) queue.clearDeferredFiles()
+      endDirectoryScan(generation)
     }
     input.value = ''
   }
@@ -267,13 +289,13 @@ async function onDirPick(ev: globalThis.Event) {
   if (files?.length) {
     const target = targetDirectory.value
     const generation = beginDirectoryScan()
-    const candidates = await candidatesFromFileList(files, true)
+    const candidates = await candidatesFromFileList(files, true, generation)
     const conflictAction = await chooseConflictPolicy(target, candidates, generation)
     if (!conflictAction) {
       input.value = ''
       return
     }
-    queue.setDeferredFileCount(candidates.length)
+    deferScanFiles(generation, candidates.length)
     try {
       await consumeUploadStream(
         target,
@@ -288,7 +310,7 @@ async function onDirPick(ev: globalThis.Event) {
         true,
       )
     } finally {
-      if (generation === directoryScanGeneration) queue.clearDeferredFiles()
+      endDirectoryScan(generation)
     }
     input.value = ''
   }
@@ -300,7 +322,7 @@ async function walkEntry(
   push: (file: File, rel: string) => Promise<boolean>,
   generation: number,
 ): Promise<boolean> {
-  if (disposed || generation !== directoryScanGeneration) return false
+  if (disposed || !activeScans.has(generation)) return false
   if (entry.isFile) {
     const f = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej))
     return push(f, rel)
@@ -312,7 +334,7 @@ async function walkEntry(
       const batch = await new Promise<FileSystemEntry[]>((res, rej) =>
         reader.readEntries(res, rej),
       )
-      if (disposed || generation !== directoryScanGeneration) return false
+      if (disposed || !activeScans.has(generation)) return false
       if (!batch.length) break
       for (const e of batch) if (!(await walkEntry(e, dirRel, push, generation))) return false
     }
@@ -384,16 +406,16 @@ async function onDrop(ev: DragEvent) {
               root,
               '',
               candidates,
-              () => generation === directoryScanGeneration,
+              () => activeScans.has(generation),
             ))
           ) {
             return
           }
         }
-        if (generation !== directoryScanGeneration) return
+        if (!activeScans.has(generation)) return
         const conflictAction = await chooseConflictPolicy(target, candidates, generation)
         if (!conflictAction) return
-        queue.setDeferredFileCount(candidates.length)
+        deferScanFiles(generation, candidates.length)
         await consumeUploadStream(
           target,
           generation,
@@ -406,7 +428,7 @@ async function onDrop(ev: DragEvent) {
       } catch {
         /* 个别条目读取失败时保留已经进入队列的任务。 */
       } finally {
-        if (generation === directoryScanGeneration) queue.clearDeferredFiles()
+        endDirectoryScan(generation)
       }
       return
     }
@@ -415,10 +437,10 @@ async function onDrop(ev: DragEvent) {
   if (files?.length) {
     const target = targetDirectory.value
     const generation = beginDirectoryScan()
-    const candidates = await candidatesFromFileList(files, false)
+    const candidates = await candidatesFromFileList(files, false, generation)
     const conflictAction = await chooseConflictPolicy(target, candidates, generation)
     if (!conflictAction) return
-    queue.setDeferredFileCount(candidates.length)
+    deferScanFiles(generation, candidates.length)
     try {
       await consumeUploadStream(
         target,
@@ -432,7 +454,7 @@ async function onDrop(ev: DragEvent) {
         true,
       )
     } finally {
-      if (generation === directoryScanGeneration) queue.clearDeferredFiles()
+      endDirectoryScan(generation)
     }
   }
 }

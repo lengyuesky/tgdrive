@@ -11,7 +11,7 @@ use crate::engine::upload::UploadHandle;
 use crate::error::AppError;
 use crate::vfs::Vfs;
 use axum::extract::{Request, State};
-use axum::response::Response;
+use axum::response::{IntoResponse as _, Response};
 use bytes::{Buf, Bytes};
 use dav_server::DavHandler;
 use dav_server::davpath::DavPath;
@@ -35,16 +35,57 @@ pub fn build_handler(vfs: Vfs) -> DavHandler {
 }
 
 /// axum 入口:/dav 全部方法(含 PROPFIND 等扩展方法),Basic 认证失败回 401+挑战头
+///
+/// 只接受 Basic,不认浏览器登录 Cookie:跨站导航带上的 Cookie 不能借 /dav 读写网盘。
 pub async fn dav_handler(State(state): State<AppState>, req: Request) -> Response {
-    if !state.auth.check_headers(req.headers()) {
-        return Response::builder()
-            .status(http::StatusCode::UNAUTHORIZED)
-            .header(http::header::WWW_AUTHENTICATE, "Basic realm=\"tgdrive\"")
-            .body(axum::body::Body::from("未认证"))
-            .expect("响应构造失败");
+    match crate::api::authorize(&state, &req, false) {
+        Ok(()) => {}
+        Err(AppError::Unauthorized) => {
+            return Response::builder()
+                .status(http::StatusCode::UNAUTHORIZED)
+                .header(http::header::WWW_AUTHENTICATE, "Basic realm=\"tgdrive\"")
+                .body(axum::body::Body::from("未认证"))
+                .expect("响应构造失败");
+        }
+        Err(error) => return error.into_response(),
     }
-    let resp = state.dav.handle(req).await;
-    resp.map(axum::body::Body::new)
+    let download = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
+    let mut resp = state.dav.handle(req).await.map(axum::body::Body::new);
+    if download {
+        harden_download(&mut resp);
+    }
+    resp
+}
+
+/// 用户文件与网盘同源:浏览器直接打开 /dav 下的 HTML/SVG/脚本时不得在本站执行。
+/// 一律按附件下载并沙箱化;主动内容改报二进制类型,配合 nosniff 也无法被 `<script>` 引用。
+fn harden_download(resp: &mut Response) {
+    let headers = resp.headers_mut();
+    let active = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .is_some_and(|mime| !crate::api::inline_mime_allowed(&mime));
+    if active {
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/octet-stream"),
+        );
+    }
+    headers.insert(
+        http::header::CONTENT_DISPOSITION,
+        http::HeaderValue::from_static("attachment"),
+    );
+    headers.insert(
+        http::header::CONTENT_SECURITY_POLICY,
+        http::HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
 }
 
 fn app_to_fs(e: AppError) -> FsError {
@@ -379,5 +420,48 @@ impl DavFile for TgDavFile {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod harden_tests {
+    use super::*;
+
+    fn served(mime: &str) -> Response {
+        let mut resp = Response::builder()
+            .header(http::header::CONTENT_TYPE, mime)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        harden_download(&mut resp);
+        resp
+    }
+
+    #[test]
+    fn active_content_is_downloaded_as_binary() {
+        for mime in [
+            "text/html; charset=utf-8",
+            "image/svg+xml",
+            "application/javascript",
+        ] {
+            let resp = served(mime);
+            assert_eq!(
+                resp.headers()[http::header::CONTENT_TYPE],
+                "application/octet-stream"
+            );
+            assert_eq!(
+                resp.headers()[http::header::CONTENT_DISPOSITION],
+                "attachment"
+            );
+        }
+        let png = served("image/png");
+        assert_eq!(png.headers()[http::header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            png.headers()[http::header::CONTENT_DISPOSITION],
+            "attachment"
+        );
+        assert!(
+            png.headers()
+                .contains_key(http::header::CONTENT_SECURITY_POLICY)
+        );
     }
 }

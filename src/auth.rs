@@ -264,33 +264,33 @@ impl Auth {
         self.verify_share_ticket(bearer.trim())
     }
 
-    /// 从请求头判定是否已认证(cookie 或 Basic 任一通过)
-    pub fn check_headers(&self, headers: &http::HeaderMap) -> bool {
-        if let Some(cookie) = headers
+    /// 请求是否携带有效的登录 Cookie
+    pub fn session_cookie_valid(&self, headers: &http::HeaderMap) -> bool {
+        let Some(cookie) = headers
             .get(http::header::COOKIE)
             .and_then(|v| v.to_str().ok())
-        {
-            for kv in cookie.split(';') {
-                if let Some((k, v)) = kv.trim().split_once('=')
-                    && k == COOKIE_NAME
-                    && self.verify_token(v.trim())
-                {
-                    return true;
-                }
-            }
-        }
-        if let Some(auth) = headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            && let Some(b64cred) = auth.strip_prefix("Basic ")
-            && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64cred.trim())
-            && let Ok(s) = String::from_utf8(raw)
-            && let Some((u, p)) = s.split_once(':')
-        {
-            return self.verify_creds(u, p);
-        }
-        false
+        else {
+            return false;
+        };
+        cookie.split(';').any(|kv| {
+            kv.trim()
+                .split_once('=')
+                .is_some_and(|(k, v)| k == COOKIE_NAME && self.verify_token(v.trim()))
+        })
     }
+}
+
+/// 解析 `Authorization: Basic` 凭据;格式不合法视同未提供。
+pub fn basic_credentials(headers: &http::HeaderMap) -> Option<(String, String)> {
+    let auth = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(auth.strip_prefix("Basic ")?.trim())
+        .ok()?;
+    let (user, pass) = String::from_utf8(raw)
+        .ok()?
+        .split_once(':')
+        .map(|(u, p)| (u.to_string(), p.to_string()))?;
+    Some((user, pass))
 }
 
 /// 登录请求体
@@ -363,14 +363,19 @@ mod tests {
             http::header::AUTHORIZATION,
             format!("Basic {cred}").parse().unwrap(),
         );
-        assert!(a.check_headers(&h));
+        let (u, p) = basic_credentials(&h).unwrap();
+        assert!(a.verify_creds(&u, &p));
 
         let bad = base64::engine::general_purpose::STANDARD.encode("u:wrong");
         h.insert(
             http::header::AUTHORIZATION,
             format!("Basic {bad}").parse().unwrap(),
         );
-        assert!(!a.check_headers(&h));
+        let (u, p) = basic_credentials(&h).unwrap();
+        assert!(!a.verify_creds(&u, &p));
+
+        h.insert(http::header::AUTHORIZATION, "Basic !!!".parse().unwrap());
+        assert!(basic_credentials(&h).is_none());
     }
 
     #[test]
@@ -382,7 +387,12 @@ mod tests {
             http::header::COOKIE,
             format!("x=1; {COOKIE_NAME}={t}").parse().unwrap(),
         );
-        assert!(a.check_headers(&h));
+        assert!(a.session_cookie_valid(&h));
+        h.insert(
+            http::header::COOKIE,
+            format!("{COOKIE_NAME}=123.bogus").parse().unwrap(),
+        );
+        assert!(!a.session_cookie_valid(&h));
     }
 
     #[test]

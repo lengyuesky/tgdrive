@@ -24,7 +24,8 @@ let queue: {
   signal: AbortSignal
   enqueue: ReturnType<typeof vi.fn>
   clearDeferredFiles: ReturnType<typeof vi.fn>
-  setDeferredFileCount: ReturnType<typeof vi.fn>
+  addDeferredFiles: ReturnType<typeof vi.fn>
+  releaseDeferredFiles: ReturnType<typeof vi.fn>
   waitForCapacity: ReturnType<typeof vi.fn>
   resolveUploadConflicts: ReturnType<typeof vi.fn>
   onCancelled: ReturnType<typeof vi.fn>
@@ -41,7 +42,7 @@ beforeEach(() => {
   queue = {
     signal: session.signal,
     enqueue: vi.fn().mockResolvedValue(undefined),
-    clearDeferredFiles: vi.fn(), setDeferredFileCount: vi.fn(),
+    clearDeferredFiles: vi.fn(), addDeferredFiles: vi.fn(), releaseDeferredFiles: vi.fn(),
     waitForCapacity: vi.fn().mockResolvedValue(true),
     resolveUploadConflicts: vi.fn().mockResolvedValue('overwrite'),
     onCancelled: vi.fn().mockReturnValue(() => {}),

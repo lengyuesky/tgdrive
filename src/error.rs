@@ -43,11 +43,22 @@ pub enum AppError {
     #[error("上传服务已重启，正在重试")]
     UploadInterrupted,
     #[error("数据库错误: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(sqlx::Error),
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
+}
+
+/// 唯一约束冲突多是并发同名创建（先查后写之间被抢先），属于客户端可理解的
+/// 冲突而不是服务故障，统一映射为「已存在」(409)。
+impl From<sqlx::Error> for AppError {
+    fn from(error: sqlx::Error) -> Self {
+        match &error {
+            sqlx::Error::Database(db) if db.is_unique_violation() => AppError::AlreadyExists,
+            _ => AppError::Db(error),
+        }
+    }
 }
 
 impl AppError {

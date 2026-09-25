@@ -47,3 +47,60 @@ jobs:
         run: npm run check
       - name: 单元测试
         run: npm test
+
+  audit:
+    name: 依赖安全审计
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - name: npm audit
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high
+
+  e2e:
+    name: 浏览器端到端测试
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 安装依赖
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          npm ci
+          npx playwright install --with-deps chromium webkit
+      - name: 构建前端
+        run: npm run check
+      - name: 桌面端
+        run: npm run test:e2e
+      - name: 移动端
+        run: npm run test:mobile
+      - name: 应用中心
+        run: npm run test:apps
+
+  docker:
+    name: Docker 镜像构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

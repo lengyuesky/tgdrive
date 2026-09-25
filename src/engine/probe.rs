@@ -11,15 +11,25 @@ use std::io::{Read, Seek, SeekFrom};
 /// moov 一般只有几 MB;超过该值视为异常文件,放弃解析
 const MOOV_MAX: u64 = 64 * 1024 * 1024;
 
-/// 从上传体解析视频元数据(内存块直接读,临时文件重开一个句柄)
-pub fn probe_body(mime: &str, body: &UploadBody) -> Option<VideoMeta> {
-    match body {
-        UploadBody::Memory(b) => probe_video(mime, &mut std::io::Cursor::new(&b[..])),
-        UploadBody::TempFile { file, .. } => {
-            let f = file.reopen().ok()?;
-            probe_video(mime, &mut std::io::BufReader::new(f))
-        }
+/// 从上传体解析视频元数据(内存块直接读,临时文件重开一个句柄)。
+/// 读临时文件与解析 moov 都是同步 IO/CPU,放到阻塞线程池,不占异步工作线程。
+pub async fn probe_body(mime: &str, body: &UploadBody) -> Option<VideoMeta> {
+    enum Source {
+        Memory(bytes::Bytes),
+        File(std::fs::File),
     }
+    let source = match body {
+        UploadBody::Memory(b) => Source::Memory(b.clone()),
+        UploadBody::TempFile { file, .. } => Source::File(file.reopen().ok()?),
+    };
+    let mime = mime.to_string();
+    tokio::task::spawn_blocking(move || match source {
+        Source::Memory(b) => probe_video(&mime, &mut std::io::Cursor::new(&b[..])),
+        Source::File(f) => probe_video(&mime, &mut std::io::BufReader::new(f)),
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 pub fn probe_video(mime: &str, r: &mut (impl Read + Seek)) -> Option<VideoMeta> {
@@ -59,7 +69,9 @@ fn probe_mp4(r: &mut (impl Read + Seek)) -> Option<VideoMeta> {
             }
             s => (s as u64, 8u64),
         };
-        if size < hdr_len || pos + size > file_end {
+        // 64 位 largesize 可以任意大:加法回绕会让 pos 倒退而死循环,必须带溢出检查
+        let end = pos.checked_add(size)?;
+        if size < hdr_len || end > file_end {
             return None;
         }
         if &typ == b"moov" {
@@ -71,7 +83,7 @@ fn probe_mp4(r: &mut (impl Read + Seek)) -> Option<VideoMeta> {
             r.read_exact(&mut buf).ok()?;
             return parse_moov(&buf);
         }
-        pos += size;
+        pos = end;
     }
     None
 }
@@ -248,6 +260,19 @@ mod tests {
     fn mp4_garbage_returns_none() {
         assert!(probe_video("video/mp4", &mut Cursor::new(vec![0u8; 64])).is_none());
         assert!(probe_video("video/mp4", &mut Cursor::new(b"not a video".to_vec())).is_none());
+    }
+
+    #[test]
+    fn mp4_oversized_largesize_does_not_wrap() {
+        // 第二个 box 的 largesize 让 pos+size 恰好回绕到 0:release 构建下旧实现会死循环
+        let mut f = 16u32.to_be_bytes().to_vec();
+        f.extend_from_slice(b"free");
+        f.extend_from_slice(&[0u8; 8]);
+        f.extend_from_slice(&1u32.to_be_bytes());
+        f.extend_from_slice(b"mdat");
+        f.extend_from_slice(&(u64::MAX - 15).to_be_bytes());
+        f.extend_from_slice(&[0u8; 32]);
+        assert!(probe_video("video/mp4", &mut Cursor::new(f)).is_none());
     }
 
     #[test]

@@ -420,6 +420,7 @@ async fn app_fixture(
         password: "proxy-test-only".into(),
         secret: None,
         cookie_secure: false,
+        trusted_proxies: Vec::new(),
         telegram_api_id: String::new(),
         telegram_api_hash: String::new(),
         send_video: false,

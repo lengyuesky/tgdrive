@@ -93,6 +93,10 @@ export function createDirectoryController(fetchPage: EntriesFetcher) {
   function selectAll(on: boolean) {
     selectedIds.value = on ? new Set(byId.keys()) : new Set()
   }
+  /** 用给定 id 替换选择集，只保留已加载项。 */
+  function setSelection(ids: Iterable<number>) {
+    selectedIds.value = new Set([...ids].filter((id) => byId.has(id)))
+  }
   function updateFavorite(id: number, favorite: boolean) {
     const entry = byId.get(id)
     if (entry) {
@@ -108,7 +112,7 @@ export function createDirectoryController(fetchPage: EntriesFetcher) {
   }
   return {
     entries, batches, selectedIds, selected, total, loading, error, hasMore, generation, revision,
-    loadMore, reset, toggle, selectAll, updateFavorite, dispose,
+    loadMore, reset, toggle, selectAll, setSelection, updateFavorite, dispose,
     indexOf: (id: number) => indices.get(id),
   }
 }

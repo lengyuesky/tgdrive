@@ -65,7 +65,7 @@ async fn send_body_to_telegram(
     let result = match mime {
         Some(mime) => {
             // 从文件头解析宽高/时长；解析不了就让 Telegram 使用默认显示比例。
-            let meta = crate::engine::probe::probe_body(mime, body);
+            let meta = crate::engine::probe::probe_body(mime, body).await;
             if meta.is_none() {
                 tracing::debug!("{filename} 未解析出视频宽高，按无元数据发送");
             }
@@ -98,19 +98,6 @@ async fn send_body_to_telegram(
         upstream_pending.fetch_sub(1, Ordering::AcqRel);
     }
     result
-}
-
-async fn stop_detached_bot_api_upload(
-    api: &Arc<dyn TgApi>,
-    upstream_pending: &AtomicU64,
-    label: &str,
-) {
-    if upstream_pending.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    if let Err(error) = api.cancel_pending_uploads().await {
-        tracing::error!("终止 Bot API 在途上传失败（{label}）: {error}");
-    }
 }
 
 pub struct UploadHandle {
@@ -418,6 +405,7 @@ impl Uploader {
         let display_path = display_path.to_string();
         let (cancel, abort_registration) = AbortHandle::new_pair();
         let cancel_api = target.api.clone();
+        let restart_generation = self.bot_restart_generation.load(Ordering::Acquire);
         let upstream_pending = Arc::new(AtomicU64::new(0));
         let pipeline_pending = upstream_pending.clone();
         let join = tokio::spawn(async move {
@@ -430,7 +418,16 @@ impl Uploader {
                 Ok(result) => result,
                 Err(_) => Err(AppError::BadRequest("上传已取消".into())),
             };
-            stop_detached_bot_api_upload(&cancel_api, &upstream_pending, &display_path).await;
+            // 与可恢复分块共用重启协调：持锁、按代次去重、多 Bot 池不重启，
+            // 被波及的可恢复分块标为可安全重试，而不是收到模糊错误。
+            this.restart_detached_resumable_upload(
+                &cancel_api,
+                &upstream_pending,
+                restart_generation,
+                &(String::new(), -1),
+                &display_path,
+            )
+            .await;
             match result {
                 Ok(node) => Ok(node),
                 Err(e) => {
@@ -607,7 +604,7 @@ impl Uploader {
             .remove(session_id);
     }
 
-    /// 一个分块被客户端中止时，TDLib 可能仍在后台上传。共享 Bot API 必须只重启
+    /// 一个上传或分块被中止时，TDLib 可能仍在后台上传。共享 Bot API 必须只重启
     /// 一次；同一代的其他分块先被标记为可安全重试并中断，避免收到模糊的 502。
     async fn restart_detached_resumable_upload(
         &self,

@@ -85,9 +85,13 @@ function firstVisibleIndex() {
   const offset = (element.value?.scrollTop ?? 0) + headerHeight.value
   return virtualizer.value.getVirtualItems().find((item) => item.end > offset)?.index ?? 0
 }
-function scrollToIndex(index: number) {
-  if (index === 0) { reset(); return }
-  virtualizer.value.scrollToIndex(index, { align: 'start' })
+function scrollToIndex(index: number, align: 'start' | 'auto' = 'start') {
+  if (index === 0 && align === 'start') { reset(); return }
+  virtualizer.value.scrollToIndex(index, { align })
+}
+/** 视口高度，供翻页键估算一屏行数。 */
+function viewportHeight() {
+  return Math.max(0, (element.value?.clientHeight ?? height.value) - headerHeight.value)
 }
 function reset() {
   if (element.value) element.value.scrollTop = 0
@@ -99,7 +103,7 @@ function restoreOffset(offset: number) {
   if (element.value) element.value.scrollTop = offset
   virtualizer.value.scrollToOffset(offset)
 }
-defineExpose({ firstVisibleIndex, scrollToIndex, reset, restoreOffset, measure: () => virtualizer.value.measure() })
+defineExpose({ firstVisibleIndex, scrollToIndex, viewportHeight, reset, restoreOffset, measure: () => virtualizer.value.measure() })
 </script>
 
 <style scoped>

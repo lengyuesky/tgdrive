@@ -36,6 +36,7 @@ async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         password: "entries-test-only".into(),
         secret: None,
         cookie_secure: false,
+        trusted_proxies: Vec::new(),
         telegram_api_id: String::new(),
         telegram_api_hash: String::new(),
         send_video: false,
@@ -337,4 +338,122 @@ async fn entries_migration_preserves_webdav_full_directory_listing() {
     for index in 0..201 {
         assert!(body.contains(&format!("child-{index:03}")));
     }
+}
+
+async fn send(app: &Router, request: Request<Body>) -> axum::response::Response {
+    app.clone().oneshot(request).await.unwrap()
+}
+
+fn basic(user_pass: &str) -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(user_pass)
+    )
+}
+
+#[tokio::test]
+async fn dav_requires_basic_and_ignores_session_cookie() {
+    let (app, state, _dir) = fixture().await;
+    state.vfs.db.mkdir(1, "d").await.unwrap();
+    let response = send(
+        &app,
+        Request::builder()
+            .uri("/dav/d")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().contains_key("www-authenticate"));
+
+    // 浏览器登录 Cookie 对 /api 有效，但不能借 /dav 读写网盘。
+    let cookie = format!("tgdrive_token={}", state.auth.issue_token());
+    let response = send(
+        &app,
+        Request::builder()
+            .uri("/api/auth/me")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &app,
+        Request::builder()
+            .uri("/dav/d")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn basic_auth_failures_lock_out_even_correct_password() {
+    let (app, state, _dir) = fixture().await;
+    state.vfs.db.mkdir(1, "d").await.unwrap();
+    let dav = |auth: String| {
+        Request::builder()
+            .method("PROPFIND")
+            .uri("/dav/d")
+            .header("authorization", auth)
+            .header("depth", "0")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let ok = send(&app, dav(basic("entries-test:entries-test-only"))).await;
+    assert!(ok.status().is_success(), "{}", ok.status());
+    for _ in 0..10 {
+        let response = send(&app, dav(basic("entries-test:wrong"))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let locked = send(&app, dav(basic("entries-test:entries-test-only"))).await;
+    assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(locked.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn cross_site_writes_are_rejected_before_auth() {
+    let (app, state, _dir) = fixture().await;
+    let cookie = format!("tgdrive_token={}", state.auth.issue_token());
+    let mkdir = |site: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/fs/mkdir")
+            .header("cookie", &cookie)
+            .header("sec-fetch-site", site)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"path":"/csrf"}"#))
+            .unwrap()
+    };
+    assert_eq!(
+        send(&app, mkdir("cross-site")).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(state.vfs.db.resolve(&["csrf"]).await.unwrap().is_none());
+    assert_eq!(
+        send(&app, mkdir("same-origin")).await.status(),
+        StatusCode::OK
+    );
+    assert!(state.vfs.db.resolve(&["csrf"]).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn metrics_require_auth_and_use_prometheus_text() {
+    let (app, state, _dir) = fixture().await;
+    state.vfs.db.mkdir(1, "m").await.unwrap();
+    assert_eq!(
+        request(&app, "/api/metrics", false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, body) = request(&app, "/api/metrics", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.as_str().unwrap();
+    assert!(
+        text.contains("# TYPE tgdrive_dirs gauge\ntgdrive_dirs 1\n"),
+        "{text}"
+    );
+    assert!(text.contains("tgdrive_http_requests_total{class=\"4xx\"}"));
 }
