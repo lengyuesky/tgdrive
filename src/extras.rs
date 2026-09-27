@@ -12,6 +12,8 @@ pub const DEFAULT_INBOX_DIR: &str = "/收件箱";
 pub const DEFAULT_BACKUP_CHUNK_SIZE: u64 = crate::config::OFFICIAL_CHUNK_DEFAULT;
 /// 管理端展示已保存凭据时使用固定占位符，避免泄露长度与内容。
 pub const BACKUP_SECRET_PLACEHOLDER: &str = "••••••••";
+/// 备份加密口令的最短长度；口令经 scrypt 派生，但过短仍可被离线穷举。
+pub const MIN_BACKUP_PASSWORD_CHARS: usize = 8;
 const MAX_INBOX_RULES: usize = 50;
 const MAX_RULE_EXTENSIONS: usize = 100;
 
@@ -54,6 +56,9 @@ pub struct Extras {
     pub backup_s3_session_token: String,
     /// true 使用 endpoint/bucket/key，false 使用 bucket.endpoint/key。
     pub backup_s3_path_style: bool,
+    /// 非空时快照先用 age（scrypt 口令）加密再投递到各渠道；丢失后备份无法解密。
+    #[serde(serialize_with = "serialize_backup_secret")]
+    pub backup_encryption_password: String,
     /// 白名单用户私聊 Bot 的文件转存。
     pub inbox_bot_enabled: bool,
     /// 存储频道内直接发送的文件自动入库，与私聊收件独立控制。
@@ -154,6 +159,9 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
             .await?
             .unwrap_or_default(),
         backup_s3_path_style: get(db, "backup_s3_path_style").await?.as_deref() != Some("0"),
+        backup_encryption_password: get(db, "backup_encryption_password")
+            .await?
+            .unwrap_or_default(),
         inbox_bot_enabled,
         inbox_channel_enabled,
         inbox_allowed_chats: get(db, "inbox_allowed_chats").await?.unwrap_or_default(),
@@ -196,6 +204,8 @@ pub struct ExtrasPatch {
     pub backup_s3_secret_key: Option<String>,
     pub backup_s3_session_token: Option<String>,
     pub backup_s3_path_style: Option<bool>,
+    /// 空串表示关闭加密；占位符原样回传表示不修改。
+    pub backup_encryption_password: Option<String>,
     /// 兼容旧版总开关；新开关同时提交时，以各自的新值为准。
     pub inbox_enabled: Option<bool>,
     pub inbox_bot_enabled: Option<bool>,
@@ -534,6 +544,19 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
         .as_deref()
         .filter(|value| *value != BACKUP_SECRET_PLACEHOLDER)
         .map(str::to_string);
+    let backup_encryption_password = p
+        .backup_encryption_password
+        .as_deref()
+        .filter(|value| *value != BACKUP_SECRET_PLACEHOLDER)
+        .map(str::to_string);
+    if let Some(value) = &backup_encryption_password
+        && !value.is_empty()
+        && value.chars().count() < MIN_BACKUP_PASSWORD_CHARS
+    {
+        return Err(AppError::BadRequest(format!(
+            "备份加密密码至少 {MIN_BACKUP_PASSWORD_CHARS} 个字符"
+        )));
+    }
 
     // 使用当前配置补齐未提交字段后整体校验，避免只改开关时绕过凭据完整性检查。
     let mut next = load(db).await?;
@@ -637,6 +660,13 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     }
     if let Some(value) = p.backup_s3_path_style {
         set(db, "backup_s3_path_style", if value { "1" } else { "0" }).await?;
+    }
+    if let Some(value) = backup_encryption_password {
+        if value.is_empty() {
+            db.setting_del("extra.backup_encryption_password").await?;
+        } else {
+            set(db, "backup_encryption_password", &value).await?;
+        }
     }
     if p.inbox_enabled.is_some()
         || p.inbox_bot_enabled.is_some()

@@ -82,9 +82,14 @@ export function useTaskQueues({ cfg, status, extras, section, reloadStatus, extK
         } else {
           ElMessage.info(`${label}:没有待处理的任务`)
         }
-      } else if (data.failed || data.discarded) {
+      } else if (data.failed) {
         ElMessage.warning(
-          `${label}:成功 ${data.completed} 条,永久跳过 ${data.discarded} 条,失败 ${data.failed} 条${more}`,
+          `${label}:成功 ${data.completed} 条,超 48 小时跳过 ${data.discarded} 条,失败 ${data.failed} 条${more}`,
+        )
+      } else if (data.discarded) {
+        // 超期跳过是 Telegram 的硬限制,属预期结果,不按失败提示
+        ElMessage.info(
+          `${label}:成功 ${data.completed} 条,超 48 小时无法删除已跳过 ${data.discarded} 条${more}`,
         )
       } else {
         ElMessage.success(`${label}:成功处理 ${data.completed} 条${more}`)

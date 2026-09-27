@@ -487,14 +487,10 @@ pub(super) async fn admin_run_delete_queue(
         .vfs
         .db
         .append_backend_log(
-            if summary.failed + summary.discarded > 0 {
-                "warn"
-            } else {
-                "info"
-            },
+            if summary.failed > 0 { "warn" } else { "info" },
             "消息清理",
             &format!(
-                "手动执行完成：成功 {} 条，永久跳过 {} 条，失败 {} 条，剩余 {} 条{}",
+                "手动执行完成：成功 {} 条，超过 48 小时无法删除已跳过 {} 条，失败 {} 条，剩余 {} 条{}",
                 summary.completed,
                 summary.discarded,
                 summary.failed,

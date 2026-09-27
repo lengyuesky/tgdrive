@@ -1388,6 +1388,7 @@ mod tests {
                 },
             ],
             auto_delete_message: false,
+            backup_encryption_password: String::new(),
         }
     }
 

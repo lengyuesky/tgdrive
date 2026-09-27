@@ -4,6 +4,8 @@
     <div>
       消息清理队列负责删除已不再被网盘引用的 Telegram 消息。
       默认<b>手动</b>:任务照常记账排队,但要你在这里点「立即执行」才会真的发请求。
+      Telegram 不允许 Bot 删除发出超过 48 小时的消息,这类任务会自动跳过;
+      想让上传残片及时清掉,建议切到<b>自动</b>。
     </div>
   </div>
 
@@ -50,7 +52,7 @@
       </div>
 
       <div v-if="queueLastRun[q.key]" class="queue-result">
-        本次执行:成功 {{ queueLastRun[q.key]!.completed }} 条,永久跳过
+        本次执行:成功 {{ queueLastRun[q.key]!.completed }} 条,超 48 小时跳过
         {{ queueLastRun[q.key]!.discarded }} 条,失败 {{ queueLastRun[q.key]!.failed }} 条,剩余
         {{ queueLastRun[q.key]!.pending }} 条<template
           v-if="queueLastRun[q.key]!.stopped_early"

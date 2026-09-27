@@ -227,7 +227,7 @@ async fn backup_selected(
         return Err(AppError::BadRequest("请至少启用一个数据库备份渠道".into()));
     }
     let _guard = BACKUP_LOCK.lock().await;
-    let snapshot = create_snapshot(vfs, runtime).await?;
+    let snapshot = create_snapshot(vfs, runtime, extras).await?;
     let proxy = runtime.current().proxy.clone();
 
     let telegram = async {
@@ -329,7 +329,7 @@ fn destination_error_summary(destination: Destination, error: &AppError) -> Stri
     }
 }
 
-async fn create_snapshot(vfs: &Vfs, runtime: &Runtime) -> AppResult<Snapshot> {
+async fn create_snapshot(vfs: &Vfs, runtime: &Runtime, extras: &Extras) -> AppResult<Snapshot> {
     let cfg = runtime.current();
     let temp_dir = tempfile::Builder::new()
         .prefix("tgdrive-backup-")
@@ -340,21 +340,93 @@ async fn create_snapshot(vfs: &Vfs, runtime: &Runtime) -> AppResult<Snapshot> {
         .ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
     vfs.db.vacuum_into(path_str).await?;
     scrub_snapshot(path_str).await?;
-    let len = tokio::fs::metadata(&path).await?.len();
     let ts = now_ts();
+    let mut name = format!("tgdrive-backup-{}.db", fmt_compact_utc8(ts));
+    let path = if extras.backup_encryption_password.is_empty() {
+        path
+    } else {
+        let encrypted = temp_dir.path().join("snapshot.db.age");
+        encrypt_file_blocking(
+            path.clone(),
+            encrypted.clone(),
+            extras.backup_encryption_password.clone(),
+        )
+        .await?;
+        // 明文快照不在临时目录里多留
+        tokio::fs::remove_file(&path).await?;
+        name.push_str(ENCRYPTED_SUFFIX);
+        encrypted
+    };
+    let len = tokio::fs::metadata(&path).await?.len();
     Ok(Snapshot {
         _temp_dir: temp_dir,
         path,
         len,
-        name: format!("tgdrive-backup-{}.db", fmt_compact_utc8(ts)),
+        name,
         ts,
     })
 }
 
+/// 加密备份的文件名后缀；内容是标准 age 格式，可用 `age -d` 或 `tgdrive decrypt-backup` 解密。
+pub const ENCRYPTED_SUFFIX: &str = ".age";
+
+async fn encrypt_file_blocking(src: PathBuf, dst: PathBuf, passphrase: String) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || encrypt_file(&src, &dst, passphrase, None))
+        .await
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("备份加密任务失败：{error}")))?
+}
+
+/// 用口令把文件加密为 age 格式。`work_factor` 仅供测试调低 scrypt 成本；
+/// 生产环境由 age 按本机性能自动标定（约 1 秒）。
+fn encrypt_file(
+    src: &Path,
+    dst: &Path,
+    passphrase: String,
+    work_factor: Option<u8>,
+) -> AppResult<()> {
+    use std::io::Write;
+    let passphrase = age::secrecy::SecretString::from(passphrase);
+    let encryptor = match work_factor {
+        None => age::Encryptor::with_user_passphrase(passphrase),
+        Some(log_n) => {
+            let mut recipient = age::scrypt::Recipient::new(passphrase);
+            recipient.set_work_factor(log_n);
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .map_err(|error| AppError::Internal(anyhow::anyhow!("备份加密失败：{error}")))?
+        }
+    };
+    let mut input = std::io::BufReader::new(std::fs::File::open(src)?);
+    let output = std::io::BufWriter::new(std::fs::File::create(dst)?);
+    let mut writer = encryptor.wrap_output(output)?;
+    std::io::copy(&mut input, &mut writer)?;
+    writer.finish()?.flush()?;
+    Ok(())
+}
+
+/// 解密 age 口令加密的备份，供 `tgdrive decrypt-backup` 使用。
+pub fn decrypt_file(src: &Path, dst: &Path, passphrase: String) -> anyhow::Result<()> {
+    use std::io::Write;
+    let input = std::io::BufReader::new(std::fs::File::open(src)?);
+    let decryptor = age::Decryptor::new_buffered(input)
+        .map_err(|error| anyhow::anyhow!("不是有效的 age 加密文件：{error}"))?;
+    let identity = age::scrypt::Identity::new(age::secrecy::SecretString::from(passphrase));
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|error| anyhow::anyhow!("解密失败，密码可能不正确：{error}"))?;
+    let mut output = std::io::BufWriter::new(std::fs::File::create(dst)?);
+    std::io::copy(&mut reader, &mut output)?;
+    output.flush()?;
+    Ok(())
+}
+
 /// 快照会离开本机，恢复时用不到的凭据一律删掉。
 /// Bot Token 必须保留：分块的 file_id 只能由对应 Bot 下载。
+/// 备份加密密码不删：它只会出现在用自己加密的快照里，恢复后自动备份照常加密。
 const SCRUBBED_SETTINGS: &[&str] = &[
     crate::auth::SECRET_KEY,
+    crate::auth::TOTP_SECRET_KEY,
+    crate::auth::TOTP_RECOVERY_KEY,
+    crate::auth::WEBDAV_PASSWORD_KEY,
     "cfg.password",
     "cfg.telegram_api_hash",
     "extra.backup_webdav_password",
@@ -423,7 +495,11 @@ async fn backup_telegram(
                 }
             };
         let filename = backup_part_filename(&snapshot.name, part_index, part_count);
-        let caption = backup_part_caption(part_index, part_count);
+        let caption = backup_part_caption(
+            part_index,
+            part_count,
+            snapshot.name.ends_with(ENCRYPTED_SUFFIX),
+        );
         let body = UploadBody::TempFile {
             file: body_file,
             len: part_len,
@@ -514,12 +590,17 @@ fn backup_part_filename(base: &str, part_index: u64, part_count: u64) -> String 
     }
 }
 
-fn backup_part_caption(part_index: u64, part_count: u64) -> String {
+fn backup_part_caption(part_index: u64, part_count: u64, encrypted: bool) -> String {
+    let note = if encrypted {
+        "，已用备份密码加密"
+    } else {
+        ""
+    };
     if part_count == 1 {
-        "tgdrive 数据库备份（含配置与文件索引，请勿删除最近几份）".into()
+        format!("tgdrive 数据库备份（含配置与文件索引{note}，请勿删除最近几份）")
     } else {
         format!(
-            "tgdrive 数据库备份分块 {}/{}（按文件名顺序二进制合并后恢复）",
+            "tgdrive 数据库备份分块 {}/{}（按文件名顺序二进制合并后恢复{note}）",
             part_index + 1,
             part_count
         )
@@ -1108,6 +1189,7 @@ mod tests {
             inbox_book_dir: "/收件箱/书籍".into(),
             inbox_rules: Vec::new(),
             auto_delete_message: false,
+            backup_encryption_password: String::new(),
         }
     }
 
@@ -1132,6 +1214,9 @@ mod tests {
                 ("cfg.bot_token", "123:bot"),
                 ("mtproto.session.1", "authkey-XYZ"),
                 ("extra.backup_s3_secret_key", "s3-XYZ"),
+                ("auth.totp_secret", "totp-XYZ"),
+                ("auth.totp_recovery", "recovery-XYZ"),
+                ("auth.webdav_password", "webdav-XYZ"),
             ] {
                 sqlx::query("INSERT INTO settings (k, v) VALUES (?, ?)")
                     .bind(k)
@@ -1149,6 +1234,26 @@ mod tests {
             "凭据残留在快照文件里"
         );
         assert!(raw.windows(7).any(|w| w == b"123:bot"));
+    }
+
+    #[test]
+    fn encrypted_backup_roundtrip_and_wrong_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("snap.db");
+        let encrypted = dir.path().join("snap.db.age");
+        let restored = dir.path().join("restored.db");
+        let content: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&plain, &content).unwrap();
+
+        encrypt_file(&plain, &encrypted, "correct horse".into(), Some(10)).unwrap();
+        let raw = std::fs::read(&encrypted).unwrap();
+        assert!(raw.starts_with(b"age-encryption.org/v1"));
+        assert!(!raw.windows(64).any(|w| w == &content[..64]));
+
+        decrypt_file(&encrypted, &restored, "correct horse".into()).unwrap();
+        assert_eq!(std::fs::read(&restored).unwrap(), content);
+        assert!(decrypt_file(&encrypted, &restored, "wrong".into()).is_err());
+        assert!(decrypt_file(&plain, &restored, "correct horse".into()).is_err());
     }
 
     #[test]

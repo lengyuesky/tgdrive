@@ -33,12 +33,14 @@ mod events;
 mod files;
 mod media;
 mod search;
+mod security;
 mod session;
 mod shares;
 mod trash;
 mod uploads;
 use self::{
-    admin::*, events::*, files::*, media::*, search::*, session::*, shares::*, trash::*, uploads::*,
+    admin::*, events::*, files::*, media::*, search::*, security::*, session::*, shares::*,
+    trash::*, uploads::*,
 };
 
 #[derive(Clone)]
@@ -153,6 +155,18 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/cleanup", post(admin_cleanup))
         .route("/admin/logout-all", post(admin_logout_all))
+        .route("/admin/security", get(security_status))
+        .route("/admin/security/totp/setup", post(totp_setup))
+        .route("/admin/security/totp/enable", post(totp_enable))
+        .route("/admin/security/totp/disable", post(totp_disable))
+        .route(
+            "/admin/security/totp/recovery",
+            post(totp_recovery_regenerate),
+        )
+        .route(
+            "/admin/security/webdav-password",
+            post(webdav_password_generate).delete(webdav_password_revoke),
+        )
         .route("/admin/env-export", get(admin_env_export))
         .route("/admin/backup", get(admin_backup))
         .route("/admin/backup-now", post(admin_backup_now))
@@ -216,7 +230,7 @@ pub(crate) fn authorize(state: &AppState, req: &Request, allow_cookie: bool) -> 
     if let Some(wait) = state.attempts.retry_after(&key, BASIC_LIMIT, BASIC_WINDOW) {
         return Err(AppError::RateLimited(wait));
     }
-    if !state.auth.verify_creds(&user, &pass) {
+    if !state.auth.verify_basic(&user, &pass) {
         state.attempts.record_failure(&key, BASIC_WINDOW);
         return Err(AppError::Unauthorized);
     }

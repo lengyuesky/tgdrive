@@ -66,6 +66,7 @@ pub struct RuntimeCfg {
     pub send_video: bool,
     pub tmp_dir: PathBuf,
     pub username: String,
+    /// 存储形式：数据库里一律是 argon2 哈希；来自 `.env` 时可能是明文。
     pub password: String,
     pub telegram_api_id: String,
     pub telegram_api_hash: String,
@@ -413,8 +414,21 @@ impl Runtime {
         if let Some(v) = &patch.username {
             next.username = v.trim().to_string();
         }
-        if let Some(v) = &patch.password {
-            next.password = v.clone();
+        if let Some(v) = patch.password.clone() {
+            if v.is_empty() {
+                return Err(AppError::BadRequest("用户名与密码都不能为空".into()));
+            }
+            // 与原密码相同就保留原哈希，免得无谓地让所有会话失效
+            let prev_stored = prev.password.clone();
+            next.password = tokio::task::spawn_blocking(move || {
+                if crate::password::verify(&prev_stored, &v) {
+                    Ok(prev_stored)
+                } else {
+                    crate::password::hash(&v)
+                }
+            })
+            .await
+            .map_err(|error| AppError::Internal(anyhow::anyhow!("密码哈希任务失败：{error}")))??;
         }
         if let Some(v) = &patch.telegram_api_id {
             next.telegram_api_id = v.trim().to_string();
@@ -691,7 +705,14 @@ impl Runtime {
             if LOCAL_API_KEYS.contains(k) {
                 continue;
             }
-            s.push_str(&format!("{envk}={}\n", c.value_of(k)));
+            let value = c.value_of(k);
+            if *k == "password" && crate::password::is_hash(&value) {
+                // 哈希里的 `$` 会被 Compose 当成变量插值，单引号保持原样
+                s.push_str("# 密码以 argon2 哈希导出，tgdrive 可直接识别\n");
+                s.push_str(&format!("{envk}='{value}'\n"));
+                continue;
+            }
+            s.push_str(&format!("{envk}={value}\n"));
         }
         s.push_str(&format!("TGDRIVE_LISTEN={}\n", self.env.listen));
         s.push_str(&format!("TGDRIVE_DB_PATH={}\n", self.env.db_path));
@@ -721,6 +742,20 @@ impl Runtime {
         );
         s
     }
+}
+
+/// 旧版把后台改过的登录密码明文存在 `cfg.password`；启动时一次性换成哈希。
+pub async fn migrate_password_hash(db: &Db) -> AppResult<bool> {
+    let key = format!("{P}password");
+    let Some(stored) = db.setting_get(&key).await? else {
+        return Ok(false);
+    };
+    if crate::password::is_hash(&stored) {
+        return Ok(false);
+    }
+    let hashed = crate::password::hash_blocking(stored).await?;
+    db.setting_set(&key, &hashed).await?;
+    Ok(true)
 }
 
 /// 敏感值脱敏展示
@@ -793,6 +828,69 @@ mod tests {
             .unwrap();
         let c = RuntimeCfg::load(&db, &env).await.unwrap();
         assert_eq!(c.upload_bot_tokens, vec!["extra1", "extra2"]);
+    }
+
+    #[tokio::test]
+    async fn password_is_stored_as_hash_and_legacy_plaintext_is_migrated() {
+        let (db, _guard) = test_db().await;
+        let mut env = env_cfg();
+        env.bot_token.clear();
+        env.chat_id.clear();
+        let env = Arc::new(env);
+
+        // 旧版明文 → 启动迁移后变哈希，原密码仍能登录
+        db.setting_set("cfg.password", "legacy-pass").await.unwrap();
+        assert!(migrate_password_hash(&db).await.unwrap());
+        assert!(!migrate_password_hash(&db).await.unwrap());
+        let cfg = RuntimeCfg::load(&db, &env).await.unwrap();
+        assert!(crate::password::is_hash(&cfg.password));
+        let tg =
+            Arc::new(TgRegistry::new(&[], None, vec![], None, ProxyConfig::default()).unwrap());
+        let knobs = Arc::new(UploadKnobs::new(
+            cfg.chunk_size,
+            cfg.tmp_dir.clone(),
+            2,
+            false,
+        ));
+        let auth = Arc::new(
+            Auth::init(&cfg.username, &cfg.password, None, false, &db)
+                .await
+                .unwrap(),
+        );
+        assert!(auth.verify_login_password("envuser", "legacy-pass"));
+        let rt = Runtime::new(db.clone(), env.clone(), cfg, tg, knobs, auth.clone());
+
+        // 提交相同密码不算账号变化
+        let same = rt
+            .apply(ConfigPatch {
+                password: Some("legacy-pass".into()),
+                ..ConfigPatch::default()
+            })
+            .await
+            .unwrap();
+        assert!(!same.account_changed);
+
+        let changed = rt
+            .apply(ConfigPatch {
+                password: Some("new-pass".into()),
+                ..ConfigPatch::default()
+            })
+            .await
+            .unwrap();
+        assert!(changed.account_changed);
+        let stored = db.setting_get("cfg.password").await.unwrap().unwrap();
+        assert!(crate::password::is_hash(&stored));
+        assert!(!stored.contains("new-pass"));
+        assert!(auth.verify_login_password("envuser", "new-pass"));
+        assert!(!auth.verify_login_password("envuser", "legacy-pass"));
+        assert!(
+            rt.env_export()
+                .contains(&format!("TGDRIVE_PASSWORD='{stored}'\n"))
+        );
+
+        // 恢复为 .env 明文密码
+        rt.reset(&["password".into()]).await.unwrap();
+        assert!(auth.verify_login_password("envuser", "envpass"));
     }
 
     #[tokio::test]

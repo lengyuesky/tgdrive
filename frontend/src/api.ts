@@ -172,6 +172,8 @@ export interface Extras {
   /** 可选临时凭据；已保存时为固定脱敏占位符。 */
   backup_s3_session_token: string
   backup_s3_path_style: boolean
+  /** 非空时备份先加密再上传；已保存时为固定脱敏占位符，清空保存即关闭加密。 */
+  backup_encryption_password: string
   inbox_bot_enabled: boolean
   inbox_channel_enabled: boolean
   inbox_allowed_chats: string
@@ -423,6 +425,28 @@ export type ConfigPatch = Partial<{
   force: boolean
 }>
 
+/** 后台「账号安全」状态 */
+export interface SecurityStatus {
+  totp_enabled: boolean
+  recovery_remaining: number
+  webdav_password_set: boolean
+  /** 登录密码是否以 argon2 哈希保存;来自 .env 明文时为 false */
+  password_hashed: boolean
+}
+
+export interface TotpSetup {
+  secret: string
+  uri: string
+  /** 后端渲染的二维码 SVG,密钥不经过第三方服务 */
+  qr_svg: string
+}
+
+/** 后端错误的机器码(JSON {code}) */
+export function errCode(e: unknown): string | undefined {
+  const any = e as { response?: { data?: { code?: string | null } } }
+  return any.response?.data?.code ?? undefined
+}
+
 /** 后端返回的错误信息(JSON {error}) */
 export function errMsg(e: unknown): string {
   const any = e as { response?: { data?: { error?: string } }; message?: string }
@@ -438,8 +462,8 @@ async function endSession(path: string) {
 
 export const api = {
   apps: appApi,
-  login: (username: string, password: string) =>
-    http.post('/auth/login', { username, password }),
+  login: (username: string, password: string, totp?: string) =>
+    http.post('/auth/login', { username, password, totp }),
   logout: () => endSession('/auth/logout'),
   me: () => http.get<{ username: string }>('/auth/me'),
   info: () => http.get<ServerInfo>('/info'),
@@ -608,6 +632,18 @@ export const api = {
     pauseStorageMigration: () =>
       http.post<StorageMigrationStatus>('/admin/storage-migration/pause'),
     logoutAll: () => endSession('/admin/logout-all'),
+    security: {
+      status: () => http.get<SecurityStatus>('/admin/security'),
+      totpSetup: () => http.post<TotpSetup>('/admin/security/totp/setup'),
+      totpEnable: (code: string) =>
+        http.post<{ recovery_codes: string[] }>('/admin/security/totp/enable', { code }),
+      totpDisable: (code: string) => http.post('/admin/security/totp/disable', { code }),
+      regenerateRecovery: (code: string) =>
+        http.post<{ recovery_codes: string[] }>('/admin/security/totp/recovery', { code }),
+      generateWebdavPassword: () =>
+        http.post<{ password: string }>('/admin/security/webdav-password'),
+      revokeWebdavPassword: () => http.delete('/admin/security/webdav-password'),
+    },
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
     backupUrl: '/api/admin/backup',
     backupNow: () => http.post<BackupOutcome>('/admin/backup-now'),

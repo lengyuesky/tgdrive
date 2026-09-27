@@ -38,7 +38,7 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(sqlx::query_as(
-            "SELECT id, storage_target_id, tg_message_id, attempts, created_at
+            "SELECT id, storage_target_id, tg_message_id, attempts
              FROM delete_jobs
              WHERE next_retry_at <= ?
              ORDER BY next_retry_at, id

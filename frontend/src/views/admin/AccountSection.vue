@@ -23,14 +23,17 @@
   <div class="note warn">
     <el-icon><WarnTriangleFilled /></el-icon>
     <div>
-      改动账号后所有设备的登录状态立即失效,需要重新登录;WebDAV 客户端也要同步改密码。
+      改动账号后所有设备的登录状态立即失效,需要重新登录;使用登录密码的 WebDAV
+      客户端也要同步修改。密码以 argon2 哈希保存,数据库里不留明文。
     </div>
   </div>
+  <SecurityPanel />
 </template>
 
 <script setup lang="ts">
 import { WarnTriangleFilled } from '@element-plus/icons-vue'
 import SettingField from '../../components/SettingField.vue'
+import SecurityPanel from './SecurityPanel.vue'
 import { useAdminContext } from './useAdmin'
 
 const {

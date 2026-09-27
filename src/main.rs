@@ -16,11 +16,13 @@ mod housekeeping;
 mod inbox;
 mod migration;
 mod mtproto;
+mod password;
 mod proxy;
 mod security;
 mod settings;
 mod tasks;
 mod telegram;
+mod totp;
 mod vfs;
 mod web;
 
@@ -51,8 +53,13 @@ fn main() {
         "serve" => rt.block_on(serve()),
         "check" => rt.block_on(check()),
         "healthcheck" => rt.block_on(healthcheck()),
+        "hash-password" => hash_password(),
+        "reset-2fa" => rt.block_on(reset_2fa()),
+        "decrypt-backup" => decrypt_backup(),
         other => {
-            eprintln!("未知子命令: {other}\n用法: tgdrive [serve|check|healthcheck]");
+            eprintln!(
+                "未知子命令: {other}\n用法: tgdrive [serve|check|healthcheck|hash-password|reset-2fa|decrypt-backup]"
+            );
             std::process::exit(2);
         }
     };
@@ -66,6 +73,9 @@ async fn serve() -> anyhow::Result<()> {
     let env_cfg = Arc::new(Config::from_env()?);
     let db = Db::open(&env_cfg.db_path).await?;
     db.recover_storage_migration().await?;
+    if crate::settings::migrate_password_hash(&db).await? {
+        tracing::info!("已将数据库中的登录密码迁移为 argon2 哈希");
+    }
     // 环境变量只是底层默认值,后台改过的配置(settings 表)优先
     let mut cfg = RuntimeCfg::load(&db, &env_cfg).await?;
 
@@ -301,6 +311,74 @@ async fn shutdown_signal(
     tracing::info!("收到退出信号，正在停止后台任务并等待连接结束");
     migration.shutdown().await;
     tasks.cancel();
+}
+
+/// 从标准输入读一行（去掉行尾换行）。可用管道传入，避免口令留在 shell 历史里。
+fn read_stdin_line(prompt: &str) -> anyhow::Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let line = line.trim_end_matches(['\r', '\n']).to_string();
+    anyhow::ensure!(!line.is_empty(), "输入为空");
+    Ok(line)
+}
+
+/// 生成 argon2 哈希，可直接写进 `.env` 的 `TGDRIVE_PASSWORD='...'`（注意单引号）。
+fn hash_password() -> anyhow::Result<()> {
+    let plain = read_stdin_line("输入要设置的登录密码（输入内容会显示）: ")?;
+    let hashed = crate::password::hash(&plain)?;
+    println!("{hashed}");
+    eprintln!("写入 .env 时请加单引号：TGDRIVE_PASSWORD='{hashed}'");
+    Ok(())
+}
+
+/// 丢失验证器和恢复码时的兜底：直接清掉数据库里的两步验证配置。
+async fn reset_2fa() -> anyhow::Result<()> {
+    let env_cfg = Config::from_env()?;
+    let db = Db::open(&env_cfg.db_path).await?;
+    db.settings_apply(
+        &[],
+        &[
+            crate::auth::TOTP_SECRET_KEY.to_string(),
+            crate::auth::TOTP_RECOVERY_KEY.to_string(),
+        ],
+    )
+    .await?;
+    db.append_backend_log("warn", "账号安全", "已通过命令行关闭两步验证")
+        .await
+        .ok();
+    println!("已关闭两步验证。请重启 tgdrive 容器使其生效，然后用账号密码登录并重新绑定。");
+    Ok(())
+}
+
+/// 解密 `.db.age` 备份。口令优先取 `TGDRIVE_BACKUP_PASSWORD`，否则从标准输入读取。
+fn decrypt_backup() -> anyhow::Result<()> {
+    let mut args = std::env::args().skip(2);
+    let (Some(input), Some(output)) = (args.next(), args.next()) else {
+        anyhow::bail!("用法: tgdrive decrypt-backup <加密备份.db.age> <输出.db>");
+    };
+    anyhow::ensure!(
+        !std::path::Path::new(&output).exists(),
+        "输出文件 {output} 已存在，为避免覆盖请换一个路径"
+    );
+    let passphrase = match std::env::var("TGDRIVE_BACKUP_PASSWORD") {
+        Ok(value) if !value.is_empty() => value,
+        _ => read_stdin_line("输入备份加密密码（输入内容会显示）: ")?,
+    };
+    if let Err(error) = crate::backup::decrypt_file(
+        std::path::Path::new(&input),
+        std::path::Path::new(&output),
+        passphrase,
+    ) {
+        let _ = std::fs::remove_file(&output);
+        return Err(error);
+    }
+    println!("已解密到 {output}");
+    Ok(())
 }
 
 /// 用真实 bot 验证配置与整条链路(getMe → 上传测试文件 → 下载比对 → 删除)

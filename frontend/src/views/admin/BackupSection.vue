@@ -29,6 +29,20 @@
       >
         <el-switch v-model="extras.backup_auto" />
       </SettingField>
+      <SettingField label="备份加密密码" wide>
+        <el-input
+          v-model="extras.backup_encryption_password"
+          type="password"
+          show-password
+          autocomplete="new-password"
+          placeholder="留空则不加密"
+        />
+        <template #help>
+          设置后,发往 Telegram、WebDAV、S3 的快照都先用 age 加密(文件名以 .age 结尾),
+          至少 8 个字符;清空后保存即关闭加密。<b>密码丢失后备份无法解密</b>,请另行妥善保存。
+          「下载数据库备份」是完整的明文数据库,不受此设置影响。
+        </template>
+      </SettingField>
     </div>
 
     <div class="block">
@@ -182,7 +196,8 @@
       <el-icon><InfoFilled /></el-icon>
       <div>
         WebDAV 与 S3 保存完整 .db;Telegram 单块 .db 可直接恢复,多块需按 part
-        编号顺序二进制合并后再替换 data/tgdrive.db。
+        编号顺序二进制合并后再替换 data/tgdrive.db。加密备份(.db.age)先合并分块,再用
+        <code>tgdrive decrypt-backup 备份.db.age tgdrive.db</code> 或 <code>age -d</code> 解密。
       </div>
     </div>
   </template>

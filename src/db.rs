@@ -143,8 +143,6 @@ pub struct DeleteJob {
     pub storage_target_id: i64,
     pub tg_message_id: i64,
     pub attempts: i64,
-    /// 消息一定早于任务入队时间，可据此判断是否越过 Bot API 的 48 小时窗口。
-    pub created_at: i64,
 }
 
 /// 面向管理员展示的关键后台事件摘要。

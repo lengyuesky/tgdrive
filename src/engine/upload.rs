@@ -281,7 +281,7 @@ impl QueueTrigger {
 pub struct QueueRunSummary {
     pub completed: usize,
     pub failed: usize,
-    /// Telegram 已确认不可恢复，已安全退出队列的任务数。
+    /// 消息超过 48 小时、Bot 无法删除，已直接移出队列的任务数。
     pub discarded: usize,
     /// 这一轮结束后队列里还剩多少条
     pub pending: i64,
@@ -304,11 +304,11 @@ impl QueueRunSummary {
     }
 }
 
-const TELEGRAM_DELETE_WINDOW_SECS: i64 = 48 * 60 * 60;
-
-fn is_expired_undeletable_message(job: &crate::db::DeleteJob, error: &AppError) -> bool {
+/// Bot 无法删除发出超过 48 小时的消息（频道管理员也一样），重试没有意义。
+/// 入队时间晚于消息发送时间，删旧文件时消息往往入队即已超期，所以不看任务年龄，
+/// 碰到该错误直接跳过。存储目标配置时已校验删除权限，其余原因极少见。
+fn is_undeletable_message(error: &AppError) -> bool {
     matches!(error, AppError::Telegram(detail) if detail.contains("message can't be deleted"))
-        && crate::db::now_ts().saturating_sub(job.created_at) >= TELEGRAM_DELETE_WINDOW_SECS
 }
 
 #[cfg(test)]
@@ -316,25 +316,12 @@ mod queue_failure_tests {
     use super::*;
 
     #[test]
-    fn only_expired_cannot_delete_error_is_permanent() {
-        let now = crate::db::now_ts();
-        let old = crate::db::DeleteJob {
-            id: 1,
-            storage_target_id: 1,
-            tg_message_id: 33,
-            attempts: 3,
-            created_at: now - TELEGRAM_DELETE_WINDOW_SECS,
-        };
-        let recent = crate::db::DeleteJob {
-            created_at: now - 60,
-            ..old.clone()
-        };
+    fn only_cannot_delete_error_is_permanent() {
         let denied = AppError::Telegram("[400] Bad Request: message can't be deleted".to_string());
         let offline = AppError::Telegram("deleteMessage: 连接失败".to_string());
 
-        assert!(is_expired_undeletable_message(&old, &denied));
-        assert!(!is_expired_undeletable_message(&recent, &denied));
-        assert!(!is_expired_undeletable_message(&old, &offline));
+        assert!(is_undeletable_message(&denied));
+        assert!(!is_undeletable_message(&offline));
     }
 }
 
@@ -830,14 +817,10 @@ impl Uploader {
                         had_work = true;
                         record_backend_log(
                             &this.db,
-                            if summary.failed + summary.discarded > 0 {
-                                "warn"
-                            } else {
-                                "info"
-                            },
+                            if summary.failed > 0 { "warn" } else { "info" },
                             "消息清理",
                             &format!(
-                                "Telegram 消息清理进度：完成 {} 条，永久跳过 {} 条，失败 {} 条，剩余 {} 条",
+                                "Telegram 消息清理进度：完成 {} 条，超过 48 小时无法删除已跳过 {} 条，失败 {} 条，剩余 {} 条",
                                 summary.completed,
                                 summary.discarded,
                                 summary.failed,
@@ -924,19 +907,10 @@ impl Uploader {
                     summary.completed += 1;
                 }
                 Err(e) => {
-                    if is_expired_undeletable_message(&job, &e) {
+                    // 预期内的情况，不逐条记日志，由调用方的本轮汇总带出条数
+                    if is_undeletable_message(&e) {
                         self.db.delete_job_done(job.id).await?;
                         summary.discarded += 1;
-                        record_backend_log(
-                            &self.db,
-                            "warn",
-                            "消息清理",
-                            &format!(
-                                "消息 {} 已超过 Telegram Bot API 的 48 小时删除窗口，停止重试；如频道中仍存在，请在 Telegram 客户端手动删除",
-                                job.tg_message_id
-                            ),
-                        )
-                        .await;
                         continue;
                     }
                     summary.failed += 1;

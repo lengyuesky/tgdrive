@@ -28,6 +28,11 @@ pub enum AppError {
     NotDirectory,
     #[error("未认证")]
     Unauthorized,
+    /// 密码正确但还需要两步验证码；前端凭 `totp_required` 码显示验证码输入框。
+    #[error("请输入两步验证码")]
+    TotpRequired,
+    #[error("两步验证码错误或已使用")]
+    TotpInvalid,
     #[error("{0}")]
     Forbidden(String),
     #[error("请求无效: {0}")]
@@ -70,7 +75,9 @@ impl AppError {
             AppError::InvalidPath(_) | AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::IsDirectory | AppError::NotDirectory => StatusCode::UNPROCESSABLE_ENTITY,
-            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Unauthorized | AppError::TotpRequired | AppError::TotpInvalid => {
+                StatusCode::UNAUTHORIZED
+            }
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::SessionExpired => StatusCode::FORBIDDEN,
             AppError::AppChanged => StatusCode::CONFLICT,
@@ -107,6 +114,8 @@ impl AppError {
             AppError::AppDataConflict => Some("storage_conflict"),
             AppError::SessionExpired => Some("session_expired"),
             AppError::AppChanged => Some("app_changed"),
+            AppError::TotpRequired => Some("totp_required"),
+            AppError::TotpInvalid => Some("totp_invalid"),
             _ => None,
         };
         (message, code)

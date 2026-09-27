@@ -21,8 +21,18 @@
             @keydown.enter="onEnter"
           />
         </el-form-item>
+        <el-form-item v-if="needTotp" label="两步验证码">
+          <el-input
+            ref="totpInput"
+            v-model="totp"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            placeholder="验证器上的 6 位数字,或一个恢复码"
+            @keydown.enter="onEnter"
+          />
+        </el-form-item>
         <el-button type="primary" style="width: 100%" :loading="loading" @click="doLogin">
-          登录
+          {{ needTotp ? '验证并登录' : '登录' }}
         </el-button>
       </el-form>
     </el-card>
@@ -30,16 +40,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Promotion } from '@element-plus/icons-vue'
-import { api, errMsg } from '../api'
+import { api, errCode, errMsg } from '../api'
 import { isComposingKey } from '../mobile/keyboard'
 
 const router = useRouter()
 const username = ref('')
 const password = ref('')
+const totp = ref('')
+/** 密码校验通过但账号启用了两步验证,后端返回 totp_required 后才显示验证码框 */
+const needTotp = ref(false)
+const totpInput = ref<{ focus: () => void }>()
 const loading = ref(false)
 
 function onEnter(event: Event) {
@@ -50,11 +64,20 @@ function onEnter(event: Event) {
 
 async function doLogin() {
   if (loading.value || !username.value || !password.value) return
+  if (needTotp.value && !totp.value.trim()) return
   loading.value = true
   try {
-    await api.login(username.value, password.value)
+    await api.login(username.value, password.value, needTotp.value ? totp.value : undefined)
     router.push('/files/')
   } catch (e) {
+    const code = errCode(e)
+    if (code === 'totp_required') {
+      needTotp.value = true
+      await nextTick()
+      totpInput.value?.focus()
+      return
+    }
+    if (code === 'totp_invalid') totp.value = ''
     ElMessage.error(errMsg(e))
   } finally {
     loading.value = false

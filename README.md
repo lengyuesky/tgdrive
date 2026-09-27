@@ -24,15 +24,15 @@ WebDAV 客户端─┘   ├ /api/*  REST+SSE       └─> Telegram Bot API
 - **回收站**:网页删除时可选择移入回收站或直接删除;WebDAV 删除始终进回收站,超过保留天数自动彻底清理
 - **高级搜索与收藏**:按名称、文件/目录、文件类别或后缀、大小、修改时间和收藏状态组合筛选,支持排序;文件与目录均可收藏并从侧栏集中查看
 - **Bot 收件**:白名单用户私聊 Bot 转存与存储频道直发入库可分别开关;多档视频自动选择最高可用清晰度;可把视频、图片、书籍分别存到指定目录,并自定义「文件后缀 → 目录」规则
-- **多渠道数据库备份**:一键下载一致性快照;可同时备份到 Telegram、WebDAV 与 S3 兼容对象存储,各渠道独立滚动保留最近 7 份并单独重试失败项
-- **可靠后台任务**:Telegram 删除失败进入持久化重试队列;超过 Bot API 48 小时窗口的永久失败会停止重试并提示手动清理;Bot 收件连续失败会进入死信,避免卡住后续消息
+- **多渠道数据库备份**:一键下载一致性快照;可同时备份到 Telegram、WebDAV 与 S3 兼容对象存储,各渠道独立滚动保留最近 7 份并单独重试失败项;可设置备份密码,快照先用 age 加密再离开本机
+- **可靠后台任务**:Telegram 删除失败进入持久化重试队列;Bot 无法删除发出超过 48 小时的消息,这类任务直接跳过、不再重试;Bot 收件连续失败会进入死信,避免卡住后续消息
 - **后台日志**:管理页「后台日志」可查看消息清理、维护与备份等关键后台事件的进度和失败重试;日志持久化保留最近 2000 条
 - **WebDAV**:支持 rclone、Windows 资源管理器、macOS Finder(Class 2 LOCK)
 - **零成本复制**:复制文件/目录只复制元数据,共享底层 Telegram 消息(引用计数,删除安全)
 - **SQLite 唯一索引**:普通文件上传不向 Telegram 消息写入虚拟路径；重命名和移动只修改 SQLite 元数据，目录结构随数据库备份恢复
 - **流式传输**:上传下载全程流式,内存占用与文件大小无关;>32MB 的分块经临时文件中转
 - **零原片流量缩略图**:网页上传视频时从浏览器本地取帧,按内容哈希缓存小图;浏览文件列表不会读取原视频
-- **单用户认证**:Web 登录(HttpOnly cookie)+ WebDAV Basic,同一套账号密码
+- **单用户认证**:Web 登录(HttpOnly cookie)+ WebDAV Basic;登录密码以 argon2 哈希保存;可选 TOTP 两步验证(附一次性恢复码),启用后 WebDAV 与命令行 API 改用独立的应用密码
 - **应用中心**:按需安装独立页面插件，支持版本更新、启停、常用入口和卸载；提供短视频、图书（TXT/EPUB/PDF）、漫画（图片目录/CBZ/ZIP）、影视（影院界面、续播、字幕及客户端 MKV 转封装），阅读／观看进度跨设备实时同步；每应用可配置目录范围，插件凭票据直连字节数据面，无服务器转码
 - **后台管理**:网页上改 bot token、存储频道、端点、分块大小、账号密码、回收站保留期、收件白名单,保存即生效,不用重启容器
 
@@ -97,7 +97,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 | 变量 | 必填 | 默认 | 可在后台改 | 说明 |
 |---|---|---|---|---|
-| `TGDRIVE_USERNAME` / `TGDRIVE_PASSWORD` | ✔ | — | ✔ | Web 与 WebDAV 的账号密码;唯一必填项(没有它就没法登录后台配其余部分) |
+| `TGDRIVE_USERNAME` / `TGDRIVE_PASSWORD` | ✔ | — | ✔ | Web 与 WebDAV 的账号密码;唯一必填项(没有它就没法登录后台配其余部分)。密码可写明文,也可写 `tgdrive hash-password` 生成的 argon2 哈希(须加单引号:`TGDRIVE_PASSWORD='$argon2id$...'`);后台改过的密码只以哈希存库 |
 | `TGDRIVE_BOT_TOKEN` | | — | ✔ | bot token;留空则启动后在网页里配 |
 | `TGDRIVE_UPLOAD_BOT_TOKENS` | | — | ✔ | 额外上传 Bot Token，逗号分隔；各 Bot 必须是同一存储频道管理员，主 Bot 也会参与上传池 |
 | `TGDRIVE_CHAT_ID` | | — | ✔ | 存储频道 ID(`-100…`)或 `@频道名`;同上 |
@@ -209,7 +209,15 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 - **导出 .env**:把当前生效配置生成 `.env` 文本,方便同步回宿主机文件
 - **维护**:设置多渠道数据库备份、Telegram 备份分块大小(默认采用官方 Bot API 安全值 18MB)、清理上传中断留下的残留、登出所有会话(轮换签名密钥)
 
-> 改账号后所有设备的登录状态立即失效,WebDAV 客户端也要同步改密码。
+> 改账号后所有设备的登录状态立即失效,使用登录密码的 WebDAV 客户端也要同步修改。
+
+### 账号安全
+
+- **密码哈希**:后台设置的登录密码以 argon2id 哈希存进数据库;旧版明文会在启动时自动迁移。「导出 .env」导出的也是哈希(带单引号,可直接使用)。
+- **两步验证**:在「账号安全」中扫码绑定任意 TOTP 验证器(Google Authenticator、Microsoft Authenticator、1Password 等),绑定成功会显示 10 个一次性恢复码,并登出其他设备。之后网页登录需输入 6 位验证码,手机丢失时可用恢复码代替。
+- **WebDAV 应用密码**:随机生成,只显示一次,用户名不变。启用两步验证后,WebDAV 与 `/api` 的 Basic 认证**不再接受登录密码**,只能用应用密码,避免借 WebDAV 绕过两步验证。
+- **找回**:验证器和恢复码都丢失时,在宿主机执行 `docker compose exec tgdrive tgdrive reset-2fa` 关闭两步验证,再 `docker compose restart tgdrive`。
+- 两步验证密钥、恢复码和应用密码与登录密码一样,不会写进离开本机的备份;从备份恢复后需要重新绑定。
 
 **改配置前请注意:**
 
@@ -247,6 +255,18 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 cat tgdrive-backup-YYYYMMDD-HHMMSS.db.part*-of-* > tgdrive.db
 ```
 
+设置了**备份加密密码**时,远端快照是 age 格式,文件名以 `.db.age` 结尾(多块时为
+`.db.age.part0001-of-000N`)。先按上面的方法合并分块,再解密:
+
+```bash
+cat tgdrive-backup-YYYYMMDD-HHMMSS.db.age.part*-of-* > backup.db.age   # 单块可省略
+# 任选其一:官方 age 工具,或 tgdrive 自带的子命令
+age -d -o tgdrive.db backup.db.age
+docker run --rm -i -v "$PWD:/work" -w /work --entrypoint tgdrive tgdrive:latest decrypt-backup backup.db.age tgdrive.db
+```
+
+备份密码只用于加密远端快照,丢失后这些备份无法解密;「下载数据库备份」得到的始终是明文完整数据库。
+
 停止 tgdrive 后再用合并出的 `tgdrive.db` 替换原数据库。每个渠道独立滚动保留最近 7 份；
 Telegram 按整组清理，不会只留下半组。修改 WebDAV URL，或修改 S3 端点、桶、前缀、Access
 Key 后，程序不会跨目标删除旧备份，需要自行清理旧位置。
@@ -261,7 +281,7 @@ MTProto 按 512KiB 读取；任意偏移最多只会额外读取前方不足 512
 
 ## WebDAV 使用
 
-地址:`http://<host>:8080/dav`,Basic 认证,账号密码同上。
+地址:`http://<host>:8080/dav`,Basic 认证,账号密码同上;启用两步验证后密码一栏填「账号安全」里生成的应用密码。
 
 **rclone:**
 
@@ -288,6 +308,15 @@ docker compose run --rm tgdrive check
 
 # 容器健康检查(镜像 HEALTHCHECK 已内置)
 tgdrive healthcheck
+
+# 生成 argon2 密码哈希,写进 .env 时加单引号(从标准输入读取,避免留在 shell 历史)
+printf '%s' '新密码' | docker compose run --rm -T tgdrive hash-password
+
+# 丢失验证器与恢复码时关闭两步验证,执行后重启容器
+docker compose exec tgdrive tgdrive reset-2fa
+
+# 解密 .db.age 备份;口令取 TGDRIVE_BACKUP_PASSWORD,未设置时从标准输入读取
+tgdrive decrypt-backup tgdrive-backup-YYYYMMDD-HHMMSS.db.age tgdrive.db
 ```
 
 HTTP 探针:
@@ -341,9 +370,9 @@ npm --prefix frontend run check
 
 ## 重要注意事项
 
-- **务必备份 `./data/tgdrive.db`(SQLite,项目目录下的 `data/` 映射进容器 `/data`)**。Bot API 无法读取频道历史消息，普通上传也不会把虚拟路径写进消息；元数据库一旦丢失，频道里的分块将无法自动找回。库里同时存着后台改过的配置(含 bot token 与密码,明文),请一并妥善保管。
+- **务必备份 `./data/tgdrive.db`(SQLite,项目目录下的 `data/` 映射进容器 `/data`)**。Bot API 无法读取频道历史消息，普通上传也不会把虚拟路径写进消息；元数据库一旦丢失，频道里的分块将无法自动找回。库里同时存着后台改过的配置(含 bot token 等明文凭据;登录密码只存哈希),请一并妥善保管;远端备份建议开启备份加密。
 - **限流**:Telegram 对单个 bot 发消息到同一频道限流约 20 条/分钟。触发 429 时该 Bot 会按 `retry_after` 自动重试；大量小文件可配置额外上传 Bot 分流，大文件则建议自建 Bot API 并调大分块。
-- **删除**:网页删除可选择移入回收站或直接删除;后者不可恢复。删除文件不会等待 Telegram 消息删除完成;失败任务会持久化到 SQLite,后台按指数退避重试。任务入队超过 48 小时后若 Telegram 仍明确返回 `message can't be deleted`,会停止无效重试并提示在 Telegram 客户端手动删除。可在后台系统状态查看队列。
+- **删除**:网页删除可选择移入回收站或直接删除;后者不可恢复。删除文件不会等待 Telegram 消息删除完成;失败任务会持久化到 SQLite,后台按指数退避重试。Telegram 不允许 Bot 删除发出超过 48 小时的消息(频道管理员也不例外),因此删除上传已超过两天的文件时,其频道消息通常会保留;遇到 `message can't be deleted` 的任务直接移出队列,只在每轮汇总日志中计数,如需清理可在 Telegram 客户端手动删除。消息清理默认手动执行,建议切到自动,以便上传残片在 48 小时内被清掉。可在后台系统状态查看队列。
 - **后台日志**:系统设置中的「后台日志」会显示消息清理、维护与备份任务的批次完成、限流重试和队列清空状态;容器重启后仍可查看最近记录。完整 HTTP 诊断仍需查看 Docker 日志。
 - **不加密**:分块原样存储,频道成员可直接查看文件;需要保密请勿把他人拉进存储频道。
 - 未实现(欢迎扩展):多用户、端到端加密。

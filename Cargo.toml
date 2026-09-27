@@ -4,12 +4,15 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+age = "0.12.1"
 anyhow = "1.0.104"
+argon2 = "0.6"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
 brotli = "8.0.4"
 bytes = "1.12.1"
+data-encoding = "2"
 dav-server = "0.11.0"
 dotenvy = "0.15.7"
 flate2 = "1.1.9"
@@ -24,11 +27,13 @@ http-body-util = "0.1.4"
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.10.2"
 reqwest = { version = "0.13.4", features = ["json", "multipart", "query", "socks", "stream"] }
+semver = "1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-semver = "1.0"
+sha1 = "0.11"
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 subtle = "2.6.1"
@@ -57,4 +62,17 @@ opt-level = 3
 [profile.dev.package.zlib-rs]
 opt-level = 3
 [profile.dev.package.miniz_oxide]
+opt-level = 3
+# argon2 / scrypt 在未优化构建下慢一两个数量级，测试里的登录与备份加密会被拖慢。
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.chacha20]
 opt-level = 3

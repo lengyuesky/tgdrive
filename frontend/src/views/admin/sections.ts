@@ -32,7 +32,7 @@ export const SECTIONS: { key: SectionKey; label: string; desc: string; icon: Com
   { key: 'telegram', label: 'Telegram 存储', desc: 'Bot、频道与分块', icon: Promotion },
   { key: 'proxy', label: '网络代理', desc: 'HTTP / SOCKS5', icon: Link },
   { key: 'stream', label: '流式播放', desc: 'MTProto / 自建 Bot API', icon: VideoPlay },
-  { key: 'account', label: '账号', desc: '登录用户名与密码', icon: User },
+  { key: 'account', label: '账号安全', desc: '密码、两步验证与 WebDAV', icon: User },
   { key: 'backup', label: '备份与回收站', desc: '数据库快照与保留期', icon: FolderOpened },
   { key: 'inbox', label: 'Bot 收件', desc: '自动入库与分类目录', icon: Message },
   { key: 'advanced', label: '高级', desc: '临时目录、只读项与维护', icon: Tools },
