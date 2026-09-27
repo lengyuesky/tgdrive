@@ -366,8 +366,6 @@ cargo test --locked
 npm --prefix frontend run check
 ```
 
-仓库内置 GitHub Actions CI,会在 push 和 pull request 时执行同一套 Rust 格式、Clippy、测试以及前端类型检查和生产构建。
-
 ## 重要注意事项
 
 - **务必备份 `./data/tgdrive.db`(SQLite,项目目录下的 `data/` 映射进容器 `/data`)**。Bot API 无法读取频道历史消息，普通上传也不会把虚拟路径写进消息；元数据库一旦丢失，频道里的分块将无法自动找回。库里同时存着后台改过的配置(含 bot token 等明文凭据;登录密码只存哈希),请一并妥善保管;远端备份建议开启备份加密。
