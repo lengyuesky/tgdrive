@@ -52,6 +52,13 @@ impl Db {
         &self,
         main_target_id: i64,
     ) -> AppResult<Vec<StorageMigrationSource>> {
+        Self::migration_sources(&self.pool, main_target_id).await
+    }
+
+    async fn migration_sources<'c>(
+        executor: impl sqlx::SqliteExecutor<'c>,
+        main_target_id: i64,
+    ) -> AppResult<Vec<StorageMigrationSource>> {
         Ok(sqlx::query_as(
             "SELECT c.storage_target_id,
                     CASE WHEN instr(st.bot_token, ':') > 0
@@ -68,7 +75,7 @@ impl Db {
              ORDER BY c.storage_target_id",
         )
         .bind(main_target_id)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?)
     }
 
@@ -93,13 +100,32 @@ impl Db {
     }
 
     pub async fn storage_migration_job(&self) -> AppResult<Option<StorageMigrationJob>> {
+        Self::migration_job(&self.pool).await
+    }
+
+    async fn migration_job<'c>(
+        executor: impl sqlx::SqliteExecutor<'c>,
+    ) -> AppResult<Option<StorageMigrationJob>> {
         Ok(sqlx::query_as(
             "SELECT main_target_id, status, total_messages, migrated_messages,
                     total_chunks, migrated_chunks, last_error, started_at, updated_at
              FROM storage_migration_jobs WHERE id = 1",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?)
+    }
+
+    /// 剩余来源与任务进度取自同一读快照。迁移在一个事务里切换引用并推进进度，
+    /// 分两次读取时若夹着一次提交，同一条消息会在已迁移和剩余里各算一次。
+    pub async fn storage_migration_progress(
+        &self,
+        main_target_id: i64,
+    ) -> AppResult<(Vec<StorageMigrationSource>, Option<StorageMigrationJob>)> {
+        let mut tx = self.pool.begin().await?;
+        let sources = Self::migration_sources(&mut *tx, main_target_id).await?;
+        let job = Self::migration_job(&mut *tx).await?;
+        tx.commit().await?;
+        Ok((sources, job))
     }
 
     /// 开始或继续迁移；同一主目标会保留历史进度，切换主目标则重新计数。

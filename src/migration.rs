@@ -60,10 +60,9 @@ impl StorageMigrationManager {
             .map(|(id, _)| id)
             .unwrap_or("未知")
             .to_string();
-        let sources = self.db.storage_migration_sources(main_target_id).await?;
+        let (sources, job) = self.db.storage_migration_progress(main_target_id).await?;
         let remaining_messages = sources.iter().map(|source| source.messages).sum::<i64>();
         let remaining_chunks = sources.iter().map(|source| source.chunks).sum::<i64>();
-        let job = self.db.storage_migration_job().await?;
         let matching_job = job.filter(|job| job.main_target_id == main_target_id);
         let migrated_messages = matching_job
             .as_ref()
