@@ -43,6 +43,9 @@ pub async fn run(vfs: Vfs, runtime: Arc<Runtime>, task: crate::tasks::TaskReport
 }
 
 async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
+    if vfs.db.background_blocked() {
+        return Ok(());
+    }
     vfs.uploader.process_pending_deletes();
     let extras = crate::extras::load(&vfs.db).await?;
 
@@ -402,7 +405,13 @@ mod tests {
                 .into_iter()
                 .find(|s| s.name == "housekeeping")
                 .and_then(|s| s.last_error);
-            if reported.is_some() {
+            // report_error 先于异步落库；不能在日志事务完成前 cancel worker。
+            if reported.is_some()
+                && f.logs()
+                    .await
+                    .iter()
+                    .any(|l| l.starts_with("error|维护|维护任务失败，下轮重试"))
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

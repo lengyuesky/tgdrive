@@ -776,6 +776,9 @@ impl Uploader {
     /// 处理到期的持久化删除任务。并发触发会合并成一个工作循环。
     /// 手动模式下循环只空转,不消费队列——任务照常积压,等后台点「立即执行」。
     pub fn process_pending_deletes(&self) {
+        if self.db.background_blocked() {
+            return;
+        }
         if self
             .delete_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -787,6 +790,9 @@ impl Uploader {
         tokio::spawn(async move {
             let mut had_work = false;
             loop {
+                if this.db.background_blocked() {
+                    break;
+                }
                 if !this.knobs.auto_delete_message() {
                     had_work = false;
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -845,6 +851,7 @@ impl Uploader {
         limit: i64,
         trigger: QueueTrigger,
     ) -> AppResult<QueueRunSummary> {
+        self.db.require_background_enabled()?;
         let jobs = match self
             .db
             .delete_jobs_due(limit, trigger.ignores_backoff())
@@ -866,6 +873,7 @@ impl Uploader {
         let mut summary = QueueRunSummary::default();
         let started = std::time::Instant::now();
         for job in jobs {
+            self.db.require_background_enabled()?;
             if let Some(budget) = trigger.budget()
                 && started.elapsed() >= budget
             {

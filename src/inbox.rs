@@ -136,6 +136,13 @@ pub async fn run(
             return;
         }
         task.heartbeat();
+        if vfs.db.background_blocked() {
+            task.clear_error();
+            if !task.sleep(Duration::from_secs(5)).await {
+                return;
+            }
+            continue;
+        }
         let cfg = rt.current();
         let ex = match crate::extras::load(&vfs.db).await {
             Ok(e) => e,
@@ -156,6 +163,7 @@ pub async fn run(
             continue;
         }
         let result = async {
+            let _snapshot = crate::proxy::ProxySnapshot::new(cfg.proxy.clone())?;
             if cached_http
                 .as_ref()
                 .is_none_or(|(proxy, _)| *proxy != cfg.proxy)
@@ -190,6 +198,7 @@ pub async fn run(
 }
 
 async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppResult<usize> {
+    vfs.db.require_background_enabled()?;
     let offset: i64 = vfs
         .db
         .setting_get(OFFSET_KEY)
@@ -954,6 +963,7 @@ pub async fn probe_updates(
     token: &str,
     proxy: &crate::proxy::ProxyConfig,
 ) -> AppResult<Vec<SeenChat>> {
+    let _snapshot = crate::proxy::ProxySnapshot::new(proxy.clone())?;
     let http = inbox_http_client(proxy, Duration::from_secs(10))?;
     let url = format!("{}/bot{}/getUpdates", api_base.trim_end_matches('/'), token);
     let resp = http

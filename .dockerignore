@@ -6,6 +6,8 @@ apps
 *.db
 *.db-shm
 *.db-wal
+.claude
 .git
 data
 telegram-bot-api-data
+bot-api-control

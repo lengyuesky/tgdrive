@@ -1,4 +1,9 @@
 <template>
+  <div class="block">
+    <div class="block-head">从 Telegram 频道恢复</div>
+    <p>选择本机记录的备份，或在全新部署中粘贴完整一组备份消息链接。先下载和预检，再次认证后才会替换数据库并重启。</p>
+    <el-button :disabled="saving || extrasSaving || backingUp" @click="restore.open">打开恢复向导</el-button>
+  </div>
   <template v-if="extras">
     <div class="note">
       <el-icon><InfoFilled /></el-icon>
@@ -195,9 +200,8 @@
     <div class="note">
       <el-icon><InfoFilled /></el-icon>
       <div>
-        WebDAV 与 S3 保存完整 .db;Telegram 单块 .db 可直接恢复,多块需按 part
-        编号顺序二进制合并后再替换 data/tgdrive.db。加密备份(.db.age)先合并分块,再用
-        <code>tgdrive decrypt-backup 备份.db.age tgdrive.db</code> 或 <code>age -d</code> 解密。
+        Telegram 备份请使用上方恢复向导：提供完整一组消息后，由服务端合并分块、解密和预检。
+        WebDAV 与 S3 保存完整 .db 或 .db.age；下载数据库备份仍是明文，请妥善保管。
       </div>
     </div>
   </template>
@@ -210,6 +214,9 @@ import SettingField from '../../components/SettingField.vue'
 import { useAdminContext } from './useAdmin'
 
 const {
+  restore,
+  saving,
+  extrasSaving,
   backingUp,
   backupChunkSizeInput,
   backupLastByTarget,

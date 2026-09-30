@@ -11,6 +11,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
+pub mod bot_api;
+pub mod usque;
+
 const REDACTED: &str = "***";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 容器内的 Bot API 和本机服务不能交给远端代理解析、访问。
@@ -19,32 +22,88 @@ const LOCAL_HOSTS: &str = "localhost,127.0.0.1,::1,telegram-bot-api";
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProxyConfig {
     pub enabled: bool,
+    pub provider: ProxyProvider,
     pub url: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyProvider {
+    #[default]
+    Manual,
+    Usque,
+}
+
+impl ProxyProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Usque => "usque",
+        }
+    }
+
+    pub fn parse(value: &str) -> AppResult<Self> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "usque" => Ok(Self::Usque),
+            _ => Err(AppError::BadRequest("代理方式须为 manual 或 usque".into())),
+        }
+    }
+}
+
 impl ProxyConfig {
+    #[cfg(test)]
     pub fn new(enabled: bool, url: &str) -> AppResult<Self> {
+        Self::with_provider(enabled, url, ProxyProvider::Manual)
+    }
+
+    pub fn with_provider(enabled: bool, url: &str, provider: ProxyProvider) -> AppResult<Self> {
         let url = normalize_url(url)?;
-        if enabled && url.is_empty() {
+        if enabled && provider == ProxyProvider::Manual && url.is_empty() {
             return Err(AppError::BadRequest("启用代理时必须填写代理地址".into()));
         }
-        Ok(Self { enabled, url })
+        Ok(Self {
+            enabled,
+            provider,
+            url,
+        })
     }
 
     /// 脱敏地址原样回传时保留凭据；编辑了地址则必须重新输入完整认证信息。
+    #[cfg(test)]
     pub fn patched(&self, enabled: Option<bool>, url: Option<&str>) -> AppResult<Self> {
+        self.patched_provider(enabled, url, None)
+    }
+
+    pub fn patched_provider(
+        &self,
+        enabled: Option<bool>,
+        url: Option<&str>,
+        provider: Option<ProxyProvider>,
+    ) -> AppResult<Self> {
         let url = match url {
             Some(value) if value.trim() != mask_url(&self.url) => value,
             _ => &self.url,
         };
-        Self::new(enabled.unwrap_or(self.enabled), url)
+        Self::with_provider(
+            enabled.unwrap_or(self.enabled),
+            url,
+            provider.unwrap_or(self.provider),
+        )
+    }
+
+    pub fn effective_url(&self) -> &str {
+        match self.provider {
+            ProxyProvider::Manual => &self.url,
+            ProxyProvider::Usque => usque::proxy_url(),
+        }
     }
 
     pub fn http_builder(&self) -> AppResult<reqwest::ClientBuilder> {
         // 显式关闭系统代理，避免关闭网页开关后仍被 HTTP_PROXY / ALL_PROXY 接管。
         let mut builder = reqwest::Client::builder().no_proxy();
         if self.enabled {
-            let proxy = reqwest::Proxy::all(&self.url)
+            let proxy = reqwest::Proxy::all(self.effective_url())
                 .map_err(|_| AppError::BadRequest("代理地址无效".into()))?
                 .no_proxy(reqwest::NoProxy::from_string(LOCAL_HOSTS));
             builder = builder.proxy(proxy);
@@ -135,6 +194,8 @@ pub fn mask_url(raw: &str) -> String {
 pub struct ProxySnapshot {
     pub config: ProxyConfig,
     pub http: reqwest::Client,
+    // 旧下载流仍持有快照时保留 usque，避免切换代理中断在途传输。
+    usque: Option<Arc<usque::Service>>,
 }
 
 impl ProxySnapshot {
@@ -146,24 +207,53 @@ impl ProxySnapshot {
             // 大分块上传、下载不设置整体超时。
             .build()
             .map_err(|_| AppError::BadRequest("构造代理 HTTP 客户端失败".into()))?;
-        Ok(Arc::new(Self { config, http }))
+        let usque = (config.enabled && config.provider == ProxyProvider::Usque)
+            .then(usque::Service::acquire);
+        Ok(Arc::new(Self {
+            config,
+            http,
+            usque,
+        }))
+    }
+
+    pub async fn ready(&self) -> AppResult<()> {
+        if let Some(service) = &self.usque {
+            service.ready().await?;
+        }
+        Ok(())
     }
 }
 
 /// 历史目标和正在使用的 Bot 共享句柄，切换代理不重置限流状态和文件路径缓存。
-pub struct ProxyClient(RwLock<Arc<ProxySnapshot>>);
+pub struct ProxyClient {
+    current: RwLock<Arc<ProxySnapshot>>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
 
 impl ProxyClient {
     pub fn new(config: ProxyConfig) -> AppResult<Self> {
-        Ok(Self(RwLock::new(ProxySnapshot::new(config)?)))
+        Ok(Self {
+            current: RwLock::new(ProxySnapshot::new(config)?),
+            changes: tokio::sync::watch::channel(0).0,
+        })
     }
 
     pub fn current(&self) -> Arc<ProxySnapshot> {
-        self.0.read().unwrap().clone()
+        self.current.read().unwrap().clone()
     }
 
     pub fn install(&self, snapshot: Arc<ProxySnapshot>) {
-        *self.0.write().unwrap() = snapshot;
+        let mut current = self.current.write().unwrap();
+        let changed = current.config != snapshot.config;
+        *current = snapshot;
+        if changed {
+            self.changes
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 }
 
@@ -176,7 +266,7 @@ pub struct DcTunnel {
 
 impl DcTunnel {
     pub fn new(config: &ProxyConfig, destination: SocketAddrV4) -> io::Result<Self> {
-        let url = reqwest::Url::parse(&config.url)
+        let url = reqwest::Url::parse(config.effective_url())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "代理地址无效"))?;
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;

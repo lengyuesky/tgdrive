@@ -325,6 +325,8 @@ pub struct Db {
     apps_cache: std::sync::Arc<apps::AppCache>,
     /// 应用封面缓存库（主库旁的独立文件，见 apps/covers_db.rs）。
     covers: SqlitePool,
+    /// 恢复安全模式/维护状态，随所有 Db 克隆共享；后台入口必须检查。
+    background_blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 有待执行迁移的既有库先做一份一致性快照：部分迁移会删表重建，无法回退。
@@ -381,14 +383,50 @@ impl Db {
             .connect_with(opts)
             .await?;
         let migrator = sqlx::migrate!("./migrations");
-        snapshot_before_migration(&pool, &migrator, db_path).await?;
-        migrator.run(&pool).await?;
-        let covers = apps::open_covers(db_path).await?;
+        let initialized = async {
+            snapshot_before_migration(&pool, &migrator, db_path).await?;
+            migrator.run(&pool).await?;
+            apps::open_covers(db_path).await
+        }
+        .await;
+        let covers = match initialized {
+            Ok(covers) => covers,
+            Err(error) => {
+                // 恢复验证失败必须等主库连接全部关闭，才能离线回滚文件。
+                pool.close().await;
+                return Err(error);
+            }
+        };
         Ok(Db {
             pool,
             apps_cache: Default::default(),
             covers,
+            background_blocked: Default::default(),
         })
+    }
+
+    pub fn background_blocked(&self) -> bool {
+        self.background_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_background_blocked(&self, blocked: bool) {
+        self.background_blocked
+            .store(blocked, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn require_background_enabled(&self) -> AppResult<()> {
+        if self.background_blocked() {
+            return Err(AppError::Forbidden(
+                "恢复安全模式或维护中，后台任务已暂停".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        self.pool.close().await;
+        self.covers.close().await;
     }
 
     pub async fn ping(&self) -> AppResult<()> {

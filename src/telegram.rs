@@ -103,6 +103,28 @@ pub struct TgMessage {
     pub thumbnail_file_id: Option<String>,
 }
 
+/// 恢复时临时转发得到的文档；调用方负责清理临时消息，而不是来源消息。
+#[derive(Debug, Clone)]
+pub struct TgBackupDocument {
+    pub message_id: i64,
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+/// 频道探测只返回文件名和原消息号，不发送、转发或下载文档内容。
+#[derive(Debug, Clone)]
+pub struct TgHistoryDocument {
+    pub message_id: i32,
+    pub file_name: String,
+}
+
+pub struct TgHistoryPage {
+    pub documents: Vec<TgHistoryDocument>,
+    pub next_before: Option<i32>,
+    pub scanned: usize,
+}
+
 /// 视频显示元数据(从文件头解析);sendVideo 不带宽高时
 /// Telegram 不探测内容,消息气泡的长宽比是猜的
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -173,7 +195,22 @@ pub trait TgApi: Send + Sync + 'static {
             "当前 Telegram 客户端不支持消息迁移".into(),
         ))
     }
+    /// 临时转发备份消息，严格要求 document；不读取或遍历频道历史。
+    async fn forward_backup_document(
+        &self,
+        _from_chat_id: &str,
+        _message_id: i64,
+    ) -> AppResult<TgBackupDocument> {
+        Err(AppError::BadRequest(
+            "当前 Telegram 客户端不支持频道备份恢复".into(),
+        ))
+    }
     async fn delete_message(&self, message_id: i64) -> AppResult<()>;
+    async fn backup_history_page(&self, _before: Option<i32>) -> AppResult<TgHistoryPage> {
+        Err(AppError::BadRequest(
+            "频道探测需要配置 TELEGRAM_API_ID 和 TELEGRAM_API_HASH，并重启服务".into(),
+        ))
+    }
     /// 终止已经交给自建 Bot API、但尚未完成的上传。
     /// 官方 Bot API 和测试实现没有进程控制能力，默认无需处理。
     async fn cancel_pending_uploads(&self) -> AppResult<()> {
@@ -252,6 +289,8 @@ impl RawMessage {
 #[derive(Deserialize)]
 struct RawFileRef {
     file_id: String,
+    file_name: Option<String>,
+    file_size: Option<u64>,
     thumbnail: Option<RawThumbnailRef>,
 }
 
@@ -351,6 +390,10 @@ fn choose_upload_target(
 }
 
 impl TgRegistry {
+    pub fn proxy_client(&self) -> Arc<ProxyClient> {
+        self.network.clone()
+    }
+
     pub fn new(
         targets: &[StorageTarget],
         current: Option<i64>,
@@ -750,10 +793,6 @@ impl TgClient {
         })
     }
 
-    fn http(&self) -> reqwest::Client {
-        self.network.current().http.clone()
-    }
-
     fn method_url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.api_base, self.token, method)
     }
@@ -764,8 +803,8 @@ impl TgClient {
 
     async fn raw_me(&self) -> AppResult<RawUser> {
         let url = self.method_url("getMe");
-        self.call_with_retry("getMe", || {
-            self.http().get(&url).timeout(API_CALL_TIMEOUT).send()
+        self.call_with_retry("getMe", |http| {
+            http.get(&url).timeout(API_CALL_TIMEOUT).send()
         })
         .await
     }
@@ -784,9 +823,8 @@ impl TgClient {
 
         let get_chat_url = self.method_url("getChat");
         let chat: RawChat = self
-            .call_with_retry("getChat", || {
-                self.http()
-                    .post(&get_chat_url)
+            .call_with_retry("getChat", |http| {
+                http.post(&get_chat_url)
                     .json(&serde_json::json!({ "chat_id": self.chat_id }))
                     .timeout(API_CALL_TIMEOUT)
                     .send()
@@ -796,9 +834,8 @@ impl TgClient {
         if matches!(chat.kind.as_str(), "channel" | "group" | "supergroup") {
             let member_url = self.method_url("getChatMember");
             let member: RawChatMember = self
-                .call_with_retry("getChatMember", || {
-                    self.http()
-                        .post(&member_url)
+                .call_with_retry("getChatMember", |http| {
+                    http.post(&member_url)
                         .json(&serde_json::json!({
                             "chat_id": self.chat_id,
                             "user_id": user.id,
@@ -876,13 +913,14 @@ impl TgClient {
     async fn call_with_retry<T, F, Fut>(&self, what: &str, mut make_req: F) -> AppResult<T>
     where
         T: serde::de::DeserializeOwned,
-        F: FnMut() -> Fut,
+        F: FnMut(reqwest::Client) -> Fut,
         Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
     {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let outcome = match make_req().await {
+            let snapshot = self.network.current();
+            let outcome = match make_req(snapshot.http.clone()).await {
                 Ok(resp) => self.parse::<T>(resp, CallMode::Idempotent).await,
                 Err(e) => Err((
                     Some(Duration::from_secs(2u64.pow(attempt.min(4)))),
@@ -911,8 +949,8 @@ impl TgClient {
         }
         let url = self.method_url("getFile");
         let file: RawFile = self
-            .call_with_retry("getFile", || {
-                self.http().get(&url).query(&[("file_id", file_id)]).send()
+            .call_with_retry("getFile", |http| {
+                http.get(&url).query(&[("file_id", file_id)]).send()
             })
             .await?;
         let path = file.file_path.ok_or_else(|| {
@@ -1009,7 +1047,8 @@ impl TgClient {
             let part = self.body_to_part(filename, mime, body)?;
             form = form.part(field, part);
 
-            let outcome = match self.http().post(&url).multipart(form).send().await {
+            let snapshot = self.network.current();
+            let outcome = match snapshot.http.post(&url).multipart(form).send().await {
                 Ok(resp) => self.parse::<RawMessage>(resp, CallMode::SendMedia).await,
                 // 连接尚未建立或请求体没有发完整时，Telegram 不可能成功解析媒体，可安全重试。
                 Err(e) if e.is_connect() || e.is_body() => Err((
@@ -1063,10 +1102,79 @@ impl TgClient {
         })
     }
 
+    // copyMessage 只返回消息号，forwardMessage 才能取得当前 Bot 的 file_id。
+    // 迁移和备份恢复共用发送重试规则，避免不确定的响应产生重复消息。
+    async fn forward_raw_message(
+        &self,
+        from_chat_id: &str,
+        message_id: i64,
+    ) -> AppResult<RawMessage> {
+        let url = self.method_url("forwardMessage");
+        let mut attempt = 0u32;
+        loop {
+            if attempt > 0 {
+                self.media_throttle.wait_turn().await;
+            }
+            attempt += 1;
+            let snapshot = self.network.current();
+            let outcome = match snapshot
+                .http
+                .post(&url)
+                .json(&serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "from_chat_id": from_chat_id,
+                    "message_id": message_id,
+                    "disable_notification": true,
+                }))
+                .timeout(API_CALL_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    self.parse::<RawMessage>(response, CallMode::SendMedia)
+                        .await
+                }
+                Err(error) if error.is_connect() => Err((
+                    None,
+                    AppError::Telegram(format!(
+                        "forwardMessage: {}",
+                        reqwest_error_summary(&error)
+                    )),
+                )),
+                Err(error) => Err((
+                    None,
+                    AppError::TelegramUncertain(format!(
+                        "forwardMessage 请求结果不确定（{}）；可能已产生一条未登记的复制消息",
+                        reqwest_error_summary(&error)
+                    )),
+                )),
+            };
+            match outcome {
+                Ok(message) => return Ok(message),
+                Err((Some(wait), error)) if is_flood_limit(&error) && attempt < MAX_RETRIES => {
+                    let wait = wait + Duration::from_millis((attempt as u64 * 137) % 500);
+                    self.media_throttle.defer_all(wait).await;
+                    tracing::warn!(
+                        "forwardMessage 第 {attempt} 次触发限流({error})，共享等待 {:?}",
+                        wait
+                    );
+                }
+                // 发送类 5xx 即使带有重试提示也可能已经创建消息，不能自动重放。
+                Err((Some(_), error)) => {
+                    return Err(AppError::TelegramUncertain(format!(
+                        "{error}；可能已产生一条未登记的复制消息"
+                    )));
+                }
+                Err((_, error)) => return Err(error),
+            }
+        }
+    }
+
     /// HTTP 下载分块;offset>0 时先试 Range,服务器不支持则丢弃前缀
     async fn open_http_stream(&self, file_path: &str, offset: u64) -> AppResult<ByteReader> {
         let url = self.file_url(file_path);
-        let mut req = self.http().get(&url);
+        let snapshot = self.network.current();
+        let mut req = snapshot.http.get(&url);
         if offset > 0 {
             req = req.header(http::header::RANGE, format!("bytes={offset}-"));
         }
@@ -1079,7 +1187,10 @@ impl TgClient {
             return Err(AppError::Telegram(format!("下载分块 HTTP {status}")));
         }
         let got_range = status == http::StatusCode::PARTIAL_CONTENT;
-        let stream = resp.bytes_stream();
+        let stream = futures_util::StreamExt::map(resp.bytes_stream(), move |chunk| {
+            let _keep_proxy_alive = &snapshot;
+            chunk
+        });
         let reader = tokio_util::io::StreamReader::new(futures_util::TryStreamExt::map_err(
             stream,
             |error| std::io::Error::other(reqwest_error_summary(&error)),
@@ -1135,6 +1246,20 @@ impl TgClient {
 
 #[async_trait::async_trait]
 impl TgApi for TgClient {
+    async fn backup_history_page(&self, before: Option<i32>) -> AppResult<TgHistoryPage> {
+        let mtproto = self.mtproto.as_ref().ok_or_else(|| {
+            AppError::BadRequest(
+                "频道探测需要在 .env 配置 TELEGRAM_API_ID 和 TELEGRAM_API_HASH，并重启服务".into(),
+            )
+        })?;
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            mtproto.backup_history_page(&self.chat_id, before),
+        )
+        .await
+        .map_err(|_| AppError::Telegram("频道探测超时，请检查代理和 Telegram 连接后重试".into()))?
+    }
+
     fn set_restart_enabled(&self, enabled: bool) {
         self.bot_api_restart_enabled
             .store(enabled, Ordering::Release);
@@ -1191,66 +1316,7 @@ impl TgApi for TgClient {
     }
 
     async fn copy_message_from(&self, from_chat_id: &str, message_id: i64) -> AppResult<TgMessage> {
-        // Bot API 的 copyMessage 只返回 MessageId，拿不到主 Bot 专属的新 file_id；
-        // forwardMessage 同样在 Telegram 服务端复制媒体，但会返回完整 Message，
-        // 因而能安全更新 tgdrive 的分块映射。
-        let url = self.method_url("forwardMessage");
-        let mut attempt = 0u32;
-        let raw: RawMessage = loop {
-            if attempt > 0 {
-                self.media_throttle.wait_turn().await;
-            }
-            attempt += 1;
-            let outcome = match self
-                .http()
-                .post(&url)
-                .json(&serde_json::json!({
-                    "chat_id": self.chat_id,
-                    "from_chat_id": from_chat_id,
-                    "message_id": message_id,
-                    "disable_notification": true,
-                }))
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    self.parse::<RawMessage>(response, CallMode::SendMedia)
-                        .await
-                }
-                Err(error) if error.is_connect() => Err((
-                    None,
-                    AppError::Telegram(format!(
-                        "forwardMessage: {}",
-                        reqwest_error_summary(&error)
-                    )),
-                )),
-                Err(error) => Err((
-                    None,
-                    AppError::TelegramUncertain(format!(
-                        "forwardMessage 请求结果不确定（{}）；可能已产生一条未登记的复制消息",
-                        reqwest_error_summary(&error)
-                    )),
-                )),
-            };
-            match outcome {
-                Ok(message) => break message,
-                Err((Some(wait), error)) if is_flood_limit(&error) && attempt < MAX_RETRIES => {
-                    let wait = wait + Duration::from_millis((attempt as u64 * 137) % 500);
-                    self.media_throttle.defer_all(wait).await;
-                    tracing::warn!(
-                        "forwardMessage 第 {attempt} 次触发限流({error})，共享等待 {:?}",
-                        wait
-                    );
-                }
-                // 发送类 5xx 即使带有重试提示也可能已经创建消息，不能自动重放。
-                Err((Some(_), error)) => {
-                    return Err(AppError::TelegramUncertain(format!(
-                        "{error}；可能已产生一条未登记的复制消息"
-                    )));
-                }
-                Err((_, error)) => return Err(error),
-            }
-        };
+        let raw = self.forward_raw_message(from_chat_id, message_id).await?;
         let copied_message_id = raw.message_id;
         let Some(media) = raw.any_file() else {
             if let Err(error) = self.delete_message(copied_message_id).await {
@@ -1267,12 +1333,47 @@ impl TgApi for TgClient {
         })
     }
 
+    async fn forward_backup_document(
+        &self,
+        from_chat_id: &str,
+        message_id: i64,
+    ) -> AppResult<TgBackupDocument> {
+        if message_id <= 0 {
+            return Err(AppError::BadRequest("备份消息 ID 必须为正整数".into()));
+        }
+        self.media_throttle.wait_turn().await;
+        let raw = self.forward_raw_message(from_chat_id, message_id).await?;
+        // 恢复在同频道转发；不可信上游不能使清理逻辑拿来源消息号去删除原备份。
+        if raw.message_id <= 0 || raw.message_id == message_id {
+            return Err(AppError::TelegramUncertain(
+                "转发返回了无效的临时消息 ID，已拒绝清理；请检查频道中的临时消息".into(),
+            ));
+        }
+        let temporary_id = raw.message_id;
+        match raw.document {
+            Some(document) => Ok(TgBackupDocument {
+                message_id: temporary_id,
+                file_id: document.file_id,
+                file_name: document.file_name,
+                file_size: document.file_size,
+            }),
+            None => {
+                let cleanup = match self.delete_message(temporary_id).await {
+                    Ok(()) => String::new(),
+                    Err(_) => format!("；临时消息 {temporary_id} 清理失败，请在频道手动删除"),
+                };
+                Err(AppError::BadRequest(format!(
+                    "指定消息不是文档备份，不能用于恢复{cleanup}"
+                )))
+            }
+        }
+    }
+
     async fn delete_message(&self, message_id: i64) -> AppResult<()> {
         let url = self.method_url("deleteMessage");
         let res: Result<bool, AppError> = self
-            .call_with_retry("deleteMessage", || {
-                self.http()
-                    .post(&url)
+            .call_with_retry("deleteMessage", |http| {
+                http.post(&url)
                     .json(&serde_json::json!({
                         "chat_id": self.chat_id,
                         "message_id": message_id,
@@ -1525,6 +1626,160 @@ mod tests {
                 .as_deref(),
             Some("thumbnail-file")
         );
+    }
+
+    type ForwardRequests = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    async fn forward_fixture(
+        responses: Vec<(http::StatusCode, serde_json::Value)>,
+    ) -> (TgClient, ForwardRequests, tokio::task::JoinHandle<()>) {
+        #[derive(Clone)]
+        struct State {
+            responses:
+                Arc<Mutex<std::collections::VecDeque<(http::StatusCode, serde_json::Value)>>>,
+            requests: ForwardRequests,
+        }
+        async fn handle(
+            axum::extract::State(state): axum::extract::State<State>,
+            uri: http::Uri,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> (http::StatusCode, axum::Json<serde_json::Value>) {
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .push((uri.path().into(), body));
+            let response = if uri.path().ends_with("/deleteMessage") {
+                (
+                    http::StatusCode::OK,
+                    serde_json::json!({"ok": true, "result": true}),
+                )
+            } else {
+                state.responses.lock().unwrap().pop_front().unwrap_or((
+                    http::StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "description": "unexpected retry", "error_code": 400}),
+                ))
+            };
+            (response.0, axum::Json(response.1))
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = State {
+            responses: Arc::new(Mutex::new(responses.into())),
+            requests: requests.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/{*path}", axum::routing::post(handle))
+            .with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = TgClient::new(
+            &format!("http://{address}"),
+            "restore-test-token",
+            "-100123",
+            ProxyConfig::default(),
+        )
+        .unwrap();
+        (client, requests, server)
+    }
+
+    #[tokio::test]
+    async fn backup_forward_returns_document_metadata_without_deleting_source() {
+        let (client, requests, server) = forward_fixture(vec![(
+            http::StatusCode::OK,
+            serde_json::json!({"ok": true, "result": {
+                "message_id": 81,
+                "document": {"file_id": "backup-file", "file_name": "backup.db.age.part0001-of-0002", "file_size": 4096}
+            }}),
+        )]).await;
+        let document = client.forward_backup_document("-100123", 12).await.unwrap();
+        assert_eq!(document.message_id, 81);
+        assert_eq!(document.file_id, "backup-file");
+        assert_eq!(
+            document.file_name.as_deref(),
+            Some("backup.db.age.part0001-of-0002")
+        );
+        assert_eq!(document.file_size, Some(4096));
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].0.ends_with("/forwardMessage"));
+        assert_eq!(sent[0].1["chat_id"], "-100123");
+        assert_eq!(sent[0].1["from_chat_id"], "-100123");
+        assert_eq!(sent[0].1["message_id"], 12);
+        assert_eq!(sent[0].1["disable_notification"], true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backup_forward_rejects_video_and_only_cleans_temporary_message() {
+        let (client, requests, server) = forward_fixture(vec![(
+            http::StatusCode::OK,
+            serde_json::json!({"ok": true, "result": {
+                "message_id": 82, "video": {"file_id": "not-a-backup"}
+            }}),
+        )])
+        .await;
+        let error = client
+            .forward_backup_document("-100123", 12)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("不是文档备份"));
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].0.ends_with("/deleteMessage"));
+        assert_eq!(sent[1].1["message_id"], 82);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backup_forward_never_cleans_a_returned_source_id() {
+        let (client, requests, server) = forward_fixture(vec![(
+            http::StatusCode::OK,
+            serde_json::json!({"ok": true, "result": {"message_id": 12}}),
+        )])
+        .await;
+        let error = client
+            .forward_backup_document("-100123", 12)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::TelegramUncertain(_)));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backup_forward_does_not_retry_rejected_or_uncertain_sends() {
+        for status in [http::StatusCode::FORBIDDEN, http::StatusCode::BAD_GATEWAY] {
+            let (client, requests, server) = forward_fixture(vec![(
+                status,
+                serde_json::json!({"ok": false, "error_code": status.as_u16(), "description": "forwarding unavailable"}),
+            )]).await;
+            assert!(client.forward_backup_document("-100123", 12).await.is_err());
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_forward_retries_only_explicit_flood_rejection() {
+        let (client, requests, server) = forward_fixture(vec![
+            (http::StatusCode::TOO_MANY_REQUESTS, serde_json::json!({
+                "ok": false, "error_code": 429, "description": "Too Many Requests", "parameters": {"retry_after": 0}
+            })),
+            (http::StatusCode::OK, serde_json::json!({"ok": true, "result": {
+                "message_id": 83, "document": {"file_id": "backup-file", "file_name": "backup.db", "file_size": 10}
+            }})),
+        ]).await;
+        assert_eq!(
+            client
+                .forward_backup_document("-100123", 12)
+                .await
+                .unwrap()
+                .message_id,
+            83
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
     }
 
     #[test]

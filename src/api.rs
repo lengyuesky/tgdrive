@@ -32,6 +32,7 @@ mod admin;
 mod events;
 mod files;
 mod media;
+pub(crate) mod restore;
 mod search;
 mod security;
 mod session;
@@ -54,6 +55,7 @@ pub struct AppState {
     pub attempts: crate::security::AttemptLimiter,
     pub tasks: crate::tasks::TaskManager,
     pub migration: crate::migration::StorageMigrationManager,
+    pub restore: crate::restore::RestoreManager,
     pub apps_catalog: Arc<crate::apps::CatalogManager>,
     /// 进程内事件总线；SSE 向浏览器转发应用与文件树粗粒度变更。
     pub events: crate::events::EventBus,
@@ -94,6 +96,7 @@ pub fn router(state: AppState) -> Router {
         .route("/share/{token}/list", get(share_list_dir))
         .route("/share/{token}/download", get(share_download));
     let protected = Router::new()
+        .merge(restore::routes())
         .merge(crate::apps::protected_router())
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
@@ -133,6 +136,8 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/config", get(admin_config).post(admin_save))
         .route("/admin/config/reset", post(admin_reset))
         .route("/admin/test", post(admin_test))
+        .route("/admin/proxy/usque", get(admin_usque_status))
+        .route("/admin/proxy/usque/register", post(admin_usque_register))
         .route("/admin/detect-chats", post(admin_detect_chats))
         .route("/admin/status", get(admin_status))
         .route("/admin/logs", get(admin_logs))

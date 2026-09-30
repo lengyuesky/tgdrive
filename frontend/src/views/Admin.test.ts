@@ -6,7 +6,9 @@ import Admin from './Admin.vue'
 import SettingField from '../components/SettingField.vue'
 
 const mocks = vi.hoisted(() => ({
+  restore: { status: vi.fn() },
   config: vi.fn(), status: vi.fn(), extras: vi.fn(), save: vi.fn(), reset: vi.fn(),
+  usqueStatus: vi.fn(), usqueRegister: vi.fn(),
   test: vi.fn(), detectChats: vi.fn(), confirm: vi.fn(),
   route: { query: { s: 'proxy' } },
 }))
@@ -20,6 +22,7 @@ vi.mock('../api', () => ({
   errMsg: (error: { response?: { data?: { error?: string } } }) => error.response?.data?.error ?? String(error),
   fmtSize: String, fmtTime: String, fmtDuration: String,
 }))
+vi.mock('../http', () => ({ holdAuthRedirect: () => vi.fn() }))
 vi.mock('../dialog', () => ({ appAlert: vi.fn(), appConfirm: mocks.confirm }))
 vi.mock('../theme', () => ({ isDark: false, toggleDark: vi.fn() }))
 
@@ -31,11 +34,11 @@ function configFixture() {
   return {
     values: {
       api_base: 'https://api.telegram.org', bot_token: 'masked-bot-token', upload_bot_tokens: '', chat_id: '-100123',
-      proxy_enabled: true, proxy_url: maskedUrl,
+      proxy_enabled: true, proxy_provider: 'manual', proxy_url: maskedUrl,
       chunk_size: 18 * 1024 ** 2, upload_concurrency: 2, download_concurrency: 4, send_video: false,
       tmp_dir: '/tmp', username: 'test', password: '••••••••', telegram_api_id: '', telegram_api_hash: '',
     },
-    sources: { proxy_enabled: 'db', proxy_url: 'db' }, configured: false,
+    sources: { proxy_enabled: 'db', proxy_provider: 'db', proxy_url: 'db' }, configured: false,
     official_api: true, official_api_base: 'https://api.telegram.org',
     official_chunk_max: 19_500_000, official_chunk_default: 18 * 1024 ** 2, local_chunk_default: 256 * 1024 ** 2,
     readonly: {},
@@ -46,6 +49,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.useFakeTimers()
   localStorage.clear()
+  mocks.restore.status.mockResolvedValue({ data: { phase: 'idle', warnings: [], safe_mode: false } })
   mocks.route.query.s = 'proxy'
   config = configFixture()
   mocks.config.mockImplementation(async () => ({ data: structuredClone(config) }))
@@ -63,6 +67,8 @@ beforeEach(() => {
     config.values.proxy_url = ''
     return { data: { changed: ['proxy_enabled', 'proxy_url'], account_changed: false, needs_local_api_restart: false } }
   })
+  mocks.usqueStatus.mockResolvedValue({ data: { phase: 'unregistered', registered: false, message: '尚未初始化' } })
+  mocks.usqueRegister.mockResolvedValue({ data: { phase: 'stopped', registered: true, message: '初始化完成' } })
   mocks.test.mockResolvedValue({ data: { bot: 'test-bot' } })
   mocks.detectChats.mockResolvedValue({ data: { bot: 'test-bot', chats: [] } })
   mocks.confirm.mockResolvedValue(undefined)
@@ -100,6 +106,34 @@ async function section(label: string) {
 }
 
 describe('系统设置网络代理', () => {
+  it('切换 usque 保留自定义凭据，初始化与保存分别执行', async () => {
+    const view = await render()
+    field('代理方式').findComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', 'usque')
+    await flushPromises()
+    expect(view.text()).toContain('Cloudflare 服务条款')
+    expect(mocks.usqueRegister).not.toHaveBeenCalled()
+    expect(view.findAllComponents(SettingField).some(item => item.props('label') === '代理地址')).toBe(false)
+    await button('同意条款并初始化 usque')
+    expect(mocks.usqueRegister).toHaveBeenCalledOnce()
+    expect(mocks.save).not.toHaveBeenCalled()
+    await button('测试连接')
+    expect(mocks.test).toHaveBeenCalledWith(expect.objectContaining({ proxy_provider: 'usque', proxy_url: maskedUrl }))
+    await button('保存并生效')
+    expect(mocks.save).toHaveBeenCalledWith({ proxy_provider: 'usque' })
+    field('代理方式').findComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', 'manual')
+    await flushPromises()
+    expect(field('代理地址').findComponent({ name: 'ElInput' }).props('modelValue')).toBe(maskedUrl)
+  })
+
+  it('恢复预检期间锁定设置区域并拒绝保存，避免长任务与配置写入冲突', async () => {
+    mocks.restore.status.mockResolvedValue({ data: { phase: 'preparing', id: 'restore-job', warnings: [], safe_mode: false } })
+    const view = await render()
+    expect(view.find('.layout').attributes('inert')).toBeDefined()
+    await editProxy(false)
+    await button('保存并生效')
+    expect(mocks.save).not.toHaveBeenCalled()
+  })
+
   it('回填脱敏地址，关闭时只提交开关并保留原凭据', async () => {
     const view = await render()
     expect(view.find('.pane-title h2').text()).toBe('网络代理')
@@ -125,14 +159,14 @@ describe('系统设置网络代理', () => {
     await button('测试连接')
     expect(mocks.test).toHaveBeenCalledWith({
       api_base: config.values.api_base, bot_token: config.values.bot_token, chat_id: config.values.chat_id,
-      proxy_enabled: true, proxy_url: url,
+      proxy_enabled: true, proxy_provider: 'manual', proxy_url: url,
     })
     expect(mocks.save).not.toHaveBeenCalled()
     await section('Telegram 存储')
     await button('检测 ID')
     expect(mocks.detectChats).toHaveBeenCalledWith({
       api_base: config.values.api_base, bot_token: config.values.bot_token,
-      proxy_enabled: true, proxy_url: url,
+      proxy_enabled: true, proxy_provider: 'manual', proxy_url: url,
     })
     await section('网络代理')
     expect(field('代理地址').findComponent({ name: 'ElInput' }).props('modelValue')).toBe(url)
@@ -145,7 +179,7 @@ describe('系统设置网络代理', () => {
     field('代理地址').vm.$emit('reset')
     await flushPromises()
     expect(mocks.confirm).toHaveBeenCalled()
-    expect(mocks.reset).toHaveBeenCalledWith(['proxy_enabled', 'proxy_url'])
+    expect(mocks.reset).toHaveBeenCalledWith(['proxy_enabled', 'proxy_provider', 'proxy_url'])
     expect(field('启用代理').findComponent({ name: 'ElSwitch' }).props('modelValue')).toBe(false)
     expect(field('代理地址').findComponent({ name: 'ElInput' }).props('modelValue')).toBe('')
   })

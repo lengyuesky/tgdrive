@@ -244,6 +244,7 @@ impl CatalogTransport for HttpCatalogTransport {
         timeout: Duration,
         max_bytes: usize,
     ) -> AppResult<Vec<u8>> {
+        let _snapshot = crate::proxy::ProxySnapshot::new(proxy.clone())?;
         let client = proxy
             .http_builder()?
             .redirect(reqwest::redirect::Policy::none())

@@ -18,6 +18,7 @@ mod migration;
 mod mtproto;
 mod password;
 mod proxy;
+mod restore;
 mod security;
 mod settings;
 mod tasks;
@@ -48,6 +49,24 @@ fn main() {
         .init();
 
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
+    // 锁活到进程结束（不能随 serve future 返回释放，后台线程此时未必退出）。
+    let _instance_lock = if matches!(cmd.as_str(), "serve" | "check" | "reset-2fa") {
+        match Config::from_env().and_then(|cfg| {
+            let lock = restore::InstanceLock::acquire(&cfg.db_path)?;
+            if cmd != "serve" {
+                restore::require_cli_idle(&cfg.db_path, cmd == "check")?;
+            }
+            Ok(lock)
+        }) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                tracing::error!("{error:#}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let rt = tokio::runtime::Runtime::new().expect("无法创建 tokio 运行时");
     let result = match cmd.as_str() {
         "serve" => rt.block_on(serve()),
@@ -67,12 +86,19 @@ fn main() {
         tracing::error!("{e:#}");
         std::process::exit(1);
     }
+    // 全部线程真正退出后操作系统才释放实例锁；禁止旧后台写入与下一实例重叠。
+    std::process::exit(0);
 }
 
 async fn serve() -> anyhow::Result<()> {
     let env_cfg = Arc::new(Config::from_env()?);
+    let safe_mode = restore::startup(&env_cfg).await?;
+    let restore = restore::RestoreManager::new(&env_cfg.db_path)?;
     let db = Db::open(&env_cfg.db_path).await?;
-    db.recover_storage_migration().await?;
+    db.set_background_blocked(safe_mode);
+    if !safe_mode {
+        db.recover_storage_migration().await?;
+    }
     if crate::settings::migrate_password_hash(&db).await? {
         tracing::info!("已将数据库中的登录密码迁移为 argon2 哈希");
     }
@@ -97,7 +123,11 @@ async fn serve() -> anyhow::Result<()> {
         let primary_target_id = cfg
             .storage_target_id
             .ok_or_else(|| anyhow::anyhow!("Telegram 主存储目标未初始化"))?;
-        let migrated = db.backfill_unassigned_chunks(primary_target_id).await?;
+        let migrated = if safe_mode {
+            0
+        } else {
+            db.backfill_unassigned_chunks(primary_target_id).await?
+        };
         if migrated > 0 {
             tracing::warn!(
                 "已将 {migrated} 个旧版分块关联到当前 Telegram 存储目标；如数据库曾切换过 Bot/频道，请人工核对历史文件"
@@ -119,6 +149,8 @@ async fn serve() -> anyhow::Result<()> {
         mtproto,
         cfg.proxy.clone(),
     )?);
+    // 自建 Bot API 的连接和 tgdrive 共用同一个热更新代理句柄。
+    let _bot_api_proxy = proxy::bot_api::Bridge::from_env(tg.proxy_client()).await?;
     let knobs = Arc::new(UploadKnobs::new(
         cfg.chunk_size,
         cfg.tmp_dir.clone(),
@@ -137,9 +169,11 @@ async fn serve() -> anyhow::Result<()> {
     }
 
     // 进程退出会让在途分块声明失效；已完成分块仍由可恢复会话保留。
-    db.reset_upload_part_claims().await?;
+    if !safe_mode {
+        db.reset_upload_part_claims().await?;
+    }
     // 旧上传管线的崩溃残留仍需回滚；带 upload_sessions 的节点不能删除。
-    if db.unassigned_chunk_count().await? == 0 {
+    if !safe_mode && db.unassigned_chunk_count().await? == 0 {
         let stale = db.cleanup_stale_uploads().await?;
         if !stale.is_empty() {
             tracing::info!("清理上次遗留的 {} 条未完成上传消息", stale.len());
@@ -199,6 +233,7 @@ async fn serve() -> anyhow::Result<()> {
         ),
         tasks: tasks.clone(),
         migration: migration.clone(),
+        restore: restore.clone(),
         apps_catalog,
         events,
         range_cache: Arc::new(std::sync::Mutex::new(crate::apps::RangeCache::default())),
@@ -262,6 +297,10 @@ async fn serve() -> anyhow::Result<()> {
     }
 
     let app = app
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::restore::write_guard,
+        ))
         // JSON/表单默认最多 1MiB；只有文件上传与 WebDAV 写入在各自路由放开。
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
@@ -282,7 +321,7 @@ async fn serve() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(tasks, migration))
+    .with_graceful_shutdown(shutdown_signal(tasks, migration, restore.shutdown.clone()))
     .await?;
     Ok(())
 }
@@ -290,6 +329,7 @@ async fn serve() -> anyhow::Result<()> {
 async fn shutdown_signal(
     tasks: crate::tasks::TaskManager,
     migration: crate::migration::StorageMigrationManager,
+    restore_shutdown: tokio_util::sync::CancellationToken,
 ) {
     #[cfg(unix)]
     let terminate = async {
@@ -307,10 +347,17 @@ async fn shutdown_signal(
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = terminate => {},
+        _ = restore_shutdown.cancelled() => {},
     }
+    // 长下载/SSE 或失联后台任务不能无限阻止重启。切库仍只发生在下一进程。
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        tracing::warn!("退出等待达到上限，结束进程以释放实例锁");
+        std::process::exit(0);
+    });
     tracing::info!("收到退出信号，正在停止后台任务并等待连接结束");
-    migration.shutdown().await;
     tasks.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), migration.shutdown()).await;
 }
 
 /// 从标准输入读一行（去掉行尾换行）。可用管道传入，避免口令留在 shell 历史里。
@@ -369,14 +416,11 @@ fn decrypt_backup() -> anyhow::Result<()> {
         Ok(value) if !value.is_empty() => value,
         _ => read_stdin_line("输入备份加密密码（输入内容会显示）: ")?,
     };
-    if let Err(error) = crate::backup::decrypt_file(
+    crate::backup::decrypt_file(
         std::path::Path::new(&input),
         std::path::Path::new(&output),
         passphrase,
-    ) {
-        let _ = std::fs::remove_file(&output);
-        return Err(error);
-    }
+    )?;
     println!("已解密到 {output}");
     Ok(())
 }

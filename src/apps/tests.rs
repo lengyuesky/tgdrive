@@ -172,6 +172,7 @@ async fn state_at(path: &std::path::Path, media: Arc<MemoryMedia>) -> AppState {
         dav: crate::dav::build_handler(vfs.clone()),
         vfs,
         auth,
+        restore: crate::restore::RestoreManager::new(&rt.env.db_path).unwrap(),
         rt,
         attempts: Default::default(),
         tasks: crate::tasks::TaskManager::new(),

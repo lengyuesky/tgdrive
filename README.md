@@ -15,7 +15,7 @@ WebDAV 客户端─┘   ├ /api/*  REST+SSE       └─> Telegram Bot API
 
 - **大文件不受单文件限制**:自动分块上传/拼接下载,官方 Bot API 也能存任意大小文件
 - **双端点**:官方 `api.telegram.org` 开箱即用;可切换自部署 `telegram-bot-api`(单块上限 2000MB，默认使用更稳妥的 256MB 分块；local 模式直读磁盘,速度更快)
-- **网络代理**:在设置中启用 HTTP / SOCKS5 代理，支持账号密码；Bot API、MTProto 流式下载、收件和远端备份共用，保存后无需重启
+- **网络代理**:在设置中启用 HTTP / SOCKS5 代理，支持账号密码；tgdrive、项目内自建 Bot API、MTProto 流式下载、收件和远端备份共用，保存后无需重启容器
 - **Web 界面**:目录树侧栏、列表/网格/大图/时间线四种视图、拖拽上传(带进度)、下载、重命名、移动(目录选择器)、复制、图片/视频/音频/文本预览、暗色模式、在线主屏幕应用
 - **手机与 iPhone**:文件／传输／应用／我的四标签、触控列表、底部操作面板、安全区与软键盘适配；前台切页继续上传，支持添加到主屏幕
 - **断点续传**:多分块大文件固定交给默认 Bot 串行上传,上传期间其他任务暂缓并在完成后自动继续;支持单项或一键批量暂停、继续、重试和取消;刷新页面或服务重启后重新选择原文件并通过 SHA-256 校验,只补传缺失分块
@@ -71,10 +71,12 @@ tgdrive 的 MTProto Range 下载使用：浏览器播放视频时每次只向 Te
 
 自建服务位于 Compose 的 `local-bot-api` profile 中,不会随普通的 `docker compose up` 启动。
 
+两个服务由同一份 Compose 管理，并共用 tgdrive 后台「网络代理」设置。无法直连 Telegram 时，只需在后台启用代理，或在 `.env` 设置 `TGDRIVE_PROXY_ENABLED=true` 和 `TGDRIVE_PROXY_URL`。首次升级到支持共享代理的版本，需要执行下面的构建命令重建两个服务；以后修改代理无需重建。
+
 **A. 网页里配**(推荐):后台「自建 Bot API 服务器」填好 api_id / api_hash 并保存,点「导出 .env」把内容覆盖回项目目录的 `.env`,执行:
 
 ```bash
-docker compose --profile local-bot-api up -d
+docker compose --profile local-bot-api up -d --build tgdrive telegram-bot-api
 ```
 
 重建容器后,回「Telegram 存储」把「接口端点」切到**自建 Bot API** 再保存即可。
@@ -104,7 +106,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_API_BASE` | | `https://api.telegram.org` | ✔ | Bot API 端点 |
 | `TGDRIVE_PROXY_ENABLED` | | `false`（仅配置代理 URL 时自动启用） | ✔ | 出站代理开关；关闭后直连，但保留已保存的地址 |
 | `TGDRIVE_PROXY_URL` | | — | ✔ | HTTP / SOCKS5 代理 URL，例如 `http://proxy:7890`、`socks5h://user:password@proxy:1080` |
-| `TGDRIVE_CHUNK_SIZE` | | 官方 18MB / 自建 1900MB | ✔ | 分块大小,支持 `18MB`/`1g` 写法;官方端点上限 19.5MB(受 getFile 20MB 限制),自建上限 1900MB |
+| `TGDRIVE_CHUNK_SIZE` | | 官方 18MB / 自建 256MB | ✔ | 分块大小,支持 `18MB`/`1g` 写法;官方端点上限 19.5MB(受 getFile 20MB 限制),自建上限 1900MB |
 | `TGDRIVE_UPLOAD_CONCURRENCY` | | `2` | ✔ | 单个上传 Bot API 实例的并发数；总并发 = 此值 × 上传 Bot 数量 |
 | `TGDRIVE_DOWNLOAD_CONCURRENCY` | | `4` | ✔ | MTProto 单个下载流的并行分段数，范围 1~8；「流式播放」中保存后对新请求生效。同一 Bot 的所有存储目标共享最多 8 路在途请求 |
 | `TGDRIVE_SEND_VIDEO` | | 官方 `false` / 自建 `true` | ✔ | 视频消息模式:不超过分块大小的 mp4/mov/m4v 以「视频消息」发送(自动带宽高时长),Telegram 里可直接播放,文件内容不变;mkv/webm 仍走文档(Telegram 播放器不支持其常见编码);超过分块大小的视频仍按文档分块存储 |
@@ -216,7 +218,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 - **密码哈希**:后台设置的登录密码以 argon2id 哈希存进数据库;旧版明文会在启动时自动迁移。「导出 .env」导出的也是哈希(带单引号,可直接使用)。
 - **两步验证**:在「账号安全」中扫码绑定任意 TOTP 验证器(Google Authenticator、Microsoft Authenticator、1Password 等),绑定成功会显示 10 个一次性恢复码,并登出其他设备。之后网页登录需输入 6 位验证码,手机丢失时可用恢复码代替。
 - **WebDAV 应用密码**:随机生成,只显示一次,用户名不变。启用两步验证后,WebDAV 与 `/api` 的 Basic 认证**不再接受登录密码**,只能用应用密码,避免借 WebDAV 绕过两步验证。
-- **找回**:验证器和恢复码都丢失时,在宿主机执行 `docker compose exec tgdrive tgdrive reset-2fa` 关闭两步验证,再 `docker compose restart tgdrive`。
+- **找回**:验证器和恢复码都丢失时，先 `docker compose stop tgdrive`，再运行 `docker compose run --rm tgdrive reset-2fa` 关闭两步验证，最后 `docker compose up -d tgdrive`。服务与写库命令共用实例锁，不能在服务运行时直接执行重置。
 - 两步验证密钥、恢复码和应用密码与登录密码一样,不会写进离开本机的备份;从备份恢复后需要重新绑定。
 
 **改配置前请注意:**
@@ -225,26 +227,62 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 - **旧数据库首次升级**无法凭 Telegram 消息反推出每个历史分块的原目标,程序会把尚未关联目标的旧分块一次性绑定到升级时的当前配置。如果旧库曾经换过 Bot、端点或频道,请先备份数据库并人工核对。
 - **api_id / api_hash 改完不会立刻生效**：tgdrive 在启动时读取它们建立 MTProto 会话，Compose 也把它们传给 telegram-bot-api。保存后要导出 `.env` 覆盖回项目目录，再执行 `docker compose --profile local-bot-api up -d --build tgdrive telegram-bot-api`。
 
-### HTTP / SOCKS5 代理
+### 网络代理（HTTP / SOCKS5 / usque WARP）
 
-打开「系统设置 → 网络代理」，填写地址并打开开关，点击「保存并生效」。支持：
+打开「系统设置 → 网络代理」，可以选择「自定义代理」或「usque（Cloudflare WARP）」。切换方式会保留原有自定义代理地址。
+
+**使用内置 usque：** 镜像包含 [usque v4.2.1](https://github.com/Diniboy1123/usque)。选择 usque 后，首次点击「同意条款并初始化 usque」注册 WARP 设备，再打开代理开关并保存。初始化需要连接 Cloudflare 注册服务；隧道默认使用 HTTP/2，通过 TCP/443 连接 Cloudflare，以兼容 QUIC 数据传输受限的网络。网络支持 QUIC 时可在 `.env` 设置 `TGDRIVE_USQUE_TRANSPORT=quic`（UDP/443），然后重建 tgdrive 容器；切换传输方式无需重新注册 WARP。页面显示进程状态，「测试连接」会额外检查 WARP 隧道。进程异常退出会自动重启，连接失败不会回退直连。
+
+注册配置保存在数据库同级的 `usque/config.json`（默认容器 `/data/usque/config.json`，宿主机 `./data/usque/config.json`），重建容器后复用。它包含私钥，请单独妥善备份；数据库备份不包含这个文件。也可在启用前将已有 usque 配置放入该路径，初始化按钮不会覆盖已有文件。usque 只监听容器内 `127.0.0.1:1083`，使用自动生成的认证信息，无需公开端口、TUN 或额外权限。直接运行 Rust 程序时，请自行安装该版本 usque，并通过 `TGDRIVE_USQUE_BIN` 指定二进制路径。
+
+**使用自定义代理：** 填写地址并打开开关，点击「保存并生效」。支持：
 
 - `http://主机:端口`：HTTP 代理；MTProto 使用 HTTP CONNECT 隧道，代理需允许连接 Telegram DC 的端口。
 - `socks5://主机:端口`：SOCKS5，HTTP 请求的目标域名由 tgdrive 解析。
 - `socks5h://主机:端口`：SOCKS5，目标域名交给代理解析，推荐使用；`socks://` 是此方式的别名。
 - 认证格式为 `协议://用户名:密码@主机:端口`，用户名、密码中的 `@`、`:`、`#` 等特殊字符需 URL 编码。HTTP 默认端口为 80，SOCKS5 默认为 1080。
 
-「测试连接」使用当前尚未保存的代理、Bot Token 和存储频道。保存时也会验证连接；失败不会覆盖当前配置，仍可确认后强制保存。关闭代理后保留地址，恢复直连；恢复地址时会一并恢复开关，避免留下无效组合。
+「测试连接」不保存配置。连接官方或远端 Bot API 时，使用当前表单中的代理；项目内自建 Bot API 的 Telegram 连接使用已保存的代理，新的代理在保存后生效。保存时会验证当前 Bot API 链路；失败不会覆盖配置，仍可确认后强制保存。关闭代理后保留地址，恢复直连；恢复代理方式或地址时会一并恢复方式、地址与开关，避免留下无效组合。
 
 代理覆盖 tgdrive 发出的 Bot API 请求（含历史存储目标）、MTProto、Bot 收件和 WebDAV / S3 备份。已发出的 HTTP 请求和已打开的 MTProto 下载流继续使用原连接；新请求使用新配置，收件在下一轮轮询切换。HTTP 请求到 `localhost`、`127.0.0.1`、`::1` 和 `telegram-bot-api` 时保持直连。
 
+项目内的 `telegram-bot-api` 也共用这份配置。它的 Telegram TCP 连接由 proxychains 转给 tgdrive 的内部认证入口，再由 tgdrive 使用当前 HTTP CONNECT / SOCKS5 代理连接 Telegram；关闭代理时由 tgdrive 直连。保存或恢复代理设置会断开 Bot API 的旧连接，由 TDLib 自动重连，在途上传或下载可能短暂停顿。代理失败时不会自动绕过代理直连。
+
+内部入口不映射到宿主机端口，也不需要 `NET_ADMIN`、TUN 或 Docker socket。Compose 使用 `TGDRIVE_BOT_API_PROXY_LISTEN=0.0.0.0:1082`、`TGDRIVE_BOT_API_PROXY_CONFIG=/bot-api-control/proxychains.conf` 和共享目录自动建立连接。配置文件只含启动时生成的内部认证密钥，不含上游代理凭据，且不进入镜像。tgdrive 重建后 Bot API 自动重新读取入口配置。请保留这两个环境变量和共享挂载，不要把该端口公开到公网；自行部署到项目外的 Bot API 不受此配置管理。
+
+开发验证：构建两个项目镜像后运行 `node docker/test-shared-proxy.mjs`。测试创建独立的内部网络、空数据库和临时容器，验证代理切换、失败时不回退、恢复配置以及重启联动，结束后清理测试资源，不连接生产实例或 Telegram。
+
 注意：
-- 独立的 `telegram-bot-api` 服务访问 Telegram 的代理需要另外配置，本设置不会改变该服务或浏览器的网络设置。
+- 本项目 Compose 中的 `telegram-bot-api` 自动共用代理；其他外部 Bot API 服务及浏览器的网络设置需要分别管理。Bot API 原生 `--proxy` 只代理 webhook，不能替代这里的 Telegram 出站代理。
 - Docker 中的 `127.0.0.1` 指容器本身。使用宿主机代理需填写容器可访问的宿主机地址，并让代理监听可访问的接口；不要向公网开放无认证代理。
-- tgdrive 使用这里的显式设置，不读取系统 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`。也可在 `.env` 配置 `TGDRIVE_PROXY_URL` 和 `TGDRIVE_PROXY_ENABLED`，后台覆盖优先。
+- tgdrive 使用这里的显式设置，不读取系统 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`。也可在 `.env` 配置 `TGDRIVE_PROXY_PROVIDER`、`TGDRIVE_PROXY_URL` 和 `TGDRIVE_PROXY_ENABLED`，后台覆盖优先。
 - 设置接口会隐藏代理用户名和密码，原样回传不会覆盖凭据；修改地址时需重新填写完整认证信息。数据库备份和「导出 .env」仍包含真实凭据，应妥善保管。
 
 ### 数据库备份恢复
+
+#### 从 Telegram 频道恢复
+
+在「系统设置 → 备份」中选择「从 Telegram 恢复」，可以：
+
+- **探测频道备份**：全新部署在 `.env` 配置 `TGDRIVE_BOT_TOKEN`、`TGDRIVE_CHAT_ID`、`TELEGRAM_API_ID`、`TELEGRAM_API_HASH` 及网页登录账号密码后启动，即可直接查找频道里以前发送的 `tgdrive-backup-*.db` / `.db.age` 备份，无需旧数据库或手机账号登录。打开向导后需手动点击「探测频道备份」才开始。每批读取 100 个消息位置，找到最近 5 份完整备份即停止，列表最多显示 5 份；不足 5 份时探测到频道起点。按文件名组合非连续分块，缺块、重复或不一致的备份不能恢复。后台已保存的频道配置优先于 `.env`。
+- **选择已记录的备份**：使用当前数据库保存的频道备份记录。
+- **输入备份消息链接/ID**：适用于全新部署或本地记录丢失。先配置可访问该频道的 Bot、Bot API 端点及代理，再粘贴备份消息链接；也可填写频道 ID 和消息 ID。分块备份必须提供同一份备份的**所有分块消息**，消息号不需要连续。
+
+频道探测使用 Bot 可调用的 MTProto 频道差分和按消息号读取接口，只读取消息信息，不发送、转发或删除消息，也不把探测结果加入自动备份清理队列。未配置 API ID / Hash 时仍可手动提供消息链接。选择备份并开始下载预检时，会把指定消息**临时转发回同一频道**，下载完成后仅清理本次产生的临时消息，不删除来源备份。开始前需要确认此行为；Bot 必须能访问频道并发布消息，禁止转发的频道不支持这种方式。没有删除权限时，临时消息可能需要手动清理。
+
+向导会下载、按分块编号合并、解密（如有）并校验 SQLite 数据库。加密备份需要备份时的密码，与登录密码不是同一个用途。文件不完整、密码错误、数据库损坏或版本比当前程序新时，不能确认恢复。旧版备份没有内容签名，只应导入自己信任的频道备份。
+
+单次最多 128 块，密文和解密后的数据库分别不超过 8 GiB；准备任务与已就绪候选各有 30 分钟时限。暂存、试迁移和回滚都需要额外磁盘空间。age 工作因子上限为 20，密钥派生峰值内存约 1 GiB；超过此限制的旧备份需在资源足够的受控环境使用外部 `age` 离线解密后手动恢复。进程被强制终止或 Telegram 响应丢失时，临时转发可能残留，请按提示手动清理，不要删除原备份。
+
+**确认恢复会覆盖当前文件索引和后台配置。** 查看预检摘要后，需要输入「恢复」、当前登录密码及已启用的两步验证码。恢复接口只允许网页登录会话，WebDAV 应用密码不能授权恢复。程序保留当前实例的登录安全设置与当前网络代理，不恢复旧的登录会话；完成后重新登录。未包含在备份里的远端备份密码等敏感配置，可能仍需重新填写。
+
+数据库不是在线替换：服务先持久化恢复任务并退出，下一次启动在打开连接池前生成包含已提交 WAL 数据的本机回滚快照，再切换数据库。项目的 Docker Compose 会自动重启；直接运行二进制时需由进程管理器拉起，或手动再次执行 `tgdrive serve`。回滚副本包含本机敏感配置，请妥善保护，不要公开上传。
+
+恢复后默认进入**安全模式**，暂停旧的上传残留清理、消息删除、迁移、自动备份和收件等后台任务，避免备份中的旧队列误删频道数据。检查恢复结果后，在备份页面再次认证并明确解除安全模式；该操作会重启服务。恢复仅导入主数据库，不会重新上传频道文件，也不恢复独立的封面缓存等旁路文件。
+
+网络必须先连通 Telegram：本项目 Compose 中的 `telegram-bot-api` 共用后台代理，外部 Bot API 服务仍需单独保证网络可用；大分块还需要支持相应大小的 Bot API 或有效的 MTProto 配置。
+
+#### 手动下载备份恢复
 
 自动备份只生成一次 SQLite 一致性快照，再同时投递到全部已启用渠道。WebDAV 与 S3 保存完整
 `.db` 文件；Telegram 使用独立的备份分块设置，默认每块 18MB，确保官方 Bot API 也能下载。
@@ -304,7 +342,10 @@ rclone copy ./本地目录 tgdrive:备份目录
 
 ```bash
 # 用真实 bot 自检整条链路:getMe → 上传 1MB → 下载比对 → 删除
+# check 会访问数据库；先停止主服务以获取实例锁
+docker compose stop tgdrive
 docker compose run --rm tgdrive check
+docker compose up -d tgdrive
 
 # 容器健康检查(镜像 HEALTHCHECK 已内置)
 tgdrive healthcheck
@@ -312,8 +353,10 @@ tgdrive healthcheck
 # 生成 argon2 密码哈希,写进 .env 时加单引号(从标准输入读取,避免留在 shell 历史)
 printf '%s' '新密码' | docker compose run --rm -T tgdrive hash-password
 
-# 丢失验证器与恢复码时关闭两步验证,执行后重启容器
-docker compose exec tgdrive tgdrive reset-2fa
+# 丢失验证器与恢复码时关闭两步验证（需独占数据库）
+docker compose stop tgdrive
+docker compose run --rm tgdrive reset-2fa
+docker compose up -d tgdrive
 
 # 解密 .db.age 备份;口令取 TGDRIVE_BACKUP_PASSWORD,未设置时从标准输入读取
 tgdrive decrypt-backup tgdrive-backup-YYYYMMDD-HHMMSS.db.age tgdrive.db

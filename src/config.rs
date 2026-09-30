@@ -29,7 +29,7 @@ pub struct Config {
     pub chat_id: String,
     /// Bot API 基地址,官方或自部署 telegram-bot-api
     pub api_base: String,
-    /// tgdrive 出站请求代理；独立 Bot API 服务的联网配置不受影响。
+    /// tgdrive 与项目内自建 Bot API 共用的出站代理。
     pub proxy: crate::proxy::ProxyConfig,
     pub chunk_size: u64,
     pub upload_concurrency: usize,
@@ -105,7 +105,7 @@ pub fn env_present(key: &str) -> bool {
     env_opt(key).is_some()
 }
 
-fn env_opt(key: &str) -> Option<String> {
+pub(crate) fn env_opt(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|v| v.trim().to_string())
@@ -233,7 +233,13 @@ impl Config {
             .transpose()
             .map_err(|_| anyhow::anyhow!("TGDRIVE_PROXY_ENABLED 应为 true 或 false"))?
             .unwrap_or(!proxy_url.is_empty());
-        let proxy = crate::proxy::ProxyConfig::new(proxy_enabled, &proxy_url)?;
+        let proxy = crate::proxy::ProxyConfig::with_provider(
+            proxy_enabled,
+            &proxy_url,
+            crate::proxy::ProxyProvider::parse(
+                &env_opt("TGDRIVE_PROXY_PROVIDER").unwrap_or_else(|| "manual".into()),
+            )?,
+        )?;
 
         let cfg = Config {
             listen: env_opt("TGDRIVE_LISTEN")

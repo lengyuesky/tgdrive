@@ -30,7 +30,7 @@ export const SECTIONS: { key: SectionKey; label: string; desc: string; icon: Com
   { key: 'queues', label: '后台任务', desc: 'Telegram 消息删除', icon: Cpu },
   { key: 'logs', label: '后台日志', desc: '操作进度与失败重试', icon: Notebook },
   { key: 'telegram', label: 'Telegram 存储', desc: 'Bot、频道与分块', icon: Promotion },
-  { key: 'proxy', label: '网络代理', desc: 'HTTP / SOCKS5', icon: Link },
+  { key: 'proxy', label: '网络代理', desc: '自定义代理 / usque WARP', icon: Link },
   { key: 'stream', label: '流式播放', desc: 'MTProto / 自建 Bot API', icon: VideoPlay },
   { key: 'account', label: '账号安全', desc: '密码、两步验证与 WebDAV', icon: User },
   { key: 'backup', label: '备份与回收站', desc: '数据库快照与保留期', icon: FolderOpened },
@@ -45,6 +45,7 @@ export const isSectionKey = (k: string): k is SectionKey => SECTIONS.some((s) =>
 export const CFG_SECTION: Record<string, SectionKey> = {
   api_base: 'telegram',
   proxy_enabled: 'proxy',
+  proxy_provider: 'proxy',
   proxy_url: 'proxy',
   bot_token: 'telegram',
   upload_bot_tokens: 'telegram',

@@ -32,7 +32,7 @@ export const INBOX_DIRS: { key: InboxDirKey; label: string; help: string }[] = [
  * 维护类设置(回收站/备份/Bot 收件/后台任务开关),走独立的 extras 保存接口。
  * 首次加载由调用方在 onMounted 里触发,以保持与拆分前一致的请求顺序。
  */
-export function useAdminExtras() {
+export function useAdminExtras(writesBlocked = () => false, backupsBlocked = writesBlocked) {
   const extras = ref<Extras>()
   /** 加载时的深拷贝快照,用于统计维护类设置改了几项 */
   const extrasOrigin = ref<Extras>()
@@ -127,6 +127,7 @@ export function useAdminExtras() {
   }
 
   async function saveExtras() {
+    if (writesBlocked()) return
     if (!extras.value) return
     // 用户直接点保存时，也要收下输入框里尚未按回车的后缀，避免静默丢失。
     extras.value.inbox_rules.forEach((rule, index) => addRuleExtensions(rule, index))
@@ -161,6 +162,7 @@ export function useAdminExtras() {
   }
 
   async function backupNow() {
+    if (backupsBlocked() || backingUp.value) return
     backingUp.value = true
     try {
       const { data } = await api.admin.backupNow()

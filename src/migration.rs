@@ -102,6 +102,7 @@ impl StorageMigrationManager {
     }
 
     pub async fn start(&self, main_target_id: i64) -> AppResult<StorageMigrationStatus> {
+        self.db.require_background_enabled()?;
         // 在启动后台任务前验证主目标客户端仍已注册。
         self.tg.binding(main_target_id)?;
         let sources = self.db.storage_migration_sources(main_target_id).await?;
@@ -200,7 +201,7 @@ impl StorageMigrationManager {
         let main = self.tg.binding(main_target_id)?;
         let mut completed_this_run = 0i64;
         loop {
-            if token.is_cancelled() {
+            if token.is_cancelled() || self.db.background_blocked() {
                 self.db.storage_migration_set_status("paused", None).await?;
                 return Ok(());
             }

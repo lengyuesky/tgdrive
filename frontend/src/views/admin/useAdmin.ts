@@ -22,6 +22,7 @@ import { CFG_SECTION, SECTIONS, SECTION_STORE, isSectionKey, type SectionKey } f
 import { useAdminConfig } from './useAdminConfig'
 import { useAdminExtras } from './useAdminExtras'
 import { useBackendLogs } from './useBackendLogs'
+import { useRestore } from './useRestore'
 import { useTaskQueues } from './useTaskQueues'
 
 interface Tile {
@@ -72,10 +73,11 @@ function createAdminState() {
   // 注意调用顺序即 onMounted 的注册顺序:主配置 → 日志 → 迁移轮询 → 维护设置 → beforeunload,与拆分前一致
   // eslint-disable-next-line prefer-const
   let queues: ReturnType<typeof useTaskQueues>
-  const config = useAdminConfig(router, () => void queues.loadStorageMigration(true))
+  const config = useAdminConfig(router, () => void queues.loadStorageMigration(true), () => restore.locked.value)
   const { cfg, status, form, leaving, load, buildPatch, save, reloadStatus } = config
   const logs = useBackendLogs(status, section)
-  const ext = useAdminExtras()
+  const ext = useAdminExtras(() => restore.locked.value, () => restore.locked.value || restore.status.value.safe_mode)
+  const restore = useRestore(() => !config.loading.value && !!ext.extras.value && !changed.value.total && !config.saving.value && !ext.extrasSaving.value && !ext.backingUp.value)
   const { extras, loadExtras, saveExtras, extrasPatchKeys, hasRuleDraft } = ext
   queues = useTaskQueues({
     cfg,
@@ -155,6 +157,7 @@ function createAdminState() {
         api_base: form.value.api_base,
         bot_token: form.value.bot_token,
         proxy_enabled: form.value.proxy_enabled,
+        proxy_provider: form.value.proxy_provider,
         proxy_url: form.value.proxy_url,
       })
       detectBot.value = data.bot
@@ -293,6 +296,7 @@ function createAdminState() {
   })
 
   async function saveAll() {
+    if (restore.locked.value) return
     if (!changed.value.total) {
       ElMessage.info('没有改动')
       return
@@ -303,11 +307,13 @@ function createAdminState() {
   }
 
   async function discardAll() {
+    if (restore.locked.value) return
     await Promise.all([load(), loadExtras()])
     ElMessage.info('已放弃未保存的改动')
   }
 
   async function reloadAll() {
+    if (restore.locked.value) return
     await Promise.all([load(), loadExtras()])
   }
 
@@ -404,6 +410,8 @@ function createAdminState() {
   ])
 
   const ctx = {
+    restore,
+    restoreLocked: restore.locked,
     router,
     section,
     activeSection,

@@ -12,6 +12,8 @@ import type { DetectedChat } from '../api'
 // 全部状态与动作在 useAdmin 中创建并 provide，分区子组件注入同一份。
 const {
   activeSection,
+  restore,
+  restoreLocked,
   addInboxRule,
   addWhitelist,
   backingUp,
@@ -67,6 +69,8 @@ import TelegramSection from './admin/TelegramSection.vue'
 import ProxySection from './admin/ProxySection.vue'
 import StreamSection from './admin/StreamSection.vue'
 import AccountSection from './admin/AccountSection.vue'
+import RestoreDialog from './admin/RestoreDialog.vue'
+import { restorePhaseLabel } from './admin/useRestore'
 import BackupSection from './admin/BackupSection.vue'
 import InboxSection from './admin/InboxSection.vue'
 import AdvancedSection from './admin/AdvancedSection.vue'
@@ -102,7 +106,18 @@ import AdvancedSection from './admin/AdvancedSection.vue'
       <el-button type="primary" size="small" @click="go('telegram')">去配置</el-button>
     </div>
 
-    <div class="layout">
+    <div v-if="restore.status.value.phase !== 'idle' || restore.status.value.safe_mode || restore.error.value" class="note warn" role="status">
+      <div>
+        <b>{{ restorePhaseLabel[restore.status.value.phase] }}</b>
+        <p v-if="restore.waiting.value">等待服务重启后重新登录，不会自动重复恢复操作。</p>
+        <p v-if="restore.status.value.safe_mode">恢复安全模式已启用：旧清理、删除、迁移、备份清理及收件任务暂停。请检查旧任务风险，不会自动解除。</p>
+        <p v-if="restore.error.value">{{ restore.error.value }}</p>
+      </div>
+      <el-button @click="restore.open">查看恢复状态</el-button>
+    </div>
+    <RestoreDialog v-if="restore.opened.value" :controller="restore" />
+
+    <div class="layout" :inert="restoreLocked || undefined">
       <nav class="nav glass">
         <button
           v-for="s in SECTIONS"
@@ -188,7 +203,7 @@ import AdvancedSection from './admin/AdvancedSection.vue'
         <span class="savebar-dot" />
         <span class="savebar-text">{{ changed.total }} 项改动待保存</span>
         <el-button text @click="discardAll">放弃</el-button>
-        <el-button type="primary" :loading="saving || extrasSaving" @click="saveAll">
+        <el-button type="primary" :disabled="restoreLocked" :loading="saving || extrasSaving" @click="saveAll">
           保存并生效
         </el-button>
       </div>

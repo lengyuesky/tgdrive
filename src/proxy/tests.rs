@@ -1,4 +1,32 @@
 use super::*;
+
+#[test]
+fn usque_selection_preserves_manual_credentials_and_validates_switch_back() {
+    let manual = ProxyConfig::new(true, "socks5h://user:pass@proxy.example:1080").unwrap();
+    let usque = manual
+        .patched_provider(
+            None,
+            Some(&mask_url(&manual.url)),
+            Some(ProxyProvider::Usque),
+        )
+        .unwrap();
+    assert_eq!(usque.url, manual.url);
+    assert!(usque.effective_url().contains("@127.0.0.1:1083"));
+    assert_eq!(
+        usque
+            .patched_provider(None, None, Some(ProxyProvider::Manual))
+            .unwrap()
+            .url,
+        manual.url
+    );
+    let empty = ProxyConfig::with_provider(true, "", ProxyProvider::Usque).unwrap();
+    assert!(
+        empty
+            .patched_provider(None, None, Some(ProxyProvider::Manual))
+            .is_err()
+    );
+    assert!(ProxyProvider::parse("unknown").is_err());
+}
 use axum::{Json, Router, extract::Request};
 
 pub(crate) struct HttpProxy {
@@ -182,7 +210,7 @@ async fn http_requests_use_proxy_auth_and_hot_updates_preserve_old_snapshots() {
     assert_eq!(seen[3], ("/getMe".into(), "".into()));
 }
 
-async fn read_header(stream: &mut TcpStream) -> String {
+pub(super) async fn read_header(stream: &mut TcpStream) -> String {
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
         assert!(header.len() < 8192);
@@ -191,7 +219,7 @@ async fn read_header(stream: &mut TcpStream) -> String {
     String::from_utf8(header).unwrap()
 }
 
-async fn accept_socks(stream: &mut TcpStream, auth: bool) -> (String, u16) {
+pub(super) async fn accept_socks(stream: &mut TcpStream, auth: bool) -> (String, u16) {
     assert_eq!(stream.read_u8().await.unwrap(), 5);
     let len = stream.read_u8().await.unwrap() as usize;
     let mut methods = vec![0; len];
@@ -477,6 +505,7 @@ async fn app_fixture(
         dav: crate::dav::build_handler(vfs.clone()),
         vfs,
         auth,
+        restore: crate::restore::RestoreManager::new(&rt.env.db_path).unwrap(),
         rt,
         attempts: Default::default(),
         tasks: crate::tasks::TaskManager::new(),
@@ -612,6 +641,78 @@ async fn api_request(
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn usque_provider_api_persists_exports_and_resets_without_registering() {
+    use axum::http::StatusCode;
+    use serde_json::json;
+    let (state, _dir) = app_fixture(ProxyConfig::default(), false).await;
+    assert_eq!(
+        api_request(
+            &state,
+            "POST",
+            "/admin/proxy/usque/register",
+            json!({"accept_tos":true}),
+            false
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        api_request(
+            &state,
+            "POST",
+            "/admin/proxy/usque/register",
+            json!({"accept_tos":false}),
+            true
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(
+        serde_json::from_value::<crate::settings::ConfigPatch>(json!({"proxy_provider":"unknown"}))
+            .is_err()
+    );
+    let (code, _) = api_request(
+        &state,
+        "POST",
+        "/admin/config",
+        json!({"proxy_provider":"usque"}),
+        true,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let (_, config) = api_request(&state, "GET", "/admin/config", json!({}), true).await;
+    assert_eq!(config["values"]["proxy_provider"], "usque");
+    assert_eq!(config["sources"]["proxy_provider"], "db");
+    assert_eq!(
+        crate::settings::RuntimeCfg::load(&state.vfs.db, &state.rt.env)
+            .await
+            .unwrap()
+            .proxy
+            .provider,
+        ProxyProvider::Usque
+    );
+    assert!(!state.rt.current().proxy.enabled);
+    assert!(
+        state
+            .rt
+            .env_export()
+            .contains("TGDRIVE_PROXY_PROVIDER=usque\n")
+    );
+    let (code, _) = api_request(
+        &state,
+        "POST",
+        "/admin/config/reset",
+        json!({"keys":["proxy_provider","proxy_enabled","proxy_url"]}),
+        true,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(state.rt.current().proxy.provider, ProxyProvider::Manual);
 }
 
 #[tokio::test]

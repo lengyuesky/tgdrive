@@ -27,7 +27,7 @@ const S3_HISTORY_KEY: &str = "extra.backup_s3_history";
 const LEGACY_LAST_KEY: &str = "extra.backup_last_ts";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-static BACKUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static BACKUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Destination {
@@ -124,9 +124,9 @@ struct Snapshot {
 
 /// 一次数据库备份可能对应多条 Telegram 分块消息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TelegramBackupRecord {
-    name: String,
-    messages: Vec<StoredMessage>,
+pub(crate) struct TelegramBackupRecord {
+    pub name: String,
+    pub messages: Vec<StoredMessage>,
 }
 
 /// 远端历史与目标身份绑定；修改端点、桶或目录后不误删旧目标中的对象。
@@ -226,9 +226,14 @@ async fn backup_selected(
     if !selection.any() {
         return Err(AppError::BadRequest("请至少启用一个数据库备份渠道".into()));
     }
-    let _guard = BACKUP_LOCK.lock().await;
+    vfs.db.require_background_enabled()?;
+    let _guard = BACKUP_LOCK
+        .try_lock()
+        .map_err(|_| AppError::Conflict("备份或恢复任务正在运行".into()))?;
+    vfs.db.require_background_enabled()?;
     let snapshot = create_snapshot(vfs, runtime, extras).await?;
     let proxy = runtime.current().proxy.clone();
+    let _proxy_snapshot = crate::proxy::ProxySnapshot::new(proxy.clone())?;
 
     let telegram = async {
         if selection.telegram {
@@ -405,18 +410,50 @@ fn encrypt_file(
 
 /// 解密 age 口令加密的备份，供 `tgdrive decrypt-backup` 使用。
 pub fn decrypt_file(src: &Path, dst: &Path, passphrase: String) -> anyhow::Result<()> {
+    decrypt_file_limited(src, dst, passphrase, 8 * 1024 * 1024 * 1024)
+}
+
+/// 下载内容不可信：限制 scrypt 成本和明文输出，失败时不保留部分明文。
+pub(crate) fn decrypt_file_limited(
+    src: &Path,
+    dst: &Path,
+    passphrase: String,
+    limit: u64,
+) -> anyhow::Result<()> {
     use std::io::Write;
-    let input = std::io::BufReader::new(std::fs::File::open(src)?);
-    let decryptor = age::Decryptor::new_buffered(input)
-        .map_err(|error| anyhow::anyhow!("不是有效的 age 加密文件：{error}"))?;
-    let identity = age::scrypt::Identity::new(age::secrecy::SecretString::from(passphrase));
-    let mut reader = decryptor
-        .decrypt(std::iter::once(&identity as &dyn age::Identity))
-        .map_err(|error| anyhow::anyhow!("解密失败，密码可能不正确：{error}"))?;
-    let mut output = std::io::BufWriter::new(std::fs::File::create(dst)?);
-    std::io::copy(&mut reader, &mut output)?;
-    output.flush()?;
-    Ok(())
+    let mut created = false;
+    let result = (|| {
+        let input = std::io::BufReader::new(std::fs::File::open(src)?);
+        let decryptor = age::Decryptor::new_buffered(input)
+            .map_err(|_| anyhow::anyhow!("不是有效的 age 加密文件"))?;
+        let mut identity = age::scrypt::Identity::new(age::secrecy::SecretString::from(passphrase));
+        // log_n=20 约 1 GiB KDF 内存，兼容本程序通常校准为 18/19 的历史备份。
+        identity.set_max_work_factor(20);
+        let reader = decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .map_err(|error| match error {
+                age::DecryptError::ExcessiveWork { .. } => anyhow::anyhow!(
+                    "加密工作因子超出在线恢复限制（最高 20），请在受控环境使用 age 离线解密后恢复"
+                ),
+                _ => anyhow::anyhow!("解密失败：备份密码错误或加密文件已损坏"),
+            })?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst)?;
+        created = true;
+        let mut output = std::io::BufWriter::new(file);
+        let copied = std::io::copy(&mut reader.take(limit + 1), &mut output)?;
+        anyhow::ensure!(copied <= limit, "解密输出超过安全上限");
+        output.flush()?;
+        output.get_ref().sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() && created {
+        // 只清理本次确实创建的输出，不覆盖或删除已有文件。
+        let _ = std::fs::remove_file(dst);
+    }
+    result
 }
 
 /// 快照会离开本机，恢复时用不到的凭据一律删掉。
@@ -607,21 +644,19 @@ fn backup_part_caption(part_index: u64, part_count: u64, encrypted: bool) -> Str
     }
 }
 
-async fn load_telegram_history(db: &Db) -> AppResult<Vec<TelegramBackupRecord>> {
+pub(crate) async fn load_telegram_history(db: &Db) -> AppResult<Vec<TelegramBackupRecord>> {
     if let Some(raw) = db.setting_get(TELEGRAM_HISTORY_KEY).await? {
-        return Ok(serde_json::from_str(&raw).unwrap_or_else(|error| {
-            tracing::warn!("数据库备份分组记录损坏，为避免误删将忽略旧记录：{error}");
-            Vec::new()
-        }));
+        return serde_json::from_str(&raw).map_err(|_| {
+            AppError::BadRequest("数据库备份分组记录损坏，请手动输入消息链接；原记录未修改".into())
+        });
     }
     let Some(raw) = db.setting_get(LEGACY_TELEGRAM_HISTORY_KEY).await? else {
         return Ok(Vec::new());
     };
     Ok(serde_json::from_str::<Vec<StoredMessage>>(&raw)
-        .unwrap_or_else(|error| {
-            tracing::warn!("旧版数据库备份记录损坏，为避免误删将忽略：{error}");
-            Vec::new()
-        })
+        .map_err(|_| {
+            AppError::BadRequest("旧版数据库备份记录损坏，请手动输入消息链接；原记录未修改".into())
+        })?
         .into_iter()
         .map(|message| TelegramBackupRecord {
             name: "旧版数据库备份".into(),
@@ -1254,6 +1289,22 @@ mod tests {
         assert_eq!(std::fs::read(&restored).unwrap(), content);
         assert!(decrypt_file(&encrypted, &restored, "wrong".into()).is_err());
         assert!(decrypt_file(&plain, &restored, "correct horse".into()).is_err());
+    }
+
+    #[test]
+    fn default_encryption_is_accepted_by_restore_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("snap.db");
+        let encrypted = dir.path().join("snap.db.age");
+        let restored = dir.path().join("restored.db");
+        std::fs::write(&plain, b"default encryption regression").unwrap();
+        // 不降低工作因子，覆盖实际备份使用的默认自动校准分支。
+        encrypt_file(&plain, &encrypted, "current-default".into(), None).unwrap();
+        decrypt_file_limited(&encrypted, &restored, "current-default".into(), 4096).unwrap();
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            b"default encryption regression"
+        );
     }
 
     #[test]

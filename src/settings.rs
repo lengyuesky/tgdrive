@@ -30,6 +30,7 @@ const BOT_NAME_TTL: Duration = Duration::from_secs(60);
 pub const KEYS: &[(&str, &str)] = &[
     ("api_base", "TGDRIVE_API_BASE"),
     ("proxy_enabled", "TGDRIVE_PROXY_ENABLED"),
+    ("proxy_provider", "TGDRIVE_PROXY_PROVIDER"),
     ("proxy_url", "TGDRIVE_PROXY_URL"),
     ("bot_token", "TGDRIVE_BOT_TOKEN"),
     ("upload_bot_tokens", "TGDRIVE_UPLOAD_BOT_TOKENS"),
@@ -119,13 +120,16 @@ impl RuntimeCfg {
             .unwrap_or_else(|| env.upload_bot_tokens.clone());
         upload_bot_tokens.retain(|token| token.trim() != bot_token.trim());
 
-        let proxy = ProxyConfig::new(
+        let proxy = ProxyConfig::with_provider(
             get("proxy_enabled")
                 .map(config::parse_bool)
                 .transpose()
                 .map_err(|_| AppError::BadRequest("代理开关配置无效".into()))?
                 .unwrap_or(env.proxy.enabled),
             get("proxy_url").unwrap_or(&env.proxy.url),
+            crate::proxy::ProxyProvider::parse(
+                get("proxy_provider").unwrap_or(env.proxy.provider.as_str()),
+            )?,
         )?;
 
         Ok(RuntimeCfg {
@@ -207,6 +211,7 @@ impl RuntimeCfg {
         match key {
             "api_base" => self.api_base.clone(),
             "proxy_enabled" => self.proxy.enabled.to_string(),
+            "proxy_provider" => self.proxy.provider.as_str().into(),
             "proxy_url" => self.proxy.url.clone(),
             "bot_token" => self.bot_token.clone(),
             // .env 不适合多行值，统一导出为逗号分隔。
@@ -233,6 +238,7 @@ use crate::config::env_present;
 pub struct ConfigPatch {
     pub api_base: Option<String>,
     pub proxy_enabled: Option<bool>,
+    pub proxy_provider: Option<crate::proxy::ProxyProvider>,
     pub proxy_url: Option<String>,
     pub bot_token: Option<String>,
     /// 多行或逗号分隔的额外上传 Bot Token。
@@ -365,6 +371,36 @@ impl Runtime {
         chat_id: &str,
         proxy: &ProxyConfig,
     ) -> AppResult<String> {
+        let snapshot = ProxySnapshot::new(proxy.clone())?;
+        snapshot.ready().await?;
+        if proxy.enabled && proxy.provider == crate::proxy::ProxyProvider::Usque {
+            // 本地 Bot API 的 HTTP 请求保持直连，因此额外验证 WARP 本身。
+            let response = snapshot
+                .http
+                .get("https://www.cloudflare.com/cdn-cgi/trace")
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|error| {
+                    AppError::BadRequest(format!(
+                        "usque WARP 检测{}（{}）；本地代理启动不代表隧道网络可用，请检查 Cloudflare 连通性",
+                        crate::telegram::reqwest_error_summary(&error),
+                        crate::proxy::usque::transport_label(),
+                    ))
+                })?;
+            let trace = response
+                .text()
+                .await
+                .map_err(|_| AppError::BadRequest("usque WARP 连通性验证失败".into()))?;
+            if !trace
+                .lines()
+                .any(|line| matches!(line.trim(), "warp=on" | "warp=plus"))
+            {
+                return Err(AppError::BadRequest(
+                    "usque 尚未建立 WARP 隧道，请稍后重试".into(),
+                ));
+            }
+        }
         let client = TgClient::new(api_base, token, chat_id, proxy.clone())
             .map_err(|e| AppError::BadRequest(format!("客户端构造失败: {e}")))?;
         tokio::time::timeout(Duration::from_secs(15), client.probe_storage())
@@ -377,9 +413,11 @@ impl Runtime {
         let _guard = self.update_lock.lock().await;
         let prev = self.current();
         let mut next = (*prev).clone();
-        next.proxy = prev
-            .proxy
-            .patched(patch.proxy_enabled, patch.proxy_url.as_deref())?;
+        next.proxy = prev.proxy.patched_provider(
+            patch.proxy_enabled,
+            patch.proxy_url.as_deref(),
+            patch.proxy_provider,
+        )?;
 
         if let Some(v) = &patch.api_base {
             next.api_base = v.trim().trim_end_matches('/').to_string();
@@ -443,6 +481,10 @@ impl Runtime {
         let proxy_update = (next.proxy != prev.proxy)
             .then(|| ProxySnapshot::new(next.proxy.clone()))
             .transpose()?;
+        if let Some(snapshot) = &proxy_update {
+            // 即使尚未配置 Telegram，也不能保存一个尚未初始化的 usque。
+            snapshot.ready().await?;
+        }
         let tg_changed = next.proxy != prev.proxy
             || next.api_base != prev.api_base
             || next.bot_token != prev.bot_token
@@ -459,11 +501,11 @@ impl Runtime {
                 let proxy = next.proxy.clone();
                 async move {
                     let result = tokio::time::timeout(
-                        Duration::from_secs(15),
+                        Duration::from_secs(45),
                         Self::probe(&api_base, token, &chat_id, &proxy),
                     )
                     .await
-                    .map_err(|_| AppError::BadRequest("连接验证超时(15 秒)".into()))
+                    .map_err(|_| AppError::BadRequest("连接验证超时(45 秒)".into()))
                     .and_then(|result| result);
                     (index, result)
                 }

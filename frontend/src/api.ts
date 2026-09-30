@@ -191,6 +191,35 @@ export type ExtrasPatch = Omit<Partial<Extras>, 'backup_chunk_size'> & {
   backup_chunk_size?: string
 }
 
+export interface RestoreBackup {
+  id: string
+  name: string
+  parts: number
+  available: boolean
+  error?: string
+}
+
+export interface RestoreStatus {
+  phase: 'idle' | 'preparing' | 'ready' | 'restarting' | 'succeeded' | 'failed' | 'cancelled' | 'rolled_back'
+  id?: string
+  message?: string
+  summary?: { name: string; bytes: number; files: number; directories: number; encrypted: boolean }
+  warnings: string[]
+  safe_mode: boolean
+  rollback_path?: string
+}
+
+export interface RestorePrepare {
+  backup_id?: string
+  messages?: string
+  channel?: string
+  password?: string
+  acknowledge_forward: boolean
+}
+
+export interface RestoreAuth { password: string; totp?: string }
+export interface RestoreConfirm extends RestoreAuth { id: string; confirmation: '恢复' }
+
 export interface BackupLastTimes {
   telegram: number | null
   webdav: number | null
@@ -218,6 +247,7 @@ export interface BackupOutcome {
 export type CfgKey =
   | 'api_base'
   | 'proxy_enabled'
+  | 'proxy_provider'
   | 'proxy_url'
   | 'bot_token'
   | 'upload_bot_tokens'
@@ -232,6 +262,13 @@ export type CfgKey =
   | 'telegram_api_id'
   | 'telegram_api_hash'
 
+export type ProxyProvider = 'manual' | 'usque'
+export interface UsqueStatus {
+  phase: 'unregistered' | 'stopped' | 'starting' | 'running' | 'error'
+  message: string
+  registered: boolean
+}
+
 /** 每项的来源:后台改过 / 来自环境变量 / 内置默认 */
 export type CfgSource = 'db' | 'env' | 'default'
 
@@ -239,6 +276,7 @@ export interface AdminConfig {
   values: {
     api_base: string
     proxy_enabled: boolean
+    proxy_provider: ProxyProvider
     /** 代理 URL 中的用户名和密码均已脱敏。 */
     proxy_url: string
     bot_token: string
@@ -256,6 +294,7 @@ export interface AdminConfig {
     telegram_api_id: string
     telegram_api_hash: string
   }
+  usque?: UsqueStatus
   sources: Record<CfgKey, CfgSource>
   configured: boolean
   official_api: boolean
@@ -409,6 +448,7 @@ export interface ApplyOutcome {
 export type ConfigPatch = Partial<{
   api_base: string
   proxy_enabled: boolean
+  proxy_provider: ProxyProvider
   proxy_url: string
   bot_token: string
   upload_bot_tokens: string
@@ -604,11 +644,13 @@ export const api = {
     config: () => http.get<AdminConfig>('/admin/config'),
     save: (patch: ConfigPatch) => http.post<ApplyOutcome>('/admin/config', patch),
     reset: (keys: CfgKey[]) => http.post<ApplyOutcome>('/admin/config/reset', { keys }),
-    test: (probe: { api_base?: string; bot_token?: string; chat_id?: string; proxy_enabled?: boolean; proxy_url?: string } = {}) =>
+    test: (probe: { api_base?: string; bot_token?: string; chat_id?: string; proxy_enabled?: boolean; proxy_provider?: ProxyProvider; proxy_url?: string } = {}) =>
       http.post<{ ok: boolean; bot: string; api_base: string }>('/admin/test', probe),
     /** 根据 Bot Token 检测最近向 bot 发过消息的频道/用户,辅助填 chat_id */
-    detectChats: (probe: { api_base?: string; bot_token?: string; proxy_enabled?: boolean; proxy_url?: string } = {}) =>
+    detectChats: (probe: { api_base?: string; bot_token?: string; proxy_enabled?: boolean; proxy_provider?: ProxyProvider; proxy_url?: string } = {}) =>
       http.post<{ bot: string; chats: DetectedChat[] }>('/admin/detect-chats', probe),
+    usqueStatus: () => http.get<UsqueStatus>('/admin/proxy/usque'),
+    usqueRegister: () => http.post<UsqueStatus>('/admin/proxy/usque/register', { accept_tos: true }),
     status: () => http.get<AdminStatus>('/admin/status'),
     logs: (params: BackendLogQuery = {}) =>
       http.get<BackendLogPage>('/admin/logs', {
@@ -643,6 +685,15 @@ export const api = {
       generateWebdavPassword: () =>
         http.post<{ password: string }>('/admin/security/webdav-password'),
       revokeWebdavPassword: () => http.delete('/admin/security/webdav-password'),
+    },
+    restore: {
+      discover: (reset = false) => http.post<{ backups: RestoreBackup[]; scanned: number; has_more: boolean }>('/admin/restore/discover', { reset }, { handleAuthLocally: true, timeout: 100000 }),
+      history: () => http.get<{ backups: RestoreBackup[] }>('/admin/restore/history', { handleAuthLocally: true }),
+      status: () => http.get<RestoreStatus>('/admin/restore/status', { handleAuthLocally: true }),
+      prepare: (body: RestorePrepare) => http.post<RestoreStatus>('/admin/restore/prepare', body, { handleAuthLocally: true }),
+      cancel: (id: string) => http.post<RestoreStatus>('/admin/restore/cancel', { id }, { handleAuthLocally: true }),
+      confirm: (body: RestoreConfirm) => http.post<RestoreStatus>('/admin/restore/confirm', body, { handleAuthLocally: true }),
+      resume: (body: RestoreAuth) => http.post<RestoreStatus>('/admin/restore/resume', body, { handleAuthLocally: true }),
     },
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
     backupUrl: '/api/admin/backup',

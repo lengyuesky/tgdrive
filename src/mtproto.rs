@@ -4,6 +4,8 @@
 //! 播放。这里直接解析 Bot API `file_id`，并行请求 1~8 个 512 KiB 分段，
 //! 按顺序交给现有 `ChunkedReader`；有界预读随读取流一起释放。
 
+mod history;
+
 use crate::config::{
     DEFAULT_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_CONCURRENCY, MIN_DOWNLOAD_CONCURRENCY,
 };
@@ -113,6 +115,7 @@ pub struct MtprotoClient {
 
 struct ClientState {
     proxy: ProxyConfig,
+    _snapshot: Arc<crate::proxy::ProxySnapshot>,
     client: Client,
     handle: SenderPoolFatHandle,
     runner_task: tokio::task::JoinHandle<()>,
@@ -159,6 +162,7 @@ impl MtprotoClient {
             SenderPool::new(Arc::new(session), self.config.api_id);
         let state = Arc::new(ClientState {
             proxy: snapshot.config.clone(),
+            _snapshot: snapshot,
             client: Client::new(handle.clone()),
             handle,
             runner_task: tokio::spawn(runner.run()),

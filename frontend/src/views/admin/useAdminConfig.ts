@@ -11,6 +11,7 @@ import {
   type AdminStatus,
   type CfgKey,
   type ConfigPatch,
+  type ProxyProvider,
 } from '../../api'
 import { sizeInput } from './sections'
 
@@ -28,7 +29,7 @@ export const RESTART_CMD =
  * 主配置(.env 可覆盖的那一组):表单、原值快照、加载/保存/恢复默认/测试连接。
  * onConfigured:加载完成且已配置时的回调(用于顺带刷新存储迁移状态)。
  */
-export function useAdminConfig(router: Router, onConfigured: () => void) {
+export function useAdminConfig(router: Router, onConfigured: () => void, writesBlocked = () => false) {
   const cfg = ref<AdminConfig>()
   const status = ref<AdminStatus>()
   const loading = ref(true)
@@ -41,6 +42,7 @@ export function useAdminConfig(router: Router, onConfigured: () => void) {
   const form = ref({
     api_base: '',
     proxy_enabled: false,
+    proxy_provider: 'manual' as ProxyProvider,
     proxy_url: '',
     bot_token: '',
     upload_bot_tokens: '',
@@ -67,6 +69,7 @@ export function useAdminConfig(router: Router, onConfigured: () => void) {
       form.value = {
         api_base: c.data.values.api_base,
         proxy_enabled: c.data.values.proxy_enabled ?? false,
+        proxy_provider: c.data.values.proxy_provider ?? 'manual',
         proxy_url: c.data.values.proxy_url ?? '',
         bot_token: c.data.values.bot_token, // 脱敏值,不动则不提交
         upload_bot_tokens: c.data.values.upload_bot_tokens,
@@ -146,6 +149,7 @@ export function useAdminConfig(router: Router, onConfigured: () => void) {
     const o = origin.value
     if (f.api_base !== o.api_base) p.api_base = f.api_base
     if (f.proxy_enabled !== o.proxy_enabled) p.proxy_enabled = f.proxy_enabled
+    if (f.proxy_provider !== o.proxy_provider) p.proxy_provider = f.proxy_provider
     if (f.proxy_url !== o.proxy_url) p.proxy_url = f.proxy_url
     if (f.bot_token !== o.bot_token) p.bot_token = f.bot_token
     if (f.upload_bot_tokens !== o.upload_bot_tokens) {
@@ -165,6 +169,7 @@ export function useAdminConfig(router: Router, onConfigured: () => void) {
   }
 
   async function save(force = false) {
+    if (writesBlocked()) return
     const patch = buildPatch()
     if (!Object.keys(patch).length) return
     if (force) patch.force = true
@@ -234,8 +239,9 @@ export function useAdminConfig(router: Router, onConfigured: () => void) {
       return
     }
     try {
+      if (writesBlocked()) return
       // 恢复空地址时同时恢复开关，避免留下「已启用但无地址」的无效组合。
-      const keys: CfgKey[] = key === 'proxy_url' ? ['proxy_enabled', 'proxy_url'] : [key]
+      const keys: CfgKey[] = ['proxy_url', 'proxy_provider'].includes(key) ? ['proxy_enabled', 'proxy_provider', 'proxy_url'] : [key]
       const { data } = await api.admin.reset(keys)
       if (data.account_changed) {
         leaving.value = true
@@ -263,6 +269,7 @@ export function useAdminConfig(router: Router, onConfigured: () => void) {
         bot_token: form.value.bot_token,
         chat_id: form.value.chat_id,
         proxy_enabled: form.value.proxy_enabled,
+        proxy_provider: form.value.proxy_provider,
         proxy_url: form.value.proxy_url,
       })
       ElMessage.success(`连接正常:@${data.bot}`)

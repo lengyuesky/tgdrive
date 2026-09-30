@@ -4,6 +4,22 @@ use super::*;
 
 // ---------- 后台管理 ----------
 
+pub(super) async fn admin_usque_status() -> Json<crate::proxy::usque::Status> {
+    Json(crate::proxy::usque::current_status())
+}
+
+#[derive(Deserialize)]
+pub(super) struct UsqueRegisterBody {
+    #[serde(default)]
+    accept_tos: bool,
+}
+
+pub(super) async fn admin_usque_register(
+    Json(body): Json<UsqueRegisterBody>,
+) -> AppResult<Json<crate::proxy::usque::Status>> {
+    Ok(Json(crate::proxy::usque::register(body.accept_tos).await?))
+}
+
 /// 密码一律以固定长度占位返回,连长度都不泄露
 pub(super) const PASSWORD_PLACEHOLDER: &str = "••••••••";
 
@@ -17,6 +33,7 @@ pub(super) async fn admin_config(
         "values": {
             "api_base": c.api_base,
             "proxy_enabled": c.proxy.enabled,
+            "proxy_provider": c.proxy.provider,
             "proxy_url": crate::proxy::mask_url(&c.proxy.url),
             "bot_token": settings::mask(&c.bot_token),
             "upload_bot_tokens": c
@@ -37,6 +54,7 @@ pub(super) async fn admin_config(
             "telegram_api_hash": settings::mask(&c.telegram_api_hash),
         },
         "sources": sources,
+        "usque": crate::proxy::usque::current_status(),
         "configured": c.is_configured(),
         "official_api": c.is_official_api(),
         "official_api_base": crate::config::OFFICIAL_API_BASE,
@@ -107,6 +125,7 @@ pub(super) struct TestBody {
     pub(super) bot_token: Option<String>,
     pub(super) chat_id: Option<String>,
     pub(super) proxy_enabled: Option<bool>,
+    pub(super) proxy_provider: Option<crate::proxy::ProxyProvider>,
     pub(super) proxy_url: Option<String>,
 }
 
@@ -131,7 +150,9 @@ pub(super) async fn admin_test(
     if token.trim().is_empty() || chat_id.trim().is_empty() {
         return Err(AppError::BadRequest("请先填写 Bot Token 与存储频道".into()));
     }
-    let proxy = c.proxy.patched(b.proxy_enabled, b.proxy_url.as_deref())?;
+    let proxy =
+        c.proxy
+            .patched_provider(b.proxy_enabled, b.proxy_url.as_deref(), b.proxy_provider)?;
     let bot = Runtime::probe(&api_base, &token, &chat_id, &proxy).await?;
     Ok(Json(
         serde_json::json!({ "ok": true, "bot": bot, "api_base": api_base }),
@@ -143,6 +164,7 @@ pub(super) struct DetectBody {
     pub(super) api_base: Option<String>,
     pub(super) bot_token: Option<String>,
     pub(super) proxy_enabled: Option<bool>,
+    pub(super) proxy_provider: Option<crate::proxy::ProxyProvider>,
     pub(super) proxy_url: Option<String>,
 }
 
@@ -169,7 +191,10 @@ pub(super) async fn admin_detect_chats(
         return Err(AppError::BadRequest("请先填写 Bot Token".into()));
     }
     // 先验证 token 可用,顺带拿 bot 用户名给前端展示操作指引
-    let proxy = c.proxy.patched(b.proxy_enabled, b.proxy_url.as_deref())?;
+    let proxy =
+        c.proxy
+            .patched_provider(b.proxy_enabled, b.proxy_url.as_deref(), b.proxy_provider)?;
+    let _snapshot = crate::proxy::ProxySnapshot::new(proxy.clone())?;
     let bot = Runtime::probe(&api_base, &token, "0", &proxy).await?;
     // 快速拉一次未确认的消息。收件轮询开着时消息会被它抢走(但它会记进
     // seen_chats),这里失败/为空都不致命,合并库里的记录照样能列出来

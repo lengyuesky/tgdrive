@@ -1,4 +1,7 @@
-FROM aiogram/telegram-bot-api:latest
+FROM aiogram/telegram-bot-api:latest@sha256:6c4235b2b3ab54f20106b82f8ed330e1357840fba5c1b04cb4f2a127408c519e
+
+# Bot API 的 --proxy 仅用于 webhook；proxychains 接管其 Telegram TCP 连接。
+RUN apk add --no-cache proxychains-ng
 
 COPY docker/telegram-bot-api-supervisor.sh /usr/local/bin/tgdrive-bot-api-supervisor
 RUN chmod 0755 /usr/local/bin/tgdrive-bot-api-supervisor

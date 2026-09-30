@@ -1,6 +1,6 @@
 import { AxiosError, type AxiosAdapter, type AxiosResponse, type InternalAxiosRequestConfig } from 'axios'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { http } from './http'
+import { holdAuthRedirect, http } from './http'
 import { api } from './api'
 import { onSessionInvalidated } from './session'
 
@@ -26,6 +26,23 @@ beforeEach(() => {
 afterEach(() => { unsubscribe(); http.defaults.adapter = originalAdapter })
 
 describe('认证与会话清理', () => {
+  it('恢复二次认证 401 留在向导，不误跳登录页', async () => {
+    http.defaults.adapter = adapter(401)
+    await expect(api.admin.restore.confirm({ id: 'candidate', password: 'wrong', confirmation: '恢复' })).rejects.toBeInstanceOf(AxiosError)
+    expect(router.replace).not.toHaveBeenCalled()
+    expect(invalidated).not.toHaveBeenCalled()
+  })
+
+  it('重启期间全站轮询 401 暂缓跳转，释放后恢复普通策略', async () => {
+    http.defaults.adapter = adapter(401)
+    const release = holdAuthRedirect()
+    await expect(http.get('/admin/status')).rejects.toBeInstanceOf(AxiosError)
+    expect(router.replace).not.toHaveBeenCalled()
+    release(); release()
+    await expect(http.get('/admin/status')).rejects.toBeInstanceOf(AxiosError)
+    expect(router.replace).toHaveBeenCalledWith('/login')
+  })
+
   it('受保护接口的 401 先同步停止本地任务，再替换到登录页', async () => {
     http.defaults.adapter = adapter(401)
     router.replace.mockImplementation(() => { expect(invalidated).toHaveBeenCalledOnce() })
