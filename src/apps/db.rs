@@ -173,6 +173,30 @@ impl Db {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        // 新清单是唯一设置定义；移除已退役的键，旧值仅留在显式恢复快照中。
+        let saved: Option<String> =
+            sqlx::query_scalar("SELECT settings FROM app_settings WHERE app_id = ?")
+                .bind(input.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(saved) = saved {
+            let manifest: serde_json::Value =
+                serde_json::from_str(input.manifest).map_err(anyhow::Error::from)?;
+            let mut values: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&saved).map_err(anyhow::Error::from)?;
+            values.retain(|key, _| {
+                manifest["settings"].as_array().is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|field| field["key"].as_str() == Some(key))
+                })
+            });
+            sqlx::query("UPDATE app_settings SET settings = ? WHERE app_id = ?")
+                .bind(serde_json::to_string(&values).map_err(anyhow::Error::from)?)
+                .bind(input.id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("INSERT INTO app_lifecycle(app_id, updated_at) VALUES(?, ?) ON CONFLICT(app_id) DO UPDATE SET phase = 'installed', message = '', owner = '', lease_until = 0, updated_at = excluded.updated_at")
             .bind(input.id).bind(now).execute(&mut *tx).await?;
         tx.commit().await?;

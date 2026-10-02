@@ -109,8 +109,6 @@ async function authorizeInitial() {
   try {
     const path = await authorizeDirectory(parentPath(safeDirectory(route.query.open)))
     if (path != null) {
-      // 旧插件通过 source_dir 获得首次来源；现代应用还会从握手获得授权目录。
-      if (app.value?.manifest.settings.some(field => field.key === 'source_dir')) await api.apps.saveSettings(app.value.manifest.id, { source_dir: path })
       await start()
     }
   } catch (e) { if (e !== 'cancel' && e !== 'close') error.value = errMsg(e) }

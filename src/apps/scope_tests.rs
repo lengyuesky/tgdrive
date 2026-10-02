@@ -54,7 +54,7 @@ async fn scope_restricts_listing_stat_search_and_media() {
         &state,
         "PATCH",
         "/api/apps/books/scope",
-        json!({"paths":["/图书"]}),
+        json!({"mode":"selected","paths":["/图书"]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{app}");
@@ -168,7 +168,7 @@ async fn scope_restricts_listing_stat_search_and_media() {
         &state,
         "PATCH",
         "/api/apps/books/scope",
-        json!({"paths":["/图书"]}),
+        json!({"mode":"selected","paths":["/图书"]}),
     )
     .await;
     let response = router(&state)
@@ -185,7 +185,7 @@ async fn scope_restricts_listing_stat_search_and_media() {
         &state,
         "PATCH",
         "/api/apps/books/scope",
-        json!({"paths":["/其他"]}),
+        json!({"mode":"selected","paths":["/其他"]}),
     )
     .await;
     let response = router(&state)
@@ -204,7 +204,7 @@ async fn scope_restricts_listing_stat_search_and_media() {
         &state,
         "PATCH",
         "/api/apps/books/scope",
-        json!({"paths":[]}),
+        json!({"mode":"all","paths":[]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -232,7 +232,7 @@ async fn scope_patch_validates_paths_and_limit() {
             &state,
             "PATCH",
             "/api/apps/books/scope",
-            json!({"paths":["/秘密/../../etc"]}),
+            json!({"mode":"selected","paths":["/秘密/../../etc"]}),
         )
         .await
         .0,
@@ -244,7 +244,7 @@ async fn scope_patch_validates_paths_and_limit() {
             &state,
             "PATCH",
             "/api/apps/books/scope",
-            json!({"paths":many}),
+            json!({"mode":"selected","paths":many}),
         )
         .await
         .0,
@@ -256,7 +256,7 @@ async fn scope_patch_validates_paths_and_limit() {
             &state,
             "PATCH",
             "/api/apps/unknown/scope",
-            json!({"paths":[]}),
+            json!({"mode":"all","paths":[]}),
         )
         .await
         .0,

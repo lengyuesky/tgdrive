@@ -514,7 +514,7 @@ async fn rpc_batch_executes_calls_independently_with_per_call_errors() {
         &state,
         "PATCH",
         "/api/apps/books/scope",
-        json!({"paths": ["/别处"]}),
+        json!({"mode":"selected","paths": ["/别处"]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

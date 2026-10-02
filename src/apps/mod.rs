@@ -435,7 +435,7 @@ async fn set_state(
 struct ScopePatch {
     #[serde(default)]
     paths: Vec<String>,
-    mode: Option<String>,
+    mode: String,
 }
 
 /// 目录范围白名单：空数组表示全盘；逐条规范化并去重后落库。
@@ -461,10 +461,7 @@ async fn scope_patch(
     }
     scope.sort();
     let encoded = serde_json::to_string(&scope).map_err(|e| AppError::Internal(e.into()))?;
-    let mode = patch
-        .mode
-        .as_deref()
-        .unwrap_or(if scope.is_empty() { "all" } else { "selected" });
+    let mode = patch.mode.as_str();
     if !["none", "all", "selected"].contains(&mode)
         || (mode == "selected" && scope.is_empty())
         || (mode != "selected" && !scope.is_empty())

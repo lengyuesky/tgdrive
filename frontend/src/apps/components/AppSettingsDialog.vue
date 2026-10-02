@@ -91,7 +91,7 @@ watch(() => [props.modelValue, props.app?.revision], async () => {
     values.value = { ...data }
     originalScope = [...(props.app.scope ?? [])]
     scopePaths.value = [...(props.app.scope ?? [])]
-    scopeMode.value = props.app.scope_mode ?? (originalScope.length ? 'selected' : 'all')
+    scopeMode.value = props.app.scope_mode ?? 'none'
     originalMode = scopeMode.value
   } catch (e) { if (current === generation) error.value = errMsg(e) }
   finally { if (current === generation) loading.value = false }

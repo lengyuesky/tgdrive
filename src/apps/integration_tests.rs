@@ -290,3 +290,64 @@ async fn uninstall_preserves_data_version_until_data_is_explicitly_purged() {
         true
     );
 }
+
+#[tokio::test]
+async fn upgrade_removes_retired_settings_and_keeps_current_private_data() {
+    let (state, _media, _dir) = fixture().await;
+    let mut manifest = integrated_manifest();
+    let first = add_app(&state, &manifest, None).await;
+    state
+        .vfs
+        .db
+        .patch_app_settings("shorts", &first.revision, "{\"source_dir\":\"/旧目录\"}")
+        .await
+        .unwrap();
+    state
+        .vfs
+        .db
+        .app_data_write(
+            "shorts",
+            &first.revision,
+            "library:sources",
+            Some("{\"schemaVersion\":1,\"sources\":[]}"),
+            None,
+        )
+        .await
+        .unwrap();
+    manifest.version = "1.1.0".into();
+    manifest.settings.clear();
+    let app = add_app(&state, &manifest, Some(first.revision)).await;
+    assert_eq!(state.vfs.db.app_settings("shorts").await.unwrap(), "{}");
+    assert!(
+        state
+            .vfs
+            .db
+            .app_data_get("shorts", "library:sources")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let (_, health) = call(&state, "GET", "/api/apps/shorts/health", json!({})).await;
+    assert_eq!(health["recovery"]["version"], "1.0.0");
+    let credentials = base64::engine::general_purpose::STANDARD.encode("apps-test:apps-test-only");
+    let response = router(&state)
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/apps/shorts/scope")
+                .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"paths":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        installed(&state, &app.manifest.id)
+            .await
+            .unwrap()
+            .scope_mode,
+        "all"
+    );
+}
