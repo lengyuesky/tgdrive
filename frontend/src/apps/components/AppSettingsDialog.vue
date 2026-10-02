@@ -20,15 +20,15 @@
       <div v-if="scoped" class="app-field scope-field">
         <label>目录范围</label>
         <div class="scope-head">
-          <el-switch v-model="fullDrive" active-text="全盘访问" inactive-text="限制到指定目录" />
+          <el-select v-model="scopeMode"><el-option label="未授权" value="none" /><el-option label="指定目录" value="selected" /><el-option label="全盘访问" value="all" /></el-select>
         </div>
-        <div v-if="!fullDrive" class="scope-body">
+        <div v-if="scopeMode === 'selected'" class="scope-body">
           <div v-for="(path, index) in scopePaths" :key="path" class="scope-row">
             <code>{{ path }}</code>
             <el-button text type="danger" :icon="Delete" @click="scopePaths.splice(index, 1)">移除</el-button>
           </div>
           <el-button :icon="FolderAdd" @click="addScopeDir">添加目录</el-button>
-          <p class="scope-hint">留空保存等同全盘；应用只能列出、搜索和读取这些目录之内的文件。</p>
+          <p class="scope-hint">至少选择一个目录；应用只能列出、搜索和读取这些目录之内的文件。</p>
         </div>
       </div>
       <div v-if="showCovers && coverStats" class="app-field cover-field">
@@ -53,7 +53,7 @@ import { ElMessage } from 'element-plus'
 import { Delete, FolderAdd } from '@element-plus/icons-vue'
 import { api, errMsg, fmtSize } from '@drive/api'
 import { appConfirm } from '@drive/dialog'
-import type { CoverStats, InstalledApp, SettingValues } from '../types'
+import type { CoverStats, InstalledApp, ScopeMode, SettingValues } from '../types'
 import DirPicker from '@drive/components/DirPicker.vue'
 
 const props = defineProps<{ modelValue: boolean; app: InstalledApp | null }>()
@@ -63,7 +63,8 @@ const saving = ref(false)
 const error = ref('')
 const values = ref<SettingValues>({})
 const scopePaths = ref<string[]>([])
-const fullDrive = ref(true)
+const scopeMode = ref<ScopeMode>('none')
+let originalMode: ScopeMode = 'none'
 const picker = ref<InstanceType<typeof DirPicker>>()
 const scoped = computed(() => !!props.app?.manifest.permissions.includes('files.read'))
 const coverStats = ref<CoverStats | null>(null)
@@ -90,7 +91,8 @@ watch(() => [props.modelValue, props.app?.revision], async () => {
     values.value = { ...data }
     originalScope = [...(props.app.scope ?? [])]
     scopePaths.value = [...(props.app.scope ?? [])]
-    fullDrive.value = originalScope.length === 0
+    scopeMode.value = props.app.scope_mode ?? (originalScope.length ? 'selected' : 'all')
+    originalMode = scopeMode.value
   } catch (e) { if (current === generation) error.value = errMsg(e) }
   finally { if (current === generation) loading.value = false }
 }, { immediate: true })
@@ -134,11 +136,12 @@ async function save() {
   saving.value = true
   try {
     const patch = Object.fromEntries(Object.entries(values.value).filter(([key, value]) => value !== original[key]))
-    const paths = fullDrive.value ? [] : [...scopePaths.value]
-    const scopeDirty = paths.length !== originalScope.length || paths.some((path, index) => path !== originalScope[index])
+    const paths = scopeMode.value === 'selected' ? [...scopePaths.value] : []
+    if (scopeMode.value === 'selected' && !paths.length) throw new Error('请至少选择一个目录，或明确选择未授权')
+    const scopeDirty = scopeMode.value !== originalMode || paths.length !== originalScope.length || paths.some((path, index) => path !== originalScope[index])
     const [savedSettings] = await Promise.all([
       Object.keys(patch).length ? api.apps.saveSettings(props.app.manifest.id, patch) : Promise.resolve(null),
-      scopeDirty ? api.apps.saveScope(props.app.manifest.id, paths) : Promise.resolve(null),
+      scopeDirty ? api.apps.saveScope(props.app.manifest.id, paths, scopeMode.value) : Promise.resolve(null),
     ])
     if (current !== generation) return
     if (savedSettings) emit('saved', savedSettings.data)

@@ -332,6 +332,7 @@
                   <el-dropdown v-else trigger="click" @command="(cmd: string) => onTileCmd(cmd, row)">
                     <el-button text size="small" :icon="MoreFilled" aria-label="更多操作" />
                     <template #dropdown><el-dropdown-menu>
+                      <el-dropdown-item command="open-with">打开方式</el-dropdown-item>
                       <el-dropdown-item v-if="!row.is_dir" command="download">下载</el-dropdown-item>
                       <el-dropdown-item command="favorite">{{ row.favorite ? '取消收藏' : '收藏' }}</el-dropdown-item>
                       <el-dropdown-item command="share">分享</el-dropdown-item>
@@ -373,7 +374,7 @@
       <template #footer><el-button type="primary" @click="optionsOpen = false">完成</el-button></template>
     </ResponsivePanel>
     <ResponsivePanel v-model="actionOpen" :title="actionEntry?.name || '文件操作'" sheet>
-      <div class="action-sheet-list"><button v-if="!actionEntry?.is_dir" @click="runMobileAction('download')">下载</button><button @click="runMobileAction('favorite')">{{ actionEntry?.favorite ? '取消收藏' : '收藏' }}</button><button @click="runMobileAction('share')">分享</button><button @click="runMobileAction('rename')">重命名</button><button @click="runMobileAction('move')">移动到…</button><button @click="runMobileAction('copy')">复制到…</button><button @click="runMobileAction('properties')">属性</button><button class="danger-text" @click="runMobileAction('delete')">删除…</button></div>
+      <div class="action-sheet-list"><button @click="runMobileAction('open-with')">打开方式</button><button v-if="!actionEntry?.is_dir" @click="runMobileAction('download')">下载</button><button @click="runMobileAction('favorite')">{{ actionEntry?.favorite ? '取消收藏' : '收藏' }}</button><button @click="runMobileAction('share')">分享</button><button @click="runMobileAction('rename')">重命名</button><button @click="runMobileAction('move')">移动到…</button><button @click="runMobileAction('copy')">复制到…</button><button @click="runMobileAction('properties')">属性</button><button class="danger-text" @click="runMobileAction('delete')">删除…</button></div>
     </ResponsivePanel>
     <BoundedImagePreview v-if="viewerShow" v-model:index="viewerIndex"
       :entries="displayEntries" :count="displayEntries.length" :base="cur" @close="viewerShow = false" />
@@ -539,6 +540,7 @@
       </template>
     </ResponsivePanel>
 
+    <OpenWithDialog ref="openWithDialog" />
     <!-- 自定义右键菜单 -->
     <teleport to="body">
       <div
@@ -565,6 +567,7 @@ import { mobile, compact } from '../mobile/viewport'
 import { closeTopOverlay, useOverlay } from '../mobile/overlays'
 import { isComposingKey } from '../mobile/keyboard'
 import ResponsivePanel from '../components/ResponsivePanel.vue'
+import OpenWithDialog from '@apps/components/OpenWithDialog.vue'
 defineOptions({ name: 'Files' })
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -605,6 +608,8 @@ import type ShareDialog from '../components/ShareDialog.vue'
 import type ShareManager from '../components/ShareManager.vue'
 import type TrashPanel from '../components/TrashPanel.vue'
 
+const openWithDialog = ref<InstanceType<typeof OpenWithDialog>>()
+function openWith(row: Entry) { void openWithDialog.value?.open({ ...row, path: joinPath(cur.value, row.name) }, cur.value) }
 const route = useRoute()
 const router = useRouter()
 const directory = createDirectoryController(async (params, signal) => (await api.entries(params, signal)).data)
@@ -734,6 +739,7 @@ watch(viewMode, (v) => {
 
 // ---- 搜索：输入即过滤当前目录，回车全局搜索，高级条件由弹窗提交 ----
 const query = ref('')
+watch(() => route.query?.reveal, async (name) => { await nextTick(); if (typeof name === 'string' && name.length <= 255) { query.value = name; searchScope.value = 'directory' } }, { immediate: true, flush: 'post' })
 const searchMode = ref(false)
 const searchHits = ref<SearchHit[]>([])
 type SearchView = 'simple' | 'advanced' | 'favorites'
@@ -964,7 +970,8 @@ function toggleSelect(row: DirectoryEntry) {
   directory.toggle(row.id)
 }
 function onTileCmd(cmd: string, row: Entry) {
-  if (cmd === 'download') download(row)
+  if (cmd === 'open-with') openWith(row)
+  else if (cmd === 'download') download(row)
   else if (cmd === 'rename') rename(row)
   else onRowCmd(cmd, row)
 }
@@ -1046,6 +1053,7 @@ const ctxItems = computed<CtxItem[]>(() => {
     action: () => openEntry(row),
     divided: items.length > 0,
   })
+  items.push({ label: '打开方式', action: () => openWith(row) })
   if (!row.is_dir) items.push({ label: '下载', action: () => download(row) })
   items.push({
     label: row.favorite ? '取消收藏' : '收藏',

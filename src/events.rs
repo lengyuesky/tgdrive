@@ -52,13 +52,71 @@ impl HostEvent {
     }
 }
 
-pub type EventBus = broadcast::Sender<HostEvent>;
+#[derive(Clone)]
+pub struct EventBus {
+    sender: broadcast::Sender<HostEvent>,
+    journal: std::sync::Arc<std::sync::Mutex<FileJournal>>,
+}
+struct FileJournal {
+    epoch: String,
+    sequence: u64,
+    entries: std::collections::VecDeque<(u64, Option<Vec<String>>)>,
+}
+impl EventBus {
+    pub fn subscribe(&self) -> broadcast::Receiver<HostEvent> {
+        self.sender.subscribe()
+    }
+    pub fn file_changes(&self, cursor: Option<&str>) -> (String, Option<Vec<String>>) {
+        let journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
+        let current = format!("{}:{}", journal.epoch, journal.sequence);
+        let after = cursor
+            .and_then(|c| c.split_once(':'))
+            .filter(|(epoch, _)| *epoch == journal.epoch)
+            .and_then(|(_, seq)| seq.parse::<u64>().ok());
+        let Some(after) = after.filter(|seq| {
+            *seq <= journal.sequence
+                && journal
+                    .entries
+                    .front()
+                    .is_none_or(|(first, _)| seq.saturating_add(1) >= *first)
+        }) else {
+            return (current, None);
+        };
+        let mut paths = std::collections::BTreeSet::new();
+        for (_, changed) in journal.entries.iter().filter(|(seq, _)| *seq > after) {
+            let Some(changed) = changed else {
+                return (current, None);
+            };
+            paths.extend(changed.iter().cloned());
+            if paths.len() > MAX_EVENT_PATHS {
+                return (current, None);
+            }
+        }
+        (current, Some(paths.into_iter().collect()))
+    }
+}
 
 /// 容量覆盖秒级突发足够；无订阅者时发送失败是正常情况，直接丢弃。
 pub fn bus() -> EventBus {
-    broadcast::channel(256).0
+    EventBus {
+        sender: broadcast::channel(256).0,
+        journal: std::sync::Arc::new(std::sync::Mutex::new(FileJournal {
+            epoch: format!("{:032x}", rand::random::<u128>()),
+            sequence: 0,
+            entries: Default::default(),
+        })),
+    }
 }
 
 pub fn emit(bus: &EventBus, event: HostEvent) {
-    let _ = bus.send(event);
+    if event.kind == "files" {
+        let mut journal = bus.journal.lock().unwrap_or_else(|e| e.into_inner());
+        journal.sequence += 1;
+        let sequence = journal.sequence;
+        journal.entries.push_back((sequence, event.paths.clone()));
+        while journal.entries.len() > 256 {
+            journal.entries.pop_front();
+        }
+    }
+    let _ = bus.sender.send(event);
 }

@@ -20,6 +20,8 @@ use zip::write::SimpleFileOptions;
 mod catalog_api;
 #[path = "covers_tests.rs"]
 mod cover_cache;
+#[path = "integration_tests.rs"]
+mod integration_tests;
 #[path = "media_tests.rs"]
 mod media;
 #[path = "reader_tests.rs"]
@@ -204,6 +206,7 @@ async fn fixture() -> (AppState, Arc<MemoryMedia>, tempfile::TempDir) {
 
 fn manifest() -> Manifest {
     Manifest {
+        integration: None,
         id: "shorts".into(),
         name: "测试短视频".into(),
         version: "1.0.0".into(),
@@ -266,9 +269,16 @@ async fn add_app(state: &AppState, manifest: &Manifest, expected: Option<String>
         digest: package.digest.clone(),
         expected_revision: expected,
     };
-    install_package(state, package, options, "import")
+    let app = install_package(state, package, options, "import")
         .await
-        .unwrap()
+        .unwrap();
+    state
+        .vfs
+        .db
+        .set_app_scope(&app.manifest.id, "[]")
+        .await
+        .unwrap();
+    installed(state, &app.manifest.id).await.unwrap()
 }
 
 async fn call(state: &AppState, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {

@@ -22,7 +22,7 @@ pub(super) fn in_scope(scope: &[String], path: &str) -> bool {
 
 /// 逐次调用强制校验；范围变更不打断运行中的页面，下一次调用立即生效。
 pub(super) async fn check(state: &AppState, app: &InstalledApp, path: &str) -> AppResult<()> {
-    if in_scope(&app.scope, path) {
+    if app.scope_mode != "none" && in_scope(&app.scope, path) {
         return Ok(());
     }
     let _ = state;

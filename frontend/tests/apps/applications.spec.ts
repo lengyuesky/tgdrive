@@ -315,6 +315,27 @@ test('应用中心默认已安装，空状态不自动跳转，列表刷新保�
   await expect(page.locator('[data-app-id="sample-viewer"]')).toBeVisible()
 })
 
+test('详情页明确恢复更新前程序和配置，恢复后版本与设置一致', async ({ page }) => {
+  await page.goto('/apps')
+  await (await importApp(page, await packagePath('1.0.0', []))).getByRole('button', { name: '同意并安装' }).click()
+  await expect(page.getByRole('dialog', { name: '安装应用', exact: true })).not.toBeVisible()
+  expect((await page.request.patch('/api/apps/sample-viewer/settings', { data: { note: '更新前设置' } })).ok()).toBe(true)
+  await (await importApp(page, await packagePath('1.1.0', []), true)).getByRole('button', { name: '同意并更新' }).click()
+  await expect(page.getByRole('dialog', { name: '更新应用', exact: true })).not.toBeVisible()
+  expect((await page.request.patch('/api/apps/sample-viewer/settings', { data: { note: '更新后设置' } })).ok()).toBe(true)
+  await openSettingsTab(page)
+  await page.locator('[data-app-id="sample-viewer"]').getByRole('button', { name: '详情与恢复' }).click()
+  const details = page.getByRole('dialog', { name: '独立测试应用', exact: true })
+  await expect(details).toContainText('可恢复到 v1.0.0')
+  await details.getByRole('button', { name: '恢复更新前版本与数据' }).click()
+  const confirmation = page.getByRole('dialog', { name: '恢复应用', exact: true })
+  await expect(confirmation).toContainText('应用数据将被覆盖')
+  await confirmation.getByRole('button', { name: '恢复版本与数据' }).click()
+  await expect(details).toContainText('v1.0.0')
+  await expect(details.getByRole('button', { name: '恢复更新前版本与数据' })).toHaveCount(0)
+  expect((await (await page.request.get('/api/apps/sample-viewer/settings')).json()).note).toBe('更新前设置')
+})
+
 test('独立插件导入、权限限制、更新撤销旧页面、停用、固定入口与保留配置卸载', async ({
   page,
 }, testInfo) => {
@@ -350,6 +371,7 @@ test('独立插件导入、权限限制、更新撤销旧页面、停用、固�
   await expect(oldPage.locator('iframe')).toHaveCount(0)
   await expect(oldPage.locator('body')).toContainText('更新')
 
+  expect((await page.request.patch('/api/apps/sample-viewer/scope', { data: { mode: 'all', paths: [] } })).ok()).toBe(true)
   await oldPage.getByRole('button', { name: '重新打开' }).click()
   await expect(oldPage.frameLocator('iframe').locator('#version')).toHaveText(
     '独立运行 1.1.0'
@@ -571,6 +593,7 @@ test('封面缓存经沙箱写入服务器封面库，应用设置显示占用�
   await page.goto('/apps')
   await (await importApp(page, await coverPackagePath())).getByRole('button', { name: '同意并安装' }).click()
   const appPage = await page.context().newPage()
+  expect((await page.request.patch('/api/apps/cover-viewer/scope', { data: { mode: 'all', paths: [] } })).ok()).toBe(true)
   await appPage.goto('/apps/cover-viewer')
   const frame = appPage.frameLocator('iframe')
   await expect(frame.locator('#capability')).toHaveText('支持封面库')

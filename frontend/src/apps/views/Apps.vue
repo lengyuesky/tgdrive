@@ -46,6 +46,7 @@
             <span v-if="card.installed?.pinned" class="tile-badge-pin" aria-hidden="true"><el-icon><StarFilled /></el-icon></span>
           </button>
           <h2 class="tile-name" :title="card.manifest.description">{{ card.manifest.name }}</h2>
+          <el-button text size="small" @click="details?.open(card.manifest, card.installed, card.available)">应用详情</el-button>
           <template v-if="!card.installed && card.available">
             <p class="tile-line">v{{ card.manifest.version }} · {{ card.manifest.author }}</p>
             <p class="tile-desc">{{ card.manifest.description }}</p>
@@ -80,6 +81,7 @@
             </p>
           </div>
           <div class="manage-actions">
+            <el-button size="small" @click="details?.open(row.app.manifest, row.app, row.update)">详情与恢复</el-button>
             <el-button v-if="row.update" type="primary" size="small" :disabled="!!busy" @click="previewCatalog(row.update!)">更新</el-button>
             <el-button v-if="row.app.manifest.settings.length || row.app.manifest.permissions.includes('files.read')" size="small" :disabled="!!busy" @click="openSettings(row.app)">设置</el-button>
             <el-dropdown trigger="click" :disabled="!!busy" @command="command($event, row.app)">
@@ -106,6 +108,8 @@
         <h3 class="install-name">{{ preview.manifest.name }} <span>v{{ preview.manifest.version }}</span></h3>
         <p class="install-description">{{ preview.manifest.description }}</p>
         <p v-if="preview.existing">当前版本 v{{ preview.existing.manifest.version }}，更新后保留配置和启停状态。</p>
+        <p v-if="preview.manifest.integration?.changelog" class="update-notes">更新说明：{{ preview.manifest.integration.changelog }}</p>
+        <p>需要宿主 {{ preview.manifest.min_host_version }} 或更高版本</p>
         <div class="permissions-box">
           <strong>此应用需要以下权限</strong>
           <ul v-if="preview.manifest.permissions.length">
@@ -116,7 +120,7 @@
           </ul>
           <p v-else>仅访问自身设置和应用数据，不读取网盘文件。</p>
           <p v-if="preview.manifest.permissions.includes('files.read')" class="scope-note">
-            含「读取文件信息」的应用默认可访问整个网盘；安装后可在「应用设置 → 目录范围」收窄到指定目录。
+            新安装的应用默认未授权；首次打开时选择允许读取的目录。更新保留已有目录授权。
           </p>
         </div>
         <p class="install-meta">作者：{{ preview.manifest.author }} · 来源：{{ importFile ? '本地导入' : '应用目录' }}</p>
@@ -149,6 +153,7 @@
               <strong>{{ target.app.manifest.name }}</strong>
               <span class="batch-version">v{{ target.app.manifest.version }} → v{{ target.update.manifest.version }}</span>
             </div>
+            <p v-if="target.update.manifest.integration?.changelog">{{ target.update.manifest.integration.changelog }}</p>
             <p v-if="target.added.length" class="batch-perms">
               新增权限：<el-tag v-for="permission in target.added" :key="permission" type="warning" size="small">{{ permissionLabels[permission] ?? permission }}</el-tag>
             </p>
@@ -169,6 +174,7 @@
       </template>
     </ResponsivePanel>
 
+    <AppDetails ref="details" @changed="load" />
     <AppSettingsDialog v-model="settingsVisible" :app="settingsApp" @scope-saved="load" />
   </main>
 </template>
@@ -184,7 +190,9 @@ import { notifyAppsChanged, permissionLabels, type AppIndex, type AppManifest, t
 import { prefetchLaunch } from '../prefetch'
 import AppIcon from '../components/AppIcon.vue'
 import AppSettingsDialog from '../components/AppSettingsDialog.vue'
+import AppDetails from '../components/AppDetails.vue'
 
+const details = ref<InstanceType<typeof AppDetails>>()
 const router = useRouter()
 const route = useRoute()
 const data = ref<AppIndex>({ installed: [], available: [], api_version: 1, host_version: '' })

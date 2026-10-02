@@ -17,6 +17,7 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
 
 fn manifest() -> Manifest {
     Manifest {
+        integration: None,
         id: "test-app".into(),
         name: "测试应用".into(),
         version: "1.0.0".into(),

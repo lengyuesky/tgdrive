@@ -17,7 +17,7 @@ vi.mock('vue-router', () => ({
   onBeforeRouteUpdate: mocks.onUpdate,
 }))
 vi.mock('@drive/api', () => ({
-  api: { apps: { launch: mocks.launch, rpc: mocks.rpc, get: mocks.get } },
+  api: { apps: { launch: mocks.launch, rpc: mocks.rpc, get: mocks.get, report: async () => ({ data: {} }) } },
   errMsg: (error: unknown) => (error as Error).message,
 }))
 vi.mock('../bridge', () => ({ connectAppBridge: mocks.connect }))

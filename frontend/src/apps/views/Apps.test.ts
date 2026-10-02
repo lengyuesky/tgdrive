@@ -180,7 +180,7 @@ describe('应用中心远程目录', () => {
 })
 
 describe('桌面式图标卡片', () => {
-  it('已安装卡片只留图标与名称：无操作按钮与文字信息，更新红点保留', async () => {
+  it('已安装卡片保留图标、名称和详情入口，更新红点保留', async () => {
     const view = await render()
     const tile = view.find('[data-app-id="sample"]')
     expect(tile.find('.tile-launch').exists()).toBe(true)
@@ -189,7 +189,7 @@ describe('桌面式图标卡片', () => {
     expect(tile.text()).not.toContain('v1.0.0')
     expect(tile.text()).not.toContain('已启用')
     expect(tile.text()).not.toContain('应用目录')
-    expect(tile.findComponent({ name: 'ElButton' }).exists()).toBe(false)
+    expect(tile.findComponent({ name: 'ElButton' }).text()).toBe('应用详情')
     expect(tile.findComponent({ name: 'ElDropdown' }).exists()).toBe(false)
   })
 

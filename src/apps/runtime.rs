@@ -96,7 +96,7 @@ pub(super) async fn launch(
         app.revision, app.manifest.entry
     );
     Ok(Json(
-        json!({"app": app, "session": sign(&state, &claims)?, "frame_url": frame_url, "expires_at": claims.expires_at}),
+        json!({"app": app, "session": sign(&state, &claims)?, "frame_url": frame_url, "expires_at": claims.expires_at, "files_cursor": state.events.file_changes(None).0}),
     ))
 }
 
@@ -406,6 +406,29 @@ async fn dispatch(
         "covers.get" | "covers.put" | "covers.delete" | "covers.stats" => {
             covers::invoke(state, app, method, params).await?
         }
+        "files.changes" => {
+            app.manifest.require("files.read")?;
+            let cursor = params.get("cursor").and_then(Value::as_str);
+            if cursor.is_some_and(|c| c.len() > 128) {
+                return Err(AppError::BadRequest("变更游标无效".into()));
+            }
+            let (cursor, paths) = state.events.file_changes(cursor);
+            let paths = paths.map(|paths| {
+                paths
+                    .into_iter()
+                    .filter(|path| {
+                        app.scope_mode != "none"
+                            && (scope::in_scope(&app.scope, path)
+                                || app
+                                    .scope
+                                    .iter()
+                                    .any(|root| scope::in_scope(&[path.clone()], root)))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            json!({"cursor":cursor,"paths":if app.scope_mode == "none" { Some(Vec::<String>::new()) } else { paths }})
+        }
+        "app.lifecycle" => super::integration::lifecycle(state, app, params).await?,
         "app.ping" => json!({"ok": true, "revision": app.revision}),
         "settings.get" => read_settings(state, app).await?,
         "settings.patch" => save_settings(state, app, params).await?,
@@ -413,7 +436,7 @@ async fn dispatch(
             app.manifest.require("files.read")?;
             let query: crate::api::SearchQuery = serde_json::from_value(params)
                 .map_err(|_| AppError::BadRequest("搜索参数无效".into()))?;
-            if !app.scope.is_empty() {
+            {
                 let base = query.under.clone().unwrap_or_else(|| "/".into());
                 let normalized = crate::vfs::canonical(&base)?;
                 scope::check(state, app, &normalized).await?;

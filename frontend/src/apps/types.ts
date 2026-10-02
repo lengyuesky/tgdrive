@@ -9,6 +9,13 @@ export interface AppSetting {
   default: SettingValue
 }
 
+export interface AppIntegration {
+  file_types: string[]; directories: boolean; changelog: string; formats: string[]; limitations: string[]
+  homepage: string; support: string; screenshots: string[]; data_schema: number
+}
+export interface AppFile { id: number; content_version: string; path: string; name: string; is_dir: boolean; size: number; created_at: number; modified_at: number; favorite: boolean }
+export interface AppHealth { lifecycle: { schema_version: number; phase: string; message: string; updated_at: number } | null; recovery: { version: string; created_at: number; bytes: number } | null }
+export type ScopeMode = 'none' | 'all' | 'selected'
 export interface AppManifest {
   id: string
   name: string
@@ -21,6 +28,7 @@ export interface AppManifest {
   /** 包内可选 SVG 图标路径；安装后由宿主展示。 */
   icon?: string
   permissions: string[]
+  integration?: AppIntegration
   settings: AppSetting[]
 }
 
@@ -35,6 +43,7 @@ export interface InstalledApp {
   updated_at: number
   /** 目录范围；空数组表示全盘。 */
   scope: string[]
+  scope_mode?: ScopeMode
 }
 
 /** 应用封面缓存占用；封面存于独立封面库，可随时清理后重新生成。 */
@@ -79,6 +88,7 @@ export interface AppPreview {
 }
 
 export interface AppLaunch {
+  files_cursor?: string
   app: InstalledApp
   session: string
   frame_url: string

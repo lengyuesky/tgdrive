@@ -36,6 +36,7 @@ impl CatalogTransport for MockTransport {
 
 fn test_manifest(id: &str, version: &str, api_version: u32, min_host: &str) -> Manifest {
     Manifest {
+        integration: None,
         id: id.into(),
         name: format!("测试应用 {id}"),
         version: version.into(),

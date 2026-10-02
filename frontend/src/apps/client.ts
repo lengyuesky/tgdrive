@@ -1,5 +1,5 @@
 import { http } from '@drive/http'
-import type { AppIndex, AppLaunch, AppPreview, CoverStats, InstalledApp, SettingValues } from './types'
+import type { AppFile, AppHealth, ScopeMode, AppIndex, AppLaunch, AppPreview, CoverStats, InstalledApp, SettingValues } from './types'
 
 export const appApi = {
   list: () => http.get<AppIndex>('/apps'),
@@ -20,7 +20,12 @@ export const appApi = {
     http.delete(`/apps/${encodeURIComponent(id)}`, { params: { purge_data: purgeData } }),
   settings: (id: string) => http.get<SettingValues>(`/apps/${encodeURIComponent(id)}/settings`),
   saveSettings: (id: string, values: SettingValues) => http.patch<SettingValues>(`/apps/${encodeURIComponent(id)}/settings`, values),
-  saveScope: (id: string, paths: string[]) => http.patch<InstalledApp>(`/apps/${encodeURIComponent(id)}/scope`, { paths }),
+  saveScope: (id: string, paths: string[], mode?: ScopeMode) => http.patch<InstalledApp>(`/apps/${encodeURIComponent(id)}/scope`, { paths, mode }),
+  authorize: (id: string, path: string, expected_revision: string) => http.post<InstalledApp>(`/apps/${encodeURIComponent(id)}/authorize`, { path, expected_revision }),
+  open: (id: string, node: number | string) => http.post<AppFile>(`/apps/${encodeURIComponent(id)}/open`, typeof node === 'number' ? { id: node } : { path: node }),
+  health: (id: string) => http.get<AppHealth>(`/apps/${encodeURIComponent(id)}/health`),
+  report: (id: string, revision: string, phase: string, message = '') => http.post(`/apps/${encodeURIComponent(id)}/health`, { revision, phase, message }),
+  recover: (id: string, expected_revision: string) => http.post<InstalledApp>(`/apps/${encodeURIComponent(id)}/recovery`, { expected_revision }),
   coverStats: (id: string) => http.get<CoverStats>(`/apps/${encodeURIComponent(id)}/covers`),
   clearCovers: (id: string) => http.delete<{ ok: boolean; removed: number }>(`/apps/${encodeURIComponent(id)}/covers`),
   launch: (id: string, signal?: AbortSignal) => http.post<AppLaunch>(`/apps/${encodeURIComponent(id)}/launch`, {}, { signal }),

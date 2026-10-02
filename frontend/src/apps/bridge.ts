@@ -1,5 +1,6 @@
 /** 能力白名单、限流、取消和有界退出握手；凭据始终由宿主持有。 */
 const METHODS = new Set([
+  'files.changes', 'app.lifecycle', 'ui.authorizeDirectory', 'ui.showFile', 'ui.fileDetails', 'ui.setTitle', 'ui.setExitMessage', 'ui.task', 'ui.report',
   'app.ping', 'files.search', 'media.url', 'favorites.set', 'settings.get', 'settings.patch',
   'ui.pickDirectory', 'ui.openSettings', 'ui.download', 'ui.close', 'ui.setImmersive',
   'files.list', 'files.searchPage', 'files.stat', 'files.readRange', 'files.readRanges', 'assets.read',

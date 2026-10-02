@@ -9,6 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 mod covers_db;
 mod data;
+mod lifecycle_db;
 pub use covers_db::*;
 pub use data::*;
 
@@ -66,6 +67,7 @@ pub struct AppRecord {
     pub updated_at: i64,
     /// JSON 路径数组；空数组表示全盘。
     pub scope_paths: String,
+    pub scope_mode: String,
 }
 
 pub struct AppInstall<'a> {
@@ -80,7 +82,7 @@ pub struct AppInstall<'a> {
 
 impl Db {
     pub async fn apps(&self) -> AppResult<Vec<AppRecord>> {
-        Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths FROM apps ORDER BY installed_at, id")
+        Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths, scope_mode FROM apps ORDER BY installed_at, id")
             .fetch_all(&self.pool)
             .await?)
     }
@@ -90,7 +92,7 @@ impl Db {
             Ok(record) => return Ok(Some(record)),
             Err(generation) => generation,
         };
-        let record: Option<AppRecord> = sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths FROM apps WHERE id = ?")
+        let record: Option<AppRecord> = sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths, scope_mode FROM apps WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -102,8 +104,10 @@ impl Db {
     }
 
     /// 只更新目录范围；不轮换修订版，避免打断正在运行的页面（逐次调用强制校验）。
+    #[cfg(test)]
     pub async fn set_app_scope(&self, id: &str, paths: &str) -> AppResult<()> {
-        let changed = sqlx::query("UPDATE apps SET scope_paths = ?, updated_at = ? WHERE id = ?")
+        let changed = sqlx::query("UPDATE apps SET scope_paths = ?, scope_mode = CASE WHEN ? = '[]' THEN 'all' ELSE 'selected' END, updated_at = ? WHERE id = ?")
+            .bind(paths)
             .bind(paths)
             .bind(now_ts())
             .bind(id)
@@ -145,10 +149,15 @@ impl Db {
                 return Err(AppError::Conflict("更新包版本必须高于已安装版本".into()));
             }
         }
+        if input.expected_revision.is_some() {
+            // 同一写事务内冻结旧程序和数据，避免更新前最后一次进度写入遗漏。
+            sqlx::query("INSERT OR REPLACE INTO app_recovery(app_id, manifest, version, digest, package, source, settings, data, schema_version, created_at) SELECT id, manifest, version, digest, package, source, COALESCE((SELECT settings FROM app_settings WHERE app_id = apps.id), '{}'), COALESCE((SELECT json_group_array(json_object('key', key, 'value', value, 'revision', revision, 'updated_at', updated_at)) FROM app_data WHERE app_id = apps.id), '[]'), COALESCE((SELECT schema_version FROM app_lifecycle WHERE app_id = apps.id), 0), ? FROM apps WHERE id = ?")
+                .bind(now_ts()).bind(input.id).execute(&mut *tx).await?;
+        }
         let now = now_ts();
         sqlx::query(
-            "INSERT INTO apps (id, manifest, version, digest, revision, package, source, installed_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO apps (id, manifest, version, digest, revision, package, source, installed_at, updated_at, scope_mode)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none')
              ON CONFLICT(id) DO UPDATE SET manifest = excluded.manifest, version = excluded.version,
              digest = excluded.digest, revision = excluded.revision, package = excluded.package,
              source = excluded.source, updated_at = excluded.updated_at",
@@ -164,6 +173,8 @@ impl Db {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("INSERT INTO app_lifecycle(app_id, updated_at) VALUES(?, ?) ON CONFLICT(app_id) DO UPDATE SET phase = 'installed', message = '', owner = '', lease_until = 0, updated_at = excluded.updated_at")
+            .bind(input.id).bind(now).execute(&mut *tx).await?;
         tx.commit().await?;
         self.apps_cache.invalidate(input.id);
         Ok(())
@@ -205,6 +216,10 @@ impl Db {
             return Err(AppError::NotFound);
         }
         if purge_data {
+            sqlx::query("DELETE FROM app_lifecycle WHERE app_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("DELETE FROM app_data WHERE app_id = ?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -213,6 +228,9 @@ impl Db {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+        } else {
+            sqlx::query("UPDATE app_lifecycle SET phase = 'uninstalled', owner = '', lease_until = 0 WHERE app_id = ?")
+                .bind(id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         self.apps_cache.invalidate(id);

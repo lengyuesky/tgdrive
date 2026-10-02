@@ -3,6 +3,7 @@
 pub mod catalog;
 mod covers;
 mod files;
+mod integration;
 mod package;
 mod range_cache;
 mod runtime;
@@ -44,6 +45,7 @@ pub struct InstalledApp {
     pub updated_at: i64,
     /// 目录范围；空数组表示全盘。
     pub scope: Vec<String>,
+    pub scope_mode: String,
 }
 
 impl InstalledApp {
@@ -58,7 +60,8 @@ impl InstalledApp {
             source: record.source,
             installed_at: record.installed_at,
             updated_at: record.updated_at,
-            scope: serde_json::from_str(&record.scope_paths).unwrap_or_default(),
+            scope: serde_json::from_str(&record.scope_paths).map_err(anyhow::Error::from)?,
+            scope_mode: record.scope_mode,
         })
     }
 }
@@ -80,6 +83,17 @@ pub fn protected_router() -> Router<AppState> {
         .route("/apps/{id}", get(detail).delete(uninstall))
         .route("/apps/{id}/state", post(set_state))
         .route("/apps/{id}/scope", patch(scope_patch))
+        .route("/apps/{id}/authorize", post(integration::authorize))
+        .route("/apps/{id}/open", post(integration::open))
+        .route(
+            "/apps/{id}/health",
+            get(integration::health).post(integration::report),
+        )
+        .route("/apps/{id}/recovery", post(integration::recover))
+        .route(
+            "/apps/catalog/{id}/screenshot/{index}",
+            get(integration::screenshot),
+        )
         .route("/apps/{id}/covers", get(covers_stats).delete(covers_clear))
         .route(
             "/apps/{id}/settings",
@@ -421,6 +435,7 @@ async fn set_state(
 struct ScopePatch {
     #[serde(default)]
     paths: Vec<String>,
+    mode: Option<String>,
 }
 
 /// 目录范围白名单：空数组表示全盘；逐条规范化并去重后落库。
@@ -429,6 +444,7 @@ async fn scope_patch(
     Path(id): Path<String>,
     Json(patch): Json<ScopePatch>,
 ) -> AppResult<Json<InstalledApp>> {
+    let _guard = INSTALL_LOCK.lock().await;
     let app = installed(&state, &id).await?;
     let mut scope = Vec::new();
     if patch.paths.len() > 32 {
@@ -445,7 +461,21 @@ async fn scope_patch(
     }
     scope.sort();
     let encoded = serde_json::to_string(&scope).map_err(|e| AppError::Internal(e.into()))?;
-    state.vfs.db.set_app_scope(&id, &encoded).await?;
+    let mode = patch
+        .mode
+        .as_deref()
+        .unwrap_or(if scope.is_empty() { "all" } else { "selected" });
+    if !["none", "all", "selected"].contains(&mode)
+        || (mode == "selected" && scope.is_empty())
+        || (mode != "selected" && !scope.is_empty())
+    {
+        return Err(AppError::BadRequest("目录授权模式与目录列表不匹配".into()));
+    }
+    state
+        .vfs
+        .db
+        .set_app_scope_mode(&id, mode, &encoded, &app.revision)
+        .await?;
     crate::events::emit(
         &state.events,
         crate::events::HostEvent::app("app.scope", &app.manifest.id, None),

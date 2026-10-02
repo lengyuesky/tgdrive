@@ -40,6 +40,20 @@ pub struct SettingField {
     pub default: Value,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Integration {
+    pub file_types: Vec<String>,
+    pub directories: bool,
+    pub changelog: String,
+    pub formats: Vec<String>,
+    pub limitations: Vec<String>,
+    pub homepage: String,
+    pub support: String,
+    pub screenshots: Vec<String>,
+    pub data_schema: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -58,6 +72,8 @@ pub struct Manifest {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub settings: Vec<SettingField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<Integration>,
 }
 
 pub struct AppPackage {
@@ -149,6 +165,68 @@ impl Manifest {
             && !(valid_resource(icon) && icon.ends_with(".svg"))
         {
             return Err(invalid("应用图标必须是包内的 SVG 文件"));
+        }
+        if let Some(info) = &self.integration {
+            if self.api_version != 2
+                || semver::Version::parse(&self.min_host_version).unwrap()
+                    < semver::Version::new(0, 3, 0)
+            {
+                return Err(invalid("系统集成能力需要 API v2 和宿主 0.3.0"));
+            }
+            let mut extensions = HashSet::new();
+            if info.file_types.len() > 32
+                || info.file_types.iter().any(|s| {
+                    s.is_empty()
+                        || s.len() > 16
+                        || !s
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                        || !extensions.insert(s)
+                })
+            {
+                return Err(invalid("文件打开类型无效或重复"));
+            }
+            if (!info.file_types.is_empty() || info.directories)
+                && !self.permissions.iter().any(|p| p == "files.read")
+            {
+                return Err(invalid("文件入口需要 files.read 权限"));
+            }
+            if info.data_schema == 0
+                || info.changelog.len() > 4000
+                || info.formats.len() > 24
+                || info.limitations.len() > 12
+                || info
+                    .formats
+                    .iter()
+                    .any(|s| s.is_empty() || s.len() > 160 || s.chars().any(char::is_control))
+                || info
+                    .limitations
+                    .iter()
+                    .any(|s| s.is_empty() || s.len() > 800 || s.chars().any(char::is_control))
+            {
+                return Err(invalid("应用详情文本超限或无效"));
+            }
+            for url in [&info.homepage, &info.support] {
+                if !url.is_empty()
+                    && (url.len() > 2048
+                        || reqwest::Url::parse(url).ok().is_none_or(|u| {
+                            u.scheme() != "https"
+                                || u.host_str().is_none()
+                                || !u.username().is_empty()
+                                || u.password().is_some()
+                        }))
+                {
+                    return Err(invalid("应用链接必须是无用户凭据的 HTTPS 地址"));
+                }
+            }
+            if info.screenshots.len() > 6
+                || info.screenshots.iter().any(|p| {
+                    !valid_resource(p)
+                        || ![".png", ".jpg", ".webp"].iter().any(|ext| p.ends_with(ext))
+                })
+            {
+                return Err(invalid("应用截图必须是最多六张包内 PNG/JPG/WebP 图片"));
+            }
         }
         Ok(())
     }
@@ -310,6 +388,16 @@ impl AppPackage {
                 .is_some_and(|raw| !raw.is_empty() && raw.len() <= MAX_ICON_SIZE)
         {
             return Err(invalid("应用图标必须是包内不超过 256 KiB 的非空 SVG 文件"));
+        }
+        if let Some(info) = &manifest.integration {
+            for path in &info.screenshots {
+                if !files
+                    .get(path)
+                    .is_some_and(|bytes| !bytes.is_empty() && bytes.len() <= 512 * 1024)
+                {
+                    return Err(invalid("应用截图不存在或超过 512 KiB"));
+                }
+            }
         }
         drop(zip);
         let digest = crate::engine::upload::to_hex(&Sha256::digest(&archive));
