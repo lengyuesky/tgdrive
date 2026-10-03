@@ -74,6 +74,8 @@ pub(crate) async fn open_covers(db_path: &str) -> anyhow::Result<SqlitePool> {
         .create_if_missing(true)
         .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
+        // 封面是可再生缓存，断电丢几笔写入无碍；保持与主库一致的 WAL+NORMAL 组合。
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
         .busy_timeout(std::time::Duration::from_secs(10));
     let pool = SqlitePoolOptions::new()
         .max_connections(4)

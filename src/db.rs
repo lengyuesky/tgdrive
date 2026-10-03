@@ -376,6 +376,9 @@ impl Db {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{db_path}"))?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // WAL 下 NORMAL 已足够安全：应用/容器崩溃不丢已提交事务，仅断电或系统
+            // 崩溃可能丢失最后几笔提交；换来分块元数据等高频写入免每笔 fsync 的吞吐。
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(10))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
