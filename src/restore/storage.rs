@@ -196,11 +196,19 @@ pub(super) async fn validate_candidate(path: &Path) -> anyhow::Result<(i64, i64)
         std::fs::metadata(path)?.len() <= MAX_BYTES,
         "数据库超过 8 GiB 上限"
     );
+    // 只在内存库执行可信迁移；候选库里的可执行 schema 必须逐字匹配内置定义。
+    // 不能仅按对象名称放行，否则同名恶意触发器可能在后续迁移时执行。
+    let mut reference = SqliteConnection::connect("sqlite::memory:").await?;
+    sqlx::migrate!("./migrations")
+        .run_direct(None, &mut reference, false)
+        .await?;
+    let expected_schema = schema(&mut reference).await?;
+    reference.close().await?;
     let mut conn = SqliteConnection::connect_with(&options(path, true)).await?;
     let result = async {
         integrity(&mut conn).await?;
-        let unsafe_schema: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('trigger','view') OR upper(sql) LIKE '%VIRTUAL TABLE%'").fetch_one(&mut conn).await?;
-        anyhow::ensure!(unsafe_schema.0 == 0, "备份包含不受支持的触发器、视图或虚拟表");
+        let executable_schema: Vec<(String, String, String)> = sqlx::query_as("SELECT type,name,sql FROM sqlite_master WHERE type IN ('trigger','view') OR upper(sql) LIKE '%VIRTUAL TABLE%'").fetch_all(&mut conn).await?;
+        anyhow::ensure!(executable_schema.iter().all(|object| expected_schema.contains(object)), "备份包含不受支持或被篡改的触发器、视图或虚拟表");
         for name in ["nodes", "chunks", "settings", "_sqlx_migrations"] {
             let row: Option<(String,)> = sqlx::query_as("SELECT type FROM sqlite_master WHERE name = ?").bind(name).fetch_optional(&mut conn).await?;
             anyhow::ensure!(row.as_ref().is_some_and(|r| r.0 == "table"), "备份缺少必要表 {name}");
@@ -224,12 +232,8 @@ pub(super) async fn validate_candidate(path: &Path) -> anyhow::Result<(i64, i64)
         sqlx::migrate!("./migrations").run_direct(None, &mut conn, false).await?;
         integrity(&mut conn).await?;
         // 校验迁移后的完整 schema，不能只信可伪造的迁移记录。
-        let mut reference = SqliteConnection::connect("sqlite::memory:").await?;
-        sqlx::migrate!("./migrations").run_direct(None, &mut reference, false).await?;
         let actual = schema(&mut conn).await?;
-        let expected = schema(&mut reference).await?;
-        reference.close().await?;
-        anyhow::ensure!(actual == expected, "备份数据库结构与本版本迁移结果不匹配");
+        anyhow::ensure!(actual == expected_schema, "备份数据库结构与本版本迁移结果不匹配");
         let root: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM nodes WHERE id = 1 AND is_dir = 1 AND parent_id IS NULL").fetch_one(&mut conn).await?;
         anyhow::ensure!(root.0 == 1, "备份根目录不存在或已损坏");
         let (files, directories): (i64, i64) = sqlx::query_as("SELECT COALESCE(SUM(CASE WHEN is_dir = 0 THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN is_dir = 1 THEN 1 ELSE 0 END),0) FROM nodes").fetch_one(&mut conn).await?;

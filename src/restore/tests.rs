@@ -694,6 +694,49 @@ async fn offline_validation_rejects_corruption_future_migrations_and_custom_sche
     std::fs::write(&path, b"not a sqlite file").unwrap();
     assert!(storage::validate_candidate(&path).await.is_err());
 }
+#[tokio::test]
+async fn offline_validation_rejects_same_named_modified_reading_objects() {
+    use sqlx::Connection;
+    for (drop_sql, replacement) in [
+        (
+            "DROP TRIGGER reading_tree_insert",
+            "CREATE TRIGGER reading_tree_insert AFTER INSERT ON nodes BEGIN DELETE FROM settings; END",
+        ),
+        (
+            "DROP VIEW reading_files",
+            "CREATE VIEW reading_files AS SELECT k AS id, v AS format FROM settings",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidate.db");
+        let db = Db::open(path.to_str().unwrap()).await.unwrap();
+        db.setting_set("must_survive", "yes").await.unwrap();
+        db.close().await;
+        let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let mut conn = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
+        sqlx::query(drop_sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query(replacement).execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+        let error = storage::validate_candidate(&path)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("被篡改"), "{error}");
+        let mut conn = sqlx::SqliteConnection::connect_with(&opts.read_only(true))
+            .await
+            .unwrap();
+        let value: String = sqlx::query_scalar("SELECT v FROM settings WHERE k='must_survive'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(value, "yes");
+        conn.close().await.unwrap();
+    }
+}
+
 #[test]
 fn instance_lock_prevents_second_writer() {
     let dir = tempfile::tempdir().unwrap();
