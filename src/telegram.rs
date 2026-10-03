@@ -25,7 +25,14 @@ const MAX_RETRIES: u32 = 5;
 const API_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Telegram 建议同一聊天不要持续超过每秒一条消息。这里只错开发送请求的
 /// 起始时间，大文件仍可并行传输，不会把上传并发重新退化成串行。
+/// 该值同时是自适应配速的下限：触发 429 时间隔翻倍（上限 MEDIA_SEND_INTERVAL_MAX），
+/// 每成功取得一个时隙回落 MEDIA_SEND_INTERVAL_STEP，详见 `MediaSendThrottle`。
 const MEDIA_SEND_INTERVAL: Duration = Duration::from_millis(1100);
+/// 自适应发送间隔的上限与回落步长（AIMD）。官方端点单频道约 20 条/分钟，
+/// 固定 1100ms 起步会周期性撞限并整段冷却；自适应间隔在真实限速附近小幅震荡，
+/// 把「撞限 → 全员等 retry_after」的代价降到最低。
+const MEDIA_SEND_INTERVAL_MAX: Duration = Duration::from_secs(30);
+const MEDIA_SEND_INTERVAL_STEP: Duration = Duration::from_millis(100);
 /// Telegram 自定义媒体缩略图必须小于该值。
 pub const MAX_THUMBNAIL_SIZE: usize = 200 * 1024;
 
@@ -612,15 +619,21 @@ pub struct TgClient {
     mtproto: Option<Arc<MtprotoClient>>,
 }
 
+/// 单个 Bot 对单个会话的媒体发送配速。固定间隔负责错峰；间隔本身按 AIMD
+/// 自适应：429 时乘性翻倍，每成功取得一个时隙加性回落一步，收敛到该会话
+/// 真实限速附近，避免冷却结束后立即再次撞限并拖住所有等待者。
 struct MediaSendThrottle {
     state: tokio::sync::Mutex<MediaSendThrottleState>,
     cooldown_until_unix_ms: AtomicU64,
-    interval: Duration,
+    /// 间隔下限，即构造时的初始间隔。
+    floor: Duration,
 }
 
 struct MediaSendThrottleState {
     next_send_at: Instant,
     cooldown_until: Instant,
+    /// 当前自适应间隔，始终不低于 `floor`、不高于 `MEDIA_SEND_INTERVAL_MAX`。
+    interval: Duration,
 }
 
 fn unix_millis() -> u64 {
@@ -638,10 +651,15 @@ impl MediaSendThrottle {
             state: tokio::sync::Mutex::new(MediaSendThrottleState {
                 next_send_at: now,
                 cooldown_until: now,
+                interval,
             }),
             cooldown_until_unix_ms: AtomicU64::new(0),
-            interval,
+            floor: interval,
         }
+    }
+
+    async fn interval(&self) -> Duration {
+        self.state.lock().await.interval
     }
 
     /// 所有等待者醒来后重新竞争并检查截止时间，因此延长冷却时不需要逐个通知；
@@ -653,7 +671,12 @@ impl MediaSendThrottle {
                 let now = Instant::now();
                 let deadline = state.next_send_at.max(state.cooldown_until);
                 if deadline <= now {
-                    state.next_send_at = now + self.interval;
+                    // 取得时隙：间隔按步长缓慢回落，撞限的历史随成功发送逐步淡出。
+                    state.interval = state
+                        .interval
+                        .saturating_sub(MEDIA_SEND_INTERVAL_STEP)
+                        .max(self.floor);
+                    state.next_send_at = now + state.interval;
                     return;
                 }
                 deadline
@@ -666,6 +689,8 @@ impl MediaSendThrottle {
         let deadline = Instant::now() + wait;
         {
             let mut state = self.state.lock().await;
+            // 429 说明当前配速仍高于会话真实限速：乘性翻倍并封顶。
+            state.interval = (state.interval * 2).min(MEDIA_SEND_INTERVAL_MAX);
             state.cooldown_until = state.cooldown_until.max(deadline);
             state.next_send_at = state.next_send_at.max(deadline);
         }
@@ -1072,8 +1097,9 @@ impl TgClient {
                     if is_flood_limit(&err) {
                         self.media_throttle.defer_all(wait).await;
                         tracing::warn!(
-                            "{method} 第 {attempt} 次触发 Telegram 限流({err})，该 Bot 的上传共享等待 {:?}",
-                            wait
+                            "{method} 第 {attempt} 次触发 Telegram 限流({err})，该 Bot 的上传共享等待 {:?}，发送间隔自适应调整为 {:?}",
+                            wait,
+                            self.media_throttle.interval().await
                         );
                     } else {
                         tracing::warn!("{method} 第 {attempt} 次失败({err}),{:?} 后安全重试", wait);
@@ -1155,8 +1181,9 @@ impl TgClient {
                     let wait = wait + Duration::from_millis((attempt as u64 * 137) % 500);
                     self.media_throttle.defer_all(wait).await;
                     tracing::warn!(
-                        "forwardMessage 第 {attempt} 次触发限流({error})，共享等待 {:?}",
-                        wait
+                        "forwardMessage 第 {attempt} 次触发限流({error})，共享等待 {:?}，发送间隔自适应调整为 {:?}",
+                        wait,
+                        self.media_throttle.interval().await
                     );
                 }
                 // 发送类 5xx 即使带有重试提示也可能已经创建消息，不能自动重放。
@@ -1557,6 +1584,38 @@ mod tests {
             started.elapsed() >= Duration::from_millis(50),
             "共享冷却结束后，两个等待者仍应按发送间隔错峰"
         );
+    }
+
+    #[tokio::test]
+    async fn media_throttle_aimd_doubles_on_flood_and_decays_per_turn() {
+        // 用小初始间隔验证 AIMD 语义，避免测试真实等待。乘性翻倍不需要等待，
+        // 用生产间隔直接验证一拍数学；加性回落/下限用 20ms 起步验证。
+        let throttle = MediaSendThrottle::new(MEDIA_SEND_INTERVAL);
+        assert_eq!(throttle.interval().await, MEDIA_SEND_INTERVAL);
+
+        // 撞限：间隔乘性翻倍
+        throttle.defer_all(Duration::from_millis(50)).await;
+        assert_eq!(throttle.interval().await, MEDIA_SEND_INTERVAL * 2);
+        throttle.defer_all(Duration::from_millis(50)).await;
+        assert_eq!(throttle.interval().await, MEDIA_SEND_INTERVAL * 4);
+
+        // 连续撞限：封顶在上限，不会无限增长
+        for _ in 0..10 {
+            throttle.defer_all(Duration::from_millis(10)).await;
+        }
+        assert_eq!(throttle.interval().await, MEDIA_SEND_INTERVAL_MAX);
+
+        // 小间隔起步：验证成功取时隙后的加性回落与下限钉住
+        let fast = MediaSendThrottle::new(Duration::from_millis(20));
+        for _ in 0..3 {
+            fast.defer_all(Duration::from_millis(20)).await;
+        }
+        assert_eq!(fast.interval().await, Duration::from_millis(160));
+        fast.wait_turn().await;
+        assert_eq!(fast.interval().await, Duration::from_millis(60));
+        fast.wait_turn().await;
+        // 不足一步时直接钉在下限，不无穷下降
+        assert_eq!(fast.interval().await, Duration::from_millis(20));
     }
 
     #[test]
