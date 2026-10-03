@@ -665,6 +665,7 @@ impl MediaSendThrottle {
     /// 所有等待者醒来后重新竞争并检查截止时间，因此延长冷却时不需要逐个通知；
     /// 同一时刻只会有一个任务取得时隙，其余任务自动按 interval 排开。
     async fn wait_turn(&self) {
+        let _wait = crate::metrics::upload_wait();
         loop {
             let deadline = {
                 let mut state = self.state.lock().await;
@@ -945,6 +946,7 @@ impl TgClient {
         loop {
             attempt += 1;
             let snapshot = self.network.current();
+            let started = Instant::now();
             let outcome = match make_req(snapshot.http.clone()).await {
                 Ok(resp) => self.parse::<T>(resp, CallMode::Idempotent).await,
                 Err(e) => Err((
@@ -952,6 +954,16 @@ impl TgClient {
                     AppError::Telegram(format!("{what}: {}", reqwest_error_summary(&e))),
                 )),
             };
+            crate::metrics::telegram_attempt(
+                false,
+                started.elapsed(),
+                outcome.is_err(),
+                outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|(_, error)| is_flood_limit(error)),
+                attempt > 1,
+            );
             match outcome {
                 Ok(v) => return Ok(v),
                 Err((Some(wait), err)) if attempt < MAX_RETRIES => {
@@ -1073,6 +1085,7 @@ impl TgClient {
             form = form.part(field, part);
 
             let snapshot = self.network.current();
+            let started = Instant::now();
             let outcome = match snapshot.http.post(&url).multipart(form).send().await {
                 Ok(resp) => self.parse::<RawMessage>(resp, CallMode::SendMedia).await,
                 // 连接尚未建立或请求体没有发完整时，Telegram 不可能成功解析媒体，可安全重试。
@@ -1089,6 +1102,16 @@ impl TgClient {
                     )),
                 )),
             };
+            crate::metrics::telegram_attempt(
+                true,
+                started.elapsed(),
+                outcome.is_err(),
+                outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|(_, error)| is_flood_limit(error)),
+                attempt > 1,
+            );
             match outcome {
                 Ok(msg) => break msg,
                 Err((Some(wait), err)) if attempt < MAX_RETRIES => {

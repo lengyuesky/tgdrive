@@ -14,6 +14,8 @@ pub enum AppError {
     Conflict(String),
     #[error("阅读记录已被另一页面更新，请选择使用已保存进度或从当前页继续")]
     AppDataConflict,
+    #[error("文件树已变化，请刷新全库列表后继续")]
+    ReadingIndexChanged,
     /// 应用运行会话过期；宿主前端凭 `session_expired` 码静默续签后重试。
     #[error("应用会话已过期，请重新打开")]
     SessionExpired,
@@ -71,7 +73,9 @@ impl AppError {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::AlreadyExists => StatusCode::CONFLICT,
-            AppError::Conflict(_) | AppError::AppDataConflict => StatusCode::CONFLICT,
+            AppError::Conflict(_) | AppError::AppDataConflict | AppError::ReadingIndexChanged => {
+                StatusCode::CONFLICT
+            }
             AppError::InvalidPath(_) | AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::IsDirectory | AppError::NotDirectory => StatusCode::UNPROCESSABLE_ENTITY,
@@ -112,6 +116,7 @@ impl AppError {
         let code = match self {
             AppError::UploadInterrupted => Some("upload_interrupted"),
             AppError::AppDataConflict => Some("storage_conflict"),
+            AppError::ReadingIndexChanged => Some("reading_index_changed"),
             AppError::SessionExpired => Some("session_expired"),
             AppError::AppChanged => Some("app_changed"),
             AppError::TotpRequired => Some("totp_required"),

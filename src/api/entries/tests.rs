@@ -457,4 +457,19 @@ async fn metrics_require_auth_and_use_prometheus_text() {
         "{text}"
     );
     assert!(text.contains("tgdrive_http_requests_total{class=\"4xx\"}"));
+    for metric in [
+        "tgdrive_http_headers_seconds histogram",
+        "tgdrive_http_body_seconds histogram",
+        "tgdrive_http_body_active gauge",
+        "tgdrive_http_body_finished_total counter",
+        "tgdrive_telegram_attempt_seconds histogram",
+        "tgdrive_upload_wait_seconds histogram",
+        "tgdrive_range_cache_hits_total counter",
+        "tgdrive_range_cache_bytes gauge",
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {metric}\n")),
+            "缺少指标 {metric}"
+        );
+    }
 }

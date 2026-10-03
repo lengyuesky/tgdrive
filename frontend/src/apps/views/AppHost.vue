@@ -375,7 +375,7 @@ function onReady(event: MessageEvent) {
     frame.value.contentWindow.postMessage({ channel: 'tgdrive-app-v1', type: 'connect',
       context: { id: active.app.manifest.id, name: active.app.manifest.name, version: active.app.manifest.version, api_version: active.app.manifest.api_version, dark: isDark.value,
         scope: { mode: app.value?.scope_mode ?? 'all', paths: [...(app.value?.scope ?? [])] }, launch: contextFile.value ? { action: 'open', file: { ...contextFile.value } } : undefined, data_schema: active.app.manifest.integration?.data_schema,
-        capabilities: active.app.manifest.api_version >= 2 ? ['files.changes', 'ui.authorizeDirectory', 'ui.showFile', 'ui.fileDetails', 'ui.setTitle', 'ui.setExitMessage', 'ui.task', 'app.lifecycle', 'app.launch','ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope', 'rpc.batch', 'covers'] : [] } }, '*', [channel.port2])
+        capabilities: active.app.manifest.api_version >= 2 ? ['files.changes', 'ui.authorizeDirectory', 'ui.showFile', 'ui.fileDetails', 'ui.setTitle', 'ui.setExitMessage', 'ui.task', 'app.lifecycle', 'app.launch','ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope', 'rpc.batch', 'covers', 'library.page'] : [] } }, '*', [channel.port2])
   }).catch((error) => {
     channel.port2.close()
     if (current === generation && !signal.aborted) fail(errMsg(error))

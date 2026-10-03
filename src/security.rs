@@ -212,7 +212,7 @@ fn is_cross_site(headers: &axum::http::HeaderMap) -> bool {
 const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 进程内 HTTP 指标（Prometheus 文本格式由 /api/metrics 输出）。
-/// 按状态码类别计数，耗时只累计总和，足够算平均延迟又不引入依赖。
+/// 保留原有总计数；路由直方图和正文生命周期指标见 metrics 模块。
 static HTTP_BY_CLASS: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 static HTTP_DURATION_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -266,9 +266,16 @@ pub async fn access_log(mut request: Request, next: Next) -> Response {
     }
     let method = request.method().clone();
     let path = redact_path(request.uri().path());
+    let route_metrics = crate::metrics::route(
+        request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|path| path.as_str()),
+    );
     let started = std::time::Instant::now();
     let mut response = next.run(request).await;
     let elapsed = started.elapsed();
+    crate::metrics::observe_headers(&route_metrics, elapsed);
     let status = response.status().as_u16();
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
@@ -291,7 +298,7 @@ pub async fn access_log(mut request: Request, next: Next) -> Response {
     } else {
         tracing::debug!(%request_id, %method, %path, status, ms, "请求");
     }
-    response
+    response.map(|body| crate::metrics::observe_body(body, route_metrics))
 }
 
 /// 遮蔽路径中充当凭据的段：`/api/share/{token}`、`/api/apps/media/{ticket}`。

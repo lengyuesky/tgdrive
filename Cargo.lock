@@ -3748,6 +3748,7 @@ dependencies = [
  "grammers-tl-types",
  "hmac 0.13.0",
  "http",
+ "http-body",
  "http-body-util",
  "mime_guess",
  "percent-encoding",

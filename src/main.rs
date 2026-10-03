@@ -14,6 +14,7 @@ mod events;
 mod extras;
 mod housekeeping;
 mod inbox;
+mod metrics;
 mod migration;
 mod mtproto;
 mod password;

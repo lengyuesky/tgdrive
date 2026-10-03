@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "apps/db.rs"]
 pub mod apps;
+pub mod reading;
 mod copy;
 mod delete_jobs;
 pub mod entries;

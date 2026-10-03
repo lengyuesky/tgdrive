@@ -556,6 +556,8 @@ pub(super) async fn metrics(State(state): State<AppState>) -> AppResult<Response
     let queue = state.vfs.db.delete_queue_overview().await?;
     let mut out = String::new();
     crate::security::write_http_metrics(&mut out);
+    crate::metrics::write(&mut out);
+    state.range_cache.lock().unwrap().write_metrics(&mut out);
     let gauges: [(&str, &str, i64); 5] = [
         ("tgdrive_files", "可见文件数", files),
         ("tgdrive_dirs", "可见目录数（不含根）", dirs),

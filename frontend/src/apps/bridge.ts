@@ -3,7 +3,7 @@ const METHODS = new Set([
   'files.changes', 'app.lifecycle', 'ui.authorizeDirectory', 'ui.showFile', 'ui.fileDetails', 'ui.setTitle', 'ui.setExitMessage', 'ui.task', 'ui.report',
   'app.ping', 'files.search', 'media.url', 'favorites.set', 'settings.get', 'settings.patch',
   'ui.pickDirectory', 'ui.openSettings', 'ui.download', 'ui.close', 'ui.setImmersive',
-  'files.list', 'files.searchPage', 'files.stat', 'files.readRange', 'files.readRanges', 'assets.read',
+  'library.page', 'files.list', 'files.searchPage', 'files.stat', 'files.readRange', 'files.readRanges', 'assets.read',
   'storage.get', 'storage.set', 'storage.list', 'storage.delete', 'rpc.batch',
   'covers.get', 'covers.put', 'covers.delete', 'covers.stats',
 ])

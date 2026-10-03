@@ -396,7 +396,7 @@ async fn dispatch(
         return Err(AppError::BadRequest("此能力需要应用 API v2".into()));
     }
     let result = match method {
-        "files.list" | "files.stat" | "files.searchPage" => {
+        "files.list" | "files.stat" | "files.searchPage" | "library.page" => {
             app.manifest.require("files.read")?;
             files::invoke(state, app, method, params).await?
         }

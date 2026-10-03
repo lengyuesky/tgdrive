@@ -368,7 +368,7 @@ HTTP 探针:
 
 - `GET /healthz`:存活探针,HTTP 服务能响应即返回 `200`
 - `GET /readyz`:就绪探针,检查 SQLite、当前存储目标和关键后台任务心跳;异常时返回 `503` 及各项 JSON 状态
-- `GET /api/metrics`:Prometheus 文本格式指标(请求数按状态码类别、累计耗时、慢请求、文件/目录/容量、待删消息、后台任务状态),需登录;Prometheus 用 `basic_auth` 抓取即可
+- `GET /api/metrics`:Prometheus 文本格式指标(请求数按状态码类别、累计耗时、慢请求、路由响应头/正文耗时直方图、正文在途/字节/中断、Bot API 尝试/限流/重试/上传时隙等待、小 Range 缓存命中率、文件/目录/容量、待删消息、后台任务状态),需登录;Prometheus 用 `basic_auth` 抓取即可。口径、限制与查询示例见 [性能指标说明](docs/performance-metrics.md)。
 
 运行时镜像基于 distroless(无 shell),排查问题请用 `docker compose logs` 或 `docker cp`,不能 `docker exec sh`。
 

@@ -80,6 +80,36 @@ pub(super) async fn invoke(
     params: Value,
 ) -> AppResult<Value> {
     match method {
+        "library.page" => {
+            let mut query: crate::db::reading::ReadingQuery = parse(params)?;
+            query.validate()?;
+            let revision = state.vfs.db.reading_revision().await?;
+            let mut roots = Vec::with_capacity(query.roots.len());
+            for id in &query.roots {
+                let (node, path) = resolve(
+                    state,
+                    &Reference {
+                        id: Some(*id),
+                        path: None,
+                        content_version: None,
+                    },
+                )
+                .await?;
+                if !node.is_dir {
+                    return Err(AppError::NotDirectory);
+                }
+                scope::check(state, app, &path).await?;
+                roots.push((*id, path));
+            }
+            let page = state.vfs.db.reading_page(&query, &roots, &revision).await?;
+            let entries: Vec<_> = page.rows.iter().map(|row| {
+                let source_ids: Vec<_> = roots.iter().filter(|(_, root)| scope::in_scope(std::slice::from_ref(root), &row.path)).map(|(id, _)| *id).collect();
+                json!({"file": metadata(&row.node, &row.path), "format": row.format, "source_ids": source_ids})
+            }).collect();
+            Ok(
+                json!({"entries": entries, "revision": page.revision, "has_more": page.next_cursor.is_some(), "next_cursor": page.next_cursor}),
+            )
+        }
         "files.stat" => {
             let (node, path) = resolve(state, &parse(params)?).await?;
             scope::check(state, app, &path).await?;

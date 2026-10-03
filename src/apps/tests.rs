@@ -24,6 +24,8 @@ mod cover_cache;
 mod integration_tests;
 #[path = "media_tests.rs"]
 mod media;
+#[path = "reading_index_tests.rs"]
+mod reading_index;
 #[path = "reader_tests.rs"]
 mod readers;
 #[path = "scope_tests.rs"]
