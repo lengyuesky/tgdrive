@@ -3,6 +3,9 @@ use super::{Db, now_ts, random_token};
 use crate::error::{AppError, AppResult};
 use serde_json::{Value, json};
 
+/// 恢复快照行：manifest / version / digest / 包体 / 来源 / 设置 / 数据 / 架构版本。
+type AppRecoverySnapshot = (String, String, String, Vec<u8>, String, String, String, i64);
+
 impl Db {
     pub async fn set_app_scope_mode(
         &self,
@@ -130,7 +133,9 @@ impl Db {
         if current.as_deref() != Some(revision) {
             return Err(AppError::AppChanged);
         }
-        let snapshot: Option<(String, String, String, Vec<u8>, String, String, String, i64)> = sqlx::query_as("SELECT manifest, version, digest, package, source, settings, data, schema_version FROM app_recovery WHERE app_id = ? AND digest = ?")
+        let snapshot: Option<AppRecoverySnapshot> = sqlx::query_as(
+            "SELECT manifest, version, digest, package, source, settings, data, schema_version FROM app_recovery WHERE app_id = ? AND digest = ?",
+        )
             .bind(id).bind(digest).fetch_optional(&mut *tx).await?;
         let (manifest, version, digest, package, source, settings, data, schema) =
             snapshot.ok_or(AppError::NotFound)?;

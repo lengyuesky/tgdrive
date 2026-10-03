@@ -422,7 +422,7 @@ async fn dispatch(
                                 || app
                                     .scope
                                     .iter()
-                                    .any(|root| scope::in_scope(&[path.clone()], root)))
+                                    .any(|root| scope::in_scope(std::slice::from_ref(path), root)))
                     })
                     .collect::<Vec<_>>()
             });
