@@ -43,7 +43,7 @@ cp .env.example .env
 docker compose up -d   # 拉取发布镜像;首次使用或镜像拉不到时改用 `docker compose up -d --build` 本地构建
 ```
 
-**先手动创建 data 目录再启动**(`mkdir -p data`)。镜像以非 root 用户 `1000:1000` 运行;如果省略 mkdir 让 Docker 自动建目录,它会属于 root,容器将无权写入,启动日志出现 `Permission denied (os error 13)`。宿主机用户不是 `1000:1000` 时,把 `.env` 中的 `TGDRIVE_UID` / `TGDRIVE_GID` 改为 `id -u` / `id -g` 的输出,或直接 `sudo chown -R 1000:1000 data`。
+**先手动创建 data 目录再启动**(`mkdir -p data`)。镜像以非 root 用户 `1000:1000` 运行;如果省略 mkdir 让 Docker 自动建目录,它会属于 root,容器将无权写入,启动日志出现 `Permission denied (os error 13)`。宿主机用户不是 `1000:1000` 时,把 `.env` 中的 `TGDRIVE_UID` / `TGDRIVE_GID` 改为 `id -u` / `id -g` 的输出,或直接 `sudo chown -R 1000:1000 data`。启用自建 Bot API profile 时同样需要 `mkdir -p bot-api-control && chown 1000:1000 bot-api-control`(tgdrive 要往里写 proxychains 配置);`telegram-bot-api-data` 由服务自行管理属主,无需手动 chown。
 
 打开 <http://localhost:8080> 登录,页面会提示「还没配置 Telegram 存储」,点「去配置」填好 **Bot Token** 与**存储频道**,保存即生效(不用重启容器)。也可以在 `.env` 里预先填好 `TGDRIVE_BOT_TOKEN` / `TGDRIVE_CHAT_ID`。
 
