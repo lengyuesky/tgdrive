@@ -40,7 +40,7 @@ WebDAV 客户端─┘   ├ /api/*  REST+SSE       └─> Telegram Bot API
 mkdir -p data
 cp .env.example .env
 # 编辑 .env:只需填 TGDRIVE_USERNAME / TGDRIVE_PASSWORD,其余留空
-docker compose up -d --build
+docker compose up -d   # 拉取发布镜像;首次使用或镜像拉不到时改用 `docker compose up -d --build` 本地构建
 ```
 
 镜像默认以非 root 用户 `1000:1000` 运行;宿主机用户不是 `1000:1000` 时,把 `.env` 中的 `TGDRIVE_UID` / `TGDRIVE_GID` 改为 `id -u` / `id -g` 的输出。
@@ -51,11 +51,7 @@ docker compose up -d --build
 
 ### 3. 大文件场景:自建 Bot API(可选)
 
-官方端点单块上限 20MB 且有限流,大文件吞吐约 6MB/s。自建 `telegram-bot-api` 后分块可到 GB 级。在 <https://my.telegram.org> 申请 `api_id` / `api_hash`,后台「自建 Bot API 服务器」填好并保存,点「导出 .env」覆盖回项目目录,再执行:
-
-```bash
-docker compose --profile local-bot-api up -d --build tgdrive telegram-bot-api
-```
+官方端点单块上限 20MB 且有限流,大文件吞吐约 6MB/s。自建 `telegram-bot-api` 后分块可到 GB 级。在 <https://my.telegram.org> 申请 `api_id` / `api_hash`,后台「自建 Bot API 服务器」填好并保存,点「导出 .env」覆盖回项目目录,执行 `docker compose --profile local-bot-api up -d`(本地构建则加 `--build`)。
 
 ## WebDAV
 

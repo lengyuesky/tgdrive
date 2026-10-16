@@ -1,7 +1,8 @@
 services:
   tgdrive:
+    # 优先使用发布镜像;拉不到时回退本地构建(保留 build 字段即可 fallback)
+    image: ${TGDRIVE_IMAGE:-ghcr.io/lengyuesky/tgdrive:latest}
     build: .
-    image: tgdrive:latest
     # 与宿主机 data 目录保持同一 UID/GID；默认桌面 Linux 用户通常是 1000。
     user: "${TGDRIVE_UID:-1000}:${TGDRIVE_GID:-1000}"
     # Bot API 的 local 文件默认属于 101:101 且目录权限为 750；补充该组才能只读缩略图。
@@ -32,10 +33,10 @@ services:
     depends_on:
       tgdrive:
         condition: service_started
+    image: ${TGDRIVE_BOT_API_IMAGE:-ghcr.io/lengyuesky/tgdrive-telegram-bot-api:latest}
     build:
       context: .
       dockerfile: Dockerfile.telegram-bot-api
-    image: tgdrive-telegram-bot-api:latest
     restart: unless-stopped
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
