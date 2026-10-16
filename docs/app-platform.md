@@ -40,8 +40,6 @@
 
 插件仓库提供 `npm run create -- my-viewer /path/to/new-directory` 和 `npm run dev:host -- /path/to/app`。模拟宿主只绑定本机、使用用户选择的测试文件和页面内存数据，不连接真实网盘。`npm run test:dev-host` 验证真实沙箱握手、文件选择和数据冲突契约。
 
-实施验收记录见 [本轮实施记录](app-integration-work.md)。
-
 ## 0.3.1 设置统一
 
 图书、漫画只使用应用内 `library:sources`，删除旧 `source_dir` 设置和旧目录迁移提示。宿主不再替应用写入来源。短视频由自身根据已授权目录初始化现行取材设置。更新包会清除新清单已不再声明的设置键，现行来源、阅读进度和书签保留；旧配置只存在于用户主动恢复所需的更新前快照中。

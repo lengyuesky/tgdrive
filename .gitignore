@@ -10,3 +10,5 @@
 /data
 /telegram-bot-api-data
 /bot-api-control
+
+.DS_Store
