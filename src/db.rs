@@ -19,6 +19,7 @@ pub mod entries;
 mod logs;
 mod query;
 mod resumable;
+mod revision;
 mod search;
 mod settings;
 mod shares;

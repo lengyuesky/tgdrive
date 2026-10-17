@@ -431,4 +431,157 @@ mod tests {
                 .any(|l| l.starts_with("error|维护|维护任务失败，下轮重试"))
         );
     }
+
+    /// 本地 mock S3：只计数收到的 PUT，验证 tick 是否真的投递了快照。
+    async fn mock_s3_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<()>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::body::to_bytes;
+        use axum::extract::Request;
+        use axum::http::StatusCode;
+        let puts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = puts.clone();
+        let app = axum::Router::new().fallback(move |request: Request| {
+            let state = state.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let _ = to_bytes(body, usize::MAX).await.unwrap();
+                if parts.method == axum::http::Method::PUT {
+                    state.lock().unwrap().push(());
+                }
+                StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), puts, task)
+    }
+
+    async fn enable_skip_backup(f: &Fixture, s3_endpoint: &str) {
+        // 只用 S3 渠道验证，显式关闭默认开启的 Telegram 渠道（测试环境未配置存储）。
+        f.vfs
+            .db
+            .setting_set("extra.backup_telegram_enabled", "0")
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.backup_auto", "1")
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.backup_skip_if_unchanged", "1")
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.backup_s3_enabled", "1")
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.backup_s3_endpoint", s3_endpoint)
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.backup_s3_bucket", "backup-bucket")
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.backup_s3_access_key", "AKIDEXAMPLE")
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.backup_s3_secret_key", "secret")
+            .await
+            .unwrap();
+    }
+
+    /// 把 S3 渠道的上次成功时间改到 25 小时前，模拟「该投递了」。
+    async fn expire_s3_last_ts(f: &Fixture) {
+        sqlx::query(
+            "INSERT INTO settings (k, v) VALUES ('extra.backup_s3_last_ts', ?)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        )
+        .bind(crate::db::now_ts() - 25 * 3600)
+        .execute(&f.raw)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_backup_skips_when_data_revision_unchanged() {
+        let f = fixture().await;
+        let (endpoint, puts, server) = mock_s3_server().await;
+        enable_skip_backup(&f, &endpoint).await;
+
+        // 首次：从未成功备份（基准为 None），视为已变化，正常投递并记录基准。
+        expire_s3_last_ts(&f).await;
+        tick(&f.vfs, &f.runtime).await.unwrap();
+        assert_eq!(puts.lock().unwrap().len(), 1);
+        let stored = f
+            .vfs
+            .db
+            .setting_get("extra.backup_s3_data_revision")
+            .await
+            .unwrap();
+        assert!(stored.is_some(), "成功后应记录修订号基准");
+
+        // 数据无变化：同样到期，但基准一致，本轮跳过。
+        let logs_before = f.logs().await;
+        expire_s3_last_ts(&f).await;
+        tick(&f.vfs, &f.runtime).await.unwrap();
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "数据库无变化时不应重复投递"
+        );
+        assert_eq!(
+            f.logs().await,
+            logs_before,
+            "跳过的轮次不应新增备份日志"
+        );
+
+        // 数据变化（新建目录）：基准失效，恢复投递并更新基准。
+        expire_s3_last_ts(&f).await;
+        f.vfs.mkdir("/新目录").await.unwrap();
+        tick(&f.vfs, &f.runtime).await.unwrap();
+        assert_eq!(puts.lock().unwrap().len(), 2);
+        let after = f.vfs.db.data_revision().await.unwrap().to_string();
+        assert_eq!(
+            f.vfs
+                .db
+                .setting_get("extra.backup_s3_data_revision")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(after.as_str()),
+            "变化后应把基准更新到最新修订号"
+        );
+
+        // 无基准的渠道（新启用或从未成功）即使数据无变化也必须拿到第一份备份：
+        // 直接清掉基准键模拟（该键在排除清单里，删除不改变修订号）。
+        f.vfs
+            .db
+            .setting_del("extra.backup_s3_data_revision")
+            .await
+            .unwrap();
+        expire_s3_last_ts(&f).await;
+        tick(&f.vfs, &f.runtime).await.unwrap();
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            3,
+            "基准缺失的渠道视为已变化，必须投递"
+        );
+        server.abort();
+    }
 }

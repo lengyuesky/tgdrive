@@ -31,6 +31,8 @@ pub struct Extras {
     pub trash_retention_days: i64,
     /// 每日自动把数据库快照投递到所有已启用渠道
     pub backup_auto: bool,
+    /// 每日自动备份时数据库内容无变化则跳过本轮投递。
+    pub backup_skip_if_unchanged: bool,
     /// 数据库快照上传到 Telegram 时的单块大小
     pub backup_chunk_size: u64,
     /// 是否把数据库快照备份到当前 Telegram 存储频道；旧配置默认开启。
@@ -136,6 +138,10 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TRASH_DAYS),
         backup_auto: get(db, "backup_auto").await?.as_deref() == Some("1"),
+        backup_skip_if_unchanged: get(db, "backup_skip_if_unchanged")
+            .await?
+            .as_deref()
+            == Some("1"),
         backup_chunk_size,
         backup_telegram_enabled: get(db, "backup_telegram_enabled").await?.as_deref() != Some("0"),
         backup_webdav_enabled: get(db, "backup_webdav_enabled").await?.as_deref() == Some("1"),
@@ -188,6 +194,7 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
 pub struct ExtrasPatch {
     pub trash_retention_days: Option<i64>,
     pub backup_auto: Option<bool>,
+    pub backup_skip_if_unchanged: Option<bool>,
     /// 字符串形式便于后台使用 `18MB`、`1GB` 等写法。
     pub backup_chunk_size: Option<String>,
     pub backup_telegram_enabled: Option<bool>,
@@ -563,6 +570,9 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     if let Some(value) = p.backup_auto {
         next.backup_auto = value;
     }
+    if let Some(value) = p.backup_skip_if_unchanged {
+        next.backup_skip_if_unchanged = value;
+    }
     if let Some(value) = backup_chunk_size {
         next.backup_chunk_size = value;
     }
@@ -615,6 +625,9 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     }
     if let Some(b) = p.backup_auto {
         set(db, "backup_auto", if b { "1" } else { "0" }).await?;
+    }
+    if let Some(b) = p.backup_skip_if_unchanged {
+        set(db, "backup_skip_if_unchanged", if b { "1" } else { "0" }).await?;
     }
     if let Some(size) = backup_chunk_size {
         set(db, "backup_chunk_size", &size.to_string()).await?;
@@ -1017,5 +1030,42 @@ mod tests {
         let unchanged = load(&db).await.unwrap();
         assert!(!unchanged.backup_auto);
         assert!(unchanged.backup_telegram_enabled);
+    }
+
+    #[tokio::test]
+    async fn backup_skip_if_unchanged_roundtrips_and_defaults_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(
+            directory
+                .path()
+                .join("skip-switch.db")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(!load(&db).await.unwrap().backup_skip_if_unchanged);
+
+        save(
+            &db,
+            &ExtrasPatch {
+                backup_skip_if_unchanged: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(load(&db).await.unwrap().backup_skip_if_unchanged);
+
+        save(
+            &db,
+            &ExtrasPatch {
+                backup_skip_if_unchanged: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!load(&db).await.unwrap().backup_skip_if_unchanged);
     }
 }

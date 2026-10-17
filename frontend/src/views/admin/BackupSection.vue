@@ -34,6 +34,13 @@
       >
         <el-switch v-model="extras.backup_auto" />
       </SettingField>
+      <SettingField
+        label="无变化时跳过"
+        inline
+        help="开启后仅在数据库内容(文件、目录、分享、后台设置等)变化时执行每日备份;收件进度、维护日志等运行时状态不算变化。各渠道独立判定,手动「立即备份」与失败渠道重试不受影响。"
+      >
+        <el-switch v-model="extras.backup_skip_if_unchanged" :disabled="!extras.backup_auto" />
+      </SettingField>
       <SettingField label="备份加密密码" wide>
         <el-input
           v-model="extras.backup_encryption_password"

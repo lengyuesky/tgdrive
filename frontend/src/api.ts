@@ -152,6 +152,8 @@ export interface InboxRouteRule {
 export interface Extras {
   trash_retention_days: number
   backup_auto: boolean
+  /** 开启后每日自动备份时数据库内容无变化则跳过本轮投递。 */
+  backup_skip_if_unchanged: boolean
   /** SQLite 快照上传到 Telegram 时的单块字节数。 */
   backup_chunk_size: number
   backup_telegram_enabled: boolean

@@ -1363,6 +1363,7 @@ mod tests {
         Extras {
             trash_retention_days: 30,
             backup_auto: false,
+            backup_skip_if_unchanged: false,
             backup_chunk_size: crate::extras::DEFAULT_BACKUP_CHUNK_SIZE,
             backup_telegram_enabled: true,
             backup_webdav_enabled: false,

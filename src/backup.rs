@@ -60,6 +60,16 @@ impl Destination {
             Self::S3 => "extra.backup_s3_last_ts",
         }
     }
+
+    /// 「无变化跳过」的基准：该渠道上次成功备份时的用户数据修订号。
+    /// 按渠道独立记录，失败渠道不会拖累健康渠道的跳过判定。
+    fn revision_key(self) -> &'static str {
+        match self {
+            Self::Telegram => "extra.backup_telegram_data_revision",
+            Self::Webdav => "extra.backup_webdav_data_revision",
+            Self::S3 => "extra.backup_s3_data_revision",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -120,6 +130,9 @@ struct Snapshot {
     len: u64,
     name: String,
     ts: i64,
+    /// 快照生成时的用户数据修订号；快照期间的并发写入留在主库，
+    /// 次日比对不相等会再补备一份，宁多勿漏。
+    revision: i64,
 }
 
 /// 一次数据库备份可能对应多条 Telegram 分块消息。
@@ -186,10 +199,31 @@ pub async fn automatic_if_due(
             .map(|timestamp| now.saturating_sub(timestamp) >= BACKUP_INTERVAL_SECS)
             .unwrap_or(true)
     };
+    // 「无变化跳过」：修订号与该渠道上次成功备份一致则本轮不投递。
+    // 基准键在排除清单里，备份写它不会自增修订号；stored 为 None（从未成功
+    // 备份过，含老库升级与新启用渠道）视为已变化，保证先拿到一份完整备份。
+    // 与各渠道自己的基准比较，失败渠道不会拖累健康渠道的跳过判定。
+    let unchanged = |destination: Destination| async move {
+        let current = vfs.db.data_revision().await?;
+        setting_i64(&vfs.db, destination.revision_key())
+            .await
+            .map(|stored| stored == Some(current))
+    };
+    let skip_unchanged = if extras.backup_skip_if_unchanged {
+        [
+            unchanged(Destination::Telegram).await?,
+            unchanged(Destination::Webdav).await?,
+            unchanged(Destination::S3).await?,
+        ]
+    } else {
+        [false, false, false]
+    };
     let selection = Selection {
-        telegram: extras.backup_telegram_enabled && due(last.telegram),
-        webdav: extras.backup_webdav_enabled && due(last.webdav),
-        s3: extras.backup_s3_enabled && due(last.s3),
+        telegram: extras.backup_telegram_enabled
+            && due(last.telegram)
+            && !skip_unchanged[0],
+        webdav: extras.backup_webdav_enabled && due(last.webdav) && !skip_unchanged[1],
+        s3: extras.backup_s3_enabled && due(last.s3) && !skip_unchanged[2],
     };
     if !selection.any() {
         return Ok(None);
@@ -336,6 +370,8 @@ fn destination_error_summary(destination: Destination, error: &AppError) -> Stri
 
 async fn create_snapshot(vfs: &Vfs, runtime: &Runtime, extras: &Extras) -> AppResult<Snapshot> {
     let cfg = runtime.current();
+    // 在 VACUUM INTO 之前读修订号：这是本快照覆盖的数据状态。
+    let revision = vfs.db.data_revision().await?;
     let temp_dir = tempfile::Builder::new()
         .prefix("tgdrive-backup-")
         .tempdir_in(&cfg.tmp_dir)?;
@@ -369,6 +405,7 @@ async fn create_snapshot(vfs: &Vfs, runtime: &Runtime, extras: &Extras) -> AppRe
         len,
         name,
         ts,
+        revision,
     })
 }
 
@@ -491,8 +528,11 @@ async fn scrub_snapshot(path: &str) -> AppResult<()> {
     Ok(())
 }
 
-async fn mark_success(db: &Db, destination: Destination, ts: i64) -> AppResult<()> {
-    db.setting_set(destination.last_key(), &ts.to_string())
+async fn mark_success(db: &Db, destination: Destination, snapshot: &Snapshot) -> AppResult<()> {
+    // 修订号基准随渠道各自记录；写入失败时下轮比对不相等，会再备一次，自愈。
+    db.setting_set(destination.revision_key(), &snapshot.revision.to_string())
+        .await?;
+    db.setting_set(destination.last_key(), &snapshot.ts.to_string())
         .await
 }
 
@@ -588,7 +628,7 @@ async fn backup_telegram(
             }
         }
     }
-    mark_success(&vfs.db, Destination::Telegram, snapshot.ts).await?;
+    mark_success(&vfs.db, Destination::Telegram, snapshot).await?;
     vfs.uploader.process_pending_deletes();
     Ok(part_count)
 }
@@ -733,7 +773,7 @@ async fn backup_webdav(
         // 第一次保存的历史仍保留完整待删队列，下次会安全地重复 DELETE。
         tracing::warn!("更新 WebDAV 待删备份队列失败，下次将重新清理：{error}");
     }
-    mark_success(db, Destination::Webdav, snapshot.ts).await
+    mark_success(db, Destination::Webdav, snapshot).await
 }
 
 fn webdav_object_url(base: &str, name: &str) -> AppResult<reqwest::Url> {
@@ -828,7 +868,7 @@ async fn backup_s3(
     if let Err(error) = finish_remote_cleanup(db, S3_HISTORY_KEY, &identity, failed_cleanup).await {
         tracing::warn!("更新 S3 待删备份队列失败，下次将重新清理：{error}");
     }
-    mark_success(db, Destination::S3, snapshot.ts).await
+    mark_success(db, Destination::S3, snapshot).await
 }
 
 fn s3_object_key(prefix: &str, name: &str) -> String {
@@ -1193,6 +1233,7 @@ mod tests {
             len: data.len() as u64,
             name: "tgdrive-backup-test.db".into(),
             ts: 1_786_492_800,
+            revision: 0,
         }
     }
 
@@ -1200,6 +1241,7 @@ mod tests {
         Extras {
             trash_retention_days: 30,
             backup_auto: true,
+            backup_skip_if_unchanged: false,
             backup_chunk_size: crate::extras::DEFAULT_BACKUP_CHUNK_SIZE,
             backup_telegram_enabled: false,
             backup_webdav_enabled: false,
@@ -1566,5 +1608,49 @@ mod tests {
         assert_eq!(history.objects.len(), 7);
         assert_eq!(history.objects.last().unwrap(), "7.db");
         assert!(history.pending_delete.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_failure_records_revision_only_for_successful_channels() {
+        let (endpoint, requests, server) = mock_storage_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(directory.path().join("partial.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut extras = s3_extras();
+        // WebDAV 指向 mock 必成功；S3 指向不可达端口必失败。
+        extras.backup_webdav_enabled = true;
+        extras.backup_webdav_url = format!("{endpoint}/backups");
+        extras.backup_s3_endpoint = "http://127.0.0.1:9/unreachable".into();
+        let snapshot = test_snapshot(b"partial snapshot");
+
+        backup_webdav(&db, &extras, &snapshot, &crate::proxy::ProxyConfig::default())
+            .await
+            .unwrap();
+        assert!(backup_s3(
+            &db,
+            &extras,
+            &snapshot,
+            &crate::proxy::ProxyConfig::default(),
+        )
+        .await
+        .is_err());
+        server.abort();
+
+        // 成功渠道记录了基准；失败渠道不记录，重试轮不会被 skip 阻断。
+        assert_eq!(
+            setting_i64(&db, Destination::Webdav.revision_key())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            setting_i64(&db, Destination::S3.revision_key())
+                .await
+                .unwrap(),
+            None,
+            "失败渠道不应记录修订号基准"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 }
