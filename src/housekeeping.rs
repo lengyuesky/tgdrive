@@ -46,6 +46,19 @@ async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
     if vfs.db.background_blocked() {
         return Ok(());
     }
+    let cleanup_error = crate::apps::cleanup_caches(&vfs.db, &runtime.env.db_path)
+        .await
+        .err();
+    if let Some(error) = &cleanup_error {
+        tracing::warn!(%error, "旧应用缓存清理失败，继续执行其他维护任务");
+        record_log(
+            vfs,
+            "error",
+            "维护",
+            &format!("旧应用缓存清理失败，将重试：{error}"),
+        )
+        .await;
+    }
     vfs.uploader.process_pending_deletes();
     let extras = crate::extras::load(&vfs.db).await?;
 
@@ -109,7 +122,7 @@ async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
         )
         .await;
     }
-    Ok(())
+    cleanup_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -122,6 +135,9 @@ mod tests {
     use crate::error::AppError;
     use crate::settings::RuntimeCfg;
     use crate::telegram::{ByteReader, TgApi, TgMessage, TgRegistry, UploadBody};
+
+    // 自动备份使用进程级 try_lock；真正投递备份的维护测试须串行。
+    static BACKUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// 维护任务只会删除消息，其余能力在测试中一律拒绝。
     #[derive(Default)]
@@ -520,6 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_backup_skips_when_data_revision_unchanged() {
+        let _guard = BACKUP_TEST_LOCK.lock().await;
         let f = fixture().await;
         let (endpoint, puts, server) = mock_s3_server().await;
         enable_skip_backup(&f, &endpoint).await;
@@ -540,16 +557,8 @@ mod tests {
         let logs_before = f.logs().await;
         expire_s3_last_ts(&f).await;
         tick(&f.vfs, &f.runtime).await.unwrap();
-        assert_eq!(
-            puts.lock().unwrap().len(),
-            1,
-            "数据库无变化时不应重复投递"
-        );
-        assert_eq!(
-            f.logs().await,
-            logs_before,
-            "跳过的轮次不应新增备份日志"
-        );
+        assert_eq!(puts.lock().unwrap().len(), 1, "数据库无变化时不应重复投递");
+        assert_eq!(f.logs().await, logs_before, "跳过的轮次不应新增备份日志");
 
         // 数据变化（新建目录）：基准失效，恢复投递并更新基准。
         expire_s3_last_ts(&f).await;
@@ -583,5 +592,87 @@ mod tests {
             "基准缺失的渠道视为已变化，必须投递"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_still_reclaims_uploads_and_trash_and_backs_up() {
+        let _guard = BACKUP_TEST_LOCK.lock().await;
+        let f = fixture().await;
+        let old = f.file("old.bin", 90).await;
+        f.vfs.delete("/old.bin").await.unwrap();
+        f.vfs
+            .db
+            .setting_set("extra.trash_retention_days", "1")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE trash SET trashed_at = 0 WHERE node_id = ?")
+            .bind(old)
+            .execute(&f.raw)
+            .await
+            .unwrap();
+        let stale = f
+            .vfs
+            .db
+            .create_upload_session(
+                ROOT_ID,
+                "stale.bin",
+                "/stale.bin",
+                8,
+                &"a".repeat(64),
+                4,
+                f.target,
+            )
+            .await
+            .unwrap();
+        f.vfs
+            .db
+            .add_chunk(stale.session.node_id, 0, 4, "s0", 91, f.target, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upload_sessions SET updated_at = 0 WHERE id = ?")
+            .bind(&stale.session.id)
+            .execute(&f.raw)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO app_cleanup_jobs(app_id, token, created_at) VALUES('books', 'failed-cleanup', 0)")
+            .execute(&f.raw).await.unwrap();
+        let root = f._dir.path().join("apps");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("books"), b"blocked")
+            .await
+            .unwrap();
+        let (endpoint, puts, server) = mock_s3_server().await;
+        enable_skip_backup(&f, &endpoint).await;
+        expire_s3_last_ts(&f).await;
+
+        let error = tick(&f.vfs, &f.runtime).await.unwrap_err();
+        server.abort();
+        assert!(
+            matches!(error, AppError::Io(_)),
+            "应保留清理失败而非清除任务错误: {error}"
+        );
+        assert!(f.vfs.db.upload_sessions().await.unwrap().is_empty());
+        assert!(f.vfs.db.trash_list().await.unwrap().is_empty());
+        assert!(matches!(f.vfs.db.node(old).await, Err(AppError::NotFound)));
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "封面清理失败仍应投递数据库备份"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM app_cleanup_jobs")
+                .fetch_one(&f.raw)
+                .await
+                .unwrap(),
+            1
+        );
+        let logs = f.logs().await;
+        assert!(
+            logs.iter()
+                .any(|log| log.starts_with("error|维护|旧应用缓存清理失败"))
+        );
+        assert!(logs.iter().any(|log| log.contains("清理过期断点续传任务")));
+        assert!(logs.iter().any(|log| log.contains("回收站超期清理")));
+        assert!(logs.iter().any(|log| log.contains("数据库自动备份完成")));
     }
 }

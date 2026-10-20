@@ -10,8 +10,26 @@ use std::sync::{Mutex, MutexGuard};
 mod covers_db;
 mod data;
 mod lifecycle_db;
+mod replacement_db;
 pub use covers_db::*;
 pub use data::*;
+
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct AppReplacement {
+    pub id: String,
+    pub name: String,
+    pub installed: bool,
+    pub has_data: bool,
+    /// 仅用于替换范围指纹，保持 replacements 对外的四字段契约。
+    #[serde(skip)]
+    revision: Option<String>,
+}
+
+#[derive(Default)]
+pub struct AppReplacementPreview {
+    pub replacements: Vec<AppReplacement>,
+    pub replacement_revision: Option<String>,
+}
 
 /// 已安装记录缓存。代次计数保证"查库期间发生写入"的读者不会把陈旧行写回：
 /// 读者在查库前记下代次，回填时代次已变则放弃；写入者提交后先递增代次再移除条目。
@@ -78,6 +96,8 @@ pub struct AppInstall<'a> {
     pub package: &'a [u8],
     pub source: &'a str,
     pub expected_revision: Option<&'a str>,
+    pub replace_legacy: bool,
+    pub replacement_revision: Option<&'a str>,
 }
 
 impl Db {
@@ -131,6 +151,27 @@ impl Db {
 
     pub async fn install_app(&self, input: AppInstall<'_>) -> AppResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // 必须在写事务内重新检查，预览之后旧应用仍可能产生数据或重新安装。
+        if input.id == "reader" {
+            let replacements = replacement_db::replacements(&mut tx).await?;
+            let revision = replacement_db::replacement_revision(&replacements)?;
+            if !replacements.is_empty() && !input.replace_legacy {
+                return Err(AppError::Conflict(
+                    "安装阅读馆会清除旧图书和漫画应用及其数据，请明确确认 replace_legacy".into(),
+                ));
+            }
+            if (input.replace_legacy
+                && !replacements.is_empty()
+                && input.replacement_revision != Some(revision.as_str()))
+                || input
+                    .replacement_revision
+                    .is_some_and(|value| value != revision)
+            {
+                return Err(AppError::Conflict(
+                    "旧应用替换范围已经改变，请重新预览并确认安装".into(),
+                ));
+            }
+        }
         let previous: Option<(String, String)> =
             sqlx::query_as("SELECT revision, version FROM apps WHERE id = ?")
                 .bind(input.id)
@@ -199,8 +240,36 @@ impl Db {
         }
         sqlx::query("INSERT INTO app_lifecycle(app_id, updated_at) VALUES(?, ?) ON CONFLICT(app_id) DO UPDATE SET phase = 'installed', message = '', owner = '', lease_until = 0, updated_at = excluded.updated_at")
             .bind(input.id).bind(now).execute(&mut *tx).await?;
+        // 后来的安装接管自己的缓存命名空间，旧清理任务不能再删除它。
+        sqlx::query("DELETE FROM app_cleanup_jobs WHERE app_id = ?")
+            .bind(input.id)
+            .execute(&mut *tx)
+            .await?;
+        if input.id == "reader" {
+            for id in ["books", "comics"] {
+                for sql in [
+                    "DELETE FROM app_recovery WHERE app_id = ?",
+                    "DELETE FROM app_lifecycle WHERE app_id = ?",
+                    "DELETE FROM app_data WHERE app_id = ?",
+                    "DELETE FROM app_settings WHERE app_id = ?",
+                ] {
+                    sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+                }
+                sqlx::query("DELETE FROM apps WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                // 即使主库没有残留，也可能有孤儿封面或运行目录。每次成功安装都排入两项。
+                sqlx::query("INSERT INTO app_cleanup_jobs(app_id, token, created_at) VALUES(?, ?, ?) ON CONFLICT(app_id) DO UPDATE SET token = excluded.token, created_at = excluded.created_at")
+                    .bind(id).bind(random_token(32)).bind(now).execute(&mut *tx).await?;
+            }
+        }
         tx.commit().await?;
         self.apps_cache.invalidate(input.id);
+        if input.id == "reader" {
+            self.apps_cache.invalidate("books");
+            self.apps_cache.invalidate("comics");
+        }
         Ok(())
     }
 

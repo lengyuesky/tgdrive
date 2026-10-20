@@ -79,6 +79,7 @@ pub fn protected_router() -> Router<AppState> {
         )
         .route("/apps/catalog/refresh", post(catalog_refresh))
         .route("/apps/catalog/{id}/package", get(catalog_download))
+        .route("/apps/catalog/{id}/inspect", post(catalog_inspect))
         .route("/apps/catalog/{id}/install", post(catalog_install))
         .route("/apps/{id}", get(detail).delete(uninstall))
         .route("/apps/{id}/state", post(set_state))
@@ -139,10 +140,21 @@ async fn installed(state: &AppState, id: &str) -> AppResult<InstalledApp> {
 }
 
 fn cache_root(state: &AppState) -> PathBuf {
-    std::path::Path::new(&state.rt.env.db_path)
+    cache_root_for_db(&state.rt.env.db_path)
+}
+
+fn cache_root_for_db(db_path: &str) -> PathBuf {
+    std::path::Path::new(db_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("apps")
+}
+
+/// 维护任务启动即运行，持久任务在重启后继续。锁顺序与安装、恢复保持一致。
+pub(crate) async fn cleanup_caches(db: &crate::db::Db, db_path: &str) -> AppResult<()> {
+    let _install_guard = INSTALL_LOCK.lock().await;
+    let _cache_guard = CACHE_LOCK.lock().await;
+    db.cleanup_app_caches(&cache_root_for_db(db_path)).await
 }
 
 /// 摘要目录与预压缩目录都带完成标记才算可用（异步版 `package::is_materialized`）。
@@ -165,6 +177,11 @@ async fn cache_dir(state: &AppState, app: &InstalledApp) -> AppResult<PathBuf> {
         return Ok(target);
     }
     let _guard = CACHE_LOCK.lock().await;
+    // 请求可能在等待缓存锁期间被替换或卸载，不能再为旧页面重建缓存。
+    let current = installed(state, &app.manifest.id).await?;
+    if !current.enabled || current.revision != app.revision {
+        return Err(AppError::AppChanged);
+    }
     if materialized(&target).await? {
         return Ok(target);
     }
@@ -250,9 +267,16 @@ async fn preview(state: &AppState, package: &AppPackage) -> AppResult<Value> {
         })
         .cloned()
         .collect();
+    let replacement = state
+        .vfs
+        .db
+        .app_replacement_preview(&package.manifest.id)
+        .await?;
     Ok(
         json!({"manifest": package.manifest, "digest": package.digest,
-        "existing": existing, "added_permissions": added_permissions}),
+        "existing": existing, "added_permissions": added_permissions,
+        "replacements": replacement.replacements,
+        "replacement_revision": replacement.replacement_revision}),
     )
 }
 
@@ -265,6 +289,9 @@ async fn inspect(State(state): State<AppState>, bytes: Bytes) -> AppResult<Json<
 struct InstallOptions {
     digest: String,
     expected_revision: Option<String>,
+    #[serde(default)]
+    replace_legacy: bool,
+    replacement_revision: Option<String>,
 }
 
 /// 安装成功后清理同应用旧摘要的运行缓存目录；旧修订页面已因修订轮换不可用。
@@ -331,6 +358,8 @@ async fn install_package(
             package: &package.archive,
             source,
             expected_revision: options.expected_revision.as_deref(),
+            replace_legacy: options.replace_legacy,
+            replacement_revision: options.replacement_revision.as_deref(),
         })
         .await;
     {
@@ -341,6 +370,12 @@ async fn install_package(
         }
     }
     install?;
+    if id == "reader" {
+        let _cache_guard = CACHE_LOCK.lock().await;
+        if let Err(error) = state.vfs.db.cleanup_app_caches(&cache_root(state)).await {
+            tracing::warn!(%error, "阅读馆已安装，旧应用缓存将在维护任务中重试清理");
+        }
+    }
     installed(state, &id).await
 }
 
@@ -358,6 +393,29 @@ async fn install(
 #[derive(Default, Deserialize)]
 struct CatalogPackageQuery {
     digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CatalogInspectOptions {
+    digest: String,
+}
+
+async fn catalog_inspect(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(query): Json<CatalogInspectOptions>,
+) -> AppResult<Json<Value>> {
+    let (_, _, archive) = state
+        .apps_catalog
+        .get_package(&id, Some(&query.digest))
+        .await?;
+    let package = blocking(move || AppPackage::parse(archive)).await?;
+    if package.digest != query.digest {
+        return Err(AppError::Conflict(
+            "插件包已经变化，请重新查看安装信息".into(),
+        ));
+    }
+    Ok(Json(preview(&state, &package).await?))
 }
 
 async fn catalog_download(

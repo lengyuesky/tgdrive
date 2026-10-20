@@ -326,6 +326,7 @@ async fn catalog_refresh_download_and_install_all_require_login() {
     for (method, uri) in [
         ("POST", "/api/apps/catalog/refresh"),
         ("GET", "/api/apps/catalog/shorts/package"),
+        ("POST", "/api/apps/catalog/shorts/inspect"),
         ("POST", "/api/apps/catalog/shorts/install"),
     ] {
         let response = router(&state)
@@ -342,6 +343,106 @@ async fn catalog_refresh_download_and_install_all_require_login() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
     assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn catalog_inspect_uses_required_json_digest_and_previews_replacement_before_install() {
+    let (mut state, _, dir) = fixture().await;
+    let mut books = manifest();
+    books.id = "books".into();
+    let books = add_app(&state, &books, None).await;
+    let mut reader = manifest();
+    reader.id = "reader".into();
+    let archive = archive(&reader);
+    let entry = entry(reader.clone(), &archive);
+    state.apps_catalog = manager(
+        &dir.path().join("catalog"),
+        Arc::new(RemotePackages {
+            catalog: payload(entry.clone()),
+            package: archive,
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    state.apps_catalog.refresh(true).await;
+    let uri = "/api/apps/catalog/reader/inspect";
+    let (status, preview) = call(&state, "POST", uri, json!({"digest":entry.sha256})).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["manifest"]["id"], "reader");
+    assert_eq!(preview["digest"], entry.sha256);
+    assert!(preview["existing"].is_null());
+    assert_eq!(preview["added_permissions"], json!(reader.permissions));
+    assert_eq!(
+        preview["replacements"],
+        json!([
+            {"id":"books", "name":books.manifest.name, "installed":true, "has_data":true}
+        ])
+    );
+    assert_eq!(
+        installed(&state, "books").await.unwrap().revision,
+        books.revision
+    );
+    assert!(state.vfs.db.app("reader").await.unwrap().is_none());
+    // 即使 query 中带正确摘要，JSON 中的错误摘要也不能被静默忽略。
+    let (status, _) = call(
+        &state,
+        "POST",
+        &format!("{uri}?digest={}", entry.sha256),
+        json!({"digest":"0".repeat(64)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let credentials = base64::engine::general_purpose::STANDARD.encode("apps-test:apps-test-only");
+    let response = router(&state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{uri}?digest={}", entry.sha256))
+                .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/api/apps/catalog/reader/install",
+        json!({"digest":entry.sha256}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/api/apps/catalog/reader/install",
+        json!({"digest":entry.sha256, "replace_legacy":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let mut comics = manifest();
+    comics.id = "comics".into();
+    add_app(&state, &comics, None).await;
+    let (status, _) = call(
+        &state, "POST", "/api/apps/catalog/reader/install",
+        json!({"digest":entry.sha256, "replace_legacy":true, "replacement_revision":preview["replacement_revision"]}),
+    ).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(state.vfs.db.app("books").await.unwrap().is_some());
+    assert!(state.vfs.db.app("comics").await.unwrap().is_some());
+    let (status, refreshed) = call(&state, "POST", uri, json!({"digest":entry.sha256})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, installed) = call(
+        &state,
+        "POST",
+        "/api/apps/catalog/reader/install",
+        json!({"digest":entry.sha256, "replace_legacy":true, "replacement_revision":refreshed["replacement_revision"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{installed}");
+    assert_eq!(installed["manifest"]["id"], "reader");
+    assert!(state.vfs.db.app("books").await.unwrap().is_none());
 }
 
 struct DelayedRemote {

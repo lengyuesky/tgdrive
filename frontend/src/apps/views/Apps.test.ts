@@ -1,12 +1,12 @@
 import { flushPromises, shallowMount } from '@vue/test-utils'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessage } from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AppIndex, AppManifest, CatalogApp, InstalledApp } from '../types'
+import type { AppIndex, AppManifest, AppPreview, CatalogApp, InstalledApp } from '../types'
 import Apps from './Apps.vue'
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(), refreshCatalog: vi.fn(), installCatalog: vi.fn(), install: vi.fn(),
-  inspect: vi.fn(), state: vi.fn(), uninstall: vi.fn(), push: vi.fn(),
+  inspect: vi.fn(), inspectCatalog: vi.fn(), state: vi.fn(), uninstall: vi.fn(), push: vi.fn(),
 }))
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: {} }), useRouter: () => ({ push: mocks.push }) }))
 vi.mock('@drive/api', () => ({
@@ -40,8 +40,17 @@ beforeEach(() => {
   mocks.list.mockImplementation(async () => ({ data: structuredClone(snapshot) }))
   mocks.refreshCatalog.mockImplementation(async () => ({ data: structuredClone(snapshot) }))
   mocks.installCatalog.mockResolvedValue({ data: installed })
+  mocks.install.mockResolvedValue({ data: installed })
+  mocks.inspectCatalog.mockImplementation(async (id: string, digest: string) => {
+    const app = snapshot.available.find((item) => item.manifest.id === id && item.digest === digest)!
+    const existing = snapshot.installed.find((item) => item.manifest.id === id) ?? null
+    return { data: structuredClone({ manifest: app.manifest, digest, existing,
+      added_permissions: app.manifest.permissions.filter((permission) => !existing?.manifest.permissions.includes(permission)),
+      replacements: [], replacement_revision: null,
+    } satisfies AppPreview) }
+  })
 })
-afterEach(() => { wrapper?.unmount() })
+afterEach(() => { wrapper?.unmount(); ElMessage.closeAll() })
 
 async function render() {
   wrapper = shallowMount(Apps, { global: {
@@ -155,7 +164,8 @@ describe('应用中心远程目录', () => {
     expect(mocks.installCatalog).not.toHaveBeenCalled()
     expect(view.find('[role="dialog"]').text()).toContain('搜索文件与读取文件信息')
     await button('同意并安装')
-    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('sample', available.digest, undefined)
+    expect(mocks.inspectCatalog).toHaveBeenCalledExactlyOnceWith('sample', available.digest)
+    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('sample', available.digest, undefined, false, null)
     expect(mocks.state).not.toHaveBeenCalled()
   })
 
@@ -172,10 +182,157 @@ describe('应用中心远程目录', () => {
     expect(preview.text()).not.toContain('v1.2.0')
     mocks.installCatalog.mockRejectedValueOnce(new Error('插件包已经变化，请重新查看安装信息'))
     await button('同意并更新')
-    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('sample', available.digest, installed.revision)
+    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('sample', available.digest, installed.revision, false, null)
     expect(view.find('[role="dialog"]').exists()).toBe(true)
     expect(alertTitles()).toContain('插件包已经变化')
     expect(view.find('[data-app-id="sample"]').text()).toContain('v1.0.0')
+  })
+})
+
+describe('服务端安装预览与旧应用替换', () => {
+  const replacements: AppPreview['replacements'] = [
+    { id: 'books', name: '图书', installed: true, has_data: true },
+    { id: 'comics', name: '漫画', installed: false, has_data: true },
+  ]
+  function readerPreview(existing: InstalledApp | null = null): AppPreview {
+    return {
+      manifest: { ...manifest, id: 'reader', name: '阅读馆', version: '1.0.0', min_host_version: '0.3.3' },
+      digest: 'f'.repeat(64), existing, added_permissions: [], replacements: structuredClone(replacements),
+      replacement_revision: 'opaque-server-preview-token',
+    }
+  }
+  async function importFile(file: File) {
+    const input = wrapper!.find<HTMLInputElement>('input[type="file"]')
+    Object.defineProperty(input.element, 'files', { value: [file], configurable: true })
+    await input.trigger('change')
+    await flushPromises()
+  }
+
+  it('目录先请求服务端预览，等待时不可安装；列明已安装和卸载残留数据，显式确认才替换', async () => {
+    snapshot.installed = []
+    const info = readerPreview()
+    // 服务端返回值优先于目录中的名称、摘要与本地安装列表。
+    let finish!: (value: { data: AppPreview }) => void
+    mocks.inspectCatalog.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const view = await render()
+    await showAvailable()
+    await view.find('.tile-launch').trigger('click')
+    expect(mocks.inspectCatalog).toHaveBeenCalledExactlyOnceWith('sample', available.digest)
+    expect(view.find('[role="dialog"]').exists()).toBe(false)
+    await view.find('.tile-launch').trigger('click')
+    expect(mocks.inspectCatalog).toHaveBeenCalledTimes(1)
+    expect(mocks.installCatalog).not.toHaveBeenCalled()
+    finish({ data: info })
+    await flushPromises()
+    const dialog = view.find('[role="dialog"]')
+    expect(dialog.text()).toContain('阅读馆')
+    expect(dialog.text()).toContain('图书（books）：已安装，将卸载')
+    expect(dialog.text()).toContain('漫画（comics）：已卸载，仍有残留数据')
+    for (const text of ['阅读进度', '书签', '偏好', '书库配置', '恢复快照', '不会迁移', '网盘原文件和网盘收藏继续保留']) {
+      expect(dialog.text()).toContain(text)
+    }
+    expect(dialog.text()).not.toContain('同意并安装')
+    expect(mocks.installCatalog).not.toHaveBeenCalled()
+    await button('安装并替换旧应用')
+    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('reader', info.digest, undefined, true, info.replacement_revision)
+    expect(view.find('[role="dialog"]').exists()).toBe(false)
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+  })
+
+  it('取消不安装或清理；再次预览失败不会重用旧替换信息', async () => {
+    snapshot.installed = []
+    mocks.inspectCatalog.mockResolvedValueOnce({ data: readerPreview() })
+    const view = await render()
+    await showAvailable()
+    await button('安装')
+    await button('取消')
+    expect(view.find('[role="dialog"]').exists()).toBe(false)
+    expect(mocks.installCatalog).not.toHaveBeenCalled()
+    expect(mocks.uninstall).not.toHaveBeenCalled()
+    const message = vi.spyOn(ElMessage, 'error')
+    mocks.inspectCatalog.mockRejectedValueOnce(new Error('目录已变化，请刷新后重试'))
+    await button('安装')
+    expect(message).toHaveBeenCalledWith('目录已变化，请刷新后重试')
+    expect(view.find('[role="dialog"]').exists()).toBe(false)
+    expect(mocks.installCatalog).not.toHaveBeenCalled()
+  })
+
+  it('已安装但没有私有数据的旧应用也必须明确替换', async () => {
+    snapshot.installed = []
+    const info = readerPreview()
+    info.replacements = [{ id: 'books', name: '图书', installed: true, has_data: false }]
+    mocks.inspectCatalog.mockResolvedValueOnce({ data: info })
+    const view = await render()
+    await showAvailable()
+    await button('安装')
+    expect(view.find('[role="dialog"]').text()).toContain('无私有数据')
+    await button('安装并替换旧应用')
+    expect(mocks.installCatalog).toHaveBeenLastCalledWith('reader', info.digest, undefined, true, info.replacement_revision)
+  })
+
+  it('无替换项的目录预览也透传原指纹，刷新列表不重建指纹或自动授权新出现的旧应用', async () => {
+    snapshot.installed = []
+    const info = readerPreview()
+    info.replacements = []
+    info.replacement_revision = 'server-empty-replacement-scope'
+    mocks.inspectCatalog.mockResolvedValueOnce({ data: info })
+    await render()
+    await showAvailable()
+    await button('安装')
+    snapshot.installed.push({ ...structuredClone(installed), manifest: { ...manifest, id: 'books', name: '图书' } })
+    await button('刷新')
+    mocks.installCatalog.mockRejectedValueOnce(new Error('替换范围已变化，请重新预览'))
+    await button('同意并安装')
+    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('reader', info.digest, undefined, false, 'server-empty-replacement-scope')
+    expect(alertTitles()).toContain('替换范围已变化，请重新预览')
+    expect(mocks.inspectCatalog).toHaveBeenCalledTimes(1)
+    expect(mocks.uninstall).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('本地包复用检查响应，替换=%s 时仅确认对应按钮才安装原文件', async (replaceLegacy) => {
+    const info = readerPreview()
+    if (!replaceLegacy) info.replacements = []
+    mocks.inspect.mockResolvedValueOnce({ data: info })
+    const view = await render()
+    const file = new File(['local-package'], 'reader.tgapp', { type: 'application/octet-stream' })
+    await importFile(file)
+    expect(mocks.inspect).toHaveBeenCalledExactlyOnceWith(file)
+    expect(mocks.inspectCatalog).not.toHaveBeenCalled()
+    expect(mocks.install).not.toHaveBeenCalled()
+    expect(view.find('[role="dialog"]').text()).toContain('本地导入')
+    expect(view.find<HTMLInputElement>('input[type="file"]').element.value).toBe('')
+    await button(replaceLegacy ? '安装并替换旧应用' : '同意并安装')
+    expect(mocks.install).toHaveBeenCalledExactlyOnceWith(file, info.digest, undefined, replaceLegacy, info.replacement_revision)
+    expect(mocks.installCatalog).not.toHaveBeenCalled()
+  })
+
+  it('本地预览失败不显示确认框，也不发送安装请求', async () => {
+    mocks.inspect.mockRejectedValueOnce(new Error('安装包无效'))
+    const message = vi.spyOn(ElMessage, 'error')
+    const view = await render()
+    await importFile(new File(['broken'], 'reader.tgapp'))
+    expect(message).toHaveBeenCalledWith('安装包无效')
+    expect(view.find('[role="dialog"]').exists()).toBe(false)
+    expect(mocks.install).not.toHaveBeenCalled()
+  })
+
+  it('替换失败保留预览和错误，安装过程中重复点击不会再提交', async () => {
+    snapshot.installed = []
+    mocks.inspectCatalog.mockResolvedValueOnce({ data: readerPreview() })
+    let reject!: (error: Error) => void
+    mocks.installCatalog.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail }))
+    const view = await render()
+    await showAvailable()
+    await button('安装')
+    await button('安装并替换旧应用')
+    await button('安装并替换旧应用')
+    expect(mocks.installCatalog).toHaveBeenCalledTimes(1)
+    reject(new Error('旧应用状态已变化，请重新预览'))
+    await flushPromises()
+    expect(alertTitles()).toContain('旧应用状态已变化')
+    expect(view.find('[role="dialog"]').exists()).toBe(true)
+    expect(mocks.uninstall).not.toHaveBeenCalled()
+    expect(mocks.list).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -297,8 +454,9 @@ describe('一键更新', () => {
     const lists = mocks.list.mock.calls.length
     await button('全部更新（2）')
     expect(mocks.installCatalog.mock.calls.map((call) => call[0])).toEqual(['sample', 'demo'])
-    expect(mocks.installCatalog).toHaveBeenNthCalledWith(1, 'sample', available.digest, installed.revision)
-    expect(mocks.installCatalog).toHaveBeenNthCalledWith(2, 'demo', demoAvailable.digest, demoInstalled.revision)
+    expect(mocks.inspectCatalog.mock.calls).toEqual([['sample', available.digest], ['demo', demoAvailable.digest]])
+    expect(mocks.installCatalog).toHaveBeenNthCalledWith(1, 'sample', available.digest, installed.revision, false, null)
+    expect(mocks.installCatalog).toHaveBeenNthCalledWith(2, 'demo', demoAvailable.digest, demoInstalled.revision, false, null)
     // 列表刷新且弹窗自动关闭。
     expect(mocks.list.mock.calls.length).toBeGreaterThan(lists)
     expect(batchDialog().exists()).toBe(false)
@@ -319,5 +477,58 @@ describe('一键更新', () => {
     expect(mocks.installCatalog).toHaveBeenCalledTimes(2)
     await button('完成')
     expect(batchDialog().exists()).toBe(false)
+  })
+
+  it('批量更新发现替换时跳过该项，其他应用正常更新且始终不授权清理', async () => {
+    snapshot.installed.push(structuredClone(demoInstalled))
+    snapshot.available.push(structuredClone(demoAvailable))
+    mocks.inspectCatalog.mockResolvedValueOnce({ data: {
+      manifest: available.manifest, digest: available.digest, existing: installed, added_permissions: [],
+      replacements: [{ id: 'books', name: '图书', installed: false, has_data: true }],
+    } satisfies AppPreview })
+    await render()
+    await button('一键更新（2）')
+    expect(batchDialog().text()).toContain('请单独打开安装预览并确认清理范围')
+    expect(mocks.installCatalog).not.toHaveBeenCalled()
+    await button('全部更新（2）')
+    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('demo', demoAvailable.digest, demoInstalled.revision, false, null)
+    expect(mocks.uninstall).not.toHaveBeenCalled()
+    expect(batchDialog().text()).toContain('已更新')
+  })
+
+  it('批量预览失败的条目不安装，并使用服务端返回的当前修订确认其余项目', async () => {
+    snapshot.installed.push(structuredClone(demoInstalled))
+    snapshot.available.push(structuredClone(demoAvailable))
+    mocks.inspectCatalog.mockRejectedValueOnce(new Error('包摘要已失效'))
+    mocks.inspectCatalog.mockResolvedValueOnce({ data: {
+      manifest: demoAvailable.manifest, digest: demoAvailable.digest,
+      existing: { ...demoInstalled, revision: 'server-revision' }, added_permissions: ['media.read'], replacements: [],
+    } satisfies AppPreview })
+    await render()
+    await button('一键更新（2）')
+    expect(batchDialog().text()).toContain('包摘要已失效')
+    expect(batchDialog().text()).toContain('读取文件内容')
+    await button('全部更新（2）')
+    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('demo', demoAvailable.digest, 'server-revision', false, undefined)
+  })
+
+  it('阅读馆无残留的批量预览也回传指纹，范围变化后保留拒绝结果且不自动授权替换', async () => {
+    const reader = { ...manifest, id: 'reader', name: '阅读馆' }
+    snapshot.installed = [{ ...structuredClone(installed), manifest: reader }]
+    snapshot.available = [{ ...structuredClone(available), manifest: { ...reader, version: '1.1.0' } }]
+    mocks.inspectCatalog.mockResolvedValueOnce({ data: {
+      manifest: snapshot.available[0]!.manifest, digest: available.digest, existing: snapshot.installed[0]!,
+      added_permissions: [], replacements: [], replacement_revision: 'server-empty-batch-scope',
+    } satisfies AppPreview })
+    await render()
+    await button('一键更新（1）')
+    snapshot.installed.push({ ...structuredClone(installed), manifest: { ...manifest, id: 'comics', name: '漫画' } })
+    await button('刷新')
+    mocks.installCatalog.mockRejectedValueOnce(new Error('旧应用安装修订已变化，请重新预览'))
+    await button('全部更新（1）')
+    expect(mocks.installCatalog).toHaveBeenCalledExactlyOnceWith('reader', available.digest, installed.revision, false, 'server-empty-batch-scope')
+    expect(batchDialog().text()).toContain('旧应用安装修订已变化，请重新预览')
+    expect(mocks.inspectCatalog).toHaveBeenCalledTimes(1)
+    expect(mocks.uninstall).not.toHaveBeenCalled()
   })
 })

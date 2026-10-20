@@ -13,9 +13,9 @@
 ```json
 {
   "roots": [12, 34],
-  "kind": "books",
+  "kind": "all",
   "q": "示例",
-  "format": "epub",
+  "format": null,
   "sort": "title",
   "limit": 40,
   "cursor": null
@@ -23,16 +23,16 @@
 ```
 
 - 来源为 1～16 个稳定目录 ID。每次请求重新核验节点可见性和当前 App 目录权限；不接受越界根目录，不能用旧游标越权。
-- `kind` 为 `books` 或 `comics`；格式分别是 `txt/epub/pdf` 和 `cbz/zip/images`。
+- `kind` 支持 `all`、`books` 或 `comics`。`all` 统一列出 TXT/EPUB/PDF、CBZ/ZIP 和图片目录；`books` 限定 `txt/epub/pdf`，`comics` 限定 `cbz/zip/images`。省略 `format` 或设为 null 不限制格式，也可指定该 kind 内的单一格式。
 - 搜索为文件名子串，ASCII 字母不区分大小写，不是作者、书籍正文或远程元数据搜索。
 - 排序支持文件名（`title`）及文件创建时间倒序（`added`）。每页 1～200 项。
 - 返回 `entries[{file,format,source_ids}]`、`revision`、`next_cursor`、`has_more`。
-- keyset 游标绑定修订、来源及筛选。绑定不符返回 400；文件树已变化返回 409 和 `reading_index_changed`，要求从首页刷新。
+- keyset 游标绑定修订、来源及筛选（包括 kind）。切换 `all`/`books`/`comics` 必须从首页重新请求；绑定不符返回 400；文件树已变化返回 409 和 `reading_index_changed`，要求从首页刷新。
 - 本页在只读事务快照内执行。结果构造最多驻留 `limit + 1` 条；重叠来源去重。SQL 仍需递归遍历选中目录并可能排序，不能承诺任意大库常数时间响应，需结合性能指标压测。
 
 ## App 行为
 
-图书/漫画书库新增“全库”按钮，读取全部已添加来源或单一来源的子目录，不受旧的 2000 项已整理索引上限限制。当前页 40 项，前页游标最多保存 100 个，不保留已看页面的所有文件。
+阅读馆 `reader`（最低宿主 0.3.3）书库的“全库”视图通过 `kind=all` 读取全部已添加来源或单一来源的子目录，文本、归档与图片目录共用分页，不受旧的 2000 项已整理索引上限限制。当前页 40 项，前页游标最多保存 100 个，不保留已看页面的所有文件。
 
 浏览位置存入 App 私有存储的 `library:host-position:v1`，CAS 串行保存，只占一条记录；重开时恢复页号、查询与当前页游标，必须重新通过宿主修订及权限检查。跨会话不保存整条前页链，需要向前返回时可从首页重新开始。读位置失败不覆盖旧位置，保存冲突不影响当前阅读。
 

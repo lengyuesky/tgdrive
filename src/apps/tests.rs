@@ -24,10 +24,12 @@ mod cover_cache;
 mod integration_tests;
 #[path = "media_tests.rs"]
 mod media;
-#[path = "reading_index_tests.rs"]
-mod reading_index;
 #[path = "reader_tests.rs"]
 mod readers;
+#[path = "reading_index_tests.rs"]
+mod reading_index;
+#[path = "replacement_tests.rs"]
+mod replacements;
 #[path = "scope_tests.rs"]
 mod scopes;
 
@@ -270,6 +272,8 @@ async fn add_app(state: &AppState, manifest: &Manifest, expected: Option<String>
     let options = InstallOptions {
         digest: package.digest.clone(),
         expected_revision: expected,
+        replace_legacy: false,
+        replacement_revision: None,
     };
     let app = install_package(state, package, options, "import")
         .await
@@ -474,7 +478,9 @@ async fn update_is_atomic_and_requires_reviewed_digest_revision_and_newer_versio
             package,
             InstallOptions {
                 digest: "错误摘要".into(),
-                expected_revision: Some(first.revision.clone())
+                expected_revision: Some(first.revision.clone()),
+                replace_legacy: false,
+                replacement_revision: None,
             },
             "import"
         )
@@ -509,6 +515,8 @@ async fn update_is_atomic_and_requires_reviewed_digest_revision_and_newer_versio
         let options = InstallOptions {
             digest: package.digest.clone(),
             expected_revision: Some(revision),
+            replace_legacy: false,
+            replacement_revision: None,
         };
         assert!(
             install_package(&state, package, options, "import")
@@ -994,6 +1002,8 @@ async fn runtime_assets_cache_immutably_compress_and_revalidate() {
         InstallOptions {
             digest,
             expected_revision: None,
+            replace_legacy: false,
+            replacement_revision: None,
         },
         "import",
     )

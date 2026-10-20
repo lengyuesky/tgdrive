@@ -24,6 +24,8 @@ async fn new_install_denies_files_until_host_authorizes_and_revokes_tickets() {
         InstallOptions {
             digest,
             expected_revision: None,
+            replace_legacy: false,
+            replacement_revision: None,
         },
         "import",
     )

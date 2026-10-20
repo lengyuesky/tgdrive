@@ -5,7 +5,7 @@
       <div class="apps-title"><h1>应用中心</h1><p>安装需要的应用，独立管理功能和设置。</p></div>
       <div class="header-actions">
         <el-button :icon="Refresh" :loading="loading || refreshingCatalog" @click="refreshAll">刷新</el-button>
-        <el-button type="primary" :icon="Upload" :loading="inspecting" @click="fileInput?.click()">导入插件包</el-button>
+        <el-button type="primary" :icon="Upload" :loading="inspecting" :disabled="installing || batchRunning" @click="fileInput?.click()">导入插件包</el-button>
       </div>
       <input ref="fileInput" type="file" accept=".tgapp,.zip" hidden @change="importPackage" />
     </header>
@@ -32,7 +32,7 @@
         </div>
         <div class="tools-side">
           <el-input v-model="query" class="app-search" :prefix-icon="Search" placeholder="搜索应用" clearable />
-          <el-button v-if="updateCount" type="primary" :icon="Download" class="batch-update" @click="openBatchUpdate">一键更新（{{ updateCount }}）</el-button>
+          <el-button v-if="updateCount" type="primary" :icon="Download" class="batch-update" :disabled="!!busy || inspecting || installing || batchRunning" @click="openBatchUpdate">一键更新（{{ updateCount }}）</el-button>
         </div>
       </div>
       <div v-if="tab !== 'settings'" v-loading="loading" class="apps-grid">
@@ -55,7 +55,7 @@
               <span v-if="card.available.size" class="size-hint"> · {{ formatBytes(card.available.size) }}</span>
             </p>
             <div class="tile-actions">
-              <el-button type="primary" size="small" :disabled="!!busy" @click="previewCatalog(card.available)">安装</el-button>
+              <el-button type="primary" size="small" :disabled="!!busy || inspecting || installing || batchRunning" @click="previewCatalog(card.available)">安装</el-button>
             </div>
             <div class="tile-links">
               <a :href="api.apps.packageUrl(card.manifest.id, card.available.digest)" class="package-link">下载插件包</a>
@@ -82,7 +82,7 @@
           </div>
           <div class="manage-actions">
             <el-button size="small" @click="details?.open(row.app.manifest, row.app, row.update)">详情与恢复</el-button>
-            <el-button v-if="row.update" type="primary" size="small" :disabled="!!busy" @click="previewCatalog(row.update!)">更新</el-button>
+            <el-button v-if="row.update" type="primary" size="small" :disabled="!!busy || inspecting || installing || batchRunning" @click="previewCatalog(row.update!)">更新</el-button>
             <el-button v-if="row.app.manifest.settings.length || row.app.manifest.permissions.includes('files.read')" size="small" :disabled="!!busy" @click="openSettings(row.app)">设置</el-button>
             <el-dropdown trigger="click" :disabled="!!busy" @command="command($event, row.app)">
               <el-button :icon="MoreFilled" size="small" :loading="busy === row.app.manifest.id" aria-label="更多应用操作" />
@@ -109,6 +109,16 @@
         <p class="install-description">{{ preview.manifest.description }}</p>
         <p v-if="preview.existing">当前版本 v{{ preview.existing.manifest.version }}，更新后保留配置和启停状态。</p>
         <p v-if="preview.manifest.integration?.changelog" class="update-notes">更新说明：{{ preview.manifest.integration.changelog }}</p>
+        <section v-if="preview.replacements?.length" class="replacement-warning" aria-label="替换旧应用及清理数据">
+          <strong>安装将替换以下旧应用，并清理其应用私有数据</strong>
+          <ul>
+            <li v-for="app in preview.replacements" :key="app.id">
+              {{ app.name }}（{{ app.id }}）：{{ app.installed ? '已安装，将卸载' : '已卸载，仍有残留数据' }}；{{ app.has_data ? '有私有数据，将清理' : '无私有数据' }}
+            </li>
+          </ul>
+          <p>将清理旧应用的阅读进度、书签、偏好、书库配置及恢复快照；这些数据不会迁移到新应用，清理后无法通过应用恢复。</p>
+          <p>网盘原文件和网盘收藏继续保留。取消安装不会进行替换或清理。</p>
+        </section>
         <p>需要宿主 {{ preview.manifest.min_host_version }} 或更高版本</p>
         <div class="permissions-box">
           <strong>此应用需要以下权限</strong>
@@ -130,7 +140,7 @@
       </template>
       <template #footer>
         <el-button :disabled="installing" @click="previewVisible = false">取消</el-button>
-        <el-button type="primary" :loading="installing" @click="confirmInstall">{{ preview?.existing ? '同意并更新' : '同意并安装' }}</el-button>
+        <el-button type="primary" :loading="installing" @click="confirmInstall">{{ preview?.replacements?.length ? '安装并替换旧应用' : preview?.existing ? '同意并更新' : '同意并安装' }}</el-button>
       </template>
     </ResponsivePanel>
 
@@ -144,7 +154,7 @@
     </ResponsivePanel>
     <ResponsivePanel v-model="batchVisible" title="一键更新" width="min(560px, 94vw)" align-center
       :close-on-click-modal="!batchRunning" :close-on-press-escape="!batchRunning" :show-close="!batchRunning">
-      <p class="batch-summary">将逐个下载并安装以下 {{ batchTargets.length }} 个应用的新版本；更新保留配置、启停状态与应用数据，失败不影响其余应用。</p>
+      <p class="batch-summary">将逐个安装以下 {{ batchTargets.length }} 个应用的新版本；普通更新保留配置、启停状态与应用数据，失败不影响其余应用。需要替换旧应用的项目须单独打开安装预览确认，不会在此清理数据。</p>
       <ul class="batch-list">
         <li v-for="target in batchTargets" :key="target.app.manifest.id" class="batch-item">
           <span class="batch-icon" aria-hidden="true"><AppIcon :manifest="target.app.manifest" :revision="target.app.revision" /></span>
@@ -294,21 +304,26 @@ function launch(card: Card) {
   else if (card.available) previewCatalog(card.available)
 }
 
-function previewCatalog(app: CatalogApp) {
-  const existing = data.value.installed.find((item) => item.manifest.id === app.manifest.id) ?? null
-  preview.value = { manifest: app.manifest, digest: app.digest, existing,
-    added_permissions: app.manifest.permissions.filter((permission) => !existing?.manifest.permissions.includes(permission)) }
+async function previewCatalog(app: CatalogApp) {
+  if (inspecting.value || installing.value || batchRunning.value || previewVisible.value) return
+  inspecting.value = true
+  preview.value = null
   importFile.value = undefined
   installError.value = ''
-  previewVisible.value = true
+  try {
+    preview.value = (await api.apps.inspectCatalog(app.manifest.id, app.digest)).data
+    previewVisible.value = true
+  } catch (e) { ElMessage.error(errMsg(e)) }
+  finally { inspecting.value = false }
 }
 async function importPackage(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
   input.value = ''
-  if (!file || inspecting.value) return
+  if (!file || inspecting.value || installing.value || batchRunning.value || previewVisible.value) return
   if (file.size > 16 * 1024 * 1024) { ElMessage.error('插件包不能超过 16 MiB'); return }
   inspecting.value = true
+  preview.value = null
   try {
     preview.value = (await api.apps.inspect(file)).data
     importFile.value = file
@@ -318,13 +333,14 @@ async function importPackage(event: Event) {
   finally { inspecting.value = false }
 }
 async function confirmInstall() {
-  if (!preview.value || installing.value) return
+  if (!previewVisible.value || !preview.value || installing.value) return
   installing.value = true
   installError.value = ''
   const info = preview.value
+  const replaceLegacy = !!info.replacements?.length
   try {
-    if (importFile.value) await api.apps.install(importFile.value, info.digest, info.existing?.revision)
-    else await api.apps.installCatalog(info.manifest.id, info.digest, info.existing?.revision)
+    if (importFile.value) await api.apps.install(importFile.value, info.digest, info.existing?.revision, replaceLegacy, info.replacement_revision)
+    else await api.apps.installCatalog(info.manifest.id, info.digest, info.existing?.revision, replaceLegacy, info.replacement_revision)
     previewVisible.value = false
     tab.value = 'installed'
     notifyAppsChanged()
@@ -341,6 +357,7 @@ interface BatchTarget {
   added: string[]
   status: BatchStatus
   message: string
+  inspection?: AppPreview
 }
 const batchVisible = ref(false)
 const batchRunning = ref(false)
@@ -348,9 +365,10 @@ const batchFinished = ref(false)
 const batchDone = ref(0)
 const batchTargets = ref<BatchTarget[]>([])
 
-function openBatchUpdate() {
+async function openBatchUpdate() {
   const rows = manageRows.value.filter((row) => row.update)
-  if (!rows.length || batchRunning.value) return
+  if (!rows.length || busy.value || inspecting.value || installing.value || batchRunning.value || previewVisible.value) return
+  inspecting.value = true
   const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
   batchTargets.value = rows.map(({ app, update }) => ({
     app: clone(app),
@@ -361,6 +379,19 @@ function openBatchUpdate() {
   }))
   batchFinished.value = false
   batchDone.value = 0
+  for (const target of batchTargets.value) {
+    try {
+      const { data: info } = await api.apps.inspectCatalog(target.app.manifest.id, target.update.digest)
+      target.inspection = info
+      target.added = info.added_permissions
+      target.update.manifest = info.manifest
+      if (info.replacements?.length) throw new Error('需要替换旧应用，请单独打开安装预览并确认清理范围')
+    } catch (e) {
+      target.status = 'failed'
+      target.message = errMsg(e)
+    }
+  }
+  inspecting.value = false
   batchVisible.value = true
 }
 function onBatchAction() {
@@ -370,11 +401,13 @@ function onBatchAction() {
 async function runBatchUpdate() {
   if (batchRunning.value) return
   batchRunning.value = true
-  let failed = 0
+  let failed = batchTargets.value.filter((target) => target.status === 'failed').length
   for (const target of batchTargets.value) {
+    if (target.status === 'failed' || !target.inspection) continue
     target.status = 'running'
     try {
-      await api.apps.installCatalog(target.app.manifest.id, target.update.digest, target.app.revision)
+      const info = target.inspection
+      await api.apps.installCatalog(info.manifest.id, info.digest, info.existing?.revision, false, info.replacement_revision)
       target.status = 'done'
       batchDone.value++
     } catch (e) {
@@ -501,6 +534,8 @@ async function confirmUninstall() {
 .install-name { margin: 0 0 14px; }
 .install-name span { font-size: 13px; font-weight: normal; color: var(--el-text-color-secondary); }
 .install-description { line-height: 1.7; overflow-wrap: anywhere; }
+.replacement-warning { margin: 18px 0; padding: 16px; border: 1px solid var(--el-color-warning); border-radius: 12px; background: var(--el-color-warning-light-9); line-height: 1.7; overflow-wrap: anywhere; }
+.replacement-warning ul { padding-left: 20px; }
 .permissions-box { background: var(--tile-bg); border: 1px solid var(--tile-border); border-radius: 12px; padding: 16px; margin: 18px 0; }
 .permissions-box ul { padding-left: 20px; margin-bottom: 0; }
 .permissions-box li { margin: 10px 0; line-height: 1.5; }

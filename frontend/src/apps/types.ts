@@ -85,6 +85,10 @@ export interface AppPreview {
   digest: string
   existing: InstalledApp | null
   added_permissions: string[]
+  /** 服务端判定的旧应用及卸载后残留数据；需用户明确同意替换。 */
+  replacements: { id: string; name: string; installed: boolean; has_data: boolean }[]
+  /** 服务端预览范围指纹，安装时原样回传；前端不自行构造。 */
+  replacement_revision?: string | null
 }
 
 export interface AppLaunch {

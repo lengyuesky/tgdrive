@@ -171,3 +171,117 @@ async fn reading_index_pages_beyond_2000_without_loading_full_rows() {
     assert_eq!(ids.len(), 2005);
     assert_eq!(media.ranges.lock().unwrap().len(), reads_before);
 }
+
+#[tokio::test]
+async fn unified_reading_index_pages_all_formats_and_binds_kind_and_permissions() {
+    let (state, media, _dir) = fixture().await;
+    let mut manifest = manifest();
+    manifest.id = "reader".into();
+    manifest.api_version = 2;
+    add_app(&state, &manifest, None).await;
+    let session = launch_app(&state, "reader").await["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for path in ["/混合", "/混合/卷话", "/混合/卷话/图片", "/秘密"] {
+        state.vfs.mkdir(path).await.unwrap();
+    }
+    let root = state.vfs.resolve("/混合").await.unwrap().id;
+    let child = state.vfs.resolve("/混合/卷话").await.unwrap().id;
+    let pictures = state.vfs.resolve("/混合/卷话/图片").await.unwrap().id;
+    let mut expected = std::collections::HashSet::new();
+    for name in ["A.txt", "a.EPUB", "B.pdf", "b.CBZ", "C.zip"] {
+        expected.insert(seed_file(&state, &media, &format!("/混合/卷话/{name}"), b"x", 2).await);
+    }
+    expected.insert(pictures);
+    for name in ["1.jpg", "2.PNG"] {
+        seed_file(&state, &media, &format!("/混合/卷话/图片/{name}"), b"x", 2).await;
+    }
+    seed_file(&state, &media, "/混合/视频.mp4", b"x", 2).await;
+    seed_file(&state, &media, "/秘密/保密.pdf", b"x", 2).await;
+    let reads_before = media.ranges.lock().unwrap().len();
+    let base = json!({"roots":[root,child],"kind":"all","limit":2});
+    let mut params = base.clone();
+    let mut actual = std::collections::HashSet::new();
+    let mut formats = std::collections::HashSet::new();
+    let mut first_cursor = Value::Null;
+    loop {
+        let (status, result) =
+            rpc_call(&state, "reader", &session, "library.page", params.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        for entry in result["entries"].as_array().unwrap() {
+            assert!(
+                actual.insert(entry["file"]["id"].as_i64().unwrap()),
+                "不能因重叠来源重复返回"
+            );
+            formats.insert(entry["format"].as_str().unwrap().to_owned());
+            assert_eq!(entry["source_ids"], json!([root, child]));
+        }
+        if result["has_more"] == false {
+            break;
+        }
+        if first_cursor.is_null() {
+            first_cursor = result["next_cursor"].clone();
+        }
+        params["cursor"] = result["next_cursor"].clone();
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(
+        formats,
+        ["txt", "epub", "pdf", "cbz", "zip", "images"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert_eq!(media.ranges.lock().unwrap().len(), reads_before);
+    for format in ["txt", "epub", "pdf", "cbz", "zip", "images"] {
+        let (_, result) = rpc_call(&state, "reader", &session, "library.page",
+            json!({"roots":[root],"kind":"all","format":format,"q":if format == "images" { "图片" } else { "." }})).await;
+        assert_eq!(result["entries"].as_array().unwrap().len(), 1, "{result}");
+    }
+    let mut wrong_kind = base.clone();
+    wrong_kind["kind"] = json!("books");
+    wrong_kind["cursor"] = first_cursor.clone();
+    assert_eq!(
+        rpc_call(&state, "reader", &session, "library.page", wrong_kind)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let mut stale = base.clone();
+    stale["cursor"] = first_cursor;
+    state
+        .vfs
+        .rename("/混合/卷话/A.txt", "/混合/卷话/已移动.txt")
+        .await
+        .unwrap();
+    let (status, result) = rpc_call(&state, "reader", &session, "library.page", stale).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(result["code"], "reading_index_changed");
+    let (status, _) = call(
+        &state,
+        "PATCH",
+        "/api/apps/reader/scope",
+        json!({"mode":"selected","paths":["/混合/卷话"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rpc_call(&state, "reader", &session, "library.page", base)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        rpc_call(
+            &state,
+            "reader",
+            &session,
+            "library.page",
+            json!({"roots":[child],"kind":"all"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}

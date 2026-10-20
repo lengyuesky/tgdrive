@@ -39,16 +39,16 @@ impl ReadingQuery {
                 .roots
                 .iter()
                 .any(|id| *id <= 0 || *id > 9_007_199_254_740_991)
-            || !["books", "comics"].contains(&self.kind.as_str())
+            || !["all", "books", "comics"].contains(&self.kind.as_str())
             || !["title", "added"].contains(&self.sort.as_str())
             || !(1..=200).contains(&self.limit)
             || self.q.len() > 255
             || self.q.chars().any(char::is_control)
             || self.format.as_ref().is_some_and(|f| {
-                !(if self.kind == "books" {
-                    &["txt", "epub", "pdf"][..]
-                } else {
-                    &["cbz", "zip", "images"][..]
+                !(match self.kind.as_str() {
+                    "books" => &["txt", "epub", "pdf"][..],
+                    "comics" => &["cbz", "zip", "images"][..],
+                    _ => &["txt", "epub", "pdf", "cbz", "zip", "images"][..],
                 })
                 .contains(&f.as_str())
             })
@@ -137,17 +137,17 @@ impl Db {
         }
         sql.push("), tree(id,path) AS (SELECT n.id,r.path FROM roots r JOIN nodes n ON n.id=r.id WHERE n.status='ready' UNION SELECT n.id,CASE WHEN t.path='/' THEN '/'||n.name ELSE t.path||'/'||n.name END FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.status='ready'), candidates(id,format) AS (");
         sql.push("SELECT id,format FROM reading_files WHERE format IN (");
-        let formats = if query.kind == "books" {
-            &["txt", "epub", "pdf"][..]
-        } else {
-            &["cbz", "zip"][..]
+        let formats = match query.kind.as_str() {
+            "books" => &["txt", "epub", "pdf"][..],
+            "comics" => &["cbz", "zip"][..],
+            _ => &["txt", "epub", "pdf", "cbz", "zip"][..],
         };
         let mut separated = sql.separated(",");
         for format in formats {
             separated.push_bind(*format);
         }
         sql.push(")");
-        if query.kind == "comics" {
+        if query.kind != "books" {
             sql.push(
                 " UNION SELECT DISTINCT parent_id,'images' FROM reading_files WHERE format='image'",
             );

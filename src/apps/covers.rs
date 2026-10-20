@@ -82,6 +82,18 @@ pub(super) async fn invoke(
 ) -> AppResult<Value> {
     let db = &state.vfs.db;
     let id = &app.manifest.id;
+    // 验证凭据到实际写入之间可能发生替换；与安装和缓存回收串行，再核对修订。
+    // 旧页面的迟到删除也不能误删后来重装应用的同名封面。
+    let _guard = if matches!(method, "covers.put" | "covers.delete") {
+        let guard = super::INSTALL_LOCK.lock().await;
+        let current = installed(state, id).await?;
+        if !current.enabled || current.revision != app.revision {
+            return Err(AppError::AppChanged);
+        }
+        Some(guard)
+    } else {
+        None
+    };
     match method {
         "covers.get" => {
             let q: Keys = parse(params)?;

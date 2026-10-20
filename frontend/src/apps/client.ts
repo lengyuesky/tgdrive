@@ -5,12 +5,14 @@ export const appApi = {
   list: () => http.get<AppIndex>('/apps'),
   get: (id: string) => http.get<InstalledApp>(`/apps/${encodeURIComponent(id)}`),
   inspect: (file: File) => http.post<AppPreview>('/apps/inspect', file, { headers: { 'Content-Type': 'application/octet-stream' } }),
-  install: (file: File, digest: string, expected_revision?: string) =>
+  inspectCatalog: (id: string, digest: string) =>
+    http.post<AppPreview>(`/apps/catalog/${encodeURIComponent(id)}/inspect`, { digest }),
+  install: (file: File, digest: string, expected_revision?: string, replace_legacy = false, replacement_revision?: string | null) =>
     http.post<InstalledApp>('/apps/install', file, {
-      params: { digest, expected_revision }, headers: { 'Content-Type': 'application/octet-stream' },
+      params: { digest, expected_revision, replace_legacy, replacement_revision }, headers: { 'Content-Type': 'application/octet-stream' },
     }),
-  installCatalog: (id: string, digest: string, expected_revision?: string) =>
-    http.post<InstalledApp>(`/apps/catalog/${encodeURIComponent(id)}/install`, { digest, expected_revision }),
+  installCatalog: (id: string, digest: string, expected_revision?: string, replace_legacy = false, replacement_revision?: string | null) =>
+    http.post<InstalledApp>(`/apps/catalog/${encodeURIComponent(id)}/install`, { digest, expected_revision, replace_legacy, replacement_revision }),
   refreshCatalog: (force = false) => http.post<AppIndex>('/apps/catalog/refresh', { force }),
   packageUrl: (id: string, digest?: string) =>
     `/api/apps/catalog/${encodeURIComponent(id)}/package${digest ? `?digest=${encodeURIComponent(digest)}` : ''}`,

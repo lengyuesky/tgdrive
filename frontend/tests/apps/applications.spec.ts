@@ -589,6 +589,123 @@ test('一键更新聚合全部可更新应用，单次确认后逐个安装', as
   await expect(page.getByRole('button', { name: '一键更新' })).toHaveCount(0)
 })
 
+for (const keepInstalled of [true, false]) {
+  test(`本地阅读馆替换${keepInstalled ? '已安装图书' : '卸载残留图书数据'}，清理进度并保留原文件与收藏`, async ({ page }) => {
+    const books = makeZip({
+      'app.json': JSON.stringify({
+        id: 'books', name: '图书', version: '0.9.0', api_version: 2, min_host_version: '0.1.0',
+        description: '替换验收用旧应用', author: '测试夹具', entry: 'index.html', permissions: [], settings: [],
+      }),
+      'index.html': '<!doctype html><html><body><h1>Legacy Books</h1></body></html>',
+    })
+    const reader = makeZip({
+      'app.json': JSON.stringify({
+        id: 'reader', name: '阅读馆', version: '1.0.0', api_version: 2, min_host_version: '0.3.3',
+        description: '替换验收用合成阅读馆', author: '测试夹具', entry: 'index.html', permissions: [], settings: [],
+      }),
+      'index.html': '<!doctype html><html><body><h1>Synthetic Reader</h1></body></html>',
+    })
+    const booksPath = `${temporary}/replacement-books.tgapp`
+    const readerPath = `${temporary}/replacement-reader.tgapp`
+    await writeFile(booksPath, books)
+    await writeFile(readerPath, reader)
+    await page.goto('/apps')
+    await (await importApp(page, booksPath)).getByRole('button', { name: '同意并安装', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: '安装应用', exact: true })).not.toBeVisible()
+
+    const launch = await page.request.post('/api/apps/books/launch', { data: {} })
+    expect(launch.ok()).toBe(true)
+    const { session } = await launch.json()
+    const saved = await page.request.post('/api/apps/books/rpc', { data: {
+      session, method: 'storage.set', params: { key: 'progress:replacement', value: { page: 37 }, expected_revision: null },
+    } })
+    expect(saved.ok()).toBe(true)
+    expect(await saved.json()).toMatchObject({ value: { page: 37 } })
+    if (!keepInstalled) expect((await page.request.delete('/api/apps/books?purge_data=false')).ok()).toBe(true)
+
+    const listing = await page.request.get('/api/fs/list', { params: { path: '/' } })
+    expect(listing.ok()).toBe(true)
+    const original = (await listing.json()).entries.find((entry: { name: string }) => entry.name === '测试文档.txt')
+    expect(original).toBeDefined()
+    const originalPath = '/测试文档.txt'
+    const download = await page.request.get('/api/fs/download', { params: { path: originalPath } })
+    expect(download.ok()).toBe(true)
+    const originalBytes = await download.body()
+    expect((await page.request.post('/api/fs/favorite', { data: { path: originalPath, favorite: true } })).ok()).toBe(true)
+    try {
+      const inspectionResponse = page.waitForResponse((response) => response.url().endsWith('/api/apps/inspect') && response.request().method() === 'POST')
+      const dialog = await importApp(page, readerPath)
+      const inspected = await inspectionResponse
+      expect(inspected.ok()).toBe(true)
+      // 浏览器响应体可能已被 inspector 缓存淘汰；预览内容由真实 DOM 验证，清理结果由后续 API 验证。
+      await expect(dialog).toContainText('图书（books）')
+      await expect(dialog).toContainText(`（books）：${keepInstalled ? '已安装，将卸载' : '已卸载，仍有残留数据'}`)
+      await expect(dialog).toContainText('有私有数据，将清理')
+      for (const description of ['阅读进度', '书签', '偏好', '书库配置', '恢复快照', '不会迁移到新应用', '网盘原文件和网盘收藏继续保留']) {
+        await expect(dialog).toContainText(description)
+      }
+      await expect(dialog.getByRole('button', { name: '同意并安装', exact: true })).toHaveCount(0)
+      // 取消预览不能触发安装；残留数据必须仍出现在下一次预览中。
+      await dialog.getByRole('button', { name: '取消', exact: true }).click()
+      expect((await page.request.get('/api/apps/reader')).status()).toBe(404)
+      // APIRequestContext 不依赖浏览器 inspector 响应缓存；相同范围的指纹应保持稳定。
+      const confirmedInspection = await page.request.post('/api/apps/inspect', {
+        data: reader, headers: { 'Content-Type': 'application/octet-stream' },
+      })
+      expect(confirmedInspection.ok()).toBe(true)
+      const confirmedPreview = await confirmedInspection.json()
+      const confirmed = await importApp(page, readerPath)
+      expect(confirmedPreview.replacement_revision).toEqual(expect.any(String))
+      expect(confirmedPreview.replacement_revision).not.toBe('')
+      await expect(confirmed).toContainText('（books）')
+      const installedResponse = page.waitForResponse((response) => response.url().includes('/api/apps/install?') && response.request().method() === 'POST')
+      await confirmed.getByRole('button', { name: '安装并替换旧应用', exact: true }).click()
+      const installed = await installedResponse
+      expect(new URL(installed.url()).searchParams.get('replace_legacy')).toBe('true')
+      expect(new URL(installed.url()).searchParams.get('replacement_revision')).toBe(confirmedPreview.replacement_revision)
+      expect(installed.ok()).toBe(true)
+      await expect(confirmed).not.toBeVisible()
+      await expect(page.locator('[data-app-id="reader"].app-tile')).toBeVisible()
+      await expect(page.locator('[data-app-id="books"].app-tile')).toHaveCount(0)
+      expect((await page.request.get('/api/apps/books')).status()).toBe(404)
+      const readerApp = await page.request.get('/api/apps/reader')
+      expect(readerApp.ok()).toBe(true)
+      expect((await readerApp.json()).manifest).toMatchObject({ id: 'reader', min_host_version: '0.3.3' })
+
+      const cleaned = await page.request.post('/api/apps/inspect', { data: reader, headers: { 'Content-Type': 'application/octet-stream' } })
+      expect(cleaned.ok()).toBe(true)
+      expect((await cleaned.json()).replacements).toEqual([])
+      // 重新装回合成旧包再读同一键，证明私有进度已删除，而非仅卸载后不可见。
+      const booksInspection = await page.request.post('/api/apps/inspect', { data: books, headers: { 'Content-Type': 'application/octet-stream' } })
+      expect(booksInspection.ok()).toBe(true)
+      const { digest } = await booksInspection.json()
+      const reinstalled = await page.request.post('/api/apps/install', {
+        params: { digest }, data: books, headers: { 'Content-Type': 'application/octet-stream' },
+      })
+      expect(reinstalled.ok()).toBe(true)
+      const relaunched = await page.request.post('/api/apps/books/launch', { data: {} })
+      expect(relaunched.ok()).toBe(true)
+      const fresh = await relaunched.json()
+      const progress = await page.request.post('/api/apps/books/rpc', { data: {
+        session: fresh.session, method: 'storage.get', params: { key: 'progress:replacement' },
+      } })
+      expect(progress.ok()).toBe(true)
+      expect(await progress.json()).toBeNull()
+      expect((await page.request.delete('/api/apps/books?purge_data=true')).ok()).toBe(true)
+      expect((await page.request.get('/api/apps/reader')).ok()).toBe(true)
+
+      const preserved = await page.request.get('/api/fs/list', { params: { path: '/' } })
+      expect(preserved.ok()).toBe(true)
+      expect((await preserved.json()).entries.find((entry: { name: string }) => entry.name === original.name)).toMatchObject({ name: original.name, size: original.size, favorite: true })
+      const preservedDownload = await page.request.get('/api/fs/download', { params: { path: originalPath } })
+      expect(preservedDownload.ok()).toBe(true)
+      expect(await preservedDownload.body()).toEqual(originalBytes)
+    } finally {
+      expect((await page.request.post('/api/fs/favorite', { data: { path: originalPath, favorite: original.favorite } })).ok()).toBe(true)
+    }
+  })
+}
+
 test('封面缓存经沙箱写入服务器封面库，应用设置显示占用并可一键清理', async ({ page }) => {
   await page.goto('/apps')
   await (await importApp(page, await coverPackagePath())).getByRole('button', { name: '同意并安装' }).click()
