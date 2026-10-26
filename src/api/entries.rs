@@ -27,6 +27,7 @@ pub(super) struct DirectoryEntry {
     #[serde(flatten)]
     entry: Entry,
     id: i64,
+    content_version: String,
     has_thumbnail: bool,
 }
 
@@ -72,6 +73,7 @@ pub(super) async fn entries_get(
         .map(|node| DirectoryEntry {
             entry: Entry::from(node),
             id: node.id,
+            content_version: node.content_version(),
             has_thumbnail: !node.is_dir && page.thumbnails.contains(&node.id),
         })
         .collect();
@@ -85,4 +87,4 @@ pub(super) async fn entries_get(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

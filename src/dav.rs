@@ -38,7 +38,16 @@ pub fn build_handler(vfs: Vfs) -> DavHandler {
 ///
 /// 只接受 Basic,不认浏览器登录 Cookie:跨站导航带上的 Cookie 不能借 /dav 读写网盘。
 pub async fn dav_handler(State(state): State<AppState>, req: Request) -> Response {
-    match crate::api::authorize(&state, &req, false) {
+    match crate::api::authorize(
+        &state,
+        req.headers(),
+        req.extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .copied(),
+        false,
+    )
+    .await
+    {
         Ok(()) => {}
         Err(AppError::Unauthorized) => {
             return Response::builder()

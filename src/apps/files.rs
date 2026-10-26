@@ -9,19 +9,8 @@ use crate::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-
 pub(super) fn version(node: &Node) -> String {
-    let source = format!(
-        "{}:{}:{}:{}",
-        node.id,
-        node.is_dir,
-        node.size,
-        node.sha256
-            .clone()
-            .unwrap_or_else(|| node.created_at.to_string())
-    );
-    crate::engine::upload::to_hex(&Sha256::digest(source.as_bytes()))
+    node.content_version()
 }
 pub(super) fn metadata(node: &Node, path: &str) -> Value {
     json!({"id":node.id,"path":path,"name":node.name,"is_dir":node.is_dir,"size":node.size,

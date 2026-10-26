@@ -12,12 +12,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "apps/db.rs"]
 pub mod apps;
-pub mod reading;
 mod copy;
 mod delete_jobs;
+pub mod devices;
 pub mod entries;
 mod logs;
 mod query;
+pub mod reading;
 mod resumable;
 mod revision;
 mod search;
@@ -46,7 +47,7 @@ impl InboxSource {
     }
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub id: i64,
     pub parent_id: Option<i64>,
@@ -62,6 +63,24 @@ pub struct Node {
     pub sha256: Option<String>,
     /// 是否已收藏；目录与文件都可以收藏。
     pub favorite: bool,
+}
+
+impl Node {
+    /// 文件移动或改名不改变版本，覆盖写的新节点以及不同内容必须产生新版本。
+    /// 与应用 RPC 共用同一算法；目录版本不代表子树修订。
+    pub fn content_version(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let source = format!(
+            "{}:{}:{}:{}",
+            self.id,
+            self.is_dir,
+            self.size,
+            self.sha256
+                .clone()
+                .unwrap_or_else(|| self.created_at.to_string())
+        );
+        crate::engine::upload::to_hex(&Sha256::digest(source.as_bytes()))
+    }
 }
 
 /// 分块行;部分字段仅由 SQL 侧使用,保留以完整映射
@@ -261,6 +280,7 @@ pub struct UploadSession {
     pub sha256: String,
     pub chunk_size: i64,
     pub storage_target_id: i64,
+    pub overwrite: bool,
     pub thumbnail: Option<Vec<u8>>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -272,6 +292,21 @@ pub struct UploadSessionInfo {
     pub node: Node,
     pub uploaded_parts: Vec<i64>,
     pub uploaded_bytes: i64,
+    pub in_flight_parts: Vec<i64>,
+    pub uncertain_parts: Vec<i64>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct UploadReceipt {
+    pub id: String,
+    pub status: String,
+    pub display_path: String,
+    pub expected_size: i64,
+    pub sha256: String,
+    #[serde(skip)]
+    pub node_json: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
 }
 
 impl UploadSessionInfo {

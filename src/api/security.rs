@@ -7,12 +7,16 @@ const CODE_LIMIT: usize = 5;
 const CODE_WINDOW: i64 = 15 * 60;
 const CODE_KEY: &str = "security:totp";
 
-/// 安全设置只接受网页登录会话，WebDAV 应用密码不能反过来关闭两步验证。
-fn require_web_session(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
-    if state.auth.session_cookie_valid(headers) {
+/// 安全设置只接受主账号网页登录或原生设备会话，WebDAV 应用密码不能关闭两步验证。
+async fn require_web_session(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+    if state
+        .auth
+        .strong_session_valid(headers, &state.vfs.db)
+        .await?
+    {
         Ok(())
     } else {
-        Err(AppError::Forbidden("请在网页登录后修改安全设置".into()))
+        Err(AppError::Forbidden("请使用主账号登录后修改安全设置".into()))
     }
 }
 
@@ -57,7 +61,7 @@ pub(super) async fn totp_setup(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<crate::auth::TotpSetup>> {
-    require_web_session(&state, &headers)?;
+    require_web_session(&state, &headers).await?;
     if state.auth.totp_enabled() {
         return Err(AppError::BadRequest(
             "两步验证已启用；如需更换验证器，请先关闭再重新绑定".into(),
@@ -72,7 +76,8 @@ pub(super) async fn totp_enable(
     headers: HeaderMap,
     Json(body): Json<CodeBody>,
 ) -> AppResult<Response> {
-    require_web_session(&state, &headers)?;
+    require_web_session(&state, &headers).await?;
+    let browser_session = state.auth.session_cookie_valid(&headers);
     let codes = state
         .auth
         .enable_totp(body.code.trim(), &state.vfs.db)
@@ -80,14 +85,17 @@ pub(super) async fn totp_enable(
     state.auth.rotate_secret(&state.vfs.db).await?;
     let token = state.auth.issue_token();
     let mut resp = Json(serde_json::json!({ "recovery_codes": codes })).into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        state
-            .auth
-            .cookie_header(&token)
-            .parse()
-            .expect("cookie 头合法"),
-    );
+    // 网页继续换发 Cookie；原生会话因密钥轮换失效，需带新第二因素重新登录。
+    if browser_session {
+        resp.headers_mut().insert(
+            header::SET_COOKIE,
+            state
+                .auth
+                .cookie_header(&token)
+                .parse()
+                .expect("cookie 头合法"),
+        );
+    }
     record_security_log(&state, "已启用两步验证，其他设备的登录已失效").await;
     Ok(resp)
 }
@@ -97,7 +105,7 @@ pub(super) async fn totp_disable(
     headers: HeaderMap,
     Json(body): Json<CodeBody>,
 ) -> AppResult<Json<serde_json::Value>> {
-    require_web_session(&state, &headers)?;
+    require_web_session(&state, &headers).await?;
     require_second_factor(&state, &body.code).await?;
     state.auth.disable_totp(&state.vfs.db).await?;
     record_security_log(&state, "已关闭两步验证").await;
@@ -109,7 +117,7 @@ pub(super) async fn totp_recovery_regenerate(
     headers: HeaderMap,
     Json(body): Json<CodeBody>,
 ) -> AppResult<Json<serde_json::Value>> {
-    require_web_session(&state, &headers)?;
+    require_web_session(&state, &headers).await?;
     require_second_factor(&state, &body.code).await?;
     let codes = state.auth.regenerate_recovery_codes(&state.vfs.db).await?;
     record_security_log(&state, "已重新生成两步验证恢复码，旧恢复码作废").await;
@@ -120,7 +128,7 @@ pub(super) async fn webdav_password_generate(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    require_web_session(&state, &headers)?;
+    require_web_session(&state, &headers).await?;
     let password = state.auth.generate_webdav_password(&state.vfs.db).await?;
     record_security_log(&state, "已生成新的 WebDAV 应用密码，旧应用密码作废").await;
     Ok(Json(serde_json::json!({ "password": password })))
@@ -130,7 +138,7 @@ pub(super) async fn webdav_password_revoke(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    require_web_session(&state, &headers)?;
+    require_web_session(&state, &headers).await?;
     state.auth.revoke_webdav_password(&state.vfs.db).await?;
     record_security_log(&state, "已撤销 WebDAV 应用密码").await;
     Ok(Json(serde_json::json!({ "ok": true })))

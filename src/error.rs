@@ -115,6 +115,7 @@ impl AppError {
         };
         let code = match self {
             AppError::UploadInterrupted => Some("upload_interrupted"),
+            AppError::TelegramUncertain(_) => Some("telegram_uncertain"),
             AppError::AppDataConflict => Some("storage_conflict"),
             AppError::ReadingIndexChanged => Some("reading_index_changed"),
             AppError::SessionExpired => Some("session_expired"),

@@ -3,7 +3,7 @@
   "host": {
     "repository": "lengyuesky/tgdrive",
     "visibility": "private",
-    "version": "0.3.3",
+    "version": "0.3.4",
     "api_version": 2,
     "min_host_version": "0.1.0",
     "notes": "本文件声明宿主接口及插件分发协议，不代表任何提交已经通过跨仓库验证。宿主为私有仓库；每次插件发布前须在本机完成集成验证，并在插件仓库 compatibility.json 中记录实际验证的完整宿主提交 SHA。无宿主权限的贡献者可运行插件独立检查和单元测试，公开 CI 不检出宿主、不上传宿主产物。"
@@ -13,6 +13,12 @@
     "catalog_url": "https://raw.githubusercontent.com/lengyuesky/tgdrive-app/main/catalog.json",
     "official_apps": ["reader", "cinema", "shorts"],
     "reader_min_host_version": "0.3.3"
+  },
+  "native_client": {
+    "contract_version": 1,
+    "min_host_version": "0.3.4",
+    "capabilities_endpoint": "/api/client/capabilities",
+    "notes": "iOS 只通过 HTTP 调用现有 tgdrive 服务。原生接口为向后兼容增强，不改变插件 API v2，不代表真机后台、阅读或兼容播放已经验收。"
   },
   "local_verification": {
     "host_fixture_command": "cargo test --locked apps::tests::browser_fixture -- --ignored --exact --nocapture",

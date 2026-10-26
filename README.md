@@ -21,6 +21,7 @@ WebDAV 客户端─┘   ├ /api/*  REST+SSE       └─> Telegram Bot API
 - **Bot 收件**:白名单用户私聊与频道直发入库,可按类型/后缀自动归类,视频自动选最高清晰度
 - **多渠道备份**:一致性快照可同时备份到 Telegram、WebDAV 与 S3,各渠道滚动保留 7 份,支持 age 加密;网页向导可从频道备份一键恢复
 - **应用中心**:阅读馆、影视、短视频三款插件(独立仓库),进度跨设备实时同步,无服务器转码;阅读馆统一 TXT/EPUB/PDF、CBZ/ZIP 与图片目录,宿主 0.3.3 在安装预览中明确确认替换旧图书/漫画及清理私有数据,网盘原文件和收藏保留
+- **原生客户端接口**:开发中的 0.3.4 新增设备登录与刷新撤销、稳定节点查询、受限媒体/上传票据、七天幂等上传回执和下载 ETag/If-Range；iOS 仅调用本服务，不内置 Telegram 存储后端。接口见 [原生客户端契约](docs/native-clients.md)
 - **账号安全**:argon2 密码哈希、可选 TOTP 两步验证、WebDAV 独立应用密码
 - **网络代理**:HTTP / SOCKS5 / Cloudflare WARP(usque),网页保存即生效,自建 Bot API 共用
 - **WebDAV**(Class 2):支持 rclone、Windows 资源管理器、macOS Finder

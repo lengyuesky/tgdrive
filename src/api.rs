@@ -32,12 +32,14 @@ mod admin;
 mod events;
 mod files;
 mod media;
+mod native;
 pub(crate) mod restore;
 mod search;
 mod security;
 mod session;
 mod shares;
 mod trash;
+mod transfer;
 mod uploads;
 use self::{
     admin::*, events::*, files::*, media::*, search::*, security::*, session::*, shares::*,
@@ -88,6 +90,8 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
+        .merge(native::public_routes())
+        .merge(transfer::public_routes())
         .merge(crate::apps::public_router())
         .route("/auth/login", post(login))
         // 分享链接:免登录访问
@@ -96,6 +100,8 @@ pub fn router(state: AppState) -> Router {
         .route("/share/{token}/list", get(share_list_dir))
         .route("/share/{token}/download", get(share_download));
     let protected = Router::new()
+        .merge(native::protected_routes())
+        .merge(transfer::protected_routes())
         .merge(restore::routes())
         .merge(crate::apps::protected_router())
         .route("/auth/logout", post(logout))
@@ -119,6 +125,8 @@ pub fn router(state: AppState) -> Router {
         .route("/fs/favorite", post(favorite_set))
         .route("/fs/instant", post(instant))
         .route("/uploads", get(uploads_index).post(uploads_create))
+        .route("/uploads/lookup", get(upload_lookup))
+        .route("/uploads/{id}/result", get(upload_result))
         .route("/uploads/{id}", get(upload_status).delete(upload_cancel))
         .route("/uploads/{id}/thumbnail", post(upload_thumbnail))
         .route(
@@ -194,7 +202,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// cookie 或 Basic 任一通过即放行
+/// 网页 Cookie、原生设备 Bearer 或 Basic 任一通过即放行；不透明沙箱源始终拒绝。
 pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     // 隔离应用只能经宿主的权限网关调用能力，不能借浏览器 Cookie 直连管理接口。
     if req
@@ -204,7 +212,14 @@ pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: 
     {
         return AppError::Forbidden("隔离页面不能直接访问网盘接口".into()).into_response();
     }
-    match authorize(&state, &req, true) {
+    match authorize(
+        &state,
+        req.headers(),
+        req.extensions().get::<ConnectInfo<SocketAddr>>().copied(),
+        true,
+    )
+    .await
+    {
         Ok(()) => next.run(req).await,
         Err(error) => error.into_response(),
     }
@@ -215,22 +230,29 @@ pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: 
 const BASIC_LIMIT: usize = 10;
 const BASIC_WINDOW: i64 = 15 * 60;
 
-/// 校验登录 Cookie(`allow_cookie` 时)或 Basic 凭据。Basic 失败按来源地址计入
+/// API 可使用 Cookie/设备 Bearer；WebDAV 仅 Basic。Basic 失败按来源地址计入
 /// 限流，锁定期间即使密码正确也拒绝，避免借 API/WebDAV 入口无限次猜密码。
-pub(crate) fn authorize(state: &AppState, req: &Request, allow_cookie: bool) -> AppResult<()> {
-    if allow_cookie && state.auth.session_cookie_valid(req.headers()) {
+pub(crate) async fn authorize(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    allow_cookie: bool,
+) -> AppResult<()> {
+    if allow_cookie
+        && state
+            .auth
+            .strong_session_valid(headers, &state.vfs.db)
+            .await?
+    {
         return Ok(());
     }
-    let Some((user, pass)) = crate::auth::basic_credentials(req.headers()) else {
+    let Some((user, pass)) = crate::auth::basic_credentials(headers) else {
         return Err(AppError::Unauthorized);
     };
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map_or_else(
-            || "unknown".to_string(),
-            |info| peer_key(state, *info, req.headers()),
-        );
+    let peer = peer.map_or_else(
+        || "unknown".to_string(),
+        |info| peer_key(state, info, headers),
+    );
     let key = format!("basic:{peer}");
     if let Some(wait) = state.attempts.retry_after(&key, BASIC_LIMIT, BASIC_WINDOW) {
         return Err(AppError::RateLimited(wait));

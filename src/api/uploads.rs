@@ -10,6 +10,12 @@ pub(super) struct UploadCreateBody {
     pub(super) name: String,
     pub(super) size: i64,
     pub(super) sha256: String,
+    #[serde(default = "default_upload_overwrite")]
+    pub(super) overwrite: bool,
+}
+
+pub(super) fn default_upload_overwrite() -> bool {
+    true
 }
 
 pub(super) fn upload_session_json(info: &UploadSessionInfo) -> serde_json::Value {
@@ -19,10 +25,13 @@ pub(super) fn upload_session_json(info: &UploadSessionInfo) -> serde_json::Value
         "name": info.node.name,
         "size": info.session.expected_size,
         "sha256": info.session.sha256,
+        "overwrite": info.session.overwrite,
         "chunk_size": info.session.chunk_size,
         "part_count": info.part_count(),
         "uploaded_parts": info.uploaded_parts,
         "uploaded_bytes": info.uploaded_bytes,
+        "in_flight_parts": info.in_flight_parts,
+        "uncertain_parts": info.uncertain_parts,
         "created_at": info.session.created_at,
         "updated_at": info.session.updated_at,
     })
@@ -99,6 +108,57 @@ pub(super) async fn upload_status(
     })))
 }
 
+/// 新原生查询单独使用 result 端点，旧网页 status 成功响应始终保留 session 结构。
+pub(super) async fn upload_result(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    if let Some(receipt) = state.vfs.db.upload_receipt(&id).await? {
+        return Ok(Json(
+            serde_json::json!({"receipt":upload_receipt_json(&receipt)?}),
+        ));
+    }
+    match upload_status(State(state.clone()), Path(id.clone())).await {
+        Ok(value) => Ok(value),
+        Err(AppError::NotFound) => {
+            let receipt = state
+                .vfs
+                .db
+                .upload_receipt(&id)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            Ok(Json(
+                serde_json::json!({"receipt":upload_receipt_json(&receipt)?}),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct UploadLookupQuery {
+    path: String,
+    size: i64,
+    sha256: String,
+}
+/// 创建会话响应丢失时只读定位，不发起新上传，不覆盖文件。
+pub(super) async fn upload_lookup(
+    State(state): State<AppState>,
+    Query(query): Query<UploadLookupQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let path = crate::vfs::canonical(&query.path)?;
+    let hash = normalized_sha256(&query.sha256)?;
+    if query.size < 0 {
+        return Err(AppError::BadRequest("上传大小无效".into()));
+    }
+    let id = state
+        .vfs
+        .db
+        .find_upload_session(&path, query.size, &hash)
+        .await?;
+    Ok(Json(serde_json::json!({"id":id})))
+}
+
 pub(super) async fn uploads_create(
     State(state): State<AppState>,
     Json(body): Json<UploadCreateBody>,
@@ -121,7 +181,7 @@ pub(super) async fn uploads_create(
     let info = state
         .vfs
         .db
-        .create_upload_session(
+        .create_upload_session_with_policy(
             parent.id,
             &name,
             &display_path,
@@ -129,6 +189,7 @@ pub(super) async fn uploads_create(
             &body.sha256,
             cfg.chunk_size as i64,
             target.storage_target_id,
+            body.overwrite,
         )
         .await?;
     // 同一路径的可恢复会话可能早已绑定到另一个池成员，状态必须按实际目标返回。
@@ -204,10 +265,27 @@ pub(super) async fn upload_complete(
     // 覆盖旧文件时，删除任务已在事务内持久化；立即唤醒处理器。
     state.vfs.uploader.process_pending_deletes();
     emit_files_in_parent(&state, node.parent_id).await;
+    let receipt = state.vfs.db.upload_receipt(&id).await?;
     Ok(Json(serde_json::json!({
         "ok": true,
-        "entry": Entry::from(&node),
+        "entry": serde_json::json!({
+            "id":node.id,"name":node.name,"is_dir":node.is_dir,"size":node.size,
+            "created_at":node.created_at,"modified_at":node.modified_at,"sha256":node.sha256,
+            "favorite":node.favorite,"content_version":node.content_version(),
+        }),
+        "receipt": receipt.as_ref().map(upload_receipt_json).transpose()?,
     })))
+}
+
+pub(super) fn upload_receipt_json(
+    receipt: &crate::db::UploadReceipt,
+) -> AppResult<serde_json::Value> {
+    let entry = receipt.node_json.as_ref().map(|value| serde_json::from_str::<Node>(value)
+        .map(|node| serde_json::json!({"id":node.id,"name":node.name,"is_dir":node.is_dir,"size":node.size,"content_version":node.content_version(),"sha256":node.sha256,"created_at":node.created_at,"modified_at":node.modified_at,"favorite":node.favorite})))
+        .transpose().map_err(anyhow::Error::from)?;
+    Ok(
+        serde_json::json!({"id":receipt.id,"status":receipt.status,"path":receipt.display_path,"size":receipt.expected_size,"sha256":receipt.sha256,"entry":entry,"expires_at":receipt.expires_at}),
+    )
 }
 
 pub(super) async fn upload_cancel(

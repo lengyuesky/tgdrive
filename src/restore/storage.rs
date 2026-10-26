@@ -299,6 +299,11 @@ pub(super) async fn preserve_settings(candidate: &Path, state: &AppState) -> any
     let mut conn = SqliteConnection::connect_with(&options(candidate, false)).await?;
     let result = async {
         let mut tx = conn.begin().await?;
+        // 恢复不能复活备份中的设备会话；轮换内容命名空间及主密钥，避免旧节点缓存误绑定。
+        sqlx::query("DELETE FROM upload_receipts").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM device_refresh_tokens").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM device_sessions").execute(&mut *tx).await?;
+        sqlx::query("UPDATE client_identity SET server_id = lower(hex(randomblob(16))) WHERE id = 1").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM settings WHERE k LIKE 'auth.%' OR k LIKE 'mtproto.session.%' OR k = 'secret'").execute(&mut *tx).await?;
         for (key, value) in values {
             sqlx::query("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(key).bind(value).execute(&mut *tx).await?;

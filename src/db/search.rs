@@ -141,6 +141,7 @@ impl Db {
 
     /// 秒传:找到内容相同(sha256+size)的既有文件则零流量链接到目标位置,
     /// 覆盖同名旧文件;返回 (新节点 id, 释放的 message_id)。找不到返回 None。
+    #[cfg(test)]
     pub async fn instant_link(
         &self,
         sha256: &str,
@@ -148,14 +149,48 @@ impl Db {
         dst_parent: i64,
         dst_name: &str,
     ) -> AppResult<Option<(i64, Vec<StoredMessage>)>> {
-        // 目标本身已经是同一内容时直接成功。除了让接口具备幂等性，也避免把源节点
-        // 自己删掉后再从已删除节点复制 chunks，生成“有大小但无分块”的损坏文件。
-        if let Some(existing) = self.child(dst_parent, dst_name).await? {
+        self.instant_link_with_policy(sha256, size, dst_parent, dst_name, true)
+            .await
+    }
+
+    /// 目标检查、同内容幂等和覆盖决策必须都在同一写事务，不能用事务外快照删除目录或源。
+    pub async fn instant_link_with_policy(
+        &self,
+        sha256: &str,
+        size: i64,
+        dst_parent: i64,
+        dst_name: &str,
+        overwrite: bool,
+    ) -> AppResult<Option<(i64, Vec<StoredMessage>)>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let parent: Option<bool> =
+            sqlx::query_scalar("SELECT is_dir FROM nodes WHERE id = ? AND status = 'ready'")
+                .bind(dst_parent)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if parent != Some(true) {
+            return Err(AppError::NotDirectory);
+        }
+        let old: Option<Node> = sqlx::query_as(
+            "SELECT * FROM nodes WHERE parent_id = ? AND name = ? AND status = 'ready'",
+        )
+        .bind(dst_parent)
+        .bind(dst_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(existing) = &old {
             if existing.is_dir {
                 return Err(AppError::IsDirectory);
             }
+            if !overwrite {
+                return Err(AppError::Conflict(
+                    "同名条目已存在，本次秒传禁止覆盖".into(),
+                ));
+            }
             if existing.size == size && existing.sha256.as_deref() == Some(sha256) {
-                return Ok(Some((existing.id, Vec::new())));
+                let id = existing.id;
+                tx.commit().await?;
+                return Ok(Some((id, Vec::new())));
             }
         }
         // 源只需 chunks 有效:ready 即可(回收站子树整树置 trashed,ready ⇒ 可见)
@@ -165,31 +200,16 @@ impl Db {
         )
         .bind(sha256)
         .bind(size)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((src_id,)) = src else {
             return Ok(None);
         };
-
-        if let Some(existing) = self.child(dst_parent, dst_name).await?
-            && existing.is_dir
-        {
-            return Err(AppError::IsDirectory);
-        }
         let ts = now_ts();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        // 覆盖写:删同名旧文件并收集其消息做引用计数
-        let old: Option<(i64, bool)> = sqlx::query_as(
-            "SELECT id, favorite FROM nodes
-             WHERE parent_id = ? AND name = ? AND status = 'ready'",
-        )
-        .bind(dst_parent)
-        .bind(dst_name)
-        .fetch_optional(&mut *tx)
-        .await?;
         let mut candidates = Vec::new();
-        let inherited_favorite = old.map(|(_, favorite)| favorite).unwrap_or(false);
-        if let Some((old_id, _)) = old {
+        let inherited_favorite = old.as_ref().is_some_and(|node| node.favorite);
+        if let Some(old) = old {
+            let old_id = old.id;
             let rows: Vec<(i64, i64)> = sqlx::query_as(
                 "SELECT storage_target_id, tg_message_id FROM chunks
                  WHERE node_id = ? AND storage_target_id IS NOT NULL",

@@ -115,6 +115,9 @@ pub(crate) async fn search(
         .iter()
         .map(|(n, path)| {
             serde_json::json!({
+                "id": n.id,
+                "content_version": n.content_version(),
+                "sha256": n.sha256,
                 "path": path,
                 "name": n.name,
                 "is_dir": n.is_dir,
@@ -155,6 +158,8 @@ pub(super) struct InstantBody {
     pub(super) name: String,
     pub(super) sha256: String,
     pub(super) size: i64,
+    #[serde(default = "super::uploads::default_upload_overwrite")]
+    pub(super) overwrite: bool,
 }
 
 pub(super) fn normalized_sha256(raw: &str) -> AppResult<String> {
@@ -182,7 +187,7 @@ pub(super) async fn instant(
     match state
         .vfs
         .db
-        .instant_link(&sha, b.size, dir.id, &name)
+        .instant_link_with_policy(&sha, b.size, dir.id, &name, b.overwrite)
         .await?
     {
         Some((id, freed)) => {
@@ -192,7 +197,11 @@ pub(super) async fn instant(
             Ok(Json(serde_json::json!({
                 "linked": true,
                 "pending": false,
-                "entry": Entry::from(&node),
+                "entry": serde_json::json!({
+                    "id":node.id,"name":node.name,"is_dir":node.is_dir,"size":node.size,
+                    "created_at":node.created_at,"modified_at":node.modified_at,"sha256":node.sha256,
+                    "favorite":node.favorite,"content_version":node.content_version(),
+                }),
             })))
         }
         None => {

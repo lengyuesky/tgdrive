@@ -220,6 +220,10 @@ pub trait TgApi: Send + Sync + 'static {
     }
     /// 终止已经交给自建 Bot API、但尚未完成的上传。
     /// 官方 Bot API 和测试实现没有进程控制能力，默认无需处理。
+    /// 只有具有真实进程监督器的实现才可把取消确认视为可安全重试。
+    fn can_confirm_upload_cancellation(&self) -> bool {
+        false
+    }
     async fn cancel_pending_uploads(&self) -> AppResult<()> {
         Ok(())
     }
@@ -1438,6 +1442,10 @@ impl TgApi for TgClient {
             Err(AppError::Telegram(d)) if d.contains("message to delete not found") => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn can_confirm_upload_cancellation(&self) -> bool {
+        self.bot_api_restart_enabled.load(Ordering::Acquire) && self.bot_api_restart_file.is_some()
     }
 
     async fn cancel_pending_uploads(&self) -> AppResult<()> {

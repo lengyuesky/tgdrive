@@ -758,6 +758,7 @@ async fn confirm_preserves_security_and_only_next_start_switches_database() {
         .await
         .unwrap();
     let cookie = state.auth.issue_token();
+    let server_id_before_restore = state.vfs.db.client_server_id().await.unwrap();
     let id = ready(&state).await;
     let candidate = state.restore.root.join("candidate.db");
     let old = Db::open(candidate.to_str().unwrap()).await.unwrap();
@@ -770,6 +771,20 @@ async fn confirm_preserves_security_and_only_next_start_switches_database() {
     old.setting_set("extra.backup_s3_secret_key", "old-s3-secret")
         .await
         .unwrap();
+    old.create_device_session(
+        &crate::db::devices::DeviceSession {
+            id: "backup-device".into(),
+            name: "旧设备".into(),
+            auth_epoch: "old-epoch".into(),
+            created_at: crate::db::now_ts(),
+            last_used_at: crate::db::now_ts(),
+            expires_at: crate::db::now_ts() + 3600,
+            revoked_at: None,
+        },
+        "old-refresh-hash",
+    )
+    .await
+    .unwrap();
     old.close().await;
     // 变更候选之后旧确认令牌不能使用。
     assert!(state.restore.confirm(&state, &id).await.is_err());
@@ -845,6 +860,24 @@ async fn confirm_preserves_security_and_only_next_start_switches_database() {
             .as_deref(),
         Some("")
     );
+    assert_ne!(
+        restored.client_server_id().await.unwrap(),
+        server_id_before_restore
+    );
+    let mut connection = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&state.rt.env.db_path)
+            .read_only(true),
+    )
+    .await
+    .unwrap();
+    use sqlx::Connection as _;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_sessions")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    assert_eq!(count, 0, "恢复不得复活旧设备凭据");
     let auth = Auth::init("current-admin", &hash, None, false, &restored)
         .await
         .unwrap();

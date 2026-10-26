@@ -243,11 +243,41 @@ pub(crate) async fn stream_node(
         format!("{kind}; filename*=UTF-8''{enc}")
     };
 
-    let range = parse_range(headers, node.size as u64);
+    let etag = format!("\"{}\"", node.content_version());
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|v| v == "*" || v.trim_start_matches("W/") == etag)
+        })
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, "private, no-cache")
+            .body(axum::body::Body::empty())
+            .expect("响应构造失败"));
+    }
+    // 只接受精确的强 ETag；日期或弱标签无法证明字节相同，必须返回整份 200。
+    let range = if headers.contains_key(header::RANGE)
+        && headers
+            .get(header::IF_RANGE)
+            .is_some_and(|value| value.to_str().ok() != Some(etag.as_str()))
+    {
+        Ok(None)
+    } else {
+        parse_range(headers, node.size as u64)
+    };
     match range {
         Err(()) => Ok((
             StatusCode::RANGE_NOT_SATISFIABLE,
-            [(header::CONTENT_RANGE, format!("bytes */{}", node.size))],
+            [
+                (header::CONTENT_RANGE, format!("bytes */{}", node.size)),
+                (header::ETAG, etag),
+            ],
         )
             .into_response()),
         Ok(None) => {
@@ -256,6 +286,8 @@ pub(crate) async fn stream_node(
             let body = axum::body::Body::from_stream(ReaderStream::new(reader));
             Ok(Response::builder()
                 .status(StatusCode::OK)
+                .header(header::ETAG, &etag)
+                .header(header::CACHE_CONTROL, "private, no-cache")
                 .header(header::CONTENT_TYPE, response_mime)
                 .header(header::CONTENT_LENGTH, total)
                 .header(header::ACCEPT_RANGES, "bytes")
@@ -270,6 +302,8 @@ pub(crate) async fn stream_node(
                 axum::body::Body::from_stream(ReaderStream::new(reader.with_read_limit(len)));
             Ok(Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::ETAG, &etag)
+                .header(header::CACHE_CONTROL, "private, no-cache")
                 .header(header::CONTENT_TYPE, response_mime)
                 .header(header::CONTENT_LENGTH, len)
                 .header(

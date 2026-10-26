@@ -311,7 +311,7 @@ fn redact_path(path: &str) -> String {
             redact_next = false;
             continue;
         }
-        redact_next = index > 0 && matches!(segment, "share" | "media");
+        redact_next = index > 0 && matches!(segment, "share" | "media" | "transfer");
         out.push(segment);
     }
     out.join("/")

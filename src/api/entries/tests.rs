@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt as _;
 
-async fn fixture() -> (Router, AppState, tempfile::TempDir) {
+pub(crate) async fn fixture() -> (Router, AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("api.db").to_str().unwrap().to_string();
     let db = Db::open(&db_path).await.unwrap();

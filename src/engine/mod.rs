@@ -52,6 +52,7 @@ mod tests {
         upload_turn_release: tokio::sync::Notify,
         /// 验证取消确实通知了 Bot API 监督器。
         cancel_pending_calls: AtomicU64,
+        fail_cancel_pending: AtomicBool,
         /// 记录底层实际收到的块内范围，验证 HTTP 终点能跨分块传递。
         read_ranges: Mutex<Vec<(u64, u64)>>,
     }
@@ -78,6 +79,7 @@ mod tests {
                 upload_turn_started: AtomicBool::new(false),
                 upload_turn_release: tokio::sync::Notify::new(),
                 cancel_pending_calls: AtomicU64::new(0),
+                fail_cancel_pending: AtomicBool::new(false),
                 read_ranges: Mutex::new(Vec::new()),
             })
         }
@@ -187,8 +189,15 @@ mod tests {
             Ok(())
         }
 
+        fn can_confirm_upload_cancellation(&self) -> bool {
+            true
+        }
+
         async fn cancel_pending_uploads(&self) -> AppResult<()> {
             self.cancel_pending_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_cancel_pending.load(Ordering::SeqCst) {
+                return Err(AppError::Telegram("mock: Bot API 监督器重启失败".into()));
+            }
             Ok(())
         }
 
@@ -803,6 +812,76 @@ mod tests {
             .await
             .unwrap();
         up.finish_cancel_resumable_session(&session_b.session.id);
+    }
+
+    #[tokio::test]
+    async fn failed_restart_keeps_all_interrupted_parts_uncertain() {
+        let (up, tg, db, _guard) = fixture(4, 1024, None).await;
+        up.knobs.set_concurrency(2);
+        tg.block_send.store(true, Ordering::SeqCst);
+        tg.fail_cancel_pending.store(true, Ordering::SeqCst);
+        let target = db.storage_targets().await.unwrap()[0].id;
+        let mut sessions = Vec::new();
+        let mut requests = Vec::new();
+        for name in ["failed-restart-a.bin", "failed-restart-b.bin"] {
+            let session = db
+                .create_upload_session(
+                    ROOT_ID,
+                    name,
+                    &format!("/{name}"),
+                    4,
+                    &"00".repeat(32),
+                    4,
+                    target,
+                )
+                .await
+                .unwrap();
+            let ResumablePartStart::Upload(handle) = up
+                .start_resumable_part(&session.session.id, 0)
+                .await
+                .unwrap()
+            else {
+                panic!("分块尚未发送");
+            };
+            handle
+                .feed(Bytes::from_static(&[1, 2, 3, 4]))
+                .await
+                .unwrap();
+            requests.push(tokio::spawn(handle.finish()));
+            sessions.push(session);
+        }
+        for _ in 0..100 {
+            if tg.send_started_count.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(tg.send_started_count.load(Ordering::SeqCst), 2);
+        up.begin_cancel_resumable_session(&sessions[0].session.id)
+            .await;
+        for request in requests {
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, AppError::TelegramUncertain(_)),
+                "重启失败不得误报为可安全重试：{error}"
+            );
+        }
+        assert_eq!(tg.cancel_pending_calls.load(Ordering::SeqCst), 1);
+        for session in sessions {
+            let state = db.upload_session_info(&session.session.id).await.unwrap();
+            assert!(state.in_flight_parts.is_empty());
+            assert_eq!(state.uncertain_parts, [0]);
+            assert!(matches!(
+                db.claim_upload_part(&session.session.id, 0).await,
+                Err(AppError::TelegramUncertain(_))
+            ));
+            db.cancel_upload_session(&session.session.id).await.unwrap();
+            up.finish_cancel_resumable_session(&session.session.id);
+        }
     }
 
     #[tokio::test]

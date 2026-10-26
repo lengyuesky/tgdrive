@@ -522,6 +522,22 @@ async fn scrub_snapshot(path: &str) -> AppResult<()> {
     sqlx::query("DELETE FROM settings WHERE k LIKE 'mtproto.session.%'")
         .execute(&mut conn)
         .await?;
+    // 原生设备凭据同样不能随快照离开实例；兼容历史快照和仅有 settings 的夹具。
+    for (table, deletion) in [
+        ("device_refresh_tokens", "DELETE FROM device_refresh_tokens"),
+        ("device_sessions", "DELETE FROM device_sessions"),
+        ("upload_receipts", "DELETE FROM upload_receipts"),
+    ] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&mut conn)
+        .await?;
+        if exists > 0 {
+            sqlx::query(deletion).execute(&mut conn).await?;
+        }
+    }
     // 重写文件，确保被删的值不残留在空闲页里。
     sqlx::query("VACUUM").execute(&mut conn).await?;
     conn.close().await?;
@@ -1282,6 +1298,22 @@ mod tests {
                 .create_if_missing(true);
             let mut conn = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
             sqlx::query("CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE device_sessions (id TEXT PRIMARY KEY, name TEXT)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE device_refresh_tokens (token_hash TEXT, session_id TEXT)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO device_sessions VALUES ('device-XYZ','iPhone-XYZ')")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO device_refresh_tokens VALUES ('refresh-XYZ','device-XYZ')")
                 .execute(&mut conn)
                 .await
                 .unwrap();

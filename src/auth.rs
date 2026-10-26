@@ -1,4 +1,4 @@
-//! 认证:单用户。Web 端 HMAC 签名 cookie,WebDAV 端 HTTP Basic,中间件双通道放行。
+//! 认证:单用户。Web 使用 HMAC Cookie，WebDAV 使用 HTTP Basic，原生 API 使用可撤销设备 Bearer。
 //!
 //! 账号与签名密钥可在运行时替换(后台改配置),已被克隆持有的 `Arc<Auth>` 立即生效。
 //! 启用两步验证后,网页登录需要额外的 TOTP 验证码;Basic 通道不再接受主密码,
@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 
 #[path = "apps/auth.rs"]
 mod app_tokens;
+pub(crate) mod native;
 
 const COOKIE_NAME: &str = "tgdrive_token";
 const TOKEN_TTL_SECS: i64 = 7 * 24 * 3600;

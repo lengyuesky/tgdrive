@@ -60,6 +60,7 @@ async fn tick(vfs: &Vfs, runtime: &Runtime) -> AppResult<()> {
         .await;
     }
     vfs.uploader.process_pending_deletes();
+    vfs.db.cleanup_upload_receipts().await?;
     let extras = crate::extras::load(&vfs.db).await?;
 
     let abandoned = vfs

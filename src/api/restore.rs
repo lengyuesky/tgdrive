@@ -1,4 +1,4 @@
-//! 恢复 API 仅接受网页 Cookie；Basic/WebDAV 应用密码不能授权。
+//! 恢复 API 仅接受主账号网页或原生强认证会话；Basic/WebDAV 应用密码不能授权。
 use super::*;
 use crate::restore::{PrepareRequest, RestoreStatus};
 
@@ -12,10 +12,14 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/admin/restore/confirm", post(confirm))
         .route("/admin/restore/resume", post(resume))
 }
-fn web_session(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
-    if !state.auth.session_cookie_valid(headers) {
+async fn web_session(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+    if !state
+        .auth
+        .strong_session_valid(headers, &state.vfs.db)
+        .await?
+    {
         return Err(AppError::Forbidden(
-            "恢复操作必须先网页登录，不接受 Basic 或应用密码".into(),
+            "恢复操作必须先以主账号登录，不接受 Basic 或应用密码".into(),
         ));
     }
     Ok(())
@@ -24,7 +28,7 @@ async fn history(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     Ok(Json(
         serde_json::json!({ "backups": crate::restore::history(&state).await? }),
     ))
@@ -33,7 +37,7 @@ async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<RestoreStatus>> {
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     Ok(Json(state.restore.status().await))
 }
 #[derive(Deserialize)]
@@ -46,7 +50,7 @@ async fn discover(
     headers: HeaderMap,
     Json(body): Json<DiscoverBody>,
 ) -> AppResult<Json<crate::restore::DiscoveryResult>> {
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     Ok(Json(state.restore.discover(&state, body.reset).await?))
 }
 async fn prepare(
@@ -54,7 +58,7 @@ async fn prepare(
     headers: HeaderMap,
     Json(body): Json<PrepareRequest>,
 ) -> AppResult<Json<RestoreStatus>> {
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     let manager = state.restore.clone();
     Ok(Json(manager.prepare(state, body).await?))
 }
@@ -67,7 +71,7 @@ async fn cancel(
     headers: HeaderMap,
     Json(body): Json<IdBody>,
 ) -> AppResult<Json<RestoreStatus>> {
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     Ok(Json(state.restore.cancel(&body.id).await?))
 }
 #[derive(Deserialize)]
@@ -112,12 +116,12 @@ async fn confirm(
     headers: HeaderMap,
     Json(body): Json<ConfirmBody>,
 ) -> AppResult<(StatusCode, Json<RestoreStatus>)> {
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     if body.confirmation != "恢复" {
         return Err(AppError::BadRequest("请准确输入“恢复”".into()));
     }
     let _exclusive = state.restore.write_gate.write().await;
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     reauthenticate(&state, &body.password, body.totp.as_deref()).await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -129,9 +133,9 @@ async fn resume(
     headers: HeaderMap,
     Json(body): Json<ResumeBody>,
 ) -> AppResult<(StatusCode, Json<RestoreStatus>)> {
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     let _exclusive = state.restore.write_gate.write().await;
-    web_session(&state, &headers)?;
+    web_session(&state, &headers).await?;
     reauthenticate(&state, &body.password, body.totp.as_deref()).await?;
     Ok((
         StatusCode::ACCEPTED,

@@ -336,6 +336,7 @@ pub struct Uploader {
     active_resumable: Arc<Mutex<ActiveResumableUploads>>,
     bot_restart_lock: Arc<AsyncMutex<()>>,
     bot_restart_generation: Arc<AtomicU64>,
+    bot_restart_confirmed_generation: Arc<AtomicU64>,
 }
 
 const PART_STAGE_RECEIVING: u8 = 0;
@@ -372,6 +373,7 @@ impl Uploader {
             active_resumable: Arc::new(Mutex::new(ActiveResumableUploads::default())),
             bot_restart_lock: Arc::new(AsyncMutex::new(())),
             bot_restart_generation: Arc::new(AtomicU64::new(0)),
+            bot_restart_confirmed_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -453,6 +455,12 @@ impl Uploader {
         let target = match self.tg.binding(info.session.storage_target_id) {
             Ok(target) => target,
             Err(error) => {
+                // 存储目标未解析成功，还没有向 Telegram 发送请求，可清除保守标记。
+                if let Err(clear_error) =
+                    self.db.clear_upload_part_uncertainty(session_id, idx).await
+                {
+                    tracing::error!(%clear_error, "清除上传不确定标记失败");
+                }
                 let _ = self.db.release_upload_part(session_id, idx).await;
                 return Err(error);
             }
@@ -486,6 +494,7 @@ impl Uploader {
         };
         drop(restart_guard);
         if !accepted {
+            let _ = self.db.clear_upload_part_uncertainty(session_id, idx).await;
             let _ = self.db.release_upload_part(session_id, idx).await;
             return Err(AppError::BadRequest("上传会话正在取消".into()));
         }
@@ -508,14 +517,15 @@ impl Uploader {
                 abort_registration,
             )
             .await;
-            this.restart_detached_resumable_upload(
-                &target.api,
-                &upstream_pending,
-                restart_generation,
-                &key,
-                &format!("会话 {id} 分块 {idx}"),
-            )
-            .await;
+            let cancelled_cleanly = this
+                .restart_detached_resumable_upload(
+                    &target.api,
+                    &upstream_pending,
+                    restart_generation,
+                    &key,
+                    &format!("会话 {id} 分块 {idx}"),
+                )
+                .await;
             // 其他任务必须等重启领导者释放锁后再读取原因；若监督器重启失败，
             // 绝不能把该分块标为可自动重试，否则可能制造重复 Telegram 消息。
             let result = match pipeline_result {
@@ -527,6 +537,24 @@ impl Uploader {
                     )),
                     _ => Err(AppError::BadRequest("分块上传已取消".into())),
                 },
+            };
+            let potentially_sent = (!cancelled_cleanly
+                && upstream_pending.load(Ordering::Acquire) > 0)
+                || matches!(result, Err(AppError::TelegramUncertain(_)));
+            if !potentially_sent
+                && let Err(error) = this.db.clear_upload_part_uncertainty(&id, idx).await
+            {
+                tracing::error!(%error, "清除上传不确定标记失败");
+            }
+            let result = if result.is_err()
+                && potentially_sent
+                && !matches!(result, Err(AppError::UploadInterrupted))
+            {
+                Err(AppError::TelegramUncertain(
+                    "分块可能已经到达 Telegram，禁止自动重复发送".into(),
+                ))
+            } else {
+                result
             };
             if result.is_err()
                 && let Err(release_error) = this.db.release_upload_part(&id, idx).await
@@ -600,20 +628,23 @@ impl Uploader {
         started_generation: u64,
         own_key: &(String, i64),
         label: &str,
-    ) {
+    ) -> bool {
         // 自建 Bot API 是所有 Bot 共用的单进程；多 Bot 池下重启它会同时打断
         // 其他 Bot 的在途请求，宁可让单个取消请求自然收尾，也不要制造全局 503。
-        if self.tg.upload_bot_count() > 1 {
-            return;
+        if self.tg.upload_bot_count() > 1 || !api.can_confirm_upload_cancellation() {
+            return false;
         }
         if upstream_pending.load(Ordering::Acquire) == 0 {
-            return;
+            return true;
         }
         let _restart_guard = self.bot_restart_lock.lock().await;
         if self.bot_restart_generation.load(Ordering::Acquire) != started_generation {
-            return;
+            return self
+                .bot_restart_confirmed_generation
+                .load(Ordering::Acquire)
+                > started_generation;
         }
-        self.bot_restart_generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self.bot_restart_generation.fetch_add(1, Ordering::AcqRel) + 1;
 
         let interrupted = {
             let active = self.active_resumable.lock().unwrap();
@@ -646,7 +677,11 @@ impl Uploader {
                 );
             }
             tracing::error!("终止 Bot API 在途上传失败（{label}）: {error}");
+            return false;
         }
+        self.bot_restart_confirmed_generation
+            .store(generation, Ordering::Release);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]

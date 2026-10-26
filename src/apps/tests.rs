@@ -24,6 +24,10 @@ mod cover_cache;
 mod integration_tests;
 #[path = "media_tests.rs"]
 mod media;
+#[path = "native_download_tests.rs"]
+mod native_downloads;
+#[path = "native_client_fixture.rs"]
+mod native_client_http;
 #[path = "reader_tests.rs"]
 mod readers;
 #[path = "reading_index_tests.rs"]

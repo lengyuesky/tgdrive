@@ -118,23 +118,96 @@ impl Db {
         size: i64,
         sha256: Option<&str>,
     ) -> AppResult<(Node, Vec<StoredMessage>)> {
-        let node = self.node(node_id).await?;
-        let parent_id = node.parent_id.ok_or(AppError::NotFound)?;
-
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // 先在写事务内检查状态，完成/取消并发时不能误删已提交文件或再次覆盖新文件。
+        let current = sqlx::query_as::<_, Node>("SELECT * FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if current.status == "ready" {
+            tx.commit().await?;
+            return Ok((current, Vec::new()));
+        }
+        if current.status != "uploading" {
+            return Err(AppError::Conflict("上传节点状态已改变".into()));
+        }
+        let parent_id = current.parent_id.ok_or(AppError::NotFound)?;
+        // 上传期间目标目录可能被移入回收站；不能提交出藏在不可见祖先下的 ready 节点。
+        let visible_parent: i64 = sqlx::query_scalar(
+            "WITH RECURSIVE chain(id,parent_id,is_dir,status,depth) AS (
+                 SELECT id,parent_id,is_dir,status,0 FROM nodes WHERE id = ?
+                 UNION ALL
+                 SELECT n.id,n.parent_id,n.is_dir,n.status,c.depth+1
+                 FROM nodes n JOIN chain c ON n.id = c.parent_id WHERE c.depth < 4096
+             )
+             SELECT (EXISTS(SELECT 1 FROM chain WHERE id = ? AND parent_id IS NULL)
+                 AND NOT EXISTS(SELECT 1 FROM chain WHERE is_dir = 0 OR status != 'ready'))",
+        )
+        .bind(parent_id)
+        .bind(ROOT_ID)
+        .fetch_one(&mut *tx)
+        .await?;
+        if visible_parent == 0 {
+            return Err(AppError::Conflict(
+                "上传目标目录已不可见，请恢复目录后重试".into(),
+            ));
+        }
+        let session: Option<UploadSession> =
+            sqlx::query_as("SELECT * FROM upload_sessions WHERE node_id = ?")
+                .bind(node_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(session) = &session {
+            let rows: Vec<(i64, i64)> =
+                sqlx::query_as("SELECT idx,size FROM chunks WHERE node_id = ? ORDER BY idx")
+                    .bind(node_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let part_count = if session.expected_size == 0 {
+                0
+            } else {
+                session.expected_size / session.chunk_size
+                    + i64::from(session.expected_size % session.chunk_size != 0)
+            };
+            let claims: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM upload_part_claims WHERE session_id = ?")
+                    .bind(&session.id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if size != session.expected_size
+                || sha256 != Some(session.sha256.as_str())
+                || claims > 0
+                || rows.len() as i64 != part_count
+                || rows.iter().enumerate().any(|(idx, (part, bytes))| {
+                    *part != idx as i64
+                        || *bytes
+                            != session
+                                .chunk_size
+                                .min(session.expected_size - *part * session.chunk_size)
+                })
+            {
+                return Err(AppError::BadRequest("分块尚未完整确认，禁止提交".into()));
+            }
+        }
         // 旧同名 ready 节点(覆盖写场景)
         let old: Option<(i64, bool, bool)> = sqlx::query_as(
             "SELECT id, favorite, is_dir FROM nodes
              WHERE parent_id = ? AND name = ? AND status = 'ready' AND id != ?",
         )
         .bind(parent_id)
-        .bind(&node.name)
+        .bind(&current.name)
         .bind(node_id)
         .fetch_optional(&mut *tx)
         .await?;
         // 上传期间可能新建或改名出同名目录；只能覆盖文件，否则会级联删掉整棵子树。
         if old.is_some_and(|(_, _, is_dir)| is_dir) {
             return Err(AppError::IsDirectory);
+        }
+        if old.is_some() && session.as_ref().is_some_and(|session| !session.overwrite) {
+            return Err(AppError::Conflict(
+                "上传期间出现同名文件，本会话禁止覆盖".into(),
+            ));
         }
 
         let mut candidates: Vec<StoredMessage> = Vec::new();
@@ -182,6 +255,12 @@ impl Db {
             .bind(node_id)
             .fetch_one(&mut *tx)
             .await?;
+        if let Some(session) = session {
+            let node_json = serde_json::to_string(&ready).map_err(anyhow::Error::from)?;
+            sqlx::query("INSERT INTO upload_receipts(id,status,display_path,expected_size,sha256,node_json,created_at,expires_at) VALUES(?,'completed',?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING")
+                .bind(&session.id).bind(&session.display_path).bind(session.expected_size).bind(&session.sha256).bind(node_json).bind(now_ts()).bind(now_ts()+7*86400)
+                .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok((ready, freed))
     }
@@ -202,6 +281,26 @@ impl Db {
         enqueue_delete: bool,
     ) -> AppResult<Vec<StoredMessage>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let node: Option<(String,)> = sqlx::query_as("SELECT status FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if node
+            .as_ref()
+            .is_none_or(|n| enqueue_delete && n.0 != "uploading")
+        {
+            return Ok(Vec::new());
+        }
+        let session: Option<UploadSession> =
+            sqlx::query_as("SELECT * FROM upload_sessions WHERE node_id = ?")
+                .bind(node_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(session) = session {
+            sqlx::query("INSERT INTO upload_receipts(id,status,display_path,expected_size,sha256,created_at,expires_at) VALUES(?,'cancelled',?,?,?,?,?) ON CONFLICT(id) DO NOTHING")
+                .bind(&session.id).bind(&session.display_path).bind(session.expected_size).bind(&session.sha256).bind(now_ts()).bind(now_ts()+7*86400)
+                .execute(&mut *tx).await?;
+        }
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT storage_target_id, tg_message_id FROM chunks
              WHERE node_id = ? AND storage_target_id IS NOT NULL",
