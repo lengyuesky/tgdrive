@@ -339,7 +339,7 @@ pub enum UploadPartClaim {
 }
 
 /// URL 安全随机 token
-fn random_token(len: usize) -> String {
+pub(crate) fn random_token(len: usize) -> String {
     use rand::RngExt as _;
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
@@ -357,9 +357,11 @@ pub fn now_ts() -> i64 {
 
 #[derive(Clone)]
 pub struct Db {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
     /// 已安装应用记录的进程内缓存；`apps` 表的每条写入路径都会使其失效（见 apps/db.rs）。
     apps_cache: std::sync::Arc<apps::AppCache>,
+    /// 固定影视服务的可撤销状态，与所有数据库克隆共享。
+    pub(crate) fntv: std::sync::Arc<crate::apps::fntv::Service>,
     /// 应用封面缓存库（主库旁的独立文件，见 apps/covers_db.rs）。
     covers: SqlitePool,
     /// 恢复安全模式/维护状态，随所有 Db 克隆共享；后台入口必须检查。
@@ -440,6 +442,7 @@ impl Db {
         Ok(Db {
             pool,
             apps_cache: Default::default(),
+            fntv: Default::default(),
             covers,
             background_blocked: Default::default(),
         })
@@ -451,6 +454,9 @@ impl Db {
     }
 
     pub fn set_background_blocked(&self, blocked: bool) {
+        if blocked {
+            self.fntv.invalidate();
+        }
         self.background_blocked
             .store(blocked, std::sync::atomic::Ordering::Release);
     }

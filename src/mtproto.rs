@@ -12,7 +12,7 @@ use crate::config::{
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::proxy::{DcTunnel, ProxyClient, ProxyConfig};
-use crate::telegram::ByteReader;
+use crate::telegram::{ByteReader, ReadBudget};
 use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -200,6 +200,33 @@ impl MtprotoClient {
         offset: u64,
         length: u64,
     ) -> AppResult<Option<ByteReader>> {
+        self.open_stream_policy(file_id, message_id, size, offset, length, None)
+            .await
+    }
+
+    pub(crate) async fn open_probe_stream(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        size: u64,
+        offset: u64,
+        length: u64,
+        budget: Arc<ReadBudget>,
+    ) -> AppResult<Option<ByteReader>> {
+        self.open_stream_policy(file_id, message_id, size, offset, length, Some(budget))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_stream_policy(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        size: u64,
+        offset: u64,
+        length: u64,
+        budget: Option<Arc<ReadBudget>>,
+    ) -> AppResult<Option<ByteReader>> {
         if offset > size {
             return Err(AppError::Telegram(format!(
                 "分块偏移 {offset} 超过分块大小 {size}"
@@ -215,12 +242,12 @@ impl MtprotoClient {
         let state = self.state().await?;
         let location = Arc::new(location);
         let storage_target_id = self.storage_target_id;
-        let concurrency = self.config.download_concurrency();
-        let reader = open_parallel_stream(
+        let reader = open_parallel_stream_policy(
             offset.saturating_add(length).min(size),
             offset,
-            concurrency,
+            self.config.download_concurrency(),
             self.request_slots.clone(),
+            budget,
             move |part_offset| {
                 let state = state.clone();
                 let location = location.clone();
@@ -256,11 +283,27 @@ impl MtprotoClient {
 
 /// 按需填充固定大小的请求窗口，乱序完成的数据仍按文件偏移输出。
 /// 没有独立预取任务：暂停读取不再补充请求，丢弃 reader 同时丢弃全部待取分段。
+#[cfg(test)]
 async fn open_parallel_stream<F, Fut>(
     end: u64,
     offset: u64,
     concurrency: usize,
     request_slots: Arc<Semaphore>,
+    fetch: F,
+) -> AppResult<ByteReader>
+where
+    F: Fn(u64) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = AppResult<Vec<u8>>> + Send + 'static,
+{
+    open_parallel_stream_policy(end, offset, concurrency, request_slots, None, fetch).await
+}
+
+async fn open_parallel_stream_policy<F, Fut>(
+    end: u64,
+    offset: u64,
+    concurrency: usize,
+    request_slots: Arc<Semaphore>,
+    budget: Option<Arc<ReadBudget>>,
     fetch: F,
 ) -> AppResult<ByteReader>
 where
@@ -277,16 +320,22 @@ where
     let first_part = offset / part_size;
     let part_count = end.div_ceil(part_size);
     let fetch = Arc::new(fetch);
+    // 探测不并行预取；每次实际分段请求先预留全部对齐字节。
+    let concurrency = if budget.is_some() { 1 } else { concurrency };
     let mut parts = stream::iter(first_part..part_count)
         .map(move |index| {
             let fetch = fetch.clone();
             let request_slots = request_slots.clone();
+            let budget = budget.clone();
             async move {
                 let _permit = request_slots.acquire_owned().await.map_err(|_| {
                     AppError::Telegram("下载并发控制已关闭".into())
                 })?;
                 let part_offset = index * part_size;
                 let expected = (end - part_offset).min(part_size) as usize;
+                if let Some(budget) = budget {
+                    budget.reserve(part_size)?;
+                }
                 let bytes = fetch(part_offset).await?;
                 if bytes.len() < expected {
                     return Err(AppError::Io(std::io::Error::new(
@@ -688,6 +737,83 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn strict_probe_charges_alignment_and_rejects_before_fetch() {
+        let part_size = REQUEST_SIZE as u64;
+        for (offset, length, allowance, expected_calls, expected_bytes) in [
+            (8193, 1, part_size - 1, 0, 0),
+            (8193, 1, part_size, 1, 1),
+            (part_size - 1, 2, part_size, 1, 1),
+            (part_size - 1, 2, part_size * 2, 2, 2),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let budget = Arc::new(ReadBudget::new(allowance));
+            let reader = open_parallel_stream_policy(
+                offset + length,
+                offset,
+                8,
+                Arc::new(Semaphore::new(8)),
+                Some(budget.clone()),
+                {
+                    let calls = calls.clone();
+                    move |part_offset| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Ok((0..REQUEST_SIZE as usize)
+                                .map(|i| ((part_offset + i as u64) % 251) as u8)
+                                .collect())
+                        }
+                    }
+                },
+            )
+            .await;
+            if allowance < part_size {
+                assert!(reader.is_err());
+            } else {
+                // 即使宿主设置八并发，探测开流也只请求首个分段。
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let mut actual = Vec::new();
+                let result = reader.unwrap().read_to_end(&mut actual).await;
+                assert_eq!(result.is_ok(), expected_bytes == length as usize);
+                assert_eq!(actual.len(), expected_bytes);
+                assert_eq!(
+                    actual,
+                    (offset..offset + expected_bytes as u64)
+                        .map(|i| (i % 251) as u8)
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(budget.used(), expected_calls as u64 * part_size);
+        }
+
+        // 不同 HTTP Range 共用同一探测预算，预算拒绝不能触发下载闭包。
+        let budget = Arc::new(ReadBudget::new(part_size));
+        let first = open_parallel_stream_policy(
+            1,
+            0,
+            8,
+            Arc::new(Semaphore::new(8)),
+            Some(budget.clone()),
+            |_| async { Ok(vec![9; REQUEST_SIZE as usize]) },
+        )
+        .await
+        .unwrap();
+        drop(first);
+        let result = open_parallel_stream_policy(
+            part_size + 1,
+            part_size,
+            8,
+            Arc::new(Semaphore::new(8)),
+            Some(budget.clone()),
+            |_| async { panic!("预算已耗尽时不能发出分段请求") },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(budget.used(), part_size);
     }
 
     #[tokio::test]

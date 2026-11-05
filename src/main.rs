@@ -280,7 +280,8 @@ async fn serve() -> anyhow::Result<()> {
             axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .with_state(state.clone())
-        .nest("/api", api::router(state.clone()));
+        .nest("/api", api::router(state.clone()))
+        .merge(apps::fntv::router(state.clone()));
 
     // 前端静态文件(SPA fallback 到 index.html);候选目录都不存在则只提供 API
     let static_dir = crate::config::static_dir()

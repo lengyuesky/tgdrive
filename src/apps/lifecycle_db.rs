@@ -17,6 +17,9 @@ impl Db {
         let result = sqlx::query("UPDATE apps SET scope_mode = ?, scope_paths = ?, updated_at = ? WHERE id = ? AND revision = ?")
             .bind(mode).bind(paths).bind(now_ts()).bind(id).bind(revision).execute(&self.pool).await?;
         self.apps_cache.invalidate(id);
+        if id == "fntv" && result.rows_affected() == 1 {
+            self.fntv.invalidate();
+        }
         if result.rows_affected() != 1 {
             return Err(AppError::AppChanged);
         }
@@ -159,6 +162,9 @@ impl Db {
             .await?;
         tx.commit().await?;
         self.apps_cache.invalidate(id);
+        if id == "fntv" {
+            self.fntv.invalidate();
+        }
         Ok(())
     }
 }

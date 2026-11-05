@@ -3,6 +3,7 @@
 pub mod catalog;
 mod covers;
 mod files;
+pub(crate) mod fntv;
 mod integration;
 mod package;
 mod range_cache;
@@ -33,7 +34,7 @@ use tokio::sync::Mutex;
 static INSTALL_LOCK: Mutex<()> = Mutex::const_new(());
 static CACHE_LOCK: Mutex<()> = Mutex::const_new(());
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct InstalledApp {
     pub manifest: Manifest,
     pub digest: String,

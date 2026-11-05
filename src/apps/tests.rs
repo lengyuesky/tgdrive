@@ -20,6 +20,10 @@ use zip::write::SimpleFileOptions;
 mod catalog_api;
 #[path = "covers_tests.rs"]
 mod cover_cache;
+#[path = "fntv_native_fixture.rs"]
+mod fntv_native;
+#[path = "fntv_tests.rs"]
+mod fntv_tests;
 #[path = "integration_tests.rs"]
 mod integration_tests;
 #[path = "media_tests.rs"]
@@ -42,6 +46,7 @@ struct MemoryMedia {
     files: StdMutex<HashMap<String, Vec<u8>>>,
     ranges: StdMutex<Vec<(u64, u64)>>,
     slow: AtomicBool,
+    rate: AtomicUsize,
     active: Arc<AtomicUsize>,
     bytes_sent: Arc<AtomicUsize>,
 }
@@ -59,7 +64,8 @@ impl Drop for ActiveRead {
 
 impl MemoryMedia {
     fn reader(&self, data: Vec<u8>) -> ByteReader {
-        if !self.slow.load(Ordering::SeqCst) {
+        let rate = self.rate.load(Ordering::SeqCst);
+        if !self.slow.load(Ordering::SeqCst) && rate == 0 {
             return Box::pin(Cursor::new(data));
         }
         self.active.fetch_add(1, Ordering::SeqCst);
@@ -67,17 +73,24 @@ impl MemoryMedia {
             active: self.active.clone(),
             bytes_sent: self.bytes_sent.clone(),
         };
-        let stream =
-            futures_util::stream::unfold((data, 0, guard), |(data, offset, guard)| async move {
+        let stream = futures_util::stream::unfold(
+            (data, 0, guard),
+            move |(data, offset, guard)| async move {
                 if offset == data.len() {
                     return None;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let end = (offset + 1024).min(data.len());
+                let end = (offset + if rate > 0 { 64 * 1024 } else { 1024 }).min(data.len());
+                let delay = if rate > 0 {
+                    ((end - offset) * 1000).div_ceil(rate) as u64
+                } else {
+                    50
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 let bytes = bytes::Bytes::copy_from_slice(&data[offset..end]);
                 guard.bytes_sent.fetch_add(bytes.len(), Ordering::SeqCst);
                 Some((Ok::<_, std::io::Error>(bytes), (data, end, guard)))
-            });
+            },
+        );
         Box::pin(tokio_util::io::StreamReader::new(Box::pin(stream)))
     }
 }
@@ -122,6 +135,22 @@ impl TgApi for MemoryMedia {
         let files = self.files.lock().unwrap();
         let file = files.get(file_id).ok_or(AppError::NotFound)?;
         Ok(self.reader(file[offset as usize..(offset + length) as usize].to_vec()))
+    }
+
+    async fn open_chunk_strict_range(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        size: u64,
+        offset: u64,
+        length: u64,
+        budget: Option<Arc<crate::telegram::ReadBudget>>,
+    ) -> AppResult<ByteReader> {
+        if let Some(budget) = budget {
+            budget.reserve(length)?;
+        }
+        self.open_chunk_range(file_id, message_id, size, offset, length)
+            .await
     }
 }
 
@@ -196,6 +225,7 @@ async fn state_at(path: &std::path::Path, media: Arc<MemoryMedia>) -> AppState {
 fn router(state: &AppState) -> Router {
     Router::new()
         .nest("/api", crate::api::router(state.clone()))
+        .merge(crate::apps::fntv::router(state.clone()))
         .layer(middleware::from_fn_with_state(
             false,
             crate::security::response_headers,

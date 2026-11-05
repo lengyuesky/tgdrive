@@ -103,6 +103,7 @@ export const permissionLabels: Record<string, string> = {
   'files.read': '搜索文件与读取文件信息',
   'media.read': '读取文件内容（播放、缩略图和下载）',
   'favorites.write': '添加或取消收藏',
+  'fntv.service': '向飞牛影视客户端提供已授权媒体库，管理独立账号和服务启停',
 }
 
 export const APPS_CHANGED = 'tgdrive-apps-changed'

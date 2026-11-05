@@ -5,7 +5,7 @@
 
 use crate::db::Chunk;
 use crate::error::AppResult;
-use crate::telegram::{ByteReader, TgRegistry};
+use crate::telegram::{ByteReader, ReadBudget, TgRegistry};
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use std::io;
@@ -41,6 +41,8 @@ pub struct ChunkedReader {
     read_end: u64,
     pos: u64,
     state: State,
+    probe_budget: Option<Arc<ReadBudget>>,
+    strict_ranges: bool,
 }
 
 impl ChunkedReader {
@@ -64,6 +66,8 @@ impl ChunkedReader {
             read_end: off,
             pos: start_pos.min(off),
             state: State::Idle,
+            probe_budget: None,
+            strict_ranges: false,
         }
     }
 
@@ -74,6 +78,19 @@ impl ChunkedReader {
     /// 将本次读取限制到指定长度，并把 Range 终点传递给底层预取器。
     pub fn with_read_limit(mut self, length: u64) -> Self {
         self.read_end = self.pos.saturating_add(length).min(self.total);
+        self.state = State::Idle;
+        self
+    }
+
+    /// 探测仅使用后端明确实现的严格读取入口，不允许普通下载回退。
+    pub(crate) fn with_probe_budget(mut self, budget: Arc<ReadBudget>) -> Self {
+        self.probe_budget = Some(budget);
+        self.strict_ranges = true;
+        self.state = State::Idle;
+        self
+    }
+    pub(crate) fn with_strict_ranges(mut self) -> Self {
+        self.strict_ranges = true;
         self.state = State::Idle;
         self
     }
@@ -105,16 +122,35 @@ impl AsyncRead for ChunkedReader {
                     let message_id = chunk.message_id;
                     let chunk_size = chunk.size;
                     let target_id = chunk.storage_target_id;
+                    let probe_budget = self.probe_budget.clone();
+                    let strict = self.strict_ranges;
                     let fut = async move {
                         let target_id = target_id.ok_or_else(|| {
                             crate::error::AppError::BadRequest(
                                 "历史分块尚未关联存储目标，请先恢复原 Telegram 配置".into(),
                             )
                         })?;
-                        tg.binding(target_id)?
-                            .api
-                            .open_chunk_range(&fid, message_id, chunk_size, in_off, remain)
-                            .await
+                        let binding = tg.binding(target_id)?;
+                        if let Some(budget) = probe_budget {
+                            binding
+                                .api
+                                .open_chunk_probe_range(
+                                    &fid, message_id, chunk_size, in_off, remain, budget,
+                                )
+                                .await
+                        } else if strict {
+                            binding
+                                .api
+                                .open_chunk_strict_range(
+                                    &fid, message_id, chunk_size, in_off, remain, None,
+                                )
+                                .await
+                        } else {
+                            binding
+                                .api
+                                .open_chunk_range(&fid, message_id, chunk_size, in_off, remain)
+                                .await
+                        }
                     }
                     .boxed();
                     self.state = State::Opening { fut, remain };

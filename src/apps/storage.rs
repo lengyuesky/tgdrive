@@ -47,6 +47,12 @@ pub(super) async fn invoke(
     params: Value,
 ) -> AppResult<Value> {
     let db = &state.vfs.db;
+    // 配置、密码校验值和索引只经专用能力访问，不向页面暴露原始存储。
+    if app.manifest.id == "fntv" {
+        return Err(AppError::Forbidden(
+            "影视服务数据请通过专用管理能力访问".into(),
+        ));
+    }
     match method {
         "storage.get" => {
             let key: Key = parse(params)?;

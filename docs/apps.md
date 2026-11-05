@@ -138,6 +138,7 @@ node package.mjs /绝对路径/我的应用/dist /绝对路径/输出目录
 | `files.read` | 搜索、列目录、读取名称、路径、大小、节点 ID 和内容版本等元数据 |
 | `media.read` | 读取单个文件内容，用于播放、缩略图和下载 |
 | `favorites.write` | 添加或取消收藏 |
+| `fntv.service` | 提供已授权媒体库的独立影视服务；仅固定 `fntv`、API v2、宿主 0.3.5 起，另需 `files.read` 与 `media.read` |
 
 自身设置、应用私有数据、包内资源读取、目录选择窗口和应用导航无需额外权限。阅读馆只申请
 `files.read`、`media.read`，书签不是网盘收藏，不需要 `favorites.write`。目录选择由宿主界面交互完成，应用仅获得用户
@@ -302,6 +303,9 @@ controller.abort()
 每应用最多 10000 条、合计 8 MiB，单条 JSON 最多 32 KiB；设置偏好、进度和每个书签应分开存储。
 `revision` 为不透明随机标识，`updated_at` 为服务端 Unix 秒时间戳。
 
+固定 `fntv` 服务的内部配置、凭据校验及业务记录由宿主管理，普通 `storage.*` 请求会被拒绝。
+其管理页使用下文的 `Drive.fntv`，客户端业务状态通过受鉴权的影视协议读写；其他页面应用继续使用本节接口。
+
 ```js
 const key = 'progress:123'
 const previous = await drive.storage.get(key)
@@ -402,7 +406,28 @@ PDF 使用实际页和适宽缩放，放大后的平移不触发翻页；普通�
 安全区统一由宿主处理，iframe 内不重复加设备边距；主站固定启用 `viewport-fit=cover`，退出沉浸恢复进入前配置而不是删除该设置。
 普通同 ID 更新不清理现有设置或阅读记录；阅读馆替换旧应用须另外明确确认。主站体验和验证见 [移动端体验说明](mobile-experience.md)。
 
-## 影视应用
+## 飞牛影视服务（本地候选）
+
+`fntv 0.1.0` 使用宿主 0.3.5 起的固定 `fntv.service` 能力。管理页从应用中心安装、授权目录，
+配置独立影视账号与命名电影／电视剧库，再主动启动。客户端连接宿主服务根地址，后台协议由受限 Rust 能力处理。
+管理页关闭后服务持续运行，停用、撤权、换密码、成功更新和卸载会废止旧影视登录并中断相关传输。
+
+等待 `drive.ready` 并确认 `drive.can('fntv.service')` 后调用：
+
+| SDK | 对应 RPC 与行为 |
+| --- | --- |
+| `drive.fntv.config()` | `fntv.config.get`，返回账号名称、配置状态、媒体库及当前授权，不返回凭据 |
+| `drive.fntv.account(username, password)` | `fntv.account.set`，保存独立账号并撤销旧影视连接 |
+| `drive.fntv.libraries(libraries)` | `fntv.libraries.set`，保存 `{ id, name, kind, root_id }`，每库有独立名称与授权目录身份 |
+| `drive.fntv.status()` | `fntv.service.status`，只读查询服务、索引及探测可用性 |
+| `drive.fntv.start()` / `stop()` | `fntv.service.start` / `stop`，主动启动或撤销服务 |
+| `drive.fntv.refresh()` | `fntv.index.refresh`，刷新当前媒体库元数据 |
+
+观看记录按文件身份及内容版本保存，和 `cinema` 数据独立。实际视频信息来自有界 FFprobe，原文件与探测均使用
+严格后端分段入口。配置、读取预算、生命周期和本轮仍待完成的官方客户端复验见 [工程设计](fntv-service-engineering.md)
+及 [2026-11-05 验收记录](fntv-host-verification-20261105.md)。当前包尚未加入公开目录。
+
+## 影视页面应用（cinema）
 
 影视提供命名媒体库、库内大封面、详情选集、收藏、历史、续播、字幕和移动沉浸。用户在插件内创建媒体库并绑定一个文件夹（包含子文件夹），进入该库后才加载视频；首页不扫描整个网盘。旧 `source_dir` 不再自动启用，升级后需手动建库。只读取网盘文件与本地海报，不接外部影视源或自动刮削。
 

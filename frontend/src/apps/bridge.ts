@@ -6,6 +6,8 @@ const METHODS = new Set([
   'library.page', 'files.list', 'files.searchPage', 'files.stat', 'files.readRange', 'files.readRanges', 'assets.read',
   'storage.get', 'storage.set', 'storage.list', 'storage.delete', 'rpc.batch',
   'covers.get', 'covers.put', 'covers.delete', 'covers.stats',
+  'fntv.config.get', 'fntv.account.set', 'fntv.libraries.set',
+  'fntv.service.status', 'fntv.service.start', 'fntv.service.stop', 'fntv.index.refresh',
 ])
 /** 普通能力参数最多 64 KiB；封面写入携带 base64 小图（宿主上限 256 KiB 原图），单独放宽。 */
 const PARAM_LIMIT = 64 * 1024

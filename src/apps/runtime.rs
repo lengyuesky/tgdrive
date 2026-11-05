@@ -396,6 +396,16 @@ async fn dispatch(
         return Err(AppError::BadRequest("此能力需要应用 API v2".into()));
     }
     let result = match method {
+        "fntv.config.get"
+        | "fntv.account.set"
+        | "fntv.libraries.set"
+        | "fntv.service.status"
+        | "fntv.service.start"
+        | "fntv.service.stop"
+        | "fntv.index.refresh" => {
+            app.manifest.require("fntv.service")?;
+            super::fntv::invoke(state, app, method, params).await?
+        }
         "files.list" | "files.stat" | "files.searchPage" | "library.page" => {
             app.manifest.require("files.read")?;
             files::invoke(state, app, method, params).await?

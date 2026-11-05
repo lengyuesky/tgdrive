@@ -13,7 +13,12 @@ const MAX_EXPANDED_SIZE: usize = 32 * 1024 * 1024;
 const MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
 const MAX_ICON_SIZE: usize = 256 * 1024;
 pub const API_VERSION: u32 = 2;
-pub const PERMISSIONS: &[&str] = &["files.read", "media.read", "favorites.write"];
+pub const PERMISSIONS: &[&str] = &[
+    "files.read",
+    "media.read",
+    "favorites.write",
+    "fntv.service",
+];
 
 /// 物化完成标记：摘要目录与预压缩目录各有一份，两者齐全才算可用。
 pub const COMPLETE_MARK: &str = ".complete";
@@ -250,6 +255,17 @@ impl Manifest {
                 .any(|value| !PERMISSIONS.contains(&value.as_str()) || !permissions.insert(value))
         {
             return Err(invalid("应用声明了重复或不受支持的权限"));
+        }
+        if self.permissions.iter().any(|p| p == "fntv.service")
+            && (self.id != "fntv"
+                || self.api_version < 2
+                || minimum < semver::Version::new(0, 3, 5)
+                || !self.permissions.iter().any(|p| p == "files.read")
+                || !self.permissions.iter().any(|p| p == "media.read"))
+        {
+            return Err(invalid(
+                "飞牛服务能力仅供 fntv 应用使用，需要 API v2、主程序 0.3.5 以及文件和媒体读取权限",
+            ));
         }
         if self.settings.len() > 24 {
             return Err(invalid("每个应用最多声明 24 项设置"));

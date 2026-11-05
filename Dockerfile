@@ -35,7 +35,31 @@ RUN apk add --no-cache curl unzip \
     && unzip /tmp/usque.zip -d /opt/usque \
     && chmod 755 /opt/usque/usque
 
-# ---------- 阶段 4:运行时 ----------
+# ---------- 阶段 4:受限媒体探测组件 ----------
+FROM debian:bookworm-slim AS media-probe
+ARG TARGETARCH
+# 依赖按 SONAME 平铺到标准库目录，不依赖构建层的 alternatives 和 ld.so.cache。
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && mkdir -p /probe-root/usr/local/bin /probe-root/usr/share/licenses/fntv-media-probe \
+    && cp /usr/bin/ffprobe /probe-root/usr/local/bin/ffprobe \
+    && case "$TARGETARCH" in \
+         amd64) library_dir=/usr/lib/x86_64-linux-gnu ;; \
+         arm64) library_dir=/usr/lib/aarch64-linux-gnu ;; \
+         *) echo "不支持的媒体探测架构：$TARGETARCH" >&2; exit 1 ;; \
+       esac \
+    && mkdir -p "/probe-root$library_dir" \
+    && ldd /usr/bin/ffprobe | awk '/=> \// { print $3 }' | while read -r library; do \
+         case "$(basename "$library")" in \
+           libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgcc_s.so.1|libstdc++.so.6) continue ;; \
+         esac; \
+         cp -L "$library" "/probe-root$library_dir/$(basename "$library")"; \
+       done \
+    && dpkg-query -W > /probe-root/usr/share/licenses/fntv-media-probe/packages.txt \
+    && cp -a /usr/share/doc /probe-root/usr/share/licenses/fntv-media-probe/debian-doc \
+    && cp -a /usr/share/common-licenses /probe-root/usr/share/common-licenses \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- 阶段 5:运行时 ----------
 # distroless:无 shell 与包管理器,自带 glibc 与 CA 证书(与构建阶段同为 bookworm)。
 # 镜像内无法 mkdir/chown,/data 由构建阶段建好后以 1000:1000 复制进来,
 # 这样新建的命名卷也继承正确属主。
@@ -45,6 +69,7 @@ WORKDIR /app
 COPY --from=backend /app/target/release/tgdrive /usr/local/bin/tgdrive
 COPY --from=usque /opt/usque/usque /usr/local/bin/usque
 COPY --from=usque /opt/usque/LICENSE.md /usr/share/licenses/usque/LICENSE.md
+COPY --from=media-probe /probe-root/ /
 COPY --from=frontend /frontend/dist /app/static
 ENV TGDRIVE_STATIC_DIR=/app/static \
     TGDRIVE_DB_PATH=/data/tgdrive.db \

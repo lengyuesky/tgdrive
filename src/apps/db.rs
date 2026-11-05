@@ -134,6 +134,9 @@ impl Db {
             .execute(&self.pool)
             .await?;
         self.apps_cache.invalidate(id);
+        if id == "fntv" && changed.rows_affected() != 0 {
+            self.fntv.invalidate();
+        }
         if changed.rows_affected() == 0 {
             return Err(AppError::NotFound);
         }
@@ -264,8 +267,14 @@ impl Db {
                     .bind(id).bind(random_token(32)).bind(now).execute(&mut *tx).await?;
             }
         }
+        if input.id == "fntv" && input.expected_revision.is_none() {
+            crate::apps::fntv::data::stop_in_transaction(&mut tx).await?;
+        }
         tx.commit().await?;
         self.apps_cache.invalidate(input.id);
+        if input.id == "fntv" {
+            self.fntv.invalidate();
+        }
         if input.id == "reader" {
             self.apps_cache.invalidate("books");
             self.apps_cache.invalidate("comics");
@@ -280,6 +289,7 @@ impl Db {
         pinned: Option<bool>,
     ) -> AppResult<()> {
         // 任何启停操作都轮换运行凭据，旧页面不能在重新启用后恢复访问。
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
             "UPDATE apps SET enabled = COALESCE(?, enabled), pinned = COALESCE(?, pinned),
              revision = CASE WHEN ? IS NULL THEN revision ELSE ? END, updated_at = ? WHERE id = ?",
@@ -290,9 +300,16 @@ impl Db {
         .bind(random_token(32))
         .bind(now_ts())
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if id == "fntv" && enabled.is_some() {
+            crate::apps::fntv::data::stop_in_transaction(&mut tx).await?;
+        }
+        tx.commit().await?;
         self.apps_cache.invalidate(id);
+        if id == "fntv" && enabled.is_some() {
+            self.fntv.invalidate();
+        }
         if changed.rows_affected() == 0 {
             return Err(AppError::NotFound);
         }
@@ -307,6 +324,9 @@ impl Db {
             .await?;
         if deleted.rows_affected() == 0 {
             return Err(AppError::NotFound);
+        }
+        if id == "fntv" {
+            crate::apps::fntv::data::stop_in_transaction(&mut tx).await?;
         }
         if purge_data {
             sqlx::query("DELETE FROM app_lifecycle WHERE app_id = ?")
@@ -327,6 +347,9 @@ impl Db {
         }
         tx.commit().await?;
         self.apps_cache.invalidate(id);
+        if id == "fntv" {
+            self.fntv.invalidate();
+        }
         Ok(())
     }
 
