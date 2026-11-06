@@ -17,6 +17,8 @@
 
 每个窗口的 `runtime-provenance.json` 记录基线、未提交修复状态与文件摘要。根目录早期的 `provenance.json`、`fixture-diagnostics.json` 描述首次标签验收准备，不能替代后续窗口的源码记录。
 
+最终协议与回归随后提交为 [cea8a848ade2c2bf0c15d30bb9b26b83ffe5972f](https://github.com/lengyuesky/tgdrive/commit/cea8a848ade2c2bf0c15d30bb9b26b83ffe5972f)。已逐文件核对暂存内容和该提交中的协议、回归源码 SHA256，与最终原生窗口完全一致；诊断夹具与原始证据仍只保留在本地。
+
 使用的安装包为此前生成且未改动的 `fntv-0.1.0.tgapp`，11833 字节，最低宿主字段 `0.3.5`：
 
 ```text
@@ -106,7 +108,9 @@ Node 脚本负责安装配置和只读观察。实际登录、索引、元数据
 
 已重新读取 [v0.3.5 重建运行](https://github.com/lengyuesky/tgdrive/actions/runs/42156246379)：TGDrive 与 Telegram Bot API 的 AMD64、ARM64 原生构建、镜像运行检查和多架构清单均成功。TGDrive 两种架构都实际通过 FFprobe 与服务健康检查，解决了 2026-11-05 完整镜像验收的旧阻碍。
 
-该运行使用原 `v0.3.5` 源码。本轮协议修复没有移动既有 Git 标签，也没有替换正式 `0.3.5` 镜像。公开插件目录仍只有原三款应用；让 fntv 在应用中心直接显示，需要在包含这些修复的宿主发布之后，同步发布候选包、`catalog.json` 与 `SHA256SUMS`。
+修复提交 `cea8a848ade2c2bf0c15d30bb9b26b83ffe5972f` 随后触发的 [主分支镜像验证](https://github.com/lengyuesky/tgdrive/actions/runs/42195793002) 也已完成：四个原生构建任务均成功，TGDrive 的 AMD64、ARM64 最终镜像均通过服务健康及 FFprobe 检查。本次为主分支验证，正式发布步骤按工作流跳过，未修改正式镜像标签。结果保留在本地 `tmp/fntv-native-acceptance-20261106/source-commit-ci.json`。
+
+本轮协议修复没有移动既有 Git 标签，也没有替换正式 `0.3.5` 镜像。公开插件目录仍只有原三款应用；让 fntv 在应用中心直接显示，需要在包含这些修复的宿主发布之后，同步发布候选包、`catalog.json` 与 `SHA256SUMS`。
 
 ## 收尾与范围
 
