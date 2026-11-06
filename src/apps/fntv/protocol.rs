@@ -138,11 +138,13 @@ async fn handle_inner(state: &AppState, request: Request) -> AppResult<Response>
     context.lease = state.vfs.db.fntv.authenticate(&token, &context.lease)?;
     let all = index::entries(state).await?;
     let mut entries = Vec::new();
-    let direct_reference = path
-        .strip_prefix("/v/api/v1/media/range/")
-        .or_else(|| path.strip_prefix("/v/api/v1/stream/list/"));
+    let direct_reference = path.strip_prefix("/v/api/v1/media/range/");
+    let playback_reference = path.strip_prefix("/v/api/v1/stream/list/");
     for entry in all {
         if direct_reference.is_some_and(|id| entry.guid != id && entry.media_guid != id) {
+            continue;
+        }
+        if playback_reference.is_some_and(|id| !matches_playback_reference(&entry, id)) {
             continue;
         }
         if authorized(state, &context, entry.node_id, &entry.version)
@@ -219,6 +221,17 @@ fn poster(entry: &Entry) -> String {
         .map(|s| format!("/tgdrive-poster/{}", s.guid("poster")))
         .unwrap_or_default()
 }
+fn library_info(library: &super::Library, entries: &[Entry]) -> Value {
+    let posters = entries
+        .iter()
+        .filter(|entry| entry.libraries.contains(&library.id))
+        .filter_map(|entry| entry.poster.as_ref().map(|_| poster(entry)))
+        .take(4)
+        .collect::<Vec<_>>();
+    json!({"guid":library.id,"title":library.name,
+        "category":if library.kind=="movie" {"Movie"} else {"TV"},
+        "view_type":0,"posters":posters})
+}
 fn season_guid(entry: &Entry) -> String {
     guid(&["season", &entry.show_guid, &entry.season.to_string()])
 }
@@ -226,6 +239,27 @@ fn entry_for<'a>(entries: &'a [Entry], reference: &str) -> Option<&'a Entry> {
     entries
         .iter()
         .find(|e| e.guid == reference || e.media_guid == reference)
+}
+fn matches_playback_reference(entry: &Entry, reference: &str) -> bool {
+    entry.guid == reference
+        || entry.media_guid == reference
+        || !reference.is_empty()
+            && entry.kind == "Episode"
+            && (entry.show_guid == reference || season_guid(entry) == reference)
+}
+fn playback_entry<'a>(entries: &'a [Entry], reference: &str) -> Option<&'a Entry> {
+    entry_for(entries, reference).or_else(|| {
+        // 季、剧的播放入口使用分组身份，实际播放仍定位到当前授权的剧集文件。
+        entries
+            .iter()
+            .filter(|entry| matches_playback_reference(entry, reference))
+            .min_by(|a, b| {
+                a.season
+                    .cmp(&b.season)
+                    .then_with(|| a.episode.cmp(&b.episode))
+                    .then_with(|| a.guid.cmp(&b.guid))
+            })
+    })
 }
 
 async fn item(
@@ -271,7 +305,7 @@ async fn item(
     let poster = poster(entry);
     let mut value = json!({"guid":entry.guid,"title":entry.title,"type":entry.kind,"lan":"zh-CN","tv_title":entry.show_title,"parent_title":"",
         "original_title":"","imdb_id":"","trim_id":"","poster":poster,"posters":poster,"backdrops":"","vote_average":"0","genres":[],
-        "release_date":entry.year,"overview":entry.overview,"is_favorite":u8::from(favorite),"is_watched":u8::from(watched),"watched":u8::from(watched),"watched_ts":progress.ts,
+        "release_date":entry.year,"overview":entry.overview,"is_favorite":u8::from(favorite),"is_watched":u8::from(watched),"watched":u8::from(watched),"watched_ts":progress.ts as u64,
         "season_number":entry.season,"episode_number":entry.episode,"number_of_seasons":0,"number_of_episodes":0,"local_number_of_episodes":0,"local_number_of_seasons":0});
     value.as_object_mut().unwrap().extend(json!({
         "can_play":1,"play_error":"","parent_guid":parent,"grand_guid":entry.show_guid,"ancestor_guid":library_id,
@@ -423,10 +457,12 @@ async fn read_request(
         }
         "/v/api/v1/mediadb/list" => {
             let libraries = super::roots(state, context).await?;
-            return Ok(envelope(json!(libraries.into_iter().map(|(l,_)| {
-                let posters:Vec<_>=entries.iter().filter(|e|e.libraries.contains(&l.id)).filter_map(|e|e.poster.as_ref().map(|_|poster(e))).take(4).collect();
-                json!({"guid":l.id,"title":l.name,"category":if l.kind=="movie"{"Movie"}else{"TV"},"view_type":0,"posters":posters})
-            }).collect::<Vec<_>>())));
+            return Ok(envelope(json!(
+                libraries
+                    .into_iter()
+                    .map(|(library, _)| library_info(&library, entries))
+                    .collect::<Vec<_>>()
+            )));
         }
         "/v/api/v1/mediadb/sum" => {
             let movies = entries.iter().filter(|e| e.kind == "Movie").count();
@@ -455,7 +491,7 @@ async fn read_request(
                 if p.updated_at > 0 {
                     let info = probe::cached(state, e).await?;
                     let mut row = item(state, context, e, info.as_ref()).await?;
-                    row["ts"] = json!(p.ts);
+                    row["ts"] = json!(p.ts as u64);
                     list.push((p.updated_at, row));
                 }
             }
@@ -478,7 +514,31 @@ async fn read_request(
         }
         _ => {}
     }
+    if let Some(reference) = path.strip_prefix("/v/api/v1/mdb/") {
+        let library = super::roots(state, context)
+            .await?
+            .into_iter()
+            .find(|(library, _)| library.id == reference)
+            .ok_or(AppError::NotFound)?;
+        return Ok(envelope(library_info(&library.0, entries)));
+    }
     if let Some(reference) = path.strip_prefix("/v/api/v1/item/") {
+        if let Some((library, _)) = super::roots(state, context)
+            .await?
+            .into_iter()
+            .find(|(library, _)| library.id == reference)
+        {
+            let info = library_info(&library, entries);
+            return Ok(envelope(
+                json!({"guid":library.id,"title":library.name,"type":"Directory",
+                "ancestor_guid":library.id,"ancestor_name":library.name,"ancestor_category":info["category"],
+                "parent_guid":"","grand_guid":"","can_play":0,"play_error":"","play_item_guid":"",
+                "media_guid":"","single_child_guid":"","file_name":"","duration":0,"logic_type":0,
+                "is_favorite":0,"is_watched":0,"watched":0,"watched_ts":0,"poster":"","posters":"",
+                "vote_average":"0",
+                "poster_list":info["posters"],"tv_title":"","parent_title":"","genres":[],"overview":""}),
+            ));
+        }
         if let Some(entry) = entry_for(entries, reference) {
             let info = probe::cached(state, entry).await?;
             return Ok(envelope(item(state, context, entry, info.as_ref()).await?));
@@ -510,7 +570,7 @@ async fn read_request(
         return Ok(envelope(json!(list)));
     }
     if let Some(reference) = path.strip_prefix("/v/api/v1/stream/list/") {
-        let entry = entry_for(entries, reference).ok_or(AppError::NotFound)?;
+        let entry = playback_entry(entries, reference).ok_or(AppError::NotFound)?;
         let info = probe::media(state, context, entry).await?;
         let (video, audio, subtitle) = streams(entry, &info);
         return Ok(envelope(
@@ -721,7 +781,12 @@ async fn post_request(
         data::save(&state.vfs.db, context, &key, &enabled).await?;
         return Ok(envelope(json!(true)));
     }
-    let entry = entry_for(entries, reference).ok_or(AppError::NotFound)?;
+    let entry = if path == "/v/api/v1/play/info" {
+        playback_entry(entries, reference)
+    } else {
+        entry_for(entries, reference)
+    }
+    .ok_or(AppError::NotFound)?;
     let info = probe::media(state, context, entry).await?;
     let (videos, audios, subtitles) = streams(entry, &info);
     match path {
@@ -731,7 +796,7 @@ async fn post_request(
                 json!({"guid":entry.guid,"grand_guid":entry.show_guid,"parent_guid":if entry.kind=="Episode" {season_guid(entry)}else{entry.libraries[0].clone()},"type":entry.kind,
                 "media_guid":entry.media_guid,"video_guid":videos.first().and_then(|v|v["guid"].as_str()).unwrap_or(""),
                 "audio_guid":if progress.audio_guid.is_empty(){audios.first().and_then(|v|v["guid"].as_str()).unwrap_or("").to_owned()}else{progress.audio_guid},
-                "subtitle_guid":progress.subtitle_guid,"direct_link_audio_index":progress.direct_link_audio_index,"ts":progress.ts,"play_config":{"skip_opening":null,"skip_ending":null},"item":item(state,context,entry,Some(&info)).await?}),
+                "subtitle_guid":progress.subtitle_guid,"direct_link_audio_index":progress.direct_link_audio_index,"ts":progress.ts as u64,"play_config":{"skip_opening":null,"skip_ending":null},"item":item(state,context,entry,Some(&info)).await?}),
             ));
         }
         "/v/api/v1/stream" => {

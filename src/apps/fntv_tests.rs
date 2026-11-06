@@ -136,6 +136,7 @@ async fn configured(
     assert_eq!(status, StatusCode::OK, "{list}");
     let item = list["data"]["list"][0].clone();
     assert!(item["guid"].is_string());
+    assert_eq!(item["watched_ts"].as_u64(), Some(0));
     // 单元测试的媒体描述夹具，不作为官方播放或真实媒体探测证据。
     let version = state.vfs.db.node(node).await.unwrap().content_version();
     let info = json!({"version":version,"wrapper":"mp4","duration":300.0,"reserved_bytes":1024,"upstream_reserved_bytes":1024,"policy_version":1,
@@ -154,6 +155,92 @@ async fn configured(
         .await
         .unwrap();
     (state, media, directory, token, item)
+}
+
+#[tokio::test]
+async fn native_library_details_require_current_authorization() {
+    let (state, _, _directory, token, _) = configured(b"synthetic").await;
+    let library = "11111111111111111111111111111111";
+    for prefix in ["/v/api/v1/mdb/", "/v/api/v1/item/"] {
+        let path = format!("{prefix}{library}");
+        let (status, body) =
+            json_response(wire(&state, "GET", &path, Some(&token), Value::Null, &[]).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["guid"], library);
+        assert_eq!(body["data"]["title"], "隔离电影");
+        if prefix.ends_with("item/") {
+            assert_eq!(body["data"]["type"], "Directory");
+            assert_eq!(body["data"]["can_play"], 0);
+            assert!(body["data"]["vote_average"].is_string());
+        } else {
+            assert_eq!(body["data"]["category"], "Movie");
+        }
+        assert_eq!(
+            wire(&state, "GET", &path, None, Value::Null, &[])
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            wire(
+                &state,
+                "GET",
+                &format!("{prefix}unknown"),
+                Some(&token),
+                Value::Null,
+                &[]
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    let replacement_root = state.vfs.resolve("/其它").await.unwrap().id;
+    assert_eq!(manager(&state, "fntv.libraries.set", json!({"libraries":[
+        {"id":"22222222222222222222222222222222","name":"仍授权的库","kind":"movie","root_id":replacement_root},
+        {"id":library,"name":"原电影库","kind":"movie","root_id":state.vfs.resolve("/影视").await.unwrap().id}
+    ]})).await.0, StatusCode::OK);
+    assert_eq!(
+        call(
+            &state,
+            "PATCH",
+            "/api/apps/fntv/scope",
+            json!({"mode":"selected","paths":["/其它"]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let current = login(&state, "Synthetic-Only-Account").await;
+    // 新登录可以读取仍授权的库，不能凭旧配置读到已撤权的库。
+    for prefix in ["/v/api/v1/mdb/", "/v/api/v1/item/"] {
+        assert_eq!(
+            wire(
+                &state,
+                "GET",
+                &format!("{prefix}{library}"),
+                Some(&current),
+                Value::Null,
+                &[]
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            wire(
+                &state,
+                "GET",
+                &format!("{prefix}22222222222222222222222222222222"),
+                Some(&current),
+                Value::Null,
+                &[]
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
 }
 
 async fn start_play(state: &AppState, token: &str, item: &Value) {
@@ -484,7 +571,7 @@ async fn fntv_file_dates_are_milliseconds_and_play_positions_are_seconds() {
     )
     .await;
     assert_eq!(detail["data"]["duration"], 300);
-    assert_eq!(detail["data"]["watched_ts"], 207.0);
+    assert_eq!(detail["data"]["watched_ts"].as_u64(), Some(207));
     for invalid in [207_000.0, 302.001, -1.0] {
         let response = wire(&state, "POST", "/v/api/v1/play/record", Some(&token),
             json!({"item_guid":item["guid"],"media_guid":item["media_guid"],"play_link":link,"ts":invalid}), &[]).await;
@@ -495,6 +582,48 @@ async fn fntv_file_dates_are_milliseconds_and_play_positions_are_seconds() {
             "毫秒误报、超时长和负位置不能覆盖正确的秒位置"
         );
     }
+    // 兼容接口使用整数秒，私有进度仍保留有效上报的小数精度。
+    record(&state, &token, &item, link, 207.75).await;
+    let (_, play) = json_response(
+        wire(
+            &state,
+            "POST",
+            "/v/api/v1/play/info",
+            Some(&token),
+            json!({"item_guid":item["guid"]}),
+            &[],
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(play["data"]["ts"].as_u64(), Some(207));
+    assert_eq!(play["data"]["item"]["watched_ts"].as_u64(), Some(207));
+    let (_, recent) = json_response(
+        wire(
+            &state,
+            "GET",
+            "/v/api/v1/play/list",
+            Some(&token),
+            Value::Null,
+            &[],
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(recent["data"][0]["ts"].as_u64(), Some(207));
+    assert_eq!(recent["data"][0]["watched_ts"].as_u64(), Some(207));
+    let stored = state
+        .vfs
+        .db
+        .app_data_get(
+            "fntv",
+            &format!("fntv:progress:{}", item["media_guid"].as_str().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let stored: Value = serde_json::from_str(&stored.value).unwrap();
+    assert_eq!(stored["ts"].as_f64(), Some(207.75));
 }
 
 #[tokio::test]
@@ -549,6 +678,193 @@ async fn fntv_library_type_change_rebuilds_organization_and_keeps_progress() {
         42.0,
         "整理方式变更不应改变原文件的观看记录"
     );
+}
+
+#[tokio::test]
+async fn native_group_play_resolves_first_currently_authorized_episode() {
+    let (state, media, _directory, token, item) = configured(b"0123456789").await;
+    seed_file(
+        &state,
+        &media,
+        "/影视/合成 S01E02.mp4",
+        b"second episode",
+        1024,
+    )
+    .await;
+    state
+        .vfs
+        .rename("/影视/隔离.mp4", "/影视/合成 S01E01.mp4")
+        .await
+        .unwrap();
+    manager(&state, "fntv.index.refresh", json!({})).await;
+    start_play(&state, &token, &item).await;
+    record(
+        &state,
+        &token,
+        &item,
+        "00000000-0000-0000-0000-000000000011",
+        42.0,
+    )
+    .await;
+    let root = state.vfs.resolve("/影视").await.unwrap().id;
+    let remaining_root = state.vfs.resolve("/其它").await.unwrap().id;
+    assert_eq!(
+        manager(
+            &state,
+            "fntv.libraries.set",
+            json!({"libraries":[{
+                "id":"11111111111111111111111111111111","name":"合成剧集","kind":"tv","root_id":root
+            },{
+                "id":"22222222222222222222222222222222","name":"仍授权的空库","kind":"movie","root_id":remaining_root
+            }]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    manager(&state, "fntv.index.refresh", json!({})).await;
+    let fresh = login(&state, "Synthetic-Only-Account").await;
+    let (_, list) = json_response(
+        wire(
+            &state,
+            "POST",
+            "/v/api/v1/item/list",
+            Some(&fresh),
+            json!({"ancestor_guid":"11111111111111111111111111111111","page":1,"page_size":50}),
+            &[],
+        )
+        .await,
+    )
+    .await;
+    let show = list["data"]["list"][0]["guid"].as_str().unwrap();
+    let (_, seasons) = json_response(
+        wire(
+            &state,
+            "GET",
+            &format!("/v/api/v1/season/list/{show}"),
+            Some(&fresh),
+            Value::Null,
+            &[],
+        )
+        .await,
+    )
+    .await;
+    let season = seasons["data"][0]["guid"].as_str().unwrap();
+    for (reference, kind) in [(show, "TV"), (season, "Season")] {
+        let (status, play) = json_response(
+            wire(
+                &state,
+                "POST",
+                "/v/api/v1/play/info",
+                Some(&fresh),
+                json!({"item_guid":reference}),
+                &[],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{play}");
+        assert_eq!(play["data"]["guid"], item["guid"]);
+        assert_eq!(play["data"]["media_guid"], item["media_guid"]);
+        assert_eq!(play["data"]["type"], "Episode");
+        assert_eq!(play["data"]["ts"].as_u64(), Some(42));
+        let (_, detail) = json_response(
+            wire(
+                &state,
+                "GET",
+                &format!("/v/api/v1/item/{reference}"),
+                Some(&fresh),
+                Value::Null,
+                &[],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            detail["data"]["type"], kind,
+            "播放定位不能改变剧和季的详情身份"
+        );
+        let (status, streams) = json_response(
+            wire(
+                &state,
+                "GET",
+                &format!("/v/api/v1/stream/list/{reference}"),
+                Some(&fresh),
+                Value::Null,
+                &[],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{streams}");
+        assert_eq!(streams["data"]["files"][0]["guid"], item["media_guid"]);
+        assert_eq!(
+            wire(
+                &state,
+                "POST",
+                "/v/api/v1/play/info",
+                None,
+                json!({"item_guid":reference}),
+                &[]
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        wire(
+            &state,
+            "POST",
+            "/v/api/v1/play/info",
+            Some(&fresh),
+            json!({"item_guid":"11111111111111111111111111111111"}),
+            &[]
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &state,
+            "PATCH",
+            "/api/apps/fntv/scope",
+            json!({"mode":"selected","paths":["/其它"]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let current = login(&state, "Synthetic-Only-Account").await;
+    for reference in [show, season] {
+        assert_eq!(
+            wire(
+                &state,
+                "POST",
+                "/v/api/v1/play/info",
+                Some(&current),
+                json!({"item_guid":reference}),
+                &[]
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            wire(
+                &state,
+                "GET",
+                &format!("/v/api/v1/stream/list/{reference}"),
+                Some(&current),
+                Value::Null,
+                &[]
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
 }
 
 #[tokio::test]
@@ -783,7 +1099,7 @@ async fn fntv_rename_move_and_content_replacement_progress() {
     )
     .await;
     assert_ne!(list["data"]["list"][0]["guid"], item["guid"]);
-    assert_eq!(list["data"]["list"][0]["watched_ts"], 0.0);
+    assert_eq!(list["data"]["list"][0]["watched_ts"].as_u64(), Some(0));
 }
 
 #[tokio::test]
