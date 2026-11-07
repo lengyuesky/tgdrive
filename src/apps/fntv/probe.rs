@@ -32,8 +32,8 @@ pub(super) fn limits() -> Value {
         "index_videos":3000,"private_data_bytes":8*1024*1024,"private_data_entries":10000})
 }
 
-fn command() -> tokio::process::Command {
-    let mut c = tokio::process::Command::new("ffprobe");
+pub(super) fn command_for(program: &str) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(program);
     // 不将宿主的代理、密钥或其它环境配置交给媒体解析进程。
     c.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -42,8 +42,32 @@ fn command() -> tokio::process::Command {
     c
 }
 
+fn command() -> tokio::process::Command {
+    command_for("ffprobe")
+}
+
 pub(super) async fn available() -> bool {
     matches!(tokio::time::timeout(Duration::from_secs(2),command().arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status()).await,Ok(Ok(s)) if s.success())
+}
+
+/// 只解析受限子进程的网络错误类别，不向客户端返回输入地址或原始错误输出。
+pub(super) fn process_error(errors: &[u8], message: &str) -> AppError {
+    let errors = String::from_utf8_lossy(errors).to_ascii_lowercase();
+    if [
+        "timed out",
+        "input/output error",
+        "connection reset",
+        "connection refused",
+        "server returned 5",
+        "http error 5",
+    ]
+    .iter()
+    .any(|pattern| errors.contains(pattern))
+    {
+        AppError::Telegram("媒体分段读取暂时失败".into())
+    } else {
+        AppError::BadRequest(message.into())
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -95,6 +119,7 @@ pub(super) async fn media(
         return Ok(info);
     }
     // 不排入无界队列；客户端可以稍后重试。
+    let _foreground = super::covers::foreground(state);
     let _slot = state
         .vfs
         .db
@@ -203,7 +228,7 @@ pub(super) async fn media(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn bounded_source(
+pub(super) async fn bounded_source(
     state: &AppState,
     context: &Context,
     entry: &Entry,
@@ -232,16 +257,33 @@ async fn bounded_source(
         .map_err(|_| AppError::BadRequest("探测区间无效".into()))?
         .unwrap_or((0, size.saturating_sub(1)));
     let wanted = range.1 - range.0 + 1;
-    #[allow(deprecated)]
-    let old = budget
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-            (left > 0).then_some(left.saturating_sub(wanted))
-        })
-        .map_err(|_| AppError::BadRequest("媒体探测超过 8 MiB 累计读取上限".into()))?;
+    let old = budget.load(Ordering::Acquire);
+    if old == 0 {
+        return Err(AppError::BadRequest(
+            "媒体探测超过 8 MiB 累计读取上限".into(),
+        ));
+    }
     let length = wanted.min(old);
     let end = range.0 + length - 1;
     let stream =
         super::protocol::probe_stream(state, context, &node, range.0, length, upstream).await?;
+    use futures_util::StreamExt;
+    let stream = Body::from_stream(futures_util::stream::try_unfold(
+        (stream.into_data_stream(), budget),
+        |(mut stream, budget)| async move {
+            let Some(bytes) = stream.next().await else {
+                return Ok::<_, std::io::Error>(None);
+            };
+            let bytes = bytes.map_err(std::io::Error::other)?;
+            #[allow(deprecated)]
+            budget
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(bytes.len() as u64)
+                })
+                .map_err(|_| std::io::Error::other("媒体探测超过 8 MiB 累计读取上限"))?;
+            Ok(Some((bytes, (stream, budget))))
+        },
+    ));
     Ok(Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -255,7 +297,7 @@ async fn bounded_source(
         .unwrap())
 }
 
-async fn run(input: &str, entry: &Entry) -> AppResult<MediaInfo> {
+pub(super) async fn run(input: &str, entry: &Entry) -> AppResult<MediaInfo> {
     let mut child = command()
         .args([
             "-v",
@@ -305,8 +347,9 @@ async fn run(input: &str, entry: &Entry) -> AppResult<MediaInfo> {
     let wait = async { child.wait().await.map_err(AppError::from) };
     let (_, _, status) = tokio::try_join!(read_output, read_errors, wait)?;
     if !status.success() {
-        return Err(AppError::BadRequest(
-            "媒体探测失败或读取预算不足，未缓存或转换视频".into(),
+        return Err(process_error(
+            &errors,
+            "媒体探测失败或读取预算不足，未缓存或转换视频",
         ));
     }
     let value: Value = serde_json::from_slice(&output)

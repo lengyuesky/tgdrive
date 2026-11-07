@@ -162,7 +162,7 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}-native
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}-native
 
-      - name: 验证镜像可运行及媒体探测组件
+      - name: 验证镜像可运行及媒体探测和截帧组件
         env:
           PUBLISH: ${{ needs.prepare.outputs.publish }}
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -206,6 +206,27 @@ jobs:
           const result = JSON.parse(fs.readFileSync(process.env.RESULT_FILE, 'utf8'))
           if (result.streams?.[0]?.codec_name !== 'pcm_s16le' || Number(result.format?.duration) !== 1) {
             throw new Error('最终镜像内的 FFprobe 未正确识别合成素材')
+          }
+          NODE
+          # 生成独立的 H.264 MP4，再由最终镜像解码为 JPEG，验证两种架构的截帧依赖。
+          docker run --rm --network none --entrypoint /usr/local/bin/ffmpeg "$image" \
+            -v error -f lavfi -i color=c=red:s=64x64:r=25 -t 0.12 \
+            -an -c:v libx264 -threads 1 -pix_fmt yuv420p -f mp4 \
+            -movflags frag_keyframe+empty_moov pipe:1 > "$probe_dir/cover.mp4"
+          docker run --rm --network none --mount "type=bind,src=$probe_dir,dst=/probe,readonly" \
+            --entrypoint /usr/local/bin/ffmpeg "$image" -v error -threads 1 \
+            -i /probe/cover.mp4 -frames:v 1 -an -sn -c:v mjpeg -threads 1 \
+            -f image2pipe pipe:1 > "$probe_dir/cover.jpg"
+          docker run --rm --network none --mount "type=bind,src=$probe_dir,dst=/probe,readonly" \
+            --entrypoint /usr/local/bin/ffprobe "$image" -v error \
+            -show_entries stream=codec_name,width,height -of json /probe/cover.jpg > "$probe_dir/cover.json"
+          PROBE_DIR="$probe_dir" node <<'NODE'
+          const fs = require('node:fs')
+          const jpeg = fs.readFileSync(`${process.env.PROBE_DIR}/cover.jpg`)
+          const stream = JSON.parse(fs.readFileSync(`${process.env.PROBE_DIR}/cover.json`, 'utf8')).streams?.[0]
+          if (!jpeg.length || jpeg.length > 256 * 1024 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8 ||
+              stream?.codec_name !== 'mjpeg' || stream.width !== 64 || stream.height !== 64) {
+            throw new Error('最终镜像的 FFmpeg 未正确解码合成 MP4 并生成 JPEG')
           }
           NODE
           docker run --detach --name "$name" --network none \

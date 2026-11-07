@@ -147,6 +147,27 @@ pub(crate) async fn thumbnail_for_node(
             .body(axum::body::Body::empty())
             .expect("构造缩略图缓存响应失败"));
     }
+    let (mime, data) = thumbnail_bytes(state, &first).await?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, data.len())
+        .header(header::CACHE_CONTROL, "private, no-cache")
+        .header(header::ETAG, etag)
+        .header("x-content-type-options", "nosniff")
+        .body(axum::body::Body::from(data))
+        .expect("构造缩略图响应失败"))
+}
+
+/// 小图字节读取供宿主服务复用；调用方负责自己的授权、取消和总期限。
+pub(crate) async fn thumbnail_bytes(
+    state: &AppState,
+    first: &crate::db::Chunk,
+) -> AppResult<(&'static str, Vec<u8>)> {
+    let file_id = first
+        .tg_thumbnail_file_id
+        .as_deref()
+        .ok_or(AppError::NotFound)?;
     let storage_target_id = first
         .storage_target_id
         .ok_or_else(|| AppError::BadRequest("该历史文件没有可用的 Telegram 存储目标".into()))?;
@@ -163,15 +184,7 @@ pub(crate) async fn thumbnail_for_node(
     }
     let mime = downloaded_thumbnail_mime(&data)
         .ok_or_else(|| AppError::Telegram("Telegram 返回的缩略图格式无效".into()))?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::CONTENT_LENGTH, data.len())
-        .header(header::CACHE_CONTROL, "private, no-cache")
-        .header(header::ETAG, etag)
-        .header("x-content-type-options", "nosniff")
-        .body(axum::body::Body::from(data))
-        .expect("构造缩略图响应失败"))
+    Ok((mime, data))
 }
 
 /// 解析单个 Range;None=无 Range,Err=不可满足

@@ -155,6 +155,7 @@ async fn handle_inner(state: &AppState, request: Request) -> AppResult<Response>
         }
     }
     context.lease.check()?;
+    let entries = super::covers::decorate(state, entries).await?;
     if read {
         return read_request(state, &context, &token, &path, &headers, method, &entries).await;
     }
@@ -216,16 +217,17 @@ fn subtitle_guid(source: &Source) -> String {
 }
 fn poster(entry: &Entry) -> String {
     entry
-        .poster
+        .cover
         .as_ref()
-        .map(|s| format!("/tgdrive-poster/{}", s.guid("poster")))
+        .map(|s| format!("/tgdrive-poster/{s}"))
         .unwrap_or_default()
 }
 fn library_info(library: &super::Library, entries: &[Entry]) -> Value {
     let posters = entries
         .iter()
         .filter(|entry| entry.libraries.contains(&library.id))
-        .filter_map(|entry| entry.poster.as_ref().map(|_| poster(entry)))
+        .map(poster)
+        .filter(|poster| !poster.is_empty())
         .take(4)
         .collect::<Vec<_>>();
     json!({"guid":library.id,"title":library.name,
@@ -578,6 +580,7 @@ async fn read_request(
         ));
     }
     if let Some(reference) = path.strip_prefix("/v/api/v1/media/range/") {
+        let foreground = super::covers::foreground(state);
         let entry = entry_for(entries, reference).ok_or(AppError::NotFound)?;
         let (node, _) = authorized(state, context, entry.node_id, &entry.version).await?;
         let response =
@@ -604,7 +607,7 @@ async fn read_request(
                     .activate(token, &entry.media_guid, serial, &context.lease)?;
             }
         }
-        return Ok(response);
+        return Ok(response.map(|body| super::covers::foreground_body(body, foreground)));
     }
     if let Some(reference) = path.strip_prefix("/v/api/v1/subtitle/dl/") {
         for entry in entries {
@@ -635,12 +638,9 @@ async fn read_request(
         .or_else(|| path.strip_prefix("/tgdrive-poster/"));
     if let Some(reference) = reference {
         for entry in entries {
-            if let Some(source) = entry
-                .poster
-                .as_ref()
-                .filter(|s| s.guid("poster") == reference)
-            {
-                return source_response(state, context, entry, source, headers, method, None).await;
+            if entry.cover.as_deref() == Some(reference) {
+                return super::covers::response(state, context, entry, reference, headers, method)
+                    .await;
             }
         }
     }
@@ -896,13 +896,28 @@ async fn group_items(
     ancestor: &str,
 ) -> AppResult<Vec<Value>> {
     let mut rows = std::collections::BTreeMap::<String, Value>::new();
-    for entry in entries.iter().filter(|e| e.kind == "Episode") {
+    let mut episodes: Vec<_> = entries.iter().filter(|e| e.kind == "Episode").collect();
+    episodes.sort_by(|a, b| {
+        a.season
+            .cmp(&b.season)
+            .then_with(|| a.episode.cmp(&b.episode))
+            .then_with(|| a.guid.cmp(&b.guid))
+    });
+    let mut representatives = std::collections::HashMap::new();
+    for entry in &episodes {
+        if entry.cover.is_some() {
+            representatives
+                .entry(entry.show_guid.clone())
+                .or_insert(*entry);
+            representatives.entry(season_guid(entry)).or_insert(*entry);
+        }
+    }
+    for entry in episodes {
         let show = entry.show_guid.clone();
         let season = season_guid(entry);
         if rows.contains_key(&show) && rows.contains_key(&season) {
             continue;
         }
-        let mut base = item(state, context, entry, None).await?;
         for (id, kind, title, parent) in [
             (
                 show.clone(),
@@ -921,13 +936,24 @@ async fn group_items(
                 || (kind == "TV"
                     && (ancestor.is_empty() || entry.libraries.iter().any(|l| l == ancestor)))
                 || (kind == "Season" && ancestor == show);
-            if !include {
+            if !include || rows.contains_key(&id) {
                 continue;
             }
+            let mut base = item(state, context, entry, None).await?;
             base["guid"] = json!(id);
             base["type"] = json!(kind);
             base["title"] = json!(title);
             base["parent_guid"] = json!(parent);
+            if let Some(representative) = representatives.get(&id) {
+                let image = poster(representative);
+                base["poster"] = json!(image);
+                base["posters"] = json!(image);
+                base["poster_list"] = json!([image]);
+            } else {
+                base["poster"] = json!("");
+                base["posters"] = json!("");
+                base["poster_list"] = json!([]);
+            }
             base["number_of_episodes"] = json!(
                 entries
                     .iter()
@@ -957,7 +983,7 @@ async fn group_items(
             ));
             base["watched"] = base["is_watched"].clone();
             base["can_play"] = json!(0);
-            rows.entry(id).or_insert_with(|| base.clone());
+            rows.insert(id, base);
         }
     }
     Ok(rows.into_values().collect())
@@ -1064,7 +1090,13 @@ async fn guarded_stream(
         tokio::select! {
             biased;
             _=context.lease.cancelled.cancelled()=>return Err(AppError::AppChanged),
-            result=reader.read(&mut first)=>result.map_err(|_|AppError::BadRequest("当前文件无法严格分段读取；请检查宿主 MTProto 或现有本地缓存，已拒绝整块下载回退".into()))?,
+            result=reader.read(&mut first)=>result.map_err(|error| {
+                if error.get_ref().and_then(|e| e.downcast_ref::<AppError>()).is_some_and(|e| matches!(e,AppError::Telegram(_) | AppError::Io(_))) {
+                    AppError::Telegram("媒体分段读取暂时失败".into())
+                } else {
+                    AppError::BadRequest("当前文件无法严格分段读取；请检查宿主 MTProto 或现有本地缓存，已拒绝整块下载回退".into())
+                }
+            })?,
         }
     };
     let prefix = if count > 0 {

@@ -1,6 +1,8 @@
 //! 固定的影视服务能力。页面只管理服务，协议与所有文件读取由宿主控制。
 
+mod covers;
 pub(crate) mod data;
+mod frame;
 mod index;
 mod probe;
 mod protocol;
@@ -18,7 +20,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 pub const APP_ID: &str = "fntv";
@@ -103,6 +105,10 @@ struct Inner {
     plays: HashMap<(String, String), Play>,
     links: HashMap<(String, String), (String, u64)>,
     worker_epoch: u64,
+    cover_worker_epoch: u64,
+    cover_task: Option<CancellationToken>,
+    foreground: usize,
+    foreground_until: Instant,
     index_state: String,
     index_error: String,
     indexed: usize,
@@ -117,6 +123,8 @@ pub(crate) struct Service {
     pub(super) index_lock: AsyncMutex<()>,
     pub(super) play_lock: AsyncMutex<()>,
     pub(super) probe_slots: Arc<Semaphore>,
+    pub(super) cover_lock: AsyncMutex<()>,
+    pub(super) cover_wake: Notify,
 }
 impl Default for Service {
     fn default() -> Self {
@@ -128,6 +136,10 @@ impl Default for Service {
                 plays: HashMap::new(),
                 links: HashMap::new(),
                 worker_epoch: 0,
+                cover_worker_epoch: 0,
+                cover_task: None,
+                foreground: 0,
+                foreground_until: Instant::now(),
                 index_state: "idle".into(),
                 index_error: String::new(),
                 indexed: 0,
@@ -138,6 +150,8 @@ impl Default for Service {
             index_lock: AsyncMutex::new(()),
             play_lock: AsyncMutex::new(()),
             probe_slots: Arc::new(Semaphore::new(2)),
+            cover_lock: AsyncMutex::new(()),
+            cover_wake: Notify::new(),
         }
     }
 }
@@ -154,6 +168,45 @@ impl Service {
         inner.plays.clear();
         inner.links.clear();
         inner.worker_epoch = 0;
+        inner.cover_worker_epoch = 0;
+        inner.cover_task = None;
+        inner.foreground = 0;
+        inner.foreground_until = Instant::now();
+        self.cover_wake.notify_one();
+    }
+
+    pub(super) fn begin_foreground(&self) -> u64 {
+        let mut inner = self.lock();
+        inner.foreground += 1;
+        if let Some(task) = &inner.cover_task {
+            task.cancel();
+        }
+        inner.epoch
+    }
+
+    pub(super) fn end_foreground(&self, epoch: u64) {
+        let mut inner = self.lock();
+        if inner.epoch != epoch {
+            return;
+        }
+        inner.foreground = inner.foreground.saturating_sub(1);
+        // 连续 Range 请求之间短暂让出连接时，不立刻重复启动解码进程。
+        inner.foreground_until = Instant::now() + std::time::Duration::from_secs(2);
+        self.cover_wake.notify_one();
+    }
+
+    pub(super) fn background_context(&self, context: &Context) -> Option<Context> {
+        let mut inner = self.lock();
+        if inner.epoch != context.lease.epoch
+            || inner.foreground > 0
+            || inner.foreground_until > Instant::now()
+        {
+            return None;
+        }
+        let mut context = context.clone();
+        context.lease.cancelled = context.lease.cancelled.child_token();
+        inner.cover_task = Some(context.lease.cancelled.clone());
+        Some(context)
     }
     fn lease(&self) -> Lease {
         let inner = self.lock();
@@ -431,6 +484,18 @@ pub(super) async fn authorized(
 }
 
 pub(crate) fn router(state: AppState) -> axum::Router {
+    // 恢复已由用户启动的服务；新安装和已停止配置不会触发索引或取帧。
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let startup = state.clone();
+        runtime.spawn(async move {
+            if !startup.restore.shutdown.is_cancelled()
+                && context(&startup, true).await.is_ok()
+                && !startup.restore.shutdown.is_cancelled()
+            {
+                index::start_worker(&startup);
+            }
+        });
+    }
     axum::Router::new()
         .route("/trimcon", axum::routing::any(protocol::handle))
         .route("/v", axum::routing::any(protocol::handle))
@@ -468,7 +533,7 @@ pub(super) async fn invoke(
             )
         }
         "fntv.service.status" => Ok(
-            json!({"running":context.config.running,"index":state.vfs.db.fntv.index_status(),"probe_available":probe::available().await,"limits":probe::limits()}),
+            json!({"running":context.config.running,"index":state.vfs.db.fntv.index_status(),"probe_available":probe::available().await,"limits":probe::limits(),"covers":covers::status(state,&context).await?}),
         ),
         "fntv.account.set" => {
             #[derive(Deserialize)]
@@ -589,6 +654,10 @@ pub(super) async fn invoke(
         }
         "fntv.index.refresh" => {
             index::refresh(state, &context, None).await?;
+            covers::schedule(state, &context, true).await?;
+            if context.config.running {
+                covers::start_worker(state);
+            }
             Ok(state.vfs.db.fntv.index_status())
         }
         _ => Err(AppError::BadRequest("不支持的影视管理能力".into())),

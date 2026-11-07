@@ -35,20 +35,21 @@ RUN apk add --no-cache curl unzip \
     && unzip /tmp/usque.zip -d /opt/usque \
     && chmod 755 /opt/usque/usque
 
-# ---------- 阶段 4:受限媒体探测组件 ----------
+# ---------- 阶段 4:受限媒体探测和封面取帧组件 ----------
 FROM debian:bookworm-slim AS media-probe
 ARG TARGETARCH
 # 依赖按 SONAME 平铺到标准库目录，不依赖构建层的 alternatives 和 ld.so.cache。
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && mkdir -p /probe-root/usr/local/bin /probe-root/usr/share/licenses/fntv-media-probe \
     && cp /usr/bin/ffprobe /probe-root/usr/local/bin/ffprobe \
+    && cp /usr/bin/ffmpeg /probe-root/usr/local/bin/ffmpeg \
     && case "$TARGETARCH" in \
          amd64) library_dir=/usr/lib/x86_64-linux-gnu ;; \
          arm64) library_dir=/usr/lib/aarch64-linux-gnu ;; \
          *) echo "不支持的媒体探测架构：$TARGETARCH" >&2; exit 1 ;; \
        esac \
     && mkdir -p "/probe-root$library_dir" \
-    && ldd /usr/bin/ffprobe | awk '/=> \// { print $3 }' | while read -r library; do \
+    && ldd /usr/bin/ffprobe /usr/bin/ffmpeg | awk '/=> \// { print $3 }' | sort -u | while read -r library; do \
          case "$(basename "$library")" in \
            libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgcc_s.so.1|libstdc++.so.6) continue ;; \
          esac; \

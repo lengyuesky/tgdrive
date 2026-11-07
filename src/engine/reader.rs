@@ -159,7 +159,7 @@ impl AsyncRead for ChunkedReader {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => {
                         self.state = State::Idle;
-                        return Poll::Ready(Err(io::Error::other(e.to_string())));
+                        return Poll::Ready(Err(io::Error::other(e)));
                     }
                     Poll::Ready(Ok(reader)) => {
                         let remain = *remain;

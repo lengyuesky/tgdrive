@@ -1,6 +1,6 @@
 [package]
 name = "tgdrive"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 
 [dependencies]
@@ -25,6 +25,7 @@ hmac = "0.13.0"
 http = "1.5.0"
 http-body = "1"
 http-body-util = "0.1.4"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
@@ -76,4 +77,8 @@ opt-level = 3
 [profile.dev.package.chacha20poly1305]
 opt-level = 3
 [profile.dev.package.chacha20]
+opt-level = 3
+
+# 封面验证使用真实 JPEG 编码，调试构建也遵守与运行时相同的任务期限。
+[profile.dev.package.image]
 opt-level = 3

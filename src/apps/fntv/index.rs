@@ -37,6 +37,13 @@ impl Source {
     }
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub(super) struct Thumbnail {
+    pub target: Option<i64>,
+    pub message: i64,
+    pub file: String,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Entry {
     pub node_id: i64,
@@ -58,6 +65,12 @@ pub(super) struct Entry {
     pub show_title: String,
     pub metadata_version: String,
     pub poster: Option<Source>,
+    #[serde(default)]
+    pub posters: Vec<Source>,
+    #[serde(default)]
+    pub thumbnail: Option<Thumbnail>,
+    #[serde(skip)]
+    pub cover: Option<String>,
     pub subtitles: Vec<Source>,
 }
 
@@ -309,22 +322,27 @@ async fn refresh_inner(
                     })
                 })
                 .map(|n| Source::from_node(n));
-            let poster = related
-                .iter()
-                .find(|n| {
-                    [
-                        format!("{basename}-poster.jpg"),
-                        format!("{basename}.jpg"),
-                        "poster.jpg".into(),
-                        "folder.jpg".into(),
-                        "poster.png".into(),
-                        "poster.webp".into(),
-                    ]
-                    .iter()
-                    .any(|name| n.name.eq_ignore_ascii_case(name))
+            let posters: Vec<_> = [
+                format!("{basename}-poster.jpg"),
+                format!("{basename}.jpg"),
+                "poster.jpg".into(),
+                "folder.jpg".into(),
+                "poster.png".into(),
+                "poster.webp".into(),
+            ]
+            .iter()
+            .filter_map(|name| related.iter().find(|n| n.name.eq_ignore_ascii_case(name)))
+            .filter(|n| n.size > 0 && n.size <= 2 * 1024 * 1024)
+            .map(|n| Source::from_node(n))
+            .collect();
+            let poster = posters.first().cloned();
+            let thumbnail = state.vfs.db.first_chunk(node.id).await?.and_then(|c| {
+                c.tg_thumbnail_file_id.map(|file| Thumbnail {
+                    target: c.storage_target_id,
+                    message: c.tg_message_id,
+                    file,
                 })
-                .filter(|n| n.size > 0 && n.size <= 2 * 1024 * 1024)
-                .map(|n| Source::from_node(n));
+            });
             let subtitles: Vec<_> = related
                 .iter()
                 .filter(|n| {
@@ -343,9 +361,20 @@ async fn refresh_inner(
                 &node.name,
                 &node.parent_id.unwrap_or(0).to_string(),
                 &nfo.as_ref().map(|s| s.version.clone()).unwrap_or_default(),
-                &poster
+                &posters
+                    .iter()
+                    .map(|s| s.guid("poster"))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+                &thumbnail
                     .as_ref()
-                    .map(|s| s.version.clone())
+                    .map(|t| {
+                        super::guid(&[
+                            &t.target.unwrap_or_default().to_string(),
+                            &t.message.to_string(),
+                            &t.file,
+                        ])
+                    })
                     .unwrap_or_default(),
                 &subtitles
                     .iter()
@@ -390,6 +419,9 @@ async fn refresh_inner(
                 show_title: String::new(),
                 metadata_version,
                 poster,
+                posters,
+                thumbnail,
+                cover: None,
                 subtitles,
             };
             let mut recognized = if library.kind == "tv" {
@@ -461,6 +493,8 @@ async fn refresh_inner(
         &state.events,
         crate::events::HostEvent::app("app.storage", super::APP_ID, Some("fntv:index".into())),
     );
+    super::covers::start_worker(state);
+    state.vfs.db.fntv.cover_wake.notify_one();
     Ok(())
 }
 

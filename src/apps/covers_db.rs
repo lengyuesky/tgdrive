@@ -25,7 +25,15 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS covers (
 );
 -- 覆盖索引：占用统计与淘汰只扫索引，不读带封面数据的表页。
 CREATE INDEX IF NOT EXISTS idx_covers_lru ON covers(app_id, accessed_at, key, bytes);
-PRAGMA user_version = 1;";
+-- 任务状态与图片分开保存，图片淘汰不会遗失失败次数并触发反复生成。
+CREATE TABLE IF NOT EXISTS cover_states (
+    app_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    meta TEXT NOT NULL,
+    PRIMARY KEY (app_id, key)
+);
+PRAGMA user_version = 2;";
 
 #[derive(Clone, Copy, Debug)]
 pub struct CoverLimits {
@@ -95,6 +103,76 @@ fn push_keys(sql: &mut QueryBuilder<Sqlite>, keys: &[String]) {
 }
 
 impl Db {
+    /// 只读身份及状态，不把整库图片加载进媒体列表响应。
+    pub(crate) async fn cover_states(&self, app: &str) -> AppResult<Vec<(String, String)>> {
+        Ok(
+            sqlx::query_as("SELECT key, meta FROM cover_states WHERE app_id = ?")
+                .bind(app)
+                .fetch_all(&self.covers)
+                .await?,
+        )
+    }
+
+    pub(crate) async fn cover_state_put(
+        &self,
+        app: &str,
+        key: &str,
+        revision: &str,
+        meta: &str,
+    ) -> AppResult<()> {
+        sqlx::query("INSERT INTO cover_states(app_id,key,revision,meta) VALUES(?,?,?,?) ON CONFLICT(app_id,key) DO UPDATE SET revision=excluded.revision,meta=excluded.meta")
+            .bind(app).bind(key).bind(revision).bind(meta).execute(&self.covers).await?;
+        Ok(())
+    }
+
+    /// 旧任务只能提交到仍属于自己的来源修订，不能覆盖新来源的排队状态。
+    pub(crate) async fn cover_state_finish(
+        &self,
+        app: &str,
+        key: &str,
+        revision: &str,
+        meta: &str,
+    ) -> AppResult<bool> {
+        Ok(
+            sqlx::query("UPDATE cover_states SET meta=? WHERE app_id=? AND key=? AND revision=?")
+                .bind(meta)
+                .bind(app)
+                .bind(key)
+                .bind(revision)
+                .execute(&self.covers)
+                .await?
+                .rows_affected()
+                == 1,
+        )
+    }
+
+    pub(crate) async fn cover_state_prune(&self, app: &str, keys: &[String]) -> AppResult<()> {
+        let mut sql = QueryBuilder::<Sqlite>::new("DELETE FROM cover_states WHERE app_id = ");
+        sql.push_bind(app);
+        if !keys.is_empty() {
+            sql.push(" AND key NOT IN (");
+            let mut list = sql.separated(", ");
+            for key in keys {
+                list.push_bind(key);
+            }
+            sql.push(")");
+        }
+        sql.build().execute(&self.covers).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn cover_metadata(
+        &self,
+        app: &str,
+    ) -> AppResult<Vec<(String, Option<String>)>> {
+        Ok(
+            sqlx::query_as("SELECT key, meta FROM covers WHERE app_id=?")
+                .bind(app)
+                .fetch_all(&self.covers)
+                .await?,
+        )
+    }
+
     pub async fn cover_get_many(&self, app: &str, keys: &[String]) -> AppResult<Vec<CoverRecord>> {
         if keys.is_empty() {
             return Ok(Vec::new());
@@ -215,7 +293,12 @@ impl Db {
             .execute(&self.covers)
             .await?
             .rows_affected();
-        if removed > 0 {
+        let states = sqlx::query("DELETE FROM cover_states WHERE app_id = ?")
+            .bind(app)
+            .execute(&self.covers)
+            .await?
+            .rows_affected();
+        if removed > 0 || states > 0 {
             sqlx::query("PRAGMA incremental_vacuum")
                 .execute(&self.covers)
                 .await?;
@@ -339,5 +422,50 @@ mod tests {
         assert!(tables.iter().any(|name| name == "app_data"));
         assert!(!tables.iter().any(|name| name == "covers"));
         assert!(dir.path().join("t-covers.db").is_file());
+    }
+
+    #[tokio::test]
+    async fn task_state_survives_image_eviction_and_is_cleared_with_its_owner() {
+        let (db, _dir) = open().await;
+        db.cover_state_put(
+            "fntv",
+            "job",
+            "source-1",
+            "{\"state\":\"failed\",\"attempts\":2}",
+        )
+        .await
+        .unwrap();
+        db.cover_state_put("other", "job", "source-1", "{}")
+            .await
+            .unwrap();
+        let limits = CoverLimits {
+            bytes: 100,
+            entries: 10,
+        };
+        db.cover_put("fntv", "a", "image/jpeg", &[0; 80], None, limits)
+            .await
+            .unwrap();
+        db.cover_put("fntv", "b", "image/jpeg", &[0; 80], None, limits)
+            .await
+            .unwrap();
+        assert!(
+            db.cover_get_many("fntv", &["a".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.cover_states("fntv").await.unwrap()[0]
+                .1
+                .contains("attempts")
+        );
+        assert!(
+            !db.cover_state_finish("fntv", "job", "old-source", "{}")
+                .await
+                .unwrap()
+        );
+        db.cover_clear("fntv").await.unwrap();
+        assert!(db.cover_states("fntv").await.unwrap().is_empty());
+        assert_eq!(db.cover_states("other").await.unwrap().len(), 1);
     }
 }

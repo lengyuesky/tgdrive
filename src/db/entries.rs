@@ -356,6 +356,27 @@ impl Db {
                 .await?,
         )
     }
+
+    /// 媒体列表批量核对缩略图来源，只读首块，不加载视频或其余分块。
+    pub(crate) async fn first_chunks(&self, ids: &[i64]) -> AppResult<Vec<Chunk>> {
+        let mut rows = Vec::new();
+        for batch in ids.chunks(200) {
+            let mut query =
+                QueryBuilder::<Sqlite>::new("SELECT * FROM chunks WHERE idx=0 AND node_id IN (");
+            let mut list = query.separated(", ");
+            for id in batch {
+                list.push_bind(id);
+            }
+            list.push_unseparated(")");
+            rows.extend(
+                query
+                    .build_query_as::<Chunk>()
+                    .fetch_all(&self.pool)
+                    .await?,
+            );
+        }
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,6 @@
 //! 飞牛服务真实边界测试：临时 SQLite、内存媒体，不读取生产配置或连接 Telegram。
+#[path = "fntv_cover_tests.rs"]
+mod cover_tests;
 use super::*;
 use axum::http::header;
 use futures_util::StreamExt as _;

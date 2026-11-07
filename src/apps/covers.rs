@@ -80,6 +80,11 @@ pub(super) async fn invoke(
     method: &str,
     params: Value,
 ) -> AppResult<Value> {
+    if app.manifest.id == super::fntv::APP_ID {
+        return Err(AppError::Forbidden(
+            "影视封面由宿主管理，请使用影视服务状态和刷新能力".into(),
+        ));
+    }
     let db = &state.vfs.db;
     let id = &app.manifest.id;
     // 验证凭据到实际写入之间可能发生替换；与安装和缓存回收串行，再核对修订。
