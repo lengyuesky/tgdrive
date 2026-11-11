@@ -211,6 +211,9 @@ import AdvancedSection from './admin/AdvancedSection.vue'
 
     <ResponsivePanel class="admin-panel" v-model="inboxFailureDialog" title="Bot 收件死信" width="760px" align-center>
       <el-table :data="inboxFailures" v-loading="inboxFailureLoading" size="small">
+        <el-table-column label="收件 Bot" width="120">
+          <template #default="{ row }">{{ row.bot_id || '旧记录' }}</template>
+        </el-table-column>
         <el-table-column prop="update_id" label="Update ID" width="120" />
         <el-table-column prop="attempts" label="尝试" width="72" />
         <el-table-column label="失败时间" width="170">
@@ -219,7 +222,7 @@ import AdvancedSection from './admin/AdvancedSection.vue'
         <el-table-column prop="last_error" label="最后错误" show-overflow-tooltip />
         <el-table-column label="操作" width="72" align="right">
           <template #default="{ row }">
-            <el-button link type="danger" @click="removeInboxFailure(row.update_id)">删除</el-button>
+            <el-button link type="danger" @click="removeInboxFailure(row.id ?? row.update_id)">删除</el-button>
           </template>
         </el-table-column>
         <template #empty><el-empty description="没有死信" :image-size="56" /></template>

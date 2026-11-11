@@ -6,6 +6,9 @@ use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+pub mod inbox_dirs;
+pub use inbox_dirs::{InboxDirectory, InboxTypeDirectories};
+
 pub const DEFAULT_TRASH_DAYS: i64 = 30;
 pub const DEFAULT_INBOX_DIR: &str = "/收件箱";
 /// 数据库备份默认按官方 Bot API 可安全下载的大小分块。
@@ -77,6 +80,10 @@ pub struct Extras {
     pub inbox_book_dir: String,
     /// 自定义类型规则；优先于内置类型，重叠时更长的后缀优先
     pub inbox_rules: Vec<InboxRouteRule>,
+    /// 内置与自定义类型共用的多目录配置；旧目录字段保留用于兼容。
+    pub inbox_routes: Vec<InboxTypeDirectories>,
+    /// 路由配置变动时更新，提交时核验，不能由客户端写入。
+    pub inbox_routes_revision: i64,
     /// 删除文件后自动清理 Telegram 频道里的对应消息；关闭时改由后台手动执行。
     pub auto_delete_message: bool,
 }
@@ -96,18 +103,38 @@ async fn get(db: &Db, k: &str) -> AppResult<Option<String>> {
     db.setting_get(&format!("extra.{k}")).await
 }
 
-async fn set(db: &Db, k: &str, v: &str) -> AppResult<()> {
-    db.setting_set(&format!("extra.{k}"), v).await
-}
-
 pub async fn load(db: &Db) -> AppResult<Extras> {
-    let (inbox_bot_enabled, inbox_channel_enabled) = load_inbox_switches(db).await?;
-    let inbox_dir = get(db, "inbox_dir")
-        .await?
+    let inbox = db
+        .settings_get(&[
+            "extra.inbox_enabled",
+            "extra.inbox_bot_enabled",
+            "extra.inbox_channel_enabled",
+            "extra.inbox_allowed_chats",
+            "extra.inbox_dir",
+            "extra.inbox_video_dir",
+            "extra.inbox_image_dir",
+            "extra.inbox_book_dir",
+            "extra.inbox_rules",
+            "extra.inbox_routes",
+            "extra.inbox_routes_revision",
+        ])
+        .await?;
+    let legacy = inbox
+        .get("extra.inbox_enabled")
+        .is_some_and(|value| value == "1");
+    let inbox_bot_enabled = inbox
+        .get("extra.inbox_bot_enabled")
+        .map_or(legacy, |value| value == "1");
+    let inbox_channel_enabled = inbox
+        .get("extra.inbox_channel_enabled")
+        .map_or(legacy, |value| value == "1");
+    let inbox_dir = inbox
+        .get("extra.inbox_dir")
+        .cloned()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_INBOX_DIR.into());
     let child_dir = |name: &str| format!("{}/{name}", inbox_dir.trim_end_matches('/'));
-    let inbox_rules = match get(db, "inbox_rules").await? {
+    let inbox_rules = match inbox.get("extra.inbox_rules") {
         Some(raw) => match serde_json::from_str::<Vec<InboxRouteRule>>(&raw)
             .map_err(|e| AppError::BadRequest(format!("自定义收件规则 JSON 无效:{e}")))
             .and_then(|rules| normalize_rules(&rules))
@@ -132,15 +159,13 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
         },
         None => DEFAULT_BACKUP_CHUNK_SIZE,
     };
-    Ok(Extras {
+    let mut extras = Extras {
         trash_retention_days: get(db, "trash_retention_days")
             .await?
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TRASH_DAYS),
         backup_auto: get(db, "backup_auto").await?.as_deref() == Some("1"),
-        backup_skip_if_unchanged: get(db, "backup_skip_if_unchanged")
-            .await?
-            .as_deref()
+        backup_skip_if_unchanged: get(db, "backup_skip_if_unchanged").await?.as_deref()
             == Some("1"),
         backup_chunk_size,
         backup_telegram_enabled: get(db, "backup_telegram_enabled").await?.as_deref() != Some("0"),
@@ -170,24 +195,42 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
             .unwrap_or_default(),
         inbox_bot_enabled,
         inbox_channel_enabled,
-        inbox_allowed_chats: get(db, "inbox_allowed_chats").await?.unwrap_or_default(),
-        inbox_video_dir: get(db, "inbox_video_dir")
-            .await?
+        inbox_allowed_chats: inbox
+            .get("extra.inbox_allowed_chats")
+            .cloned()
+            .unwrap_or_default(),
+        inbox_video_dir: inbox
+            .get("extra.inbox_video_dir")
+            .cloned()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| child_dir("视频")),
-        inbox_image_dir: get(db, "inbox_image_dir")
-            .await?
+        inbox_image_dir: inbox
+            .get("extra.inbox_image_dir")
+            .cloned()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| child_dir("图片")),
-        inbox_book_dir: get(db, "inbox_book_dir")
-            .await?
+        inbox_book_dir: inbox
+            .get("extra.inbox_book_dir")
+            .cloned()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| child_dir("书籍")),
         inbox_dir,
         inbox_rules,
+        inbox_routes: Vec::new(),
+        inbox_routes_revision: inbox
+            .get("extra.inbox_routes_revision")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
         // 消息清理队列默认手动，避免 Telegram 永久性错误持续刷屏。
         auto_delete_message: get(db, "auto_delete_message").await?.as_deref() == Some("1"),
-    })
+    };
+    inbox_dirs::hydrate(
+        db,
+        &mut extras,
+        inbox.get("extra.inbox_routes").map(String::as_str),
+    )
+    .await?;
+    Ok(extras)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -223,10 +266,14 @@ pub struct ExtrasPatch {
     pub inbox_image_dir: Option<String>,
     pub inbox_book_dir: Option<String>,
     pub inbox_rules: Option<Vec<InboxRouteRule>>,
+    pub inbox_routes: Option<Vec<InboxTypeDirectories>>,
+    /// 有版本的目录编辑拒绝覆盖其他管理端刚保存的配置；开关操作独立生效。
+    pub inbox_routes_revision: Option<i64>,
     pub auto_delete_message: Option<bool>,
 }
 
 /// 旧版只有总开关，尚未保存独立开关时继承原有行为。
+#[cfg(test)]
 pub async fn load_inbox_switches(db: &Db) -> AppResult<(bool, bool)> {
     let values = db
         .settings_get(&[
@@ -620,115 +667,223 @@ pub async fn save(db: &Db, p: &ExtrasPatch) -> AppResult<()> {
     }
     validate_backup_destinations(&next)?;
 
-    if let Some(d) = p.trash_retention_days {
-        set(db, "trash_retention_days", &d.to_string()).await?;
-    }
-    if let Some(b) = p.backup_auto {
-        set(db, "backup_auto", if b { "1" } else { "0" }).await?;
-    }
-    if let Some(b) = p.backup_skip_if_unchanged {
-        set(db, "backup_skip_if_unchanged", if b { "1" } else { "0" }).await?;
-    }
-    if let Some(size) = backup_chunk_size {
-        set(db, "backup_chunk_size", &size.to_string()).await?;
-    }
-    if let Some(value) = p.backup_telegram_enabled {
-        set(db, "backup_telegram_enabled", if value { "1" } else { "0" }).await?;
-    }
-    if let Some(value) = p.backup_webdav_enabled {
-        set(db, "backup_webdav_enabled", if value { "1" } else { "0" }).await?;
-    }
-    if let Some(value) = backup_webdav_url {
-        set(db, "backup_webdav_url", &value).await?;
-    }
-    if let Some(value) = backup_webdav_username {
-        set(db, "backup_webdav_username", &value).await?;
-    }
-    if let Some(value) = backup_webdav_password {
-        set(db, "backup_webdav_password", &value).await?;
-    }
-    if let Some(value) = p.backup_s3_enabled {
-        set(db, "backup_s3_enabled", if value { "1" } else { "0" }).await?;
-    }
-    if let Some(value) = backup_s3_endpoint {
-        set(db, "backup_s3_endpoint", &value).await?;
-    }
-    if let Some(value) = backup_s3_region {
-        set(db, "backup_s3_region", &value).await?;
-    }
-    if let Some(value) = backup_s3_bucket {
-        set(db, "backup_s3_bucket", &value).await?;
-    }
-    if let Some(value) = backup_s3_prefix {
-        set(db, "backup_s3_prefix", &value).await?;
-    }
-    if let Some(value) = backup_s3_access_key {
-        set(db, "backup_s3_access_key", &value).await?;
-    }
-    if let Some(value) = backup_s3_secret_key {
-        set(db, "backup_s3_secret_key", &value).await?;
-    }
-    if let Some(value) = backup_s3_session_token {
-        set(db, "backup_s3_session_token", &value).await?;
-    }
-    if let Some(value) = p.backup_s3_path_style {
-        set(db, "backup_s3_path_style", if value { "1" } else { "0" }).await?;
-    }
-    if let Some(value) = backup_encryption_password {
-        if value.is_empty() {
-            db.setting_del("extra.backup_encryption_password").await?;
-        } else {
-            set(db, "backup_encryption_password", &value).await?;
+    let directory_patch = p.inbox_routes.is_some()
+        || inbox_rules.is_some()
+        || inbox_dir.is_some()
+        || inbox_video_dir.is_some()
+        || inbox_image_dir.is_some()
+        || inbox_book_dir.is_some();
+    let mut inbox_sets: Vec<(String, String)> = Vec::new();
+    let mut inbox_deletes = Vec::new();
+    if directory_patch {
+        if let Some(revision) = p.inbox_routes_revision
+            && revision != next.inbox_routes_revision
+        {
+            return Err(AppError::Conflict(
+                "收件目录配置已被更新，请重新加载后再保存".into(),
+            ));
         }
+        // 旧客户端只改默认路径、且分类目录从未固化时，继续派生新的子目录。
+        if p.inbox_routes.is_none()
+            && inbox_dir.is_some()
+            && db.setting_get("extra.inbox_routes").await?.is_none()
+        {
+            let base = inbox_dir
+                .as_deref()
+                .unwrap_or(&next.inbox_dir)
+                .trim_end_matches('/');
+            for (key, label, explicit) in [
+                ("video", "视频", inbox_video_dir.is_some()),
+                ("image", "图片", inbox_image_dir.is_some()),
+                ("book", "书籍", inbox_book_dir.is_some()),
+            ] {
+                if !explicit
+                    && db
+                        .setting_get(&format!("extra.inbox_{key}_dir"))
+                        .await?
+                        .is_none()
+                {
+                    let path = format!("{base}/{label}");
+                    if let Some(route) = next.inbox_routes.iter_mut().find(|route| route.key == key)
+                    {
+                        *route = inbox_dirs::single_route(key, &path);
+                    }
+                }
+            }
+        }
+        let old_rules = next.inbox_rules.clone();
+        if let Some(rules) = &inbox_rules {
+            next.inbox_rules.clone_from(rules);
+        }
+        let replacements = [
+            ("default", inbox_dir.as_ref(), &next.inbox_dir),
+            ("video", inbox_video_dir.as_ref(), &next.inbox_video_dir),
+            ("image", inbox_image_dir.as_ref(), &next.inbox_image_dir),
+            ("book", inbox_book_dir.as_ref(), &next.inbox_book_dir),
+        ];
+        let mut routes = p
+            .inbox_routes
+            .clone()
+            .unwrap_or_else(|| next.inbox_routes.clone());
+        if p.inbox_routes.is_none() {
+            for (key, value, old) in replacements {
+                if let Some(value) = value
+                    && value != old
+                {
+                    inbox_dirs::set_legacy_auto(&mut routes, key, value);
+                }
+            }
+            let valid_keys: HashSet<_> = inbox_dirs::legacy_routes(&next)
+                .iter()
+                .map(|route| route.key.clone())
+                .collect();
+            routes.retain(|route| valid_keys.contains(&route.key));
+            for rule in &next.inbox_rules {
+                let key = inbox_dirs::custom_key(&rule.name);
+                let changed = old_rules
+                    .iter()
+                    .find(|old| inbox_dirs::custom_key(&old.name) == key)
+                    .is_none_or(|old| old.dir != rule.dir);
+                if changed {
+                    inbox_dirs::set_legacy_auto(&mut routes, &key, &rule.dir);
+                }
+            }
+            for legacy in inbox_dirs::legacy_routes(&next) {
+                if !routes.iter().any(|route| route.key == legacy.key) {
+                    routes.push(legacy);
+                }
+            }
+        }
+        let mut routes = inbox_dirs::normalize_routes(&routes, &next.inbox_rules)?;
+        inbox_dirs::bind_routes(db, &mut routes).await?;
+        next.inbox_routes = routes;
+        inbox_dirs::sync_legacy(&mut next);
+        inbox_sets.extend([
+            (
+                "extra.inbox_routes".into(),
+                serde_json::to_string(&next.inbox_routes).map_err(anyhow::Error::from)?,
+            ),
+            (
+                "extra.inbox_rules".into(),
+                serde_json::to_string(&next.inbox_rules).map_err(anyhow::Error::from)?,
+            ),
+            ("extra.inbox_dir".into(), next.inbox_dir.clone()),
+            ("extra.inbox_video_dir".into(), next.inbox_video_dir.clone()),
+            ("extra.inbox_image_dir".into(), next.inbox_image_dir.clone()),
+            ("extra.inbox_book_dir".into(), next.inbox_book_dir.clone()),
+        ]);
     }
     if p.inbox_enabled.is_some()
         || p.inbox_bot_enabled.is_some()
         || p.inbox_channel_enabled.is_some()
     {
-        let (bot, channel) = load_inbox_switches(db).await?;
-        let bot = p.inbox_bot_enabled.or(p.inbox_enabled).unwrap_or(bot);
-        let channel = p
-            .inbox_channel_enabled
-            .or(p.inbox_enabled)
-            .unwrap_or(channel);
-        // 同时固化两个新开关，关闭其中一个不会再通过旧总开关联动另一个。
-        db.settings_apply(
-            &[
-                (
-                    "extra.inbox_bot_enabled".into(),
-                    if bot { "1" } else { "0" }.into(),
-                ),
-                (
-                    "extra.inbox_channel_enabled".into(),
-                    if channel { "1" } else { "0" }.into(),
-                ),
-            ],
-            &["extra.inbox_enabled".into()],
-        )
-        .await?;
+        if let Some(bot) = p.inbox_bot_enabled.or(p.inbox_enabled) {
+            inbox_sets.push((
+                "extra.inbox_bot_enabled".into(),
+                if bot { "1" } else { "0" }.into(),
+            ));
+        }
+        if let Some(channel) = p.inbox_channel_enabled.or(p.inbox_enabled) {
+            inbox_sets.push((
+                "extra.inbox_channel_enabled".into(),
+                if channel { "1" } else { "0" }.into(),
+            ));
+        }
+        inbox_deletes.push("extra.inbox_enabled".into());
     }
-    if let Some(v) = inbox_allowed_chats {
-        set(db, "inbox_allowed_chats", v).await?;
+    if let Some(value) = inbox_allowed_chats {
+        inbox_sets.push(("extra.inbox_allowed_chats".into(), value.into()));
     }
-    if let Some(v) = inbox_dir {
-        set(db, "inbox_dir", &v).await?;
+
+    if let Some(d) = p.trash_retention_days {
+        inbox_sets.push(("extra.trash_retention_days".into(), d.to_string()));
     }
-    if let Some(v) = inbox_video_dir {
-        set(db, "inbox_video_dir", &v).await?;
+    if let Some(b) = p.backup_auto {
+        inbox_sets.push(("extra.backup_auto".into(), if b { "1" } else { "0" }.into()));
     }
-    if let Some(v) = inbox_image_dir {
-        set(db, "inbox_image_dir", &v).await?;
+    if let Some(b) = p.backup_skip_if_unchanged {
+        inbox_sets.push((
+            "extra.backup_skip_if_unchanged".into(),
+            if b { "1" } else { "0" }.into(),
+        ));
     }
-    if let Some(v) = inbox_book_dir {
-        set(db, "inbox_book_dir", &v).await?;
+    if let Some(size) = backup_chunk_size {
+        inbox_sets.push(("extra.backup_chunk_size".into(), size.to_string()));
     }
-    if let Some(rules) = inbox_rules {
-        let raw = serde_json::to_string(&rules)
-            .map_err(|e| AppError::BadRequest(format!("自定义收件规则序列化失败:{e}")))?;
-        set(db, "inbox_rules", &raw).await?;
+    if let Some(value) = p.backup_telegram_enabled {
+        inbox_sets.push((
+            "extra.backup_telegram_enabled".into(),
+            if value { "1" } else { "0" }.into(),
+        ));
+    }
+    if let Some(value) = p.backup_webdav_enabled {
+        inbox_sets.push((
+            "extra.backup_webdav_enabled".into(),
+            if value { "1" } else { "0" }.into(),
+        ));
+    }
+    if let Some(value) = backup_webdav_url {
+        inbox_sets.push(("extra.backup_webdav_url".into(), value));
+    }
+    if let Some(value) = backup_webdav_username {
+        inbox_sets.push(("extra.backup_webdav_username".into(), value));
+    }
+    if let Some(value) = backup_webdav_password {
+        inbox_sets.push(("extra.backup_webdav_password".into(), value));
+    }
+    if let Some(value) = p.backup_s3_enabled {
+        inbox_sets.push((
+            "extra.backup_s3_enabled".into(),
+            if value { "1" } else { "0" }.into(),
+        ));
+    }
+    if let Some(value) = backup_s3_endpoint {
+        inbox_sets.push(("extra.backup_s3_endpoint".into(), value));
+    }
+    if let Some(value) = backup_s3_region {
+        inbox_sets.push(("extra.backup_s3_region".into(), value));
+    }
+    if let Some(value) = backup_s3_bucket {
+        inbox_sets.push(("extra.backup_s3_bucket".into(), value));
+    }
+    if let Some(value) = backup_s3_prefix {
+        inbox_sets.push(("extra.backup_s3_prefix".into(), value));
+    }
+    if let Some(value) = backup_s3_access_key {
+        inbox_sets.push(("extra.backup_s3_access_key".into(), value));
+    }
+    if let Some(value) = backup_s3_secret_key {
+        inbox_sets.push(("extra.backup_s3_secret_key".into(), value));
+    }
+    if let Some(value) = backup_s3_session_token {
+        inbox_sets.push(("extra.backup_s3_session_token".into(), value));
+    }
+    if let Some(value) = p.backup_s3_path_style {
+        inbox_sets.push((
+            "extra.backup_s3_path_style".into(),
+            if value { "1" } else { "0" }.into(),
+        ));
+    }
+    if let Some(value) = backup_encryption_password {
+        if value.is_empty() {
+            inbox_deletes.push("extra.backup_encryption_password".into());
+        } else {
+            inbox_sets.push(("extra.backup_encryption_password".into(), value));
+        }
     }
     if let Some(v) = p.auto_delete_message {
-        set(db, "auto_delete_message", if v { "1" } else { "0" }).await?;
+        inbox_sets.push((
+            "extra.auto_delete_message".into(),
+            if v { "1" } else { "0" }.into(),
+        ));
+    }
+    if !inbox_sets.is_empty() || !inbox_deletes.is_empty() {
+        db.apply_inbox_settings(
+            &inbox_sets,
+            &inbox_deletes,
+            directory_patch.then_some(next.inbox_routes_revision),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1035,15 +1190,9 @@ mod tests {
     #[tokio::test]
     async fn backup_skip_if_unchanged_roundtrips_and_defaults_off() {
         let directory = tempfile::tempdir().unwrap();
-        let db = Db::open(
-            directory
-                .path()
-                .join("skip-switch.db")
-                .to_str()
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let db = Db::open(directory.path().join("skip-switch.db").to_str().unwrap())
+            .await
+            .unwrap();
         assert!(!load(&db).await.unwrap().backup_skip_if_unchanged);
 
         save(

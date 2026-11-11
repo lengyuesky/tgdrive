@@ -112,10 +112,10 @@ function createAdminState() {
     }
   }
 
-  async function removeInboxFailure(updateId: number) {
+  async function removeInboxFailure(id: string | number) {
     try {
-      await api.admin.removeInboxFailure(updateId)
-      inboxFailures.value = inboxFailures.value.filter((item) => item.update_id !== updateId)
+      await api.admin.removeInboxFailure(id)
+      inboxFailures.value = inboxFailures.value.filter((item) => (item.id ?? item.update_id) !== id)
       if (status.value) status.value.inbox_failures = inboxFailures.value.length
     } catch (e) {
       ElMessage.error(errMsg(e))

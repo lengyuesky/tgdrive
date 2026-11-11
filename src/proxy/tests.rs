@@ -370,8 +370,14 @@ async fn mtproto_tunnels_support_http_connect_and_socks5_without_losing_early_by
             .await
             .unwrap();
             drop(tunnel);
-            tokio::task::yield_now().await;
-            assert!(TcpStream::connect(address).await.is_err());
+            // abort 后任务在后续调度中释放监听器；一次 yield 不保证该任务已经被轮询。
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while TcpStream::connect(address).await.is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("代理隧道退出后应及时释放本地监听端口");
         }
     }
 }

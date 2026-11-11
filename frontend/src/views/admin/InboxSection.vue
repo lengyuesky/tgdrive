@@ -12,7 +12,8 @@
       <div>
         <div>
           <b>Bot 私聊收件</b>和<b>频道收件</b>可独立开启或关闭，
-          文件、视频、图片或音频按原类型零流量入库，两种入口共用下方分类目录。
+          私聊收到文件后选择目录、按需改名并确认存储；频道按类型自动入库。
+          两种入口共用下方候选目录，视频继续择优保存。
         </div>
         <div>官方 Bot API 下载单文件上限 20MB:更大的文件也会入库,但需要自建端点才能下载。</div>
       </div>
@@ -21,7 +22,7 @@
     <div class="fields">
       <SettingField
         label="Bot 私聊收件"
-        help="将白名单用户私聊发给主 Bot 的文件转存到存储频道。"
+        help="白名单用户向主 Bot 发送文件，选择目录并确认后转存。"
         inline
       >
         <el-switch v-model="extras.inbox_bot_enabled" />
@@ -39,11 +40,9 @@
         :key="d.key"
         :label="d.label"
         :help="d.help"
+        wide
       >
-        <div class="ctl-row">
-          <el-input v-model="extras[d.key]" placeholder="/收件箱" />
-          <el-button @click="chooseInboxDir(d.key)">选择</el-button>
-        </div>
+        <InboxDirectoryList :route="inboxRouteForType(d.typeKey)" />
       </SettingField>
 
       <SettingField
@@ -88,11 +87,8 @@
                 placeholder="例如：音乐、压缩包、项目源码"
               />
             </SettingField>
-            <SettingField label="存储目录">
-              <div class="ctl-row">
-                <el-input v-model="rule.dir" placeholder="/收件箱/自定义" />
-                <el-button @click="chooseRuleDir(rule)">选择</el-button>
-              </div>
+            <SettingField label="候选收件目录" wide>
+              <InboxDirectoryList :route="inboxRouteForRule(rule)" />
             </SettingField>
             <SettingField
               label="文件后缀"
@@ -132,6 +128,7 @@
         </span>
       </button>
     </div>
+    <InboxRequests />
   </template>
 </template>
 
@@ -141,12 +138,14 @@ import { InfoFilled, Plus, WarnTriangleFilled } from '@element-plus/icons-vue'
 import SettingField from '../../components/SettingField.vue'
 import { INBOX_DIRS } from './useAdminExtras'
 import { useAdminContext } from './useAdmin'
+import InboxDirectoryList from './InboxDirectoryList.vue'
+import InboxRequests from './InboxRequests.vue'
 
 const {
   addInboxRule,
   addRuleExtensions,
-  chooseInboxDir,
-  chooseRuleDir,
+  inboxRouteForType,
+  inboxRouteForRule,
   extras,
   inboxRuleExtensionDrafts,
   openDetect,

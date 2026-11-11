@@ -301,6 +301,8 @@ pub(super) async fn preserve_settings(candidate: &Path, state: &AppState) -> any
         let mut tx = conn.begin().await?;
         // 恢复不能复活备份中的设备会话；轮换内容命名空间及主密钥，避免旧节点缓存误绑定。
         sqlx::query("DELETE FROM upload_receipts").execute(&mut *tx).await?;
+        // 恢复到旧请求状态不能重放可能已经发生的 Telegram 转存。
+        crate::db::inbox::invalidate_restored_inbox(&mut tx).await?;
         sqlx::query("DELETE FROM device_refresh_tokens").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM device_sessions").execute(&mut *tx).await?;
         sqlx::query("UPDATE client_identity SET server_id = lower(hex(randomblob(16))) WHERE id = 1").execute(&mut *tx).await?;

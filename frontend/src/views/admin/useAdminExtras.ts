@@ -1,28 +1,32 @@
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { api, errMsg, type BackupLastTimes, type Extras, type InboxRouteRule } from '../../api'
+import { api, errMsg, type BackupLastTimes, type Extras, type ExtrasPatch, type InboxRouteRule, type InboxDirectory, type InboxTypeDirectories } from '../../api'
 import type DirPicker from '../../components/DirPicker.vue'
 import { sizeInput } from './sections'
 
 export type InboxDirKey = 'inbox_dir' | 'inbox_video_dir' | 'inbox_image_dir' | 'inbox_book_dir'
-export const INBOX_DIRS: { key: InboxDirKey; label: string; help: string }[] = [
+export const INBOX_DIRS: { key: InboxDirKey; typeKey: string; label: string; help: string }[] = [
   {
     key: 'inbox_dir',
+    typeKey: 'default',
     label: '默认收件目录',
-    help: '没有命中任何类型规则的文件放这里,目录不存在时自动创建。',
+    help: '未匹配文件使用本组目录；新配置的路径在保存时创建。',
   },
   {
     key: 'inbox_video_dir',
+    typeKey: 'video',
     label: '视频目录',
     help: 'mp4、mkv、mov、avi、webm、flv、wmv、ts、m2ts、mpeg、3gp 等。',
   },
   {
     key: 'inbox_image_dir',
+    typeKey: 'image',
     label: '图片目录',
     help: 'jpg、png、gif、webp、bmp、avif、heic、tiff、svg 等。',
   },
   {
     key: 'inbox_book_dir',
+    typeKey: 'book',
     label: '书籍目录',
     help: 'pdf、epub、mobi、azw3、fb2、djvu、cbz、cbr、txt、rtf 等。',
   },
@@ -45,6 +49,100 @@ export function useAdminExtras(writesBlocked = () => false, backupsBlocked = wri
   const backingUp = ref(false)
   const inboxDirPicker = ref<InstanceType<typeof DirPicker>>()
   const inboxRuleExtensionDrafts = ref<string[]>([])
+  let ruleRoutes = new Map<InboxRouteRule, InboxTypeDirectories>()
+
+  function newInboxRoute(key: string, path: string): InboxTypeDirectories {
+    return { key, directories: [{ node_id: null, path, automatic: true, missing: false }] }
+  }
+
+  function inboxRouteForType(key: string): InboxTypeDirectories {
+    const ex = extras.value!
+    ex.inbox_routes ??= []
+    let route = ex.inbox_routes.find((route) => route.key === key)
+    if (!route) {
+      const field = INBOX_DIRS.find((field) => field.typeKey === key)
+      ex.inbox_routes.push(newInboxRoute(key, field ? ex[field.key] || '/收件箱' : '/收件箱'))
+      route = ex.inbox_routes[ex.inbox_routes.length - 1]!
+    }
+    return route
+  }
+
+  function inboxRouteForRule(rule: InboxRouteRule): InboxTypeDirectories {
+    const ex = extras.value!
+    ex.inbox_routes ??= []
+    const key = `custom:${rule.name.trim().toLowerCase()}`
+    let route = ruleRoutes.get(rule)
+    if (!route) {
+      const used = new Set(ruleRoutes.values())
+      route = ex.inbox_routes.find((route) => route.key === key && !used.has(route))
+      if (!route) {
+        ex.inbox_routes.push(newInboxRoute(key, rule.dir || ex.inbox_dir || '/收件箱'))
+        route = ex.inbox_routes[ex.inbox_routes.length - 1]!
+      }
+      ruleRoutes.set(rule, route)
+    }
+    route.key = key
+    return route
+  }
+
+  function syncInboxRoutes() {
+    if (!extras.value) return
+    const ex = extras.value
+    const builtin = INBOX_DIRS.map((field) => inboxRouteForType(field.typeKey))
+    const custom = ex.inbox_rules.map((rule) => inboxRouteForRule(rule))
+    ex.inbox_routes = [...builtin, ...custom]
+    INBOX_DIRS.forEach((field, index) => {
+      const directory = builtin[index]?.directories.find((directory) => directory.automatic)
+      if (directory) ex[field.key] = directory.path
+    })
+    ex.inbox_rules.forEach((rule, index) => {
+      const directory = custom[index]?.directories.find((directory) => directory.automatic)
+      if (directory) rule.dir = directory.path
+    })
+  }
+
+  function setInboxDirectoryPath(directory: InboxDirectory, path: string) {
+    if (directory.path === path) return
+    directory.path = path
+    directory.node_id = null
+    directory.missing = false
+  }
+
+  function addInboxDirectory(route: InboxTypeDirectories) {
+    if (route.directories.length >= 20) return
+    route.directories.push({ node_id: null, path: '', automatic: route.directories.length === 0, missing: false })
+  }
+
+  function removeInboxDirectory(route: InboxTypeDirectories, index: number) {
+    if (route.directories.length <= 1) return
+    const automatic = route.directories[index]?.automatic
+    route.directories.splice(index, 1)
+    if (automatic && route.directories[0]) route.directories[0].automatic = true
+  }
+
+  function moveInboxDirectory(route: InboxTypeDirectories, index: number, delta: number) {
+    const next = index + delta
+    if (next < 0 || next >= route.directories.length) return
+    const directory = route.directories.splice(index, 1)[0]!
+    route.directories.splice(next, 0, directory)
+  }
+
+  function setAutomaticInboxDirectory(route: InboxTypeDirectories, index: number) {
+    route.directories.forEach((directory, current) => { directory.automatic = current === index })
+  }
+
+  async function chooseInboxDirectory(directory: InboxDirectory) {
+    const picked = await inboxDirPicker.value?.open('选择收件目录', directory.path || '/收件箱')
+    if (!picked) return
+    if (picked === '/') {
+      ElMessage.warning('收件目录不能是根目录，请选择或新建一个文件夹')
+      return
+    }
+    // 明确重新选择可替换同一路径下已删除或重新创建的文件夹身份。
+    directory.path = picked
+    directory.node_id = null
+    directory.missing = false
+  }
 
   async function chooseInboxDir(key: InboxDirKey) {
     if (!extras.value) return
@@ -82,7 +180,13 @@ export function useAdminExtras(writesBlocked = () => false, backupsBlocked = wri
   }
 
   function removeInboxRule(index: number) {
-    extras.value?.inbox_rules.splice(index, 1)
+    const rule = extras.value?.inbox_rules[index]
+    if (rule && extras.value) {
+      const route = ruleRoutes.get(rule)
+      extras.value.inbox_routes = extras.value.inbox_routes?.filter((item) => item !== route)
+      ruleRoutes.delete(rule)
+      extras.value.inbox_rules.splice(index, 1)
+    }
     inboxRuleExtensionDrafts.value.splice(index, 1)
   }
 
@@ -114,6 +218,8 @@ export function useAdminExtras(writesBlocked = () => false, backupsBlocked = wri
     try {
       const { data } = await api.admin.extras()
       extras.value = data.extras
+      ruleRoutes = new Map()
+      syncInboxRoutes()
       extrasOrigin.value = JSON.parse(JSON.stringify(data.extras))
       backupChunkSizeInput.value = sizeInput(data.extras.backup_chunk_size)
       backupChunkOrigin.value = backupChunkSizeInput.value
@@ -131,12 +237,18 @@ export function useAdminExtras(writesBlocked = () => false, backupsBlocked = wri
     if (!extras.value) return
     // 用户直接点保存时，也要收下输入框里尚未按回车的后缀，避免静默丢失。
     extras.value.inbox_rules.forEach((rule, index) => addRuleExtensions(rule, index))
+    syncInboxRoutes()
+    const keys = extrasPatchKeys()
+    if (!keys.length) return
+    const patch = Object.fromEntries(keys.filter(key => key !== 'backup_chunk_size' && key !== 'inbox_routes_revision')
+      .map(key => [key, extras.value![key as keyof Extras]])) as ExtrasPatch
+    if (keys.includes('backup_chunk_size')) patch.backup_chunk_size = backupChunkSizeInput.value
+    if (keys.some(key => key === 'inbox_routes' || key === 'inbox_rules' || INBOX_DIRS.some(field => field.key === key))) {
+      patch.inbox_routes_revision = extras.value.inbox_routes_revision
+    }
     extrasSaving.value = true
     try {
-      await api.admin.saveExtras({
-        ...extras.value,
-        backup_chunk_size: backupChunkSizeInput.value,
-      })
+      await api.admin.saveExtras(patch)
       // 这个保存路径被维护、备份、Bot 收件、后台任务几个分区共用,别写死某一个的名字
       ElMessage.success('设置已保存并生效')
       await loadExtras()
@@ -155,7 +267,7 @@ export function useAdminExtras(writesBlocked = () => false, backupsBlocked = wri
     const org = extrasOrigin.value
     if (!cur || !org) return []
     const keys = (Object.keys(cur) as (keyof Extras)[])
-      .filter((k) => JSON.stringify(cur[k]) !== JSON.stringify(org[k]))
+      .filter((k) => k !== 'inbox_routes_revision' && JSON.stringify(cur[k]) !== JSON.stringify(org[k]))
       .map(String)
     if (backupChunkSizeInput.value !== backupChunkOrigin.value) keys.push('backup_chunk_size')
     return keys
@@ -206,6 +318,14 @@ export function useAdminExtras(writesBlocked = () => false, backupsBlocked = wri
     removeInboxRule,
     addRuleExtensions,
     removeRuleExtension,
+    inboxRouteForType,
+    inboxRouteForRule,
+    setInboxDirectoryPath,
+    addInboxDirectory,
+    removeInboxDirectory,
+    moveInboxDirectory,
+    setAutomaticInboxDirectory,
+    chooseInboxDirectory,
     loadExtras,
     saveExtras,
     hasRuleDraft,

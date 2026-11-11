@@ -192,6 +192,8 @@ pub trait TgApi: Send + Sync + 'static {
     /// 在发起一次新的媒体请求前取得共享发送时隙。真实客户端按聊天错峰，
     /// 测试/占位客户端默认不等待。
     async fn wait_upload_turn(&self) {}
+    /// 收件的 file_id 转存也参与当前 Bot 的共享冷却。
+    async fn defer_upload_turn(&self, _seconds: u64) {}
     /// 当前 Telegram 429 共享冷却剩余秒数，供上传界面显示。
     fn upload_retry_after_secs(&self) -> u64 {
         0
@@ -1383,6 +1385,12 @@ impl TgApi for TgClient {
 
     async fn wait_upload_turn(&self) {
         self.media_throttle.wait_turn().await;
+    }
+
+    async fn defer_upload_turn(&self, seconds: u64) {
+        self.media_throttle
+            .defer_all(Duration::from_secs(seconds.min(3600)))
+            .await;
     }
 
     fn upload_retry_after_secs(&self) -> u64 {

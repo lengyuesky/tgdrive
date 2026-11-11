@@ -16,6 +16,7 @@ mod copy;
 mod delete_jobs;
 pub mod devices;
 pub mod entries;
+pub mod inbox;
 mod logs;
 mod query;
 pub mod reading;

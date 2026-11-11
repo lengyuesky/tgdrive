@@ -167,6 +167,19 @@ pub fn router(state: AppState) -> Router {
             "/admin/inbox-failures/{update_id}",
             axum::routing::delete(admin_inbox_failure_remove),
         )
+        .route("/admin/inbox-requests", get(admin_inbox_requests))
+        .route(
+            "/admin/inbox-requests/{id}/cancel",
+            post(admin_inbox_request_cancel),
+        )
+        .route(
+            "/admin/inbox-requests/{id}/retry",
+            post(admin_inbox_request_retry),
+        )
+        .route(
+            "/admin/inbox-requests/{id}/resend",
+            post(admin_inbox_request_resend),
+        )
         .route("/admin/cleanup", post(admin_cleanup))
         .route("/admin/logout-all", post(admin_logout_all))
         .route("/admin/security", get(security_status))

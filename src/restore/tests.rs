@@ -714,10 +714,7 @@ async fn offline_validation_rejects_same_named_modified_reading_objects() {
         db.close().await;
         let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
         let mut conn = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
-        sqlx::query(drop_sql)
-            .execute(&mut conn)
-            .await
-            .unwrap();
+        sqlx::query(drop_sql).execute(&mut conn).await.unwrap();
         sqlx::query(replacement).execute(&mut conn).await.unwrap();
         conn.close().await.unwrap();
         let error = storage::validate_candidate(&path)
@@ -762,6 +759,50 @@ async fn confirm_preserves_security_and_only_next_start_switches_database() {
     let id = ready(&state).await;
     let candidate = state.restore.root.join("candidate.db");
     let old = Db::open(candidate.to_str().unwrap()).await.unwrap();
+    let mut old_requests = Vec::new();
+    for (message_id, status) in [
+        "pending",
+        "renaming",
+        "queued",
+        "copying",
+        "copied",
+        "failed",
+        "uncertain",
+        "stored",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let request = old
+            .create_inbox_request(crate::db::inbox::NewInboxRequest {
+                origin_target_id: None,
+                bot_id: "100",
+                chat_id: 42,
+                message_id: message_id as i64,
+                media_kind: "document",
+                name: "restore.pdf",
+                suffix: ".pdf",
+                file_id: "old-file",
+                size: 12,
+                thumbnail: None,
+                selected_dir_id: None,
+                selected_path: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE inbox_requests SET status=?,ended_at=? WHERE id=?")
+            .bind(status)
+            .bind(if *status == "stored" {
+                Some(now_ts())
+            } else {
+                None
+            })
+            .bind(&request.id)
+            .execute(&old.pool)
+            .await
+            .unwrap();
+        old_requests.push((request.id, *status));
+    }
     old.setting_set(crate::auth::TOTP_SECRET_KEY, "old-secret")
         .await
         .unwrap();
@@ -824,6 +865,27 @@ async fn confirm_preserves_security_and_only_next_start_switches_database() {
     state.vfs.db.close().await;
     assert!(storage::startup(&state.rt.env).await.unwrap());
     let restored = Db::open(&state.rt.env.db_path).await.unwrap();
+    for (request_id, old_status) in old_requests {
+        let request = restored.inbox_request(&request_id).await.unwrap();
+        if old_status == "stored" {
+            assert_eq!(request.status, "stored", "已结束记录保留原结果");
+        } else {
+            assert_eq!(
+                request.status, "invalidated",
+                "恢复不能复活 {old_status} 请求"
+            );
+            assert!(request.ended_at.is_some());
+            assert!(
+                request
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("数据库恢复")
+            );
+            assert!(request.rename_prompt_id.is_none());
+        }
+    }
+    assert!(restored.inbox_next_work("100").await.unwrap().is_none());
     assert_eq!(
         restored.setting_get("fixture").await.unwrap().as_deref(),
         Some("candidate")

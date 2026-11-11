@@ -331,29 +331,157 @@ pub(super) async fn admin_inbox_failures(
         .settings_with_prefix("extra.inbox_failure.")
         .await?;
     let mut items = Vec::new();
-    for (update_id, raw) in rows {
+    for (id, raw) in rows {
         if let Ok(serde_json::Value::Object(mut value)) =
             serde_json::from_str::<serde_json::Value>(&raw)
         {
-            value.insert(
-                "update_id".into(),
-                serde_json::json!(update_id.parse::<i64>().unwrap_or(0)),
-            );
+            let update_id = id
+                .rsplit('.')
+                .next()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            value.insert("update_id".into(), serde_json::json!(update_id));
+            value.insert("id".into(), serde_json::json!(id));
             items.push(serde_json::Value::Object(value));
         }
     }
-    items.sort_by_key(|item| item["update_id"].as_i64().unwrap_or(0));
+    items.sort_by_key(|item| std::cmp::Reverse(item["failed_at"].as_i64().unwrap_or(0)));
     Ok(Json(serde_json::json!({ "items": items })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct InboxRequestsQuery {
+    active: Option<bool>,
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
+pub(super) async fn admin_inbox_requests(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<InboxRequestsQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::BadRequest("收件分页数量必须为 1～100".into()));
+    }
+    let before = query
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            let (timestamp, id) = cursor
+                .split_once(':')
+                .ok_or_else(|| AppError::BadRequest("收件游标无效".into()))?;
+            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(AppError::BadRequest("收件游标无效".into()));
+            }
+            Ok((
+                timestamp
+                    .parse::<i64>()
+                    .map_err(|_| AppError::BadRequest("收件游标无效".into()))?,
+                id.to_string(),
+            ))
+        })
+        .transpose()?;
+    let mut requests = state
+        .vfs
+        .db
+        .inbox_requests_page(query.active.unwrap_or(true), before, i64::from(limit) + 1)
+        .await?;
+    let has_more = requests.len() > usize::from(limit);
+    requests.truncate(usize::from(limit));
+    let cursor = if has_more {
+        requests
+            .last()
+            .map(|request| format!("{}:{}", request.created_at, request.id))
+    } else {
+        None
+    };
+    let channels: Vec<(i64, String)> = sqlx::query_as("SELECT id,chat_id FROM storage_targets")
+        .fetch_all(&state.vfs.db.pool)
+        .await?;
+    let channels: std::collections::HashMap<_, _> = channels.into_iter().collect();
+    let items: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            let mut view = request.view();
+            view.target_channel = request
+                .storage_target_id
+                .and_then(|id| channels.get(&id).cloned());
+            view
+        })
+        .collect();
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status,COUNT(*) FROM inbox_requests WHERE ended_at IS NULL GROUP BY status",
+    )
+    .fetch_all(&state.vfs.db.pool)
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "items": items, "next_cursor": cursor, "counts": counts.into_iter().collect::<std::collections::HashMap<_, _>>(), "current_bot_id": crate::inbox::current_bot_id(&state.rt.current()) }),
+    ))
+}
+
+pub(super) async fn admin_inbox_request_cancel(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.vfs.db.require_background_enabled()?;
+    if !state.vfs.db.inbox_cancel_request(&id).await? {
+        return Err(AppError::Conflict("收件正在存储或已经结束".into()));
+    }
+    if state
+        .vfs
+        .db
+        .setting_get("extra.auto_delete_message")
+        .await?
+        .as_deref()
+        == Some("1")
+    {
+        state.vfs.uploader.process_pending_deletes();
+    }
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+pub(super) async fn admin_inbox_request_retry(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.vfs.db.require_background_enabled()?;
+    crate::inbox::retry_request(&state.vfs, &state.rt.current(), &id).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+pub(super) async fn admin_inbox_request_resend(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.vfs.db.require_background_enabled()?;
+    let request = state.vfs.db.inbox_request(&id).await?;
+    if request.bot_id != crate::inbox::current_bot_id(&state.rt.current()) {
+        return Err(AppError::BadRequest(
+            "该收件属于旧 Bot，请向当前 Bot 重新发送文件".into(),
+        ));
+    }
+    state.vfs.db.inbox_resend_notice(&id).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 pub(super) async fn admin_inbox_failure_remove(
     State(state): State<AppState>,
-    axum::extract::Path(update_id): axum::extract::Path<i64>,
+    axum::extract::Path(id): axum::extract::Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    // 保留旧数字 ID 的删除兼容性，新记录使用 Bot 身份与 update_id 的组合。
+    if id.is_empty()
+        || id.len() > 100
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err(AppError::BadRequest("收件死信标识无效".into()));
+    }
     state
         .vfs
         .db
-        .setting_del(&format!("extra.inbox_failure.{update_id}"))
+        .setting_del(&format!("extra.inbox_failure.{id}"))
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -420,6 +548,7 @@ pub(super) async fn admin_backup(State(state): State<AppState>) -> AppResult<Res
         .to_str()
         .ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
     state.vfs.db.vacuum_into(tmp_str).await?;
+    crate::backup::prepare_inbox_snapshot(tmp_str).await?;
     let file = tokio::fs::File::open(&tmp).await?;
     let len = file.metadata().await?.len();
     // Linux 下先删路径,fd 继续有效到流结束,不留残件

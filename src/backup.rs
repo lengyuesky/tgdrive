@@ -538,8 +538,21 @@ async fn scrub_snapshot(path: &str) -> AppResult<()> {
             sqlx::query(deletion).execute(&mut conn).await?;
         }
     }
+    crate::db::inbox::invalidate_restored_inbox(&mut conn).await?;
     // 重写文件，确保被删的值不残留在空闲页里。
     sqlx::query("VACUUM").execute(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+/// 明文下载的备份也结束快照中的旧待办，手动替换数据库不能重放它们。
+pub(crate) async fn prepare_inbox_snapshot(path: &str) -> AppResult<()> {
+    use sqlx::Connection;
+    let mut conn = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new().filename(path),
+    )
+    .await?;
+    crate::db::inbox::invalidate_restored_inbox(&mut conn).await?;
     conn.close().await?;
     Ok(())
 }
@@ -1281,6 +1294,8 @@ mod tests {
             inbox_image_dir: "/收件箱/图片".into(),
             inbox_book_dir: "/收件箱/书籍".into(),
             inbox_rules: Vec::new(),
+            inbox_routes: Vec::new(),
+            inbox_routes_revision: 0,
             auto_delete_message: false,
             backup_encryption_password: String::new(),
         }
@@ -1343,6 +1358,92 @@ mod tests {
             "凭据残留在快照文件里"
         );
         assert!(raw.windows(7).any(|w| w == b"123:bot"));
+    }
+
+    #[tokio::test]
+    async fn exported_snapshots_end_old_inbox_without_changing_live_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = Db::open(dir.path().join("live.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut requests = Vec::new();
+        for (message, status) in [
+            "pending",
+            "renaming",
+            "queued",
+            "copying",
+            "copied",
+            "failed",
+            "uncertain",
+            "stored",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let request = live
+                .create_inbox_request(crate::db::inbox::NewInboxRequest {
+                    origin_target_id: None,
+                    bot_id: "100",
+                    chat_id: 42,
+                    message_id: message as i64,
+                    media_kind: "document",
+                    name: "backup.pdf",
+                    suffix: ".pdf",
+                    file_id: "backup-file",
+                    size: 12,
+                    thumbnail: None,
+                    selected_dir_id: None,
+                    selected_path: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query("UPDATE inbox_requests SET status=?,ended_at=? WHERE id=?")
+                .bind(status)
+                .bind(if *status == "stored" {
+                    Some(now_ts())
+                } else {
+                    None
+                })
+                .bind(&request.id)
+                .execute(&live.pool)
+                .await
+                .unwrap();
+            requests.push((request.id, *status));
+        }
+        for remote in [false, true] {
+            let snapshot = dir
+                .path()
+                .join(if remote { "remote.db" } else { "download.db" });
+            live.vacuum_into(snapshot.to_str().unwrap()).await.unwrap();
+            if remote {
+                scrub_snapshot(snapshot.to_str().unwrap()).await.unwrap();
+            } else {
+                prepare_inbox_snapshot(snapshot.to_str().unwrap())
+                    .await
+                    .unwrap();
+            }
+            let exported = Db::open(snapshot.to_str().unwrap()).await.unwrap();
+            for (id, status) in &requests {
+                let request = exported.inbox_request(id).await.unwrap();
+                assert_eq!(
+                    request.status,
+                    if *status == "stored" {
+                        "stored"
+                    } else {
+                        "invalidated"
+                    }
+                );
+                assert!(request.ended_at.is_some());
+                assert_eq!(
+                    live.inbox_request(id).await.unwrap().status,
+                    *status,
+                    "生成备份不能结束在线待办"
+                );
+            }
+            assert!(exported.inbox_next_work("100").await.unwrap().is_none());
+            exported.close().await;
+        }
+        live.close().await;
     }
 
     #[test]

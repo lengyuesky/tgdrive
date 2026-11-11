@@ -148,6 +148,48 @@ export interface InboxRouteRule {
   dir: string
 }
 
+export interface InboxDirectory {
+  node_id: number | null
+  path: string
+  automatic: boolean
+  missing: boolean
+}
+
+export interface InboxTypeDirectories {
+  key: string
+  directories: InboxDirectory[]
+}
+
+export interface InboxRequest {
+  id: string
+  bot_id: string
+  chat_id: number
+  source_message_id: number
+  original_name: string
+  name: string
+  status: string
+  selected_path: string | null
+  node_id: number | null
+  result_path: string | null
+  last_error: string | null
+  created_at: number
+  updated_at: number
+  expires_at: number
+  ended_at: number | null
+  can_cancel: boolean
+  can_retry: boolean
+  target_channel?: string | null
+  stored_message_id?: number | null
+  copy_started_at?: number | null
+}
+
+export interface InboxRequestsPage {
+  items: InboxRequest[]
+  next_cursor: string | null
+  counts: Record<string, number>
+  current_bot_id: string
+}
+
 /** 维护类可调项(后台「维护」「Bot 收件」区块) */
 export interface Extras {
   trash_retention_days: number
@@ -184,6 +226,8 @@ export interface Extras {
   inbox_image_dir: string
   inbox_book_dir: string
   inbox_rules: InboxRouteRule[]
+  inbox_routes?: InboxTypeDirectories[]
+  inbox_routes_revision?: number
   /** 删除文件后自动清理 Telegram 消息;关掉则只入队,等后台手动执行 */
   auto_delete_message: boolean
 }
@@ -391,6 +435,8 @@ export interface TaskStatus {
 }
 
 export interface InboxFailure {
+  id?: string
+  bot_id?: string | null
   update_id: number
   attempts: number
   last_error: string
@@ -663,8 +709,13 @@ export const api = {
       }),
     inboxFailures: () =>
       http.get<{ items: InboxFailure[] }>('/admin/inbox-failures'),
-    removeInboxFailure: (updateId: number) =>
-      http.delete(`/admin/inbox-failures/${updateId}`),
+    inboxRequests: (params: { active?: boolean; cursor?: string; limit?: number } = {}) =>
+      http.get<InboxRequestsPage>('/admin/inbox-requests', { params }),
+    inboxRequestCancel: (id: string) => http.post(`/admin/inbox-requests/${encodeURIComponent(id)}/cancel`),
+    inboxRequestRetry: (id: string) => http.post(`/admin/inbox-requests/${encodeURIComponent(id)}/retry`),
+    inboxRequestResend: (id: string) => http.post(`/admin/inbox-requests/${encodeURIComponent(id)}/resend`),
+    removeInboxFailure: (id: string | number) =>
+      http.delete(`/admin/inbox-failures/${encodeURIComponent(id)}`),
     clearInboxFailures: () =>
       http.delete<{ cleared: number }>('/admin/inbox-failures'),
     cleanup: () => http.post<{ cleaned: number }>('/admin/cleanup'),

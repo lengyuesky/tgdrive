@@ -1,10 +1,10 @@
-//! Bot 收件:getUpdates 长轮询,把发给 bot 的文件自动登记进网盘。
+//! Bot 收件：频道自动登记，私聊选目录、按需改名并确认后转存。
 //!
 //! 两条入口:
 //! - **存储频道直发**:文件本来就落在存储频道,直接把 file_id/message_id 登记成
 //!   单块文件，零流量入库；跳过本服务上传 Bot 的消息与已经入库的分块。
-//! - **私聊白名单**:把文件、视频、图片、音频等按原媒体类型用 file_id 重发到
-//!   存储频道(Telegram 侧复制,同样零流量),再登记;完成后回复存放路径。
+//! - **私聊白名单**：先创建持久待办，用户确认后按原媒体类型用 file_id 重发到
+//!   存储频道(Telegram 侧复制,同样零流量)，再登记；完成后更新操作消息。
 //!
 //! 两种入口独立启停，并分别记录来源。
 //!
@@ -18,7 +18,18 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod interactive;
+#[cfg(test)]
+#[path = "inbox/interactive_tests.rs"]
+mod interactive_tests;
+pub(crate) use interactive::admin_retry as retry_request;
+
+pub(crate) fn current_bot_id(cfg: &RuntimeCfg) -> String {
+    interactive::bot_id(cfg)
+}
+
 const POLL_TIMEOUT_SECS: u64 = 25;
+#[cfg(test)]
 const OFFSET_KEY: &str = "extra.inbox_offset";
 const FAILURE_KEY_PREFIX: &str = "extra.inbox_failure.";
 const MAX_UPDATE_ATTEMPTS: i64 = 5;
@@ -26,7 +37,12 @@ const MAX_UPDATE_ATTEMPTS: i64 = 5;
 const SEEN_CHATS_KEY: &str = "extra.seen_chats";
 const SEEN_CHATS_MAX: usize = 30;
 /// getUpdates 一次订阅这些类型;my_chat_member 用于捕捉「bot 被拉进频道/群」
-const ALLOWED_UPDATES: [&str; 3] = ["message", "channel_post", "my_chat_member"];
+const ALLOWED_UPDATES: [&str; 4] = [
+    "message",
+    "channel_post",
+    "my_chat_member",
+    "callback_query",
+];
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "mov", "m4v", "avi", "webm", "flv", "wmv", "ts", "m2ts", "mpeg", "mpg", "3gp",
     "ogv",
@@ -51,6 +67,7 @@ struct Update {
     message: Option<Msg>,
     channel_post: Option<Msg>,
     my_chat_member: Option<ChatMemberUpd>,
+    callback_query: Option<interactive::CallbackQuery>,
 }
 
 /// bot 被拉进/移出频道、群时的成员变动事件,只关心是哪个会话
@@ -69,6 +86,8 @@ struct Msg {
     audio: Option<FileRef>,
     animation: Option<FileRef>,
     photo: Option<Vec<PhotoSize>>,
+    text: Option<String>,
+    reply_to_message: Option<interactive::ReplyMessage>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -129,6 +148,22 @@ pub async fn run(
     events: crate::events::EventBus,
     task: crate::tasks::TaskReporter,
 ) {
+    if let Err(error) = vfs.db.recover_inbox_requests().await {
+        task.report_error(&error.to_string());
+        return;
+    }
+    tokio::select! {
+        _ = polling_loop(vfs.clone(), rt.clone(), events.clone(), task.clone()) => {},
+        _ = interactive::worker_loop(vfs, rt, events, task) => {},
+    }
+}
+
+async fn polling_loop(
+    vfs: Vfs,
+    rt: Arc<Runtime>,
+    events: crate::events::EventBus,
+    task: crate::tasks::TaskReporter,
+) {
     let mut cached_http: Option<(crate::proxy::ProxyConfig, reqwest::Client)> = None;
     let mut backoff = 5u64;
     loop {
@@ -155,7 +190,15 @@ pub async fn run(
                 continue;
             }
         };
-        if (!ex.inbox_bot_enabled && !ex.inbox_channel_enabled) || !cfg.is_configured() {
+        if !cfg.is_configured()
+            || (!ex.inbox_bot_enabled
+                && !ex.inbox_channel_enabled
+                && !vfs
+                    .db
+                    .inbox_has_requests(&interactive::bot_id(&cfg))
+                    .await
+                    .unwrap_or(true))
+        {
             task.clear_error();
             if !task.sleep(Duration::from_secs(15)).await {
                 return;
@@ -173,7 +216,7 @@ pub async fn run(
                     inbox_http_client(&cfg.proxy, Duration::from_secs(POLL_TIMEOUT_SECS + 15))?;
                 cached_http = Some((cfg.proxy.clone(), http));
             }
-            poll_once(&cached_http.as_ref().unwrap().1, &vfs, &cfg).await
+            poll_with_runtime(&cached_http.as_ref().unwrap().1, &vfs, &cfg, Some(&rt)).await
         };
         let ingested = match result.await {
             Ok(ingested) => {
@@ -197,14 +240,20 @@ pub async fn run(
     }
 }
 
+#[cfg(test)]
 async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppResult<usize> {
+    poll_with_runtime(http, vfs, cfg, None).await
+}
+
+async fn poll_with_runtime(
+    http: &reqwest::Client,
+    vfs: &Vfs,
+    cfg: &RuntimeCfg,
+    runtime: Option<&Runtime>,
+) -> AppResult<usize> {
     vfs.db.require_background_enabled()?;
-    let offset: i64 = vfs
-        .db
-        .setting_get(OFFSET_KEY)
-        .await?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let bot_id = interactive::bot_id(cfg);
+    let offset = vfs.db.inbox_offset(&bot_id).await?;
 
     let url = format!("{}/bot{}/getUpdates", cfg.api_base, cfg.bot_token);
     let resp = http
@@ -246,26 +295,30 @@ async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppRe
         tracing::warn!("收件:记录会话来源失败: {e}");
     }
     // 长轮询最多等待 25 秒，返回后重新读取设置，避免继续使用关闭开关前的配置。
-    let mut ex = crate::extras::load(&vfs.db).await?;
     let mut ingested = 0usize;
     for up in &updates {
-        // 一批私聊转存可能较慢，两个开关还要在每条消息开始前重新检查。
-        (ex.inbox_bot_enabled, ex.inbox_channel_enabled) =
-            crate::extras::load_inbox_switches(&vfs.db).await?;
-        match handle_update(http, vfs, cfg, &ex, up).await {
+        let live = runtime.map(|runtime| runtime.current());
+        let current = live.as_deref().unwrap_or(cfg);
+        // 此批更新属于轮询时的 Bot，不能将旧 Bot 的文件引用当成新 Bot 的输入。
+        let result = if interactive::bot_id(current) != bot_id {
+            Ok(0)
+        } else {
+            let ex = crate::extras::load(&vfs.db).await?;
+            handle_update(http, vfs, current, &ex, up).await
+        };
+        match result {
             Ok(count) => {
                 ingested += count;
                 // 每条成功后立即推进，后续消息失败或进程退出都不会让已完成消息重复转存。
-                vfs.db
-                    .setting_set(OFFSET_KEY, &(up.update_id + 1).to_string())
-                    .await?;
+                vfs.db.set_inbox_offset(&bot_id, up.update_id + 1).await?;
                 let _ = vfs
                     .db
-                    .setting_del(&format!("{FAILURE_KEY_PREFIX}{}", up.update_id))
+                    .setting_del(&format!("{FAILURE_KEY_PREFIX}{bot_id}.{}", up.update_id))
                     .await;
             }
             Err(e) => {
-                let attempts = remember_update_failure(&vfs.db, up, &e.to_string()).await?;
+                let attempts =
+                    remember_update_failure(&vfs.db, &bot_id, up, &e.to_string()).await?;
                 if attempts < MAX_UPDATE_ATTEMPTS {
                     tracing::warn!(
                         "收件:处理 update {} 失败(第 {attempts}/{MAX_UPDATE_ATTEMPTS} 次): {e}",
@@ -278,9 +331,7 @@ async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppRe
                     "收件:update {} 连续失败 {attempts} 次，已进入死信并继续处理后续消息: {e}",
                     up.update_id
                 );
-                vfs.db
-                    .setting_set(OFFSET_KEY, &(up.update_id + 1).to_string())
-                    .await?;
+                vfs.db.set_inbox_offset(&bot_id, up.update_id + 1).await?;
             }
         }
     }
@@ -289,20 +340,28 @@ async fn poll_once(http: &reqwest::Client, vfs: &Vfs, cfg: &RuntimeCfg) -> AppRe
 
 #[derive(Serialize, Deserialize)]
 struct InboxFailure {
+    #[serde(default)]
+    bot_id: Option<String>,
     attempts: i64,
     last_error: String,
     failed_at: i64,
     update: serde_json::Value,
 }
 
-async fn remember_update_failure(db: &Db, update: &Update, error: &str) -> AppResult<i64> {
-    let key = format!("{FAILURE_KEY_PREFIX}{}", update.update_id);
+async fn remember_update_failure(
+    db: &Db,
+    bot_id: &str,
+    update: &Update,
+    error: &str,
+) -> AppResult<i64> {
+    let key = format!("{FAILURE_KEY_PREFIX}{bot_id}.{}", update.update_id);
     let previous = db
         .setting_get(&key)
         .await?
         .and_then(|raw| serde_json::from_str::<InboxFailure>(&raw).ok());
     let attempts = previous.map(|failure| failure.attempts).unwrap_or(0) + 1;
     let failure = InboxFailure {
+        bot_id: Some(bot_id.into()),
         attempts,
         last_error: error.chars().take(500).collect(),
         failed_at: crate::db::now_ts(),
@@ -325,10 +384,14 @@ async fn handle_update(
     ex: &crate::extras::Extras,
     up: &Update,
 ) -> AppResult<usize> {
+    if let Some(callback) = &up.callback_query {
+        interactive::handle_callback(http, vfs, cfg, ex, callback).await?;
+        return Ok(0);
+    }
     // 存储频道里的直发文件:零流量登记
     if let Some(post) = &up.channel_post {
         if ex.inbox_channel_enabled && is_storage_chat(&cfg.chat_id, &post.chat) {
-            if is_storage_bot(cfg, post)
+            if is_storage_bot(&vfs.db, cfg, post).await?
                 || vfs
                     .db
                     .has_stored_message_in_chat(&cfg.chat_id, post.chat.id, post.message_id)
@@ -376,48 +439,14 @@ async fn handle_update(
         return Ok(0); // 陌生人消息静默忽略,不暴露 bot 用途
     }
 
+    if msg.text.is_some() {
+        interactive::handle_rename_reply(http, vfs, cfg, ex, msg).await?;
+        return Ok(0);
+    }
+
     if let Some(file) = pick_file(msg) {
-        let (mid, fid, size, thumbnail_file_id) =
-            match resend_file(http, cfg, file.kind, &file.file_id).await {
-                Ok(sent) => sent,
-                Err(e) => {
-                    reply(http, cfg, msg, "❌ 转存失败，请稍后重新发送").await;
-                    return Err(e);
-                }
-            };
-        let size = size.filter(|n| *n > 0).unwrap_or(file.size);
-        let storage_target_id = cfg
-            .storage_target_id
-            .ok_or_else(|| AppError::BadRequest("当前 Telegram 配置缺少存储目标".into()))?;
-        let path = match ingest(
-            vfs,
-            ex,
-            &file.name,
-            size,
-            &fid,
-            thumbnail_file_id.as_deref(),
-            mid,
-            storage_target_id,
-            InboxSource::Bot,
-        )
-        .await
-        {
-            Ok(path) => path,
-            Err(e) => {
-                // 私聊文件已经转发成功但落库失败时补偿删除，不能在频道留下孤儿消息。
-                let cleanup_result = match vfs.tg.binding(storage_target_id) {
-                    Ok(binding) => binding.api.delete_message(mid).await,
-                    Err(binding_error) => Err(binding_error),
-                };
-                if let Err(cleanup) = cleanup_result {
-                    tracing::error!("收件消息 {mid} 落库失败({e})，且清理频道消息失败:{cleanup}");
-                }
-                reply(http, cfg, msg, "❌ 文件登记失败，请稍后重新发送").await;
-                return Err(e);
-            }
-        };
-        reply(http, cfg, msg, &format!("✅ 已存入 {path}")).await;
-        return Ok(1);
+        interactive::enqueue(http, vfs, cfg, msg, file).await?;
+        return Ok(0);
     } else if has_supported_media(msg) {
         reply(
             http,
@@ -601,15 +630,24 @@ fn is_storage_chat(cfg_chat: &str, chat: &Chat) -> bool {
         .is_some_and(|n| chat.username.as_deref() == Some(n))
 }
 
-fn is_storage_bot(cfg: &RuntimeCfg, msg: &Msg) -> bool {
-    msg.from.as_ref().is_some_and(|sender| {
-        cfg.all_upload_bot_tokens().iter().any(|token| {
-            token
-                .split_once(':')
-                .and_then(|(id, _)| id.parse::<i64>().ok())
-                == Some(sender.id)
-        })
-    })
+async fn is_storage_bot(db: &Db, cfg: &RuntimeCfg, msg: &Msg) -> AppResult<bool> {
+    let Some(sender) = &msg.from else {
+        return Ok(false);
+    };
+    if cfg.all_upload_bot_tokens().iter().any(|token| {
+        token
+            .split_once(':')
+            .and_then(|(id, _)| id.parse::<i64>().ok())
+            == Some(sender.id)
+    }) {
+        return Ok(true);
+    }
+    // 已开始的旧 Bot 工作可能在配置切换后才向同一频道发消息，不能自动收成第二份文件。
+    if sender.is_bot == Some(true) {
+        db.inbox_known_storage_bot(sender.id).await
+    } else {
+        Ok(false)
+    }
 }
 
 fn has_extension(lower_name: &str, extension: &str) -> bool {
@@ -654,35 +692,42 @@ fn inbox_dir_for<'a>(ex: &'a crate::extras::Extras, name: &str) -> &'a str {
     }
 }
 
-/// 收件目录里同名文件很常见(比如手机发来的 `image.jpg`),依次尝试的编号上限
-const MAX_NAME_SUFFIX: u32 = 999;
+/// 分类始终依据原始文件名；重命名不改变所匹配的收件类型。
 
-/// `image.jpg` → `image (n).jpg`;无扩展名或隐藏文件(`.bashrc`)直接在末尾编号
-fn numbered_name(name: &str, n: u32) -> String {
-    match name.rfind('.') {
-        Some(dot) if dot > 0 => format!("{} ({n}){}", &name[..dot], &name[dot..]),
-        _ => format!("{name} ({n})"),
+pub(crate) fn inbox_type_key(ex: &crate::extras::Extras, name: &str) -> String {
+    let lower = name.to_lowercase();
+    let custom = ex
+        .inbox_rules
+        .iter()
+        .flat_map(|rule| {
+            rule.extensions
+                .iter()
+                .map(move |extension| (rule, extension))
+        })
+        .filter(|(_, extension)| has_extension(&lower, extension))
+        .max_by_key(|(_, extension)| extension.len());
+    if let Some((rule, _)) = custom {
+        return crate::extras::inbox_dirs::custom_key(&rule.name);
     }
-}
-
-/// 在目录里为收件文件占一个不与已有文件、目录或上传中文件重名的上传占位。
-async fn create_unique_uploading(vfs: &Vfs, dir_id: i64, name: &str) -> AppResult<(i64, String)> {
-    for n in 0..=MAX_NAME_SUFFIX {
-        let candidate = if n == 0 {
-            name.to_string()
-        } else {
-            numbered_name(name, n)
-        };
-        if vfs.db.child(dir_id, &candidate).await?.is_some() {
-            continue;
-        }
-        match vfs.db.create_uploading(dir_id, &candidate).await {
-            Ok(node_id) => return Ok((node_id, candidate)),
-            Err(AppError::AlreadyExists | AppError::IsDirectory) => continue,
-            Err(e) => return Err(e),
-        }
+    if VIDEO_EXTENSIONS
+        .iter()
+        .any(|extension| has_extension(&lower, extension))
+    {
+        "video"
+    } else if IMAGE_EXTENSIONS
+        .iter()
+        .any(|extension| has_extension(&lower, extension))
+    {
+        "image"
+    } else if BOOK_EXTENSIONS
+        .iter()
+        .any(|extension| has_extension(&lower, extension))
+    {
+        "book"
+    } else {
+        "default"
     }
-    Err(AppError::AlreadyExists)
+    .into()
 }
 
 /// 把频道里的一条文件消息登记为网盘单块文件;同名时自动编号,不覆盖已有文件
@@ -715,123 +760,43 @@ async fn ingest(
         name
     };
 
-    let target_dir = inbox_dir_for(ex, &name);
-    let dir = vfs.mkdir_p(target_dir).await?;
-    let (node_id, name) = create_unique_uploading(vfs, dir.id, &name).await?;
-    let result = async {
-        vfs.db.record_inbox_source(node_id, source).await?;
-        vfs.db
-            .add_chunk(
-                node_id,
-                0,
+    let directory_id = if ex.inbox_routes.is_empty() {
+        vfs.mkdir_p(inbox_dir_for(ex, &name)).await?.id
+    } else {
+        let directories = ex.inbox_directories_for(&name);
+        let directory = directories
+            .iter()
+            .find(|directory| directory.automatic && !directory.missing)
+            .ok_or_else(|| {
+                AppError::BadRequest("该类型没有有效的自动收件目录，请更新配置".into())
+            })?;
+        if let Some(id) = directory.node_id {
+            id
+        } else {
+            let bound = crate::extras::inbox_dirs::ensure_bound(&vfs.db).await?;
+            bound
+                .inbox_directories_for(&name)
+                .iter()
+                .find(|directory| directory.automatic && !directory.missing)
+                .and_then(|directory| directory.node_id)
+                .ok_or(AppError::NotFound)?
+        }
+    };
+    vfs.db
+        .register_inbox_file(
+            directory_id,
+            crate::db::inbox::InboxFile {
+                name: &name,
+                suffix: interactive::suffix(ex, &name),
                 size,
                 file_id,
+                thumbnail: thumbnail_file_id,
                 message_id,
-                storage_target_id,
-                thumbnail_file_id,
-            )
-            .await?;
-        vfs.db.finalize_upload(node_id, size, None).await
-    }
-    .await;
-    let freed = match result {
-        Ok(freed) => freed,
-        Err(e) => {
-            // 不能留下 uploading 占位，否则同名文件之后会一直被判定为正在上传。
-            // 返回的消息 ID 由调用方决定是否删除：频道直发必须保留原消息，私聊转存会补偿删除。
-            if let Err(cleanup) = vfs.db.abort_upload_keep_messages(node_id).await {
-                tracing::error!("收件节点 {node_id} 登记失败({e})，且回滚临时记录失败:{cleanup}");
-            }
-            return Err(e);
-        }
-    };
-    vfs.uploader.delete_messages_best_effort(freed);
-    Ok(format!("{}/{}", target_dir.trim_end_matches('/'), name))
-}
-
-/// 按原媒体类型用 file_id 重发到存储频道(Telegram 侧复制,零流量)，
-/// 返回 (message_id, 新 file_id, file_size, thumbnail_file_id)。
-async fn resend_file(
-    http: &reqwest::Client,
-    cfg: &RuntimeCfg,
-    kind: MediaKind,
-    file_id: &str,
-) -> AppResult<(i64, String, Option<i64>, Option<String>)> {
-    #[derive(Deserialize)]
-    struct Sent {
-        message_id: i64,
-        document: Option<FileRef>,
-        video: Option<FileRef>,
-        audio: Option<FileRef>,
-        animation: Option<FileRef>,
-        photo: Option<Vec<PhotoSize>>,
-    }
-    let url = format!("{}/bot{}/{}", cfg.api_base, cfg.bot_token, kind.method());
-    let mut body = serde_json::Map::new();
-    body.insert("chat_id".into(), serde_json::json!(cfg.chat_id));
-    body.insert(kind.field().into(), serde_json::json!(file_id));
-    body.insert("disable_notification".into(), serde_json::json!(true));
-    let resp = http.post(&url).json(&body).send().await.map_err(|e| {
-        AppError::Telegram(format!(
-            "转存失败: {}",
-            crate::telegram::reqwest_error_summary(&e)
-        ))
-    })?;
-    let parsed: ApiResp<Sent> = resp.json().await.map_err(|e| {
-        AppError::Telegram(format!(
-            "转存响应解析失败: {}",
-            crate::telegram::reqwest_error_summary(&e)
-        ))
-    })?;
-    let sent = match (parsed.ok, parsed.result) {
-        (true, Some(s)) => s,
-        _ => {
-            return Err(AppError::Telegram(format!(
-                "转存被拒: {}",
-                parsed
-                    .description
-                    .unwrap_or_else(|| "未知错误".into())
-                    .replace(&cfg.bot_token, "[已脱敏]")
-            )));
-        }
-    };
-    let media = match kind {
-        MediaKind::Document => sent.document.map(|f| {
-            (
-                f.file_id,
-                f.file_size,
-                f.thumbnail.map(|thumb| thumb.file_id),
-            )
-        }),
-        MediaKind::Video => sent.video.and_then(|f| {
-            let selected = select_best_video(&f)?;
-            Some((
-                selected.file_id,
-                Some(selected.size),
-                f.thumbnail.map(|thumb| thumb.file_id),
-            ))
-        }),
-        MediaKind::Audio => sent.audio.map(|f| {
-            (
-                f.file_id,
-                f.file_size,
-                f.thumbnail.map(|thumb| thumb.file_id),
-            )
-        }),
-        MediaKind::Animation => sent.animation.map(|f| {
-            (
-                f.file_id,
-                f.file_size,
-                f.thumbnail.map(|thumb| thumb.file_id),
-            )
-        }),
-        MediaKind::Photo => sent
-            .photo
-            .and_then(|sizes| sizes.into_iter().last())
-            .map(|f| (f.file_id, f.file_size, None)),
-    }
-    .ok_or_else(|| AppError::Telegram(format!("转存响应缺少 {}", kind.field())))?;
-    Ok((sent.message_id, media.0, media.1, media.2))
+                target_id: storage_target_id,
+                source,
+            },
+        )
+        .await
 }
 
 /// 尽力回复私聊,失败只记日志
@@ -1018,6 +983,7 @@ fn inbox_http_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::inbox::numbered_name;
     use crate::extras::{Extras, InboxRouteRule};
     use axum::{
         Json, Router,
@@ -1028,8 +994,17 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Clone, Default)]
-    struct MockApi {
-        calls: Arc<Mutex<Vec<String>>>,
+    pub(super) struct MockApi {
+        pub calls: Arc<Mutex<Vec<String>>>,
+        pub paths: Arc<Mutex<Vec<String>>>,
+        pub bodies: Arc<Mutex<Vec<(String, Value)>>>,
+        pub next_message: Arc<std::sync::atomic::AtomicI64>,
+        pub copy_failure: Arc<Mutex<Option<Value>>>,
+        pub move_on_copy: Arc<Mutex<Option<(Db, i64, String)>>>,
+        pub create_on_copy: Arc<Mutex<Option<(Db, i64, String, i64)>>>,
+        pub pause_copy: Arc<std::sync::atomic::AtomicBool>,
+        pub copy_started: Arc<tokio::sync::Notify>,
+        pub copy_release: Arc<tokio::sync::Notify>,
         updates: Arc<Mutex<Vec<Value>>>,
         disable_on_poll: Arc<Mutex<Option<Db>>>,
     }
@@ -1041,6 +1016,46 @@ mod tests {
     ) -> Json<Value> {
         let method = path.rsplit('/').next().unwrap();
         state.calls.lock().unwrap().push(method.to_string());
+        state.paths.lock().unwrap().push(path.clone());
+        state
+            .bodies
+            .lock()
+            .unwrap()
+            .push((method.to_string(), body.clone()));
+        if matches!(
+            method,
+            "sendDocument" | "sendVideo" | "sendAudio" | "sendAnimation" | "sendPhoto"
+        ) {
+            let move_action = state.move_on_copy.lock().unwrap().take();
+            if let Some((db, id, name)) = move_action {
+                db.move_node(id, crate::db::ROOT_ID, &name).await.unwrap();
+            }
+            let create_action = state.create_on_copy.lock().unwrap().take();
+            if let Some((db, directory, name, target)) = create_action {
+                db.register_inbox_file(
+                    directory,
+                    crate::db::inbox::InboxFile {
+                        name: &name,
+                        suffix: ".pdf",
+                        size: 5,
+                        file_id: "existing-file",
+                        thumbnail: None,
+                        message_id: 900,
+                        target_id: target,
+                        source: InboxSource::Channel,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            if state.pause_copy.load(std::sync::atomic::Ordering::SeqCst) {
+                state.copy_started.notify_one();
+                state.copy_release.notified().await;
+            }
+            if let Some(failure) = state.copy_failure.lock().unwrap().clone() {
+                return Json(failure);
+            }
+        }
         let result = match method {
             "getUpdates" => {
                 let disable = state.disable_on_poll.lock().unwrap().clone();
@@ -1067,17 +1082,37 @@ mod tests {
                         .collect::<Vec<_>>()
                 )
             }
-            "sendDocument" => json!({
-                "message_id": 99,
-                "document": {"file_id": "copied-file", "file_size": 12}
-            }),
-            "sendMessage" => json!({"message_id": 100}),
+            "sendDocument" => {
+                let id = 100
+                    + state
+                        .next_message
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"message_id": id,"document": {"file_id": format!("copied-file-{id}"),"file_size": 12}})
+            }
+            "sendVideo" => {
+                let id = 100
+                    + state
+                        .next_message
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"message_id": id,"video": {
+                    "file_id": "copied-video-720", "file_size": 12, "width": 1280, "height": 720,
+                    "thumbnail": {"file_id": "copied-thumbnail"},
+                    "qualities": [
+                        {"file_id": "copied-video-1080", "file_size": 30, "width": 1920, "height": 1080},
+                        {"file_id": "copied-video-2160", "file_size": 60, "width": 3840, "height": 2160}
+                    ]
+                }})
+            }
+            "sendMessage" => {
+                json!({"message_id": 100 + state.next_message.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+            }
+            "editMessageText" | "answerCallbackQuery" => json!(true),
             _ => panic!("意外的 Telegram 请求: {method}"),
         };
         Json(json!({"ok": true, "result": result}))
     }
 
-    async fn test_vfs() -> (
+    pub(super) async fn test_vfs() -> (
         Vfs,
         RuntimeCfg,
         MockApi,
@@ -1103,16 +1138,10 @@ mod tests {
             .await
             .unwrap();
         let target_id = target.id;
-        let tg = Arc::new(
-            crate::telegram::TgRegistry::new(
-                &[target],
-                Some(target_id),
-                vec![target_id],
-                None,
-                crate::proxy::ProxyConfig::default(),
-            )
-            .unwrap(),
-        );
+        let tg = Arc::new(crate::telegram::TgRegistry::with_client(
+            target_id,
+            Arc::new(crate::telegram::UnconfiguredTg),
+        ));
         let knobs = Arc::new(crate::engine::upload::UploadKnobs::new(
             1024,
             dir.path().to_path_buf(),
@@ -1156,13 +1185,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_and_channel_switches_control_ingest_and_resend_independently() {
+    async fn private_and_channel_switches_control_intake_and_auto_ingest_independently() {
         for (bot, channel) in [(false, false), (true, false), (false, true), (true, true)] {
             let (vfs, cfg, mock, pool, server, _dir) = test_vfs().await;
             let mut ex = extras();
             ex.inbox_bot_enabled = bot;
             ex.inbox_channel_enabled = channel;
             ex.inbox_allowed_chats = "42".into();
+            crate::extras::save(
+                &vfs.db,
+                &crate::extras::ExtrasPatch {
+                    inbox_bot_enabled: Some(bot),
+                    inbox_channel_enabled: Some(channel),
+                    inbox_allowed_chats: Some("42".into()),
+                    inbox_dir: Some(ex.inbox_dir.clone()),
+                    inbox_video_dir: Some(ex.inbox_video_dir.clone()),
+                    inbox_image_dir: Some(ex.inbox_image_dir.clone()),
+                    inbox_book_dir: Some(ex.inbox_book_dir.clone()),
+                    inbox_rules: Some(ex.inbox_rules.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            ex = crate::extras::load(&vfs.db).await.unwrap();
             for raw in [private_update(), channel_update()] {
                 handle_update(
                     &reqwest::Client::new(),
@@ -1174,7 +1220,13 @@ mod tests {
                 .await
                 .unwrap();
             }
-            assert_eq!(vfs.resolve("/阅读/private.pdf").await.is_ok(), bot);
+            assert!(vfs.resolve("/阅读/private.pdf").await.is_err());
+            let requests: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM inbox_requests WHERE status='pending'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(requests.0, i64::from(bot));
             assert_eq!(vfs.resolve("/阅读/channel.pdf").await.is_ok(), channel);
             let sources: Vec<(String, String)> = sqlx::query_as(
                 "SELECT n.name,s.source FROM inbox_sources s JOIN nodes n ON n.id=s.node_id ORDER BY n.name",
@@ -1183,14 +1235,11 @@ mod tests {
             if channel {
                 expected.push(("channel.pdf".into(), "channel".into()));
             }
-            if bot {
-                expected.push(("private.pdf".into(), "bot".into()));
-            }
             assert_eq!(sources, expected);
             let calls = mock.calls.lock().unwrap().clone();
             assert_eq!(
                 calls.iter().filter(|call| *call == "sendDocument").count(),
-                usize::from(bot)
+                0
             );
             assert_eq!(
                 calls.iter().filter(|call| *call == "sendMessage").count(),
@@ -1202,10 +1251,18 @@ mod tests {
 
     #[test]
     fn numbered_name_keeps_extension() {
-        assert_eq!(numbered_name("image.jpg", 1), "image (1).jpg");
-        assert_eq!(numbered_name("a.tar.gz", 2), "a.tar (2).gz");
-        assert_eq!(numbered_name("README", 3), "README (3)");
-        assert_eq!(numbered_name(".bashrc", 1), ".bashrc (1)");
+        assert_eq!(
+            numbered_name("image.jpg", ".jpg", 1).unwrap(),
+            "image (1).jpg"
+        );
+        assert_eq!(
+            numbered_name("a.tar.gz", ".tar.gz", 2).unwrap(),
+            "a (2).tar.gz"
+        );
+        assert_eq!(numbered_name("README", "", 3).unwrap(), "README (3)");
+        assert_eq!(numbered_name(".bashrc", "", 1).unwrap(), ".bashrc (1)");
+        let long_suffix = format!(".{}", "a".repeat(250));
+        assert!(numbered_name(&format!("b{long_suffix}"), &long_suffix, 1).is_err());
     }
 
     #[tokio::test]
@@ -1324,6 +1381,29 @@ mod tests {
         .unwrap();
         assert!(vfs.resolve("/阅读/channel.pdf").await.is_err());
 
+        let new_target = vfs
+            .db
+            .ensure_storage_target(&cfg.api_base, "300:new", &cfg.chat_id)
+            .await
+            .unwrap();
+        let mut switched = cfg.clone();
+        switched.bot_token = "300:new".into();
+        switched.upload_bot_tokens.clear();
+        switched.storage_target_id = Some(new_target.id);
+        let mut retired_bot = channel_update();
+        retired_bot["channel_post"]["message_id"] = json!(42);
+        retired_bot["channel_post"]["from"] = json!({"id": 100, "is_bot": true});
+        handle_update(
+            &reqwest::Client::new(),
+            &vfs,
+            &switched,
+            &ex,
+            &serde_json::from_value(retired_bot).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(vfs.resolve("/阅读/channel.pdf").await.is_err());
+
         let other = vfs
             .db
             .ensure_storage_target(&cfg.api_base, "200:extra", "-1002")
@@ -1398,6 +1478,8 @@ mod tests {
                     dir: "/归档".into(),
                 },
             ],
+            inbox_routes: Vec::new(),
+            inbox_routes_revision: 0,
             auto_delete_message: false,
             backup_encryption_password: String::new(),
         }
@@ -1438,6 +1520,8 @@ mod tests {
             audio: None,
             animation: None,
             photo: None,
+            text: None,
+            reply_to_message: None,
         }
     }
 
