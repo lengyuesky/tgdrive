@@ -1,0 +1,283 @@
+# 手动选择源码和镜像，原生构建双架构；可下载镜像包或推送提交号标签。
+name: docker-build
+run-name: 构建镜像 · ${{ inputs.image }} · ${{ inputs.ref || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "源码分支、标签或提交；留空使用上方选择的分支"
+        type: string
+        default: ""
+      image:
+        description: "要构建的镜像"
+        type: choice
+        options:
+          - tgdrive
+          - telegram-bot-api
+          - all
+        default: tgdrive
+      push:
+        description: "推送到 GHCR 的 sha-提交号标签；不勾选则提供镜像包下载"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.image }}-${{ inputs.push }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+      images: ${{ steps.source.outputs.images }}
+      repository: ${{ steps.source.outputs.repository }}
+    steps:
+      - name: 检出指定源码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: 固定构建提交和镜像范围
+        id: source
+        env:
+          BUILD_IMAGE: ${{ inputs.image }}
+        shell: bash
+        run: |
+          case "$BUILD_IMAGE" in
+            tgdrive) images='["tgdrive"]' ;;
+            telegram-bot-api) images='["telegram-bot-api"]' ;;
+            all) images='["tgdrive","telegram-bot-api"]' ;;
+            *) echo "::error::不支持的镜像名称"; exit 1 ;;
+          esac
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" =~ ^[a-f0-9]{40}$ ]]
+          repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          printf '构建源码：`%s`\n' "$sha" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: prepare
+    name: 构建 ${{ matrix.image }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      IMAGE: ghcr.io/${{ needs.prepare.outputs.repository }}${{ matrix.image == 'telegram-bot-api' && '-telegram-bot-api' || '' }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: 检出固定提交
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: 核验原生架构
+        shell: bash
+        run: |
+          case "$ARCH:$(uname -m)" in
+            amd64:x86_64|arm64:aarch64) ;;
+            *) echo "::error::runner 不是目标原生架构"; exit 1 ;;
+          esac
+
+      - name: 配置 Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 构建并加载镜像
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.image == 'telegram-bot-api' && 'Dockerfile.telegram-bot-api' || 'Dockerfile' }}
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}-native
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}-native
+
+      - name: 验证镜像启动和媒体组件
+        env:
+          KIND: ${{ matrix.image }}
+        shell: bash
+        run: |
+          image="$IMAGE:$TAG-$ARCH"
+          if [[ "$KIND" == telegram-bot-api ]]; then
+            docker run --rm --network none --entrypoint /bin/sh "$image" -euc '
+              command -v proxychains4
+              test -x /usr/local/bin/tgdrive-bot-api-supervisor
+              sh -n /usr/local/bin/tgdrive-bot-api-supervisor
+              telegram-bot-api --version
+            '
+            exit 0
+          fi
+          probe_dir="$(mktemp -d)"
+          name="tgdrive-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$probe_dir"' EXIT
+          # 用合成 H.264 视频验证最终镜像的截帧和探测组件。
+          docker run --rm --network none --entrypoint /usr/local/bin/ffmpeg "$image" \
+            -v error -f lavfi -i color=c=red:s=64x64:r=25 -t 0.12 \
+            -an -c:v libx264 -threads 1 -pix_fmt yuv420p -f mp4 \
+            -movflags frag_keyframe+empty_moov pipe:1 > "$probe_dir/cover.mp4"
+          chmod 755 "$probe_dir"
+          docker run --rm --network none --mount "type=bind,src=$probe_dir,dst=/probe,readonly" \
+            --entrypoint /usr/local/bin/ffmpeg "$image" -v error -threads 1 \
+            -i /probe/cover.mp4 -frames:v 1 -an -sn -c:v mjpeg -threads 1 \
+            -f image2pipe pipe:1 > "$probe_dir/cover.jpg"
+          docker run --rm --network none --mount "type=bind,src=$probe_dir,dst=/probe,readonly" \
+            --entrypoint /usr/local/bin/ffprobe "$image" -v error \
+            -show_entries stream=codec_name,width,height -of json /probe/cover.jpg > "$probe_dir/cover.json"
+          PROBE_DIR="$probe_dir" node <<'NODE'
+          const fs = require('node:fs')
+          const jpeg = fs.readFileSync(`${process.env.PROBE_DIR}/cover.jpg`)
+          const stream = JSON.parse(fs.readFileSync(`${process.env.PROBE_DIR}/cover.json`, 'utf8')).streams?.[0]
+          if (!jpeg.length || jpeg.length > 256 * 1024 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8 ||
+              stream?.codec_name !== 'mjpeg' || stream.width !== 64 || stream.height !== 64) {
+            throw new Error('最终镜像未能从合成 MP4 生成有效 JPEG')
+          }
+          NODE
+          docker run --detach --name "$name" --network none \
+            --tmpfs /data:uid=1000,gid=1000 \
+            -e TGDRIVE_USERNAME=ci-synthetic -e TGDRIVE_PASSWORD=ci-synthetic-only \
+            "$image"
+          for attempt in {1..30}; do
+            [[ "$(docker inspect --format '{{.State.Running}}' "$name")" == true ]] || break
+            if docker exec "$name" /usr/local/bin/tgdrive healthcheck >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$name"
+          echo "::error::隔离容器健康检查未通过"
+          exit 1
+
+      - name: 导出已验证镜像
+        if: ${{ !inputs.push }}
+        env:
+          KIND: ${{ matrix.image }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/images"
+          docker save "$IMAGE:$TAG-$ARCH" | gzip -1 > "$RUNNER_TEMP/images/$KIND-$ARCH.tar.gz"
+          printf '下载镜像包后运行：`docker load -i %s-%s.tar.gz`\n\n镜像：`%s:%s-%s`\n' \
+            "$KIND" "$ARCH" "$IMAGE" "$TAG" "$ARCH" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传镜像包
+        if: ${{ !inputs.push }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.image }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/images/*.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 登录 GHCR
+        if: inputs.push
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 推送已验证镜像并保存摘要
+        if: inputs.push
+        shell: bash
+        run: |
+          docker push "$IMAGE:$TAG-$ARCH"
+          reference="$(docker image inspect --format '{{json .RepoDigests}}' "$IMAGE:$TAG-$ARCH" \
+            | jq -r --arg repository "$IMAGE" '.[] | select(startswith($repository + "@sha256:"))')"
+          digest="${reference#*@}"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - name: 上传已验证镜像摘要
+        if: inputs.push
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    if: inputs.push
+    name: 合并 ${{ matrix.image }} 双架构镜像
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+    env:
+      IMAGE: ghcr.io/${{ needs.prepare.outputs.repository }}${{ matrix.image == 'telegram-bot-api' && '-telegram-bot-api' || '' }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: 下载两种架构的已验证摘要
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: 配置 Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 合并并核验提交号标签
+        working-directory: ${{ runner.temp }}/digests
+        shell: bash
+        run: |
+          shopt -s nullglob
+          digests=(*)
+          [[ ${#digests[@]} == 2 ]] || {
+            echo "::error::必须取得两种架构的镜像摘要"
+            exit 1
+          }
+          refs=()
+          for digest in "${digests[@]}"; do
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+            refs+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create --tag "$IMAGE:$TAG" "${refs[@]}"
+          docker buildx imagetools inspect "$IMAGE:$TAG" --raw > "$RUNNER_TEMP/manifest.json"
+          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' \
+            "$RUNNER_TEMP/manifest.json"
+          printf '已推送双架构镜像：`%s:%s`\n\n拉取命令：`docker pull %s:%s`\n' \
+            "$IMAGE" "$TAG" "$IMAGE" "$TAG" >> "$GITHUB_STEP_SUMMARY"

@@ -80,6 +80,12 @@ docker compose stop tgdrive && docker compose run --rm tgdrive reset-2fa && dock
 
 探针:`GET /healthz`(存活)、`GET /readyz`(就绪)、`GET /api/metrics`(Prometheus 指标,需登录)。镜像基于 distroless,排查问题请用 `docker compose logs` 或 `docker cp`。
 
+## 手动构建镜像
+
+在 GitHub Actions 的 [docker-build 工作流](https://github.com/lengyuesky/tgdrive/actions/workflows/docker-build.yml) 点击 **Run workflow**，可选择源码分支、标签或提交，以及 `tgdrive`、`telegram-bot-api` 或 `all`。工作流固定源码提交后，在原生 AMD64、ARM64 runner 上构建和验证镜像。
+
+默认提供保留 7 天的镜像包，在运行页面的 Artifacts 下载并解压后，用 `docker load -i tgdrive-amd64.tar.gz` 导入对应架构镜像。勾选 `push` 会将已验证的镜像推送到 GHCR，生成 `sha-<12位提交号>` 双架构标签和对应的 `-amd64`、`-arm64` 标签，完整拉取命令显示在运行摘要中。正式版本及 `latest` 标签继续由 `docker-release` 的版本发布生成。
+
 ## 本地开发
 
 ```bash
