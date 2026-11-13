@@ -1,0 +1,214 @@
+{
+  "fixture": "tgdrive-fntv-native",
+  "synthetic": true,
+  "date": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "base_commit": "404300611cb10f9a0de7431667cd4f5d32579281",
+  "client": {
+    "version": "1.12.3",
+    "build": "1123003",
+    "bundle": "com.trim.media.ios"
+  },
+  "before_runtime_sha256": {
+    "src/apps/fntv/index.rs": "84b1414e7413c46d687183230d3df473c3c91d18f552e1e6b717dd7eaac83903",
+    "src/apps/fntv/protocol.rs": "ebecdae184199247e14922ae3e443a7978077f5557c8d1c039035309a8543320",
+    "src/apps/fntv_native_fixture.rs": "63f843856b50436f5ee7f32bfd25c8813041560e44c6349ddda4efe6e1b744ad"
+  },
+  "after_runtime_sha256": {
+    "src/apps/fntv/index.rs": "4b09ddb247176fde9d84ee0af90850e1ad13a54d414b961eaa4dc9a5acc1dac8",
+    "src/apps/fntv/protocol.rs": "fba17d7d3ceb36b7a74a47550635178d6673bbde14f664b12cc1145686edd617",
+    "src/apps/fntv_native_fixture.rs": "1da5255e3c48fd3335b99f9baeb7477d1dd7abccba641658dce33b899051d25f"
+  },
+  "final_source_sha256": {
+    "src/apps/fntv/index.rs": "4b09ddb247176fde9d84ee0af90850e1ad13a54d414b961eaa4dc9a5acc1dac8",
+    "src/apps/fntv/protocol.rs": "72a746d0a395d6922d8ae1f84f69f53f0d98d777396aea6822cd0c81a15fd7a1",
+    "src/apps/fntv_native_fixture.rs": "1da5255e3c48fd3335b99f9baeb7477d1dd7abccba641658dce33b899051d25f"
+  },
+  "cases": [
+    {
+      "phase": "before",
+      "request": {
+        "page": 1,
+        "page_size": 72,
+        "sort_column": "create_time",
+        "sort_type": "DESC"
+      },
+      "response_items": [
+        {
+          "title": "A 最早添加",
+          "create_time": 1710000000000
+        },
+        {
+          "title": "B 最新添加",
+          "create_time": 1709740800000
+        },
+        {
+          "title": "C 中间添加",
+          "create_time": 1709827200000
+        },
+        {
+          "title": "D 较早添加",
+          "create_time": 1709913600000
+        }
+      ],
+      "source_line": 49
+    },
+    {
+      "phase": "before",
+      "request": {
+        "page": 1,
+        "page_size": 72,
+        "sort_column": "create_time",
+        "sort_type": "ASC"
+      },
+      "response_items": [
+        {
+          "title": "A 最早添加",
+          "create_time": 1710000000000
+        },
+        {
+          "title": "B 最新添加",
+          "create_time": 1709740800000
+        },
+        {
+          "title": "C 中间添加",
+          "create_time": 1709827200000
+        },
+        {
+          "title": "D 较早添加",
+          "create_time": 1709913600000
+        }
+      ],
+      "source_line": 71
+    },
+    {
+      "phase": "after",
+      "request": {
+        "page": 1,
+        "page_size": 72,
+        "sort_column": "create_time",
+        "sort_type": "DESC"
+      },
+      "response_items": [
+        {
+          "title": "B 最新添加",
+          "create_time": 1700259200000
+        },
+        {
+          "title": "C 中间添加",
+          "create_time": 1700172800000
+        },
+        {
+          "title": "D 较早添加",
+          "create_time": 1700086400000
+        },
+        {
+          "title": "A 最早添加",
+          "create_time": 1700000000000
+        }
+      ],
+      "source_line": 70
+    },
+    {
+      "phase": "after",
+      "request": {
+        "page": 1,
+        "page_size": 72,
+        "sort_column": "create_time",
+        "sort_type": "ASC"
+      },
+      "response_items": [
+        {
+          "title": "A 最早添加",
+          "create_time": 1700000000000
+        },
+        {
+          "title": "D 较早添加",
+          "create_time": 1700086400000
+        },
+        {
+          "title": "C 中间添加",
+          "create_time": 1700172800000
+        },
+        {
+          "title": "B 最新添加",
+          "create_time": 1700259200000
+        }
+      ],
+      "source_line": 100
+    },
+    {
+      "phase": "after",
+      "request": {
+        "page": 1,
+        "page_size": 72,
+        "sort_column": "create_time",
+        "sort_type": "DESC"
+      },
+      "response_items": [
+        {
+          "title": "B 更新剧",
+          "create_time": 1700345600000
+        },
+        {
+          "title": "A 对照剧",
+          "create_time": 1700172800000
+        }
+      ],
+      "source_line": 174
+    },
+    {
+      "phase": "after",
+      "request": {
+        "page": 1,
+        "page_size": 72,
+        "sort_column": "create_time",
+        "sort_type": "ASC"
+      },
+      "response_items": [
+        {
+          "title": "A 对照剧",
+          "create_time": 1700172800000
+        },
+        {
+          "title": "B 更新剧",
+          "create_time": 1700345600000
+        }
+      ],
+      "source_line": 205
+    },
+    {
+      "phase": "after",
+      "request": {
+        "page": 1,
+        "page_size": 72,
+        "sort_column": "sort_title",
+        "sort_type": "ASC"
+      },
+      "response_items": [
+        {
+          "title": "A 最早添加",
+          "create_time": 1700000000000
+        },
+        {
+          "title": "B 最新添加",
+          "create_time": 1700259200000
+        },
+        {
+          "title": "C 中间添加",
+          "create_time": 1700172800000
+        },
+        {
+          "title": "D 较早添加",
+          "create_time": 1700086400000
+        }
+      ],
+      "source_line": 132
+    }
+  ],
+  "notes": [
+    "从官方客户端操作产生的合成列表日志提取，未使用程序自检请求替代原生证据。",
+    "原生日期复验后仅增加实际标题字段 sort_title 的降序兼容；最终日期排序逻辑与原生验收相同。",
+    "本记录不包含登录凭据、会话令牌、完整请求头或真实媒体。"
+  ]
+}

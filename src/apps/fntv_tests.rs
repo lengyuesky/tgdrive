@@ -1,6 +1,8 @@
 //! 飞牛服务真实边界测试：临时 SQLite、内存媒体，不读取生产配置或连接 Telegram。
 #[path = "fntv_cover_tests.rs"]
 mod cover_tests;
+#[path = "fntv_sort_tests.rs"]
+mod sort_tests;
 use super::*;
 use axum::http::header;
 use futures_util::StreamExt as _;
@@ -527,6 +529,10 @@ async fn fntv_new_play_wins_and_active_play_can_rewind() {
 #[tokio::test]
 async fn fntv_file_dates_are_milliseconds_and_play_positions_are_seconds() {
     let (state, _, _directory, token, item) = configured(b"0123456789").await;
+    sqlx::query("UPDATE nodes SET modified_at = created_at + 60 WHERE name = '隔离.mp4'")
+        .execute(&state.vfs.db.pool)
+        .await
+        .unwrap();
     let node = state.vfs.resolve("/影视/隔离.mp4").await.unwrap();
     let (_, streams) = json_response(
         wire(
@@ -549,11 +555,23 @@ async fn fntv_file_dates_are_milliseconds_and_play_positions_are_seconds() {
     );
     assert_eq!(
         streams["data"]["files"][0]["create_time"],
+        node.created_at * 1000
+    );
+    assert_eq!(
+        streams["data"]["files"][0]["file_birth_time"],
+        node.created_at * 1000
+    );
+    assert_eq!(
+        streams["data"]["files"][0]["update_time"],
         node.modified_at * 1000
     );
     assert_eq!(streams["data"]["video_streams"][0]["duration"], 300);
     assert_eq!(
         streams["data"]["video_streams"][0]["create_time"],
+        node.created_at * 1000
+    );
+    assert_eq!(
+        streams["data"]["video_streams"][0]["update_time"],
         node.modified_at * 1000
     );
     start_play(&state, &token, &item).await;

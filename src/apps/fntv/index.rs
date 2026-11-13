@@ -54,6 +54,9 @@ pub(super) struct Entry {
     pub filename: String,
     pub size: i64,
     pub timestamp: i64,
+    /// 加入 TGDrive 的时间，Unix 毫秒；旧索引从当前节点回填。
+    #[serde(default)]
+    pub added_at: i64,
     pub title: String,
     pub overview: String,
     pub year: String,
@@ -72,6 +75,13 @@ pub(super) struct Entry {
     #[serde(skip)]
     pub cover: Option<String>,
     pub subtitles: Vec<Source>,
+}
+
+impl Entry {
+    pub fn refresh_dates(&mut self, node: &Node) {
+        self.added_at = node.created_at.saturating_mul(1000);
+        self.timestamp = node.modified_at.saturating_mul(1000);
+    }
 }
 
 pub(super) fn extension(name: &str) -> String {
@@ -391,6 +401,7 @@ async fn refresh_inner(
                 let mut entry = (*old).clone();
                 entry.path = path.clone();
                 entry.libraries = vec![library.id.clone()];
+                entry.refresh_dates(node);
                 output.insert(node.id, entry);
                 continue;
             }
@@ -403,6 +414,7 @@ async fn refresh_inner(
                 filename: node.name.clone(),
                 size: node.size,
                 timestamp: node.modified_at.saturating_mul(1000),
+                added_at: node.created_at.saturating_mul(1000),
                 title: basename.replace(['.', '_'], " "),
                 overview: String::new(),
                 year: String::new(),

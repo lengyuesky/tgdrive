@@ -140,17 +140,16 @@ async fn handle_inner(state: &AppState, request: Request) -> AppResult<Response>
     let mut entries = Vec::new();
     let direct_reference = path.strip_prefix("/v/api/v1/media/range/");
     let playback_reference = path.strip_prefix("/v/api/v1/stream/list/");
-    for entry in all {
+    for mut entry in all {
         if direct_reference.is_some_and(|id| entry.guid != id && entry.media_guid != id) {
             continue;
         }
         if playback_reference.is_some_and(|id| !matches_playback_reference(&entry, id)) {
             continue;
         }
-        if authorized(state, &context, entry.node_id, &entry.version)
-            .await
-            .is_ok()
-        {
+        if let Ok((node, _)) = authorized(state, &context, entry.node_id, &entry.version).await {
+            // 升级后首次读取也使用节点的真实日期，不等待后台刷新旧索引。
+            entry.refresh_dates(&node);
             entries.push(entry);
         }
     }
@@ -313,14 +312,14 @@ async fn item(
         "can_play":1,"play_error":"","parent_guid":parent,"grand_guid":entry.show_guid,"ancestor_guid":library_id,
         "ancestor_name":library.map(|l|l.name.as_str()).unwrap_or(""),"ancestor_category":library.map(|l|if l.kind=="movie" { "Movie" } else { "TV" }).unwrap_or(""),
         "play_item_guid":entry.guid,"media_guid":entry.media_guid,"duration":duration,"logic_type":0,"single_child_guid":"","file_name":entry.filename,
-        "create_time":entry.timestamp,"update_time":entry.timestamp,"first_air_date":"","last_air_date":"","air_date":"","status":"","douban_id":0,
+        "create_time":entry.added_at,"update_time":entry.timestamp,"first_air_date":"","last_air_date":"","air_date":"","status":"","douban_id":0,
         "poster_list":if poster.is_empty(){Vec::<String>::new()}else{vec![poster]},"media_stream":{"resolutions":resolution.into_iter().collect::<Vec<_>>(),"audio_type":null,"color_range_type":color.into_iter().collect::<Vec<_>>()}}).as_object().unwrap().clone());
     Ok(value)
 }
 
 fn file(entry: &Entry) -> Value {
     json!({"guid":entry.media_guid,"path":entry.path,"file_name":entry.filename,"size":entry.size,"timestamp":entry.timestamp,
-        "type":1,"can_play":1,"play_error":"","create_time":entry.timestamp,"update_time":entry.timestamp,"file_birth_time":entry.timestamp,"progress_thumb_hash_dir":""})
+        "type":1,"can_play":1,"play_error":"","create_time":entry.added_at,"update_time":entry.timestamp,"file_birth_time":entry.added_at,"progress_thumb_hash_dir":""})
 }
 
 fn streams(entry: &Entry, info: &MediaInfo) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
@@ -333,7 +332,7 @@ fn streams(entry: &Entry, info: &MediaInfo) -> (Vec<Value>, Vec<Value>, Vec<Valu
             ("media_guid", json!(entry.media_guid)),
             ("guid", json!(track_guid(entry, stream))),
             ("duration", json!(info.duration.round() as u64)),
-            ("create_time", json!(entry.timestamp)),
+            ("create_time", json!(entry.added_at)),
             ("update_time", json!(entry.timestamp)),
             (
                 "title",
@@ -436,7 +435,7 @@ fn streams(entry: &Entry, info: &MediaInfo) -> (Vec<Value>, Vec<Value>, Vec<Valu
         let ext = index::extension(&source.name);
         subtitles.push(json!({"media_guid":entry.media_guid,"guid":subtitle_guid(source),"title":source.name,
             "codec_name":if ext=="srt" { "subrip" } else { ext.as_str() },"codec_type":"subtitle","language":"und","forced":0,"index":index,
-            "is_default":0,"is_external":1,"format":ext,"trim_id":"","source_id":"","Source":"","create_time":entry.timestamp,
+            "is_default":0,"is_external":1,"format":ext,"trim_id":"","source_id":"","Source":"","create_time":entry.added_at,
             "update_time":entry.timestamp,"extra_file":0,"is_bitmap":0,"file_size":source.size}));
     }
     (videos, audios, subtitles)
@@ -904,7 +903,13 @@ async fn group_items(
             .then_with(|| a.guid.cmp(&b.guid))
     });
     let mut representatives = std::collections::HashMap::new();
+    let mut dates = std::collections::HashMap::<String, (i64, i64)>::new();
     for entry in &episodes {
+        for id in [entry.show_guid.clone(), season_guid(entry)] {
+            let current = dates.entry(id).or_insert((entry.added_at, entry.timestamp));
+            current.0 = current.0.max(entry.added_at);
+            current.1 = current.1.max(entry.timestamp);
+        }
         if entry.cover.is_some() {
             representatives
                 .entry(entry.show_guid.clone())
@@ -944,6 +949,10 @@ async fn group_items(
             base["type"] = json!(kind);
             base["title"] = json!(title);
             base["parent_guid"] = json!(parent);
+            if let Some((added_at, modified_at)) = dates.get(&id) {
+                base["create_time"] = json!(added_at);
+                base["update_time"] = json!(modified_at);
+            }
             if let Some(representative) = representatives.get(&id) {
                 let image = poster(representative);
                 base["poster"] = json!(image);
@@ -1031,10 +1040,31 @@ fn page_rows(context: &Context, value: &Value, mut list: Vec<Value>) -> AppResul
                 || i["type"] == "Video" && types.iter().any(|t| t == "TV")
         });
     }
+    let column = string(value, "sort_column");
+    let by_added_date = column == "create_time";
+    let descending = if by_added_date {
+        !string(value, "sort_type").eq_ignore_ascii_case("ASC")
+    } else {
+        matches!(column, "sort_title" | "title")
+            && string(value, "sort_type").eq_ignore_ascii_case("DESC")
+    };
     list.sort_by(|a, b| {
-        a["title"]
-            .as_str()
-            .cmp(&b["title"].as_str())
+        let by_title = || a["title"].as_str().cmp(&b["title"].as_str());
+        let primary = if by_added_date {
+            a["create_time"]
+                .as_i64()
+                .unwrap_or_default()
+                .cmp(&b["create_time"].as_i64().unwrap_or_default())
+        } else {
+            by_title()
+        };
+        let primary = if descending {
+            primary.reverse()
+        } else {
+            primary
+        };
+        primary
+            .then_with(by_title)
             .then_with(|| a["guid"].as_str().cmp(&b["guid"].as_str()))
     });
     let total = list.len();

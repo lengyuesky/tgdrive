@@ -29,6 +29,57 @@ pub(super) fn assets() -> std::path::PathBuf {
     path
 }
 
+async fn seed_sorting_media(state: &AppState, media: &MemoryMedia, assets: &std::path::Path) {
+    let video = std::fs::read(assets.join("sample.mp4")).unwrap();
+    let poster = std::fs::read(assets.join("poster.jpg")).unwrap();
+    for directory in [
+        "/飞牛合成验证/排序电影",
+        "/飞牛合成验证/排序剧集",
+        "/飞牛合成验证/排序剧集/A 对照剧",
+        "/飞牛合成验证/排序剧集/A 对照剧/Season01",
+        "/飞牛合成验证/排序剧集/B 更新剧",
+        "/飞牛合成验证/排序剧集/B 更新剧/Season01",
+        "/飞牛合成验证/排序剧集/B 更新剧/Season02",
+    ] {
+        state.vfs.mkdir(directory).await.unwrap();
+        seed_file(
+            state,
+            media,
+            &format!("{directory}/poster.jpg"),
+            &poster,
+            256 * 1024,
+        )
+        .await;
+    }
+    for (relative, day) in [
+        ("排序电影/A 最早添加.mp4", 0),
+        ("排序电影/B 最新添加.mp4", 3),
+        ("排序电影/C 中间添加.mp4", 2),
+        ("排序电影/D 较早添加.mp4", 1),
+        ("排序剧集/A 对照剧/Season01/A 对照剧 S01E01.mp4", 2),
+        ("排序剧集/B 更新剧/Season01/B 更新剧 S01E01.mp4", 0),
+        ("排序剧集/B 更新剧/Season01/B 更新剧 S01E02.mp4", 4),
+        ("排序剧集/B 更新剧/Season02/B 更新剧 S02E01.mp4", 3),
+    ] {
+        let node = seed_file(
+            state,
+            media,
+            &format!("/飞牛合成验证/{relative}"),
+            &video,
+            256 * 1024,
+        )
+        .await;
+        // 添加、修改和标题顺序各不相同，防止客户端排序看起来生效却使用了错误字段。
+        sqlx::query("UPDATE nodes SET created_at = ?, modified_at = ? WHERE id = ?")
+            .bind(1_700_000_000_i64 + day * 86400)
+            .bind(1_710_000_000_i64 - day * 86400)
+            .bind(node)
+            .execute(&state.vfs.db.pool)
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 #[ignore = "需显式指定已校验的合成素材和输出目录，提供官方客户端隔离验收窗口"]
 async fn fntv_native_fixture() {
@@ -123,6 +174,10 @@ async fn fntv_native_fixture() {
         1024,
     )
     .await;
+    let sorting = std::env::var("TGDRIVE_FNTV_FIXTURE_SORTING").is_ok_and(|value| value == "1");
+    if sorting {
+        seed_sorting_media(&state, &media, &assets).await;
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let stats_state = state.clone();
@@ -131,7 +186,13 @@ async fn fntv_native_fixture() {
     let stop_request = stop.clone();
     let stop_state = state.clone();
     let release_covers = cover_gate.clone();
-    let request_log = Arc::new(StdMutex::new(std::fs::OpenOptions::new().create(true).append(true).open(output.join("native-requests.jsonl")).unwrap()));
+    let request_log = Arc::new(StdMutex::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output.join("native-requests.jsonl"))
+            .unwrap(),
+    ));
     let fixture=axum::Router::new().nest("/api",crate::api::router(state.clone())).merge(crate::apps::fntv::router(state.clone()))
         .route("/__fntv_fixture",axum::routing::get(move||{
             let state=stats_state.clone();let media=stats_media.clone();async move {
@@ -155,16 +216,38 @@ async fn fntv_native_fixture() {
             let log=request_log.clone();async move {
                 let path=request.uri().path().to_owned();let method=request.method().to_string();
                 let agent=request.headers().get("user-agent").and_then(|value|value.to_str().ok()).unwrap_or("").chars().take(256).collect::<String>();
+                let is_list=sorting && method=="POST" && matches!(path.as_str(),"/v/api/v1/item/list"|"/v/api/v1/favorite/list");
+                let (request,sort)=if is_list {
+                    let (parts,body)=request.into_parts();
+                    let Ok(bytes)=to_bytes(body,16*1024).await else {return StatusCode::BAD_REQUEST.into_response()};
+                    let value=serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                    let mut fields=serde_json::Map::new();
+                    for key in ["sort_column","sort_type"] {
+                        let safe=value[key].as_str().filter(|s|s.len()<=64 && s.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'_'));
+                        fields.insert(key.into(),json!(safe));
+                    }
+                    for key in ["page","page_size"] {fields.insert(key.into(),json!(value[key].as_u64()));}
+                    (Request::from_parts(parts,Body::from(bytes)),Value::Object(fields))
+                } else {(request,Value::Null)};
                 let response=next.run(request).await;
-                // 不记录查询参数、请求体、Cookie 或鉴权头；仅保存合成服务的协议路径和结果。
+                let (response,items)=if is_list && response.status().is_success() {
+                    let (parts,body)=response.into_parts();
+                    let bytes=to_bytes(body,1024*1024).await.unwrap();
+                    let value=serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                    let items=value["data"]["list"].as_array().map(|rows|rows.iter().map(|row|json!({
+                        "guid":row["guid"],"title":row["title"],"create_time":row["create_time"]
+                    })).collect::<Vec<_>>());
+                    (axum::response::Response::from_parts(parts,Body::from(bytes)),json!(items))
+                } else {(response,Value::Null)};
+                // 排序验收只额外记录白名单字段及合成条目；不保存原始请求体、Cookie 或鉴权头。
                 if path=="/trimcon"||path.starts_with("/v/")||path.starts_with("/tgdrive-poster/") {
-                    let row=json!({"at":crate::db::now_ts(),"method":method,"path":path,"status":response.status().as_u16(),"user_agent":agent});
+                    let row=json!({"at":crate::db::now_ts(),"method":method,"path":path,"status":response.status().as_u16(),"user_agent":agent,"sort":sort,"items":items});
                     writeln!(log.lock().unwrap(),"{row}").unwrap();
                 }
                 response
             }
         }));
-    let startup = json!({"fixture":"tgdrive-fntv-native","synthetic":true,"telegram":"memory","host_version":env!("CARGO_PKG_VERSION"),"base_url":format!("http://{address}"),"pid":std::process::id(),"database":"temporary","preinstalled_fntv":false,"window_seconds":seconds,"covers_initially_paused":paused});
+    let startup = json!({"fixture":"tgdrive-fntv-native","synthetic":true,"telegram":"memory","host_version":env!("CARGO_PKG_VERSION"),"base_url":format!("http://{address}"),"pid":std::process::id(),"database":"temporary","preinstalled_fntv":false,"window_seconds":seconds,"covers_initially_paused":paused,"sorting_samples":sorting});
     std::fs::write(
         output.join("startup.json"),
         serde_json::to_vec_pretty(&startup).unwrap(),
