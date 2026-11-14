@@ -2,6 +2,8 @@
 
 日期：2026-11-14。用户已确认[设计记录](media-scraper-design.md) Q1–Q42，默认及公共验收后端为 `https://metatube-server.hf.space/`。宿主 0.3.10 与影视刮削 0.1.0 已完成实现、修复及本机验收。本次按用户授权直接交付到两个仓库的 main，不创建其他分支；日常服务尚未部署。
 
+后续 `media-scraper 0.1.1` 按用户修订将交互简化为“选择目录 → 开始刮削”，整目录自动处理、不确定项跳过、关闭页面停止。本文保留 0.1.0 的实现验收历史；当前交互以[设计记录中的简化决策](media-scraper-design.md#2026-11-14-简化交互后的当前决策)为准，新版验证记录位于插件仓库 `docs/media-scraper-simple-validation.md`。
+
 ## 实现与代码基线
 
 宿主独立 worktree 基于完整提交 `3ad8b3f6b86dd23c49569b2bc2ad41a8cb882ff9`（源码版本 0.3.9），base tree 为 `2e1ee725297f69f5577f85ef28f87db3b145c684`。插件独立 worktree 基于 `9ae5727fd4d76a5acc8f3d4b0e9b99d8efdf5434`。这些 SHA 标识开发基线；本次提交后的宿主完整 SHA 与集成结果记录在插件仓库的 `compatibility.json` 和 `docs/media-scraper-validation.md`。原宿主目录的其他改动保留。
