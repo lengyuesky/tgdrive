@@ -16,7 +16,7 @@ impl Db {
     ) -> AppResult<()> {
         let result = sqlx::query("UPDATE apps SET scope_mode = ?, scope_paths = ?, updated_at = ? WHERE id = ? AND revision = ?")
             .bind(mode).bind(paths).bind(now_ts()).bind(id).bind(revision).execute(&self.pool).await?;
-        self.apps_cache.invalidate(id);
+        self.invalidate_app_cache(id);
         if id == "fntv" && result.rows_affected() == 1 {
             self.fntv.invalidate();
         }
@@ -160,8 +160,14 @@ impl Db {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        if id == crate::apps::scraper::APP_ID {
+            crate::apps::scraper::invalidate_in_transaction(&mut tx, false, true).await?;
+        }
         tx.commit().await?;
-        self.apps_cache.invalidate(id);
+        self.invalidate_app_cache(id);
+        if id == crate::apps::scraper::APP_ID {
+            self.scraper.purge_secret().await?;
+        }
         if id == "fntv" {
             self.fntv.invalidate();
         }

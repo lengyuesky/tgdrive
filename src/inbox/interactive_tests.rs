@@ -1,6 +1,6 @@
 //! 使用隔离 SQLite 与本地模拟 Bot 验证交互行为，不接触真实 Telegram。
 
-use super::tests::{MockApi, test_vfs};
+use super::tests::{CreateOnCopy, MockApi, test_vfs};
 use super::*;
 use crate::db::inbox::InboxRequest;
 use crate::extras::{ExtrasPatch, InboxDirectory, InboxTypeDirectories};
@@ -304,12 +304,12 @@ async fn file_created_while_copying_is_numbered_without_overwrite() {
     let (vfs, cfg, mock, _pool, server, _dir) = test_vfs().await;
     configure(&vfs).await;
     let request = receive(&vfs, &cfg, 10, "same.pdf").await;
-    *mock.create_on_copy.lock().unwrap() = Some((
-        vfs.db.clone(),
-        request.selected_dir_id.unwrap(),
-        "same.pdf".into(),
-        cfg.storage_target_id.unwrap(),
-    ));
+    *mock.create_on_copy.lock().unwrap() = Some(CreateOnCopy {
+        db: vfs.db.clone(),
+        directory_id: request.selected_dir_id.unwrap(),
+        name: "same.pdf".into(),
+        target_id: cfg.storage_target_id.unwrap(),
+    });
     click(&vfs, &cfg, &request, "s", None, 42).await;
     interactive::process_one(&vfs, runtime(&vfs, &cfg).await.as_ref(), None)
         .await
@@ -844,16 +844,18 @@ async fn replaced_bot_uses_origin_credentials_for_an_end_notice_without_buttons(
         mock.paths.lock().unwrap().last().unwrap(),
         "bot100:main/editMessageText"
     );
-    let bodies = mock.bodies.lock().unwrap();
-    let notice = &bodies.last().unwrap().1;
-    assert_eq!(
-        notice["reply_markup"]["inline_keyboard"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
-    assert!(notice["text"].as_str().unwrap().contains("Bot 已更换"));
+    {
+        let bodies = mock.bodies.lock().unwrap();
+        let notice = &bodies.last().unwrap().1;
+        assert_eq!(
+            notice["reply_markup"]["inline_keyboard"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(notice["text"].as_str().unwrap().contains("Bot 已更换"));
+    }
     assert!(
         vfs.db
             .inbox_retired_notices("200")

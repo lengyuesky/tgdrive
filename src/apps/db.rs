@@ -101,6 +101,13 @@ pub struct AppInstall<'a> {
 }
 
 impl Db {
+    pub(crate) fn invalidate_app_cache(&self, id: &str) {
+        self.apps_cache.invalidate(id);
+        if id == crate::apps::scraper::APP_ID {
+            self.scraper.invalidate();
+        }
+    }
+
     pub async fn apps(&self) -> AppResult<Vec<AppRecord>> {
         Ok(sqlx::query_as("SELECT id, manifest, version, digest, revision, source, enabled, pinned, installed_at, updated_at, scope_paths, scope_mode FROM apps ORDER BY installed_at, id")
             .fetch_all(&self.pool)
@@ -133,7 +140,7 @@ impl Db {
             .bind(id)
             .execute(&self.pool)
             .await?;
-        self.apps_cache.invalidate(id);
+        self.invalidate_app_cache(id);
         if id == "fntv" && changed.rows_affected() != 0 {
             self.fntv.invalidate();
         }
@@ -271,7 +278,7 @@ impl Db {
             crate::apps::fntv::data::stop_in_transaction(&mut tx).await?;
         }
         tx.commit().await?;
-        self.apps_cache.invalidate(input.id);
+        self.invalidate_app_cache(input.id);
         if input.id == "fntv" {
             self.fntv.invalidate();
         }
@@ -306,7 +313,7 @@ impl Db {
             crate::apps::fntv::data::stop_in_transaction(&mut tx).await?;
         }
         tx.commit().await?;
-        self.apps_cache.invalidate(id);
+        self.invalidate_app_cache(id);
         if id == "fntv" && enabled.is_some() {
             self.fntv.invalidate();
         }
@@ -328,6 +335,9 @@ impl Db {
         if id == "fntv" {
             crate::apps::fntv::data::stop_in_transaction(&mut tx).await?;
         }
+        if id == crate::apps::scraper::APP_ID {
+            crate::apps::scraper::invalidate_in_transaction(&mut tx, purge_data, false).await?;
+        }
         if purge_data {
             sqlx::query("DELETE FROM app_lifecycle WHERE app_id = ?")
                 .bind(id)
@@ -346,7 +356,10 @@ impl Db {
                 .bind(id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        self.apps_cache.invalidate(id);
+        self.invalidate_app_cache(id);
+        if id == crate::apps::scraper::APP_ID && purge_data {
+            self.scraper.purge_secret().await?;
+        }
         if id == "fntv" {
             self.fntv.invalidate();
         }
@@ -371,6 +384,10 @@ impl Db {
             .await?;
         if current.as_deref() != Some(revision) {
             return Err(AppError::Conflict("应用状态已经改变，请重新打开".into()));
+        }
+        if id == crate::apps::scraper::APP_ID {
+            crate::apps::scraper::validate_settings_patch(patch)?;
+            crate::apps::scraper::ensure_no_active(&mut tx).await?;
         }
         // 在数据库中合并，避免静音偏好与目录设置的并发保存互相覆盖。
         sqlx::query(

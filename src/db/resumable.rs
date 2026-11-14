@@ -152,9 +152,23 @@ impl Db {
         })
     }
 
+    #[cfg(test)]
     pub async fn upload_sessions(&self) -> AppResult<Vec<UploadSessionInfo>> {
+        self.load_upload_sessions(true).await
+    }
+
+    /// 刮削内部上传只在刮削记录中管理，不进入网页选择源文件的续传流程。
+    pub async fn visible_upload_sessions(&self) -> AppResult<Vec<UploadSessionInfo>> {
+        self.load_upload_sessions(false).await
+    }
+
+    async fn load_upload_sessions(
+        &self,
+        include_internal: bool,
+    ) -> AppResult<Vec<UploadSessionInfo>> {
         let ids: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM upload_sessions ORDER BY updated_at, id")
+            sqlx::query_as("SELECT s.id FROM upload_sessions s WHERE ? OR NOT EXISTS(SELECT 1 FROM app_scraper_upload_guards g WHERE g.node_id=s.node_id) ORDER BY s.updated_at,s.id")
+                .bind(include_internal)
                 .fetch_all(&self.pool)
                 .await?;
         let mut out = Vec::with_capacity(ids.len());

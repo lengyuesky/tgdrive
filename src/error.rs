@@ -49,6 +49,8 @@ pub enum AppError {
     TelegramUncertain(String),
     #[error("上传服务已重启，正在重试")]
     UploadInterrupted,
+    #[error("刮削后端请求失败：{0}")]
+    ScraperBackend(String),
     #[error("数据库错误: {0}")]
     Db(sqlx::Error),
     #[error("IO 错误: {0}")]
@@ -89,6 +91,7 @@ impl AppError {
             | AppError::TelegramRejected(_)
             | AppError::TelegramUncertain(_) => StatusCode::BAD_GATEWAY,
             AppError::UploadInterrupted => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::ScraperBackend(_) => StatusCode::BAD_GATEWAY,
             AppError::Db(_) | AppError::Io(_) | AppError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -101,7 +104,9 @@ impl AppError {
     /// 上游 URL：详细信息只进服务端日志，客户端拿到不泄密的提示。
     pub fn public_parts(&self) -> (String, Option<&'static str>) {
         let status = self.status();
-        let message = if matches!(self, AppError::UploadInterrupted) {
+        let message = if matches!(self, AppError::ScraperBackend(_)) {
+            self.to_string()
+        } else if matches!(self, AppError::UploadInterrupted) {
             "上传服务已重启，正在重试".to_string()
         } else if status.is_server_error() {
             match self {
@@ -115,6 +120,7 @@ impl AppError {
         };
         let code = match self {
             AppError::UploadInterrupted => Some("upload_interrupted"),
+            AppError::ScraperBackend(_) => Some("scraper_backend_unavailable"),
             AppError::TelegramUncertain(_) => Some("telegram_uncertain"),
             AppError::AppDataConflict => Some("storage_conflict"),
             AppError::ReadingIndexChanged => Some("reading_index_changed"),

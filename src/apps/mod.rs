@@ -5,10 +5,12 @@ mod covers;
 mod files;
 pub(crate) mod fntv;
 mod integration;
+pub(crate) mod nfo;
 mod package;
 mod range_cache;
 mod runtime;
 mod scope;
+pub(crate) mod scraper;
 mod storage;
 
 pub use range_cache::RangeCache;

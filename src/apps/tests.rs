@@ -28,10 +28,10 @@ mod fntv_tests;
 mod integration_tests;
 #[path = "media_tests.rs"]
 mod media;
-#[path = "native_download_tests.rs"]
-mod native_downloads;
 #[path = "native_client_fixture.rs"]
 mod native_client_http;
+#[path = "native_download_tests.rs"]
+mod native_downloads;
 #[path = "reader_tests.rs"]
 mod readers;
 #[path = "reading_index_tests.rs"]
@@ -40,6 +40,8 @@ mod reading_index;
 mod replacements;
 #[path = "scope_tests.rs"]
 mod scopes;
+#[path = "scraper_tests.rs"]
+mod scraper_tests;
 
 #[derive(Default)]
 struct MemoryMedia {
@@ -49,6 +51,11 @@ struct MemoryMedia {
     rate: AtomicUsize,
     active: Arc<AtomicUsize>,
     bytes_sent: Arc<AtomicUsize>,
+    upload_count: AtomicUsize,
+    upload_block: AtomicBool,
+    upload_pending: AtomicBool,
+    upload_started: tokio::sync::Notify,
+    upload_release: tokio::sync::Notify,
 }
 
 struct ActiveRead {
@@ -99,12 +106,49 @@ impl MemoryMedia {
 impl TgApi for MemoryMedia {
     async fn send_document(
         &self,
-        _: &str,
+        filename: &str,
         _: Option<String>,
         _: Option<&bytes::Bytes>,
-        _: &UploadBody,
+        body: &UploadBody,
     ) -> AppResult<TgMessage> {
-        Err(AppError::Forbidden("测试环境不发送 Telegram 消息".into()))
+        // 仅合成刮削资料写入内存，夹具从不向真实 Telegram 发送消息。
+        if !["nfo", "jpg", "jpeg"].contains(
+            &filename
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str(),
+        ) || body.len() > 2 * 1024 * 1024
+        {
+            return Err(AppError::Forbidden(
+                "夹具只接受有界的合成 NFO 和海报".into(),
+            ));
+        }
+        let bytes = match body {
+            UploadBody::Memory(bytes) => bytes.to_vec(),
+            UploadBody::TempFile { file, .. } => tokio::fs::read(file.path()).await?,
+        };
+        if self.upload_block.load(Ordering::SeqCst) {
+            struct PendingUpload<'a>(&'a AtomicBool);
+            impl Drop for PendingUpload<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            self.upload_pending.store(true, Ordering::SeqCst);
+            let _pending = PendingUpload(&self.upload_pending);
+            self.upload_started.notify_one();
+            self.upload_release.notified().await;
+        }
+        let count = self.upload_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let file_id = format!("fixture-scraper-{count}");
+        self.files.lock().unwrap().insert(file_id.clone(), bytes);
+        Ok(TgMessage {
+            message_id: count as i64 + 100_000,
+            file_id,
+            thumbnail_file_id: None,
+        })
     }
     async fn delete_message(&self, _: i64) -> AppResult<()> {
         Ok(())
@@ -1386,6 +1430,15 @@ async fn browser_fixture() {
     }
     let stats = media.clone();
     let control = media.clone();
+    // 本机 MetaTube 和写入门控仅存在于显式测试夹具，生产路由没有这些入口。
+    let scraper_backend = scraper_tests::backend_fixture().await;
+    let scraper_url = scraper_backend.url.clone();
+    let scraper_fail = scraper_backend.fail_poster.clone();
+    let scraper_stats = media.clone();
+    let scraper_control = media.clone();
+    let scraper_db = state.vfs.db.clone();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown_request = shutdown.clone();
     let fixture_range_cache = state.range_cache.clone();
     let app = router(&state)
         .route(
@@ -1393,6 +1446,38 @@ async fn browser_fixture() {
             get(|| async { Json(json!({"fixture": "tgdrive-apps-tests"})) }),
         )
         .route("/healthz", get(|| async { "ok" }))
+        .route("/__apps_fixture/stop", axum::routing::post(move || {
+            let signal = shutdown_request.clone();
+            async move { signal.cancel(); StatusCode::NO_CONTENT }
+        }))
+        .route(
+            "/__apps_fixture/scraper",
+            get(move || {
+                let url = scraper_url.clone();
+                let stats = scraper_stats.clone();
+                async move {
+                    Json(json!({"backend_url": url, "uploads": stats.upload_count.load(Ordering::SeqCst), "upload_pending": stats.upload_pending.load(Ordering::SeqCst)}))
+                }
+            })
+            .post(move |Json(input): Json<Value>| {
+                let control = scraper_control.clone();
+                let fail = scraper_fail.clone();
+                let db = scraper_db.clone();
+                async move {
+                    if let Some(block) = input["block_uploads"].as_bool() {
+                        control.upload_block.store(block, Ordering::SeqCst);
+                        if !block && control.upload_pending.load(Ordering::SeqCst) { control.upload_release.notify_one(); }
+                    }
+                    if let Some(failed) = input["fail_poster"].as_bool() { fail.store(failed, Ordering::SeqCst); }
+                    if input["restore_records"] == true {
+                        db.scraper.invalidate();
+                        let mut conn = db.pool.acquire().await.unwrap();
+                        crate::apps::scraper::data::invalidate_restored(&mut conn).await.unwrap();
+                    }
+                    Json(json!({"ok": true}))
+                }
+            }),
+        )
         .route(
             "/__apps_fixture/media",
             get(move || {
@@ -1440,6 +1525,7 @@ async fn browser_fixture() {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
     .await
     .unwrap();
 }

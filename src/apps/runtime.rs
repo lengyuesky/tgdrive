@@ -396,6 +396,23 @@ async fn dispatch(
         return Err(AppError::BadRequest("此能力需要应用 API v2".into()));
     }
     let result = match method {
+        "scraper.config.get"
+        | "scraper.config.set"
+        | "scraper.providers"
+        | "scraper.search"
+        | "scraper.poster"
+        | "scraper.batch.create"
+        | "scraper.preview"
+        | "scraper.batch.begin"
+        | "scraper.heartbeat"
+        | "scraper.next"
+        | "scraper.stop"
+        | "scraper.records"
+        | "scraper.record"
+        | "scraper.verify" => {
+            app.manifest.require("scraper.service")?;
+            super::scraper::invoke(state, app, method, params).await?
+        }
         "fntv.config.get"
         | "fntv.account.set"
         | "fntv.libraries.set"

@@ -363,6 +363,8 @@ pub struct Db {
     apps_cache: std::sync::Arc<apps::AppCache>,
     /// 固定影视服务的可撤销状态，与所有数据库克隆共享。
     pub(crate) fntv: std::sync::Arc<crate::apps::fntv::Service>,
+    /// 页面驱动的手动刮削控制；与所有数据库克隆共享取消状态。
+    pub(crate) scraper: std::sync::Arc<crate::apps::scraper::Service>,
     /// 应用封面缓存库（主库旁的独立文件，见 apps/covers_db.rs）。
     covers: SqlitePool,
     /// 恢复安全模式/维护状态，随所有 Db 克隆共享；后台入口必须检查。
@@ -429,6 +431,7 @@ impl Db {
         let initialized = async {
             snapshot_before_migration(&pool, &migrator, db_path).await?;
             migrator.run(&pool).await?;
+            crate::apps::scraper::data::recover_interrupted(&pool).await?;
             apps::open_covers(db_path).await
         }
         .await;
@@ -444,6 +447,7 @@ impl Db {
             pool,
             apps_cache: Default::default(),
             fntv: Default::default(),
+            scraper: std::sync::Arc::new(crate::apps::scraper::Service::new(db_path)),
             covers,
             background_blocked: Default::default(),
         })
@@ -457,6 +461,7 @@ impl Db {
     pub fn set_background_blocked(&self, blocked: bool) {
         if blocked {
             self.fntv.invalidate();
+            self.scraper.invalidate();
         }
         self.background_blocked
             .store(blocked, std::sync::atomic::Ordering::Release);

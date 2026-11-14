@@ -693,7 +693,6 @@ fn inbox_dir_for<'a>(ex: &'a crate::extras::Extras, name: &str) -> &'a str {
 }
 
 /// 分类始终依据原始文件名；重命名不改变所匹配的收件类型。
-
 pub(crate) fn inbox_type_key(ex: &crate::extras::Extras, name: &str) -> String {
     let lower = name.to_lowercase();
     let custom = ex
@@ -993,6 +992,13 @@ mod tests {
     use serde_json::{Value, json};
     use std::sync::Mutex;
 
+    pub(super) struct CreateOnCopy {
+        pub directory_id: i64,
+        pub name: String,
+        pub target_id: i64,
+        pub db: Db,
+    }
+
     #[derive(Clone, Default)]
     pub(super) struct MockApi {
         pub calls: Arc<Mutex<Vec<String>>>,
@@ -1001,7 +1007,7 @@ mod tests {
         pub next_message: Arc<std::sync::atomic::AtomicI64>,
         pub copy_failure: Arc<Mutex<Option<Value>>>,
         pub move_on_copy: Arc<Mutex<Option<(Db, i64, String)>>>,
-        pub create_on_copy: Arc<Mutex<Option<(Db, i64, String, i64)>>>,
+        pub create_on_copy: Arc<Mutex<Option<CreateOnCopy>>>,
         pub pause_copy: Arc<std::sync::atomic::AtomicBool>,
         pub copy_started: Arc<tokio::sync::Notify>,
         pub copy_release: Arc<tokio::sync::Notify>,
@@ -1031,22 +1037,24 @@ mod tests {
                 db.move_node(id, crate::db::ROOT_ID, &name).await.unwrap();
             }
             let create_action = state.create_on_copy.lock().unwrap().take();
-            if let Some((db, directory, name, target)) = create_action {
-                db.register_inbox_file(
-                    directory,
-                    crate::db::inbox::InboxFile {
-                        name: &name,
-                        suffix: ".pdf",
-                        size: 5,
-                        file_id: "existing-file",
-                        thumbnail: None,
-                        message_id: 900,
-                        target_id: target,
-                        source: InboxSource::Channel,
-                    },
-                )
-                .await
-                .unwrap();
+            if let Some(action) = create_action {
+                action
+                    .db
+                    .register_inbox_file(
+                        action.directory_id,
+                        crate::db::inbox::InboxFile {
+                            name: &action.name,
+                            suffix: ".pdf",
+                            size: 5,
+                            file_id: "existing-file",
+                            thumbnail: None,
+                            message_id: 900,
+                            target_id: action.target_id,
+                            source: InboxSource::Channel,
+                        },
+                    )
+                    .await
+                    .unwrap();
             }
             if state.pause_copy.load(std::sync::atomic::Ordering::SeqCst) {
                 state.copy_started.notify_one();

@@ -71,13 +71,19 @@ mod tests {
         let mut expected = db.data_revision().await.unwrap();
 
         // settings：实质配置 INSERT/UPDATE/DELETE 各 +1
-        db.setting_set("extra.trash_retention_days", "7").await.unwrap();
+        db.setting_set("extra.trash_retention_days", "7")
+            .await
+            .unwrap();
         expected += 1;
         assert_eq!(db.data_revision().await.unwrap(), expected);
         // 同值 UPSERT 不触发（OLD.v IS NOT NEW.v 守卫）。
-        db.setting_set("extra.trash_retention_days", "7").await.unwrap();
+        db.setting_set("extra.trash_retention_days", "7")
+            .await
+            .unwrap();
         assert_eq!(db.data_revision().await.unwrap(), expected);
-        db.setting_set("extra.trash_retention_days", "8").await.unwrap();
+        db.setting_set("extra.trash_retention_days", "8")
+            .await
+            .unwrap();
         expected += 1;
         db.setting_del("extra.trash_retention_days").await.unwrap();
         expected += 1;

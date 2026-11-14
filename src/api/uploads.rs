@@ -66,7 +66,7 @@ pub(super) fn normalized_display_path(dir: &str, name: &str) -> AppResult<String
 pub(super) async fn uploads_index(
     State(state): State<AppState>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let sessions = state.vfs.db.upload_sessions().await?;
+    let sessions = state.vfs.db.visible_upload_sessions().await?;
     let values: Vec<_> = sessions.iter().map(upload_session_json).collect();
     let retry_after = state.vfs.tg.upload_retry_after_secs();
     let bot_count = state.vfs.tg.upload_bot_count();

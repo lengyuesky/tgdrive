@@ -8,6 +8,9 @@ const METHODS = new Set([
   'covers.get', 'covers.put', 'covers.delete', 'covers.stats',
   'fntv.config.get', 'fntv.account.set', 'fntv.libraries.set',
   'fntv.service.status', 'fntv.service.start', 'fntv.service.stop', 'fntv.index.refresh',
+  'scraper.config.get', 'scraper.config.set', 'scraper.providers', 'scraper.search', 'scraper.poster',
+  'scraper.batch.create', 'scraper.preview', 'scraper.batch.begin', 'scraper.heartbeat', 'scraper.next',
+  'scraper.stop', 'scraper.records', 'scraper.record', 'scraper.verify',
 ])
 /** 普通能力参数最多 64 KiB；封面写入携带 base64 小图（宿主上限 256 KiB 原图），单独放宽。 */
 const PARAM_LIMIT = 64 * 1024

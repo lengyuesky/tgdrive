@@ -135,7 +135,7 @@ pub async fn load(db: &Db) -> AppResult<Extras> {
         .unwrap_or_else(|| DEFAULT_INBOX_DIR.into());
     let child_dir = |name: &str| format!("{}/{name}", inbox_dir.trim_end_matches('/'));
     let inbox_rules = match inbox.get("extra.inbox_rules") {
-        Some(raw) => match serde_json::from_str::<Vec<InboxRouteRule>>(&raw)
+        Some(raw) => match serde_json::from_str::<Vec<InboxRouteRule>>(raw)
             .map_err(|e| AppError::BadRequest(format!("自定义收件规则 JSON 无效:{e}")))
             .and_then(|rules| normalize_rules(&rules))
         {

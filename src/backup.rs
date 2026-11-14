@@ -219,9 +219,7 @@ pub async fn automatic_if_due(
         [false, false, false]
     };
     let selection = Selection {
-        telegram: extras.backup_telegram_enabled
-            && due(last.telegram)
-            && !skip_unchanged[0],
+        telegram: extras.backup_telegram_enabled && due(last.telegram) && !skip_unchanged[0],
         webdav: extras.backup_webdav_enabled && due(last.webdav) && !skip_unchanged[1],
         s3: extras.backup_s3_enabled && due(last.s3) && !skip_unchanged[2],
     };
@@ -539,6 +537,7 @@ async fn scrub_snapshot(path: &str) -> AppResult<()> {
         }
     }
     crate::db::inbox::invalidate_restored_inbox(&mut conn).await?;
+    crate::apps::scraper::data::invalidate_restored(&mut conn).await?;
     // 重写文件，确保被删的值不残留在空闲页里。
     sqlx::query("VACUUM").execute(&mut conn).await?;
     conn.close().await?;
@@ -553,6 +552,7 @@ pub(crate) async fn prepare_inbox_snapshot(path: &str) -> AppResult<()> {
     )
     .await?;
     crate::db::inbox::invalidate_restored_inbox(&mut conn).await?;
+    crate::apps::scraper::data::invalidate_restored(&mut conn).await?;
     conn.close().await?;
     Ok(())
 }
@@ -1757,17 +1757,24 @@ mod tests {
         extras.backup_s3_endpoint = "http://127.0.0.1:9/unreachable".into();
         let snapshot = test_snapshot(b"partial snapshot");
 
-        backup_webdav(&db, &extras, &snapshot, &crate::proxy::ProxyConfig::default())
-            .await
-            .unwrap();
-        assert!(backup_s3(
+        backup_webdav(
             &db,
             &extras,
             &snapshot,
             &crate::proxy::ProxyConfig::default(),
         )
         .await
-        .is_err());
+        .unwrap();
+        assert!(
+            backup_s3(
+                &db,
+                &extras,
+                &snapshot,
+                &crate::proxy::ProxyConfig::default(),
+            )
+            .await
+            .is_err()
+        );
         server.abort();
 
         // 成功渠道记录了基准；失败渠道不记录，重试轮不会被 skip 阻断。

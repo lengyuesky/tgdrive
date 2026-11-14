@@ -3,6 +3,7 @@
 use super::*;
 
 impl Db {
+    #[cfg(test)]
     pub async fn record_inbox_source(&self, node_id: i64, source: InboxSource) -> AppResult<()> {
         sqlx::query("INSERT INTO inbox_sources (node_id, source) VALUES (?, ?)")
             .bind(node_id)
@@ -99,6 +100,7 @@ impl Db {
     }
 
     /// 完成上传:置 ready 并原子替换同名旧文件;返回旧文件释放的 message_id(需在 TG 侧删除)
+    #[cfg(test)]
     pub async fn finalize_upload(
         &self,
         node_id: i64,
@@ -153,6 +155,7 @@ impl Db {
                 "上传目标目录已不可见，请恢复目录后重试".into(),
             ));
         }
+        crate::apps::scraper::data::check_upload_guard(self, &mut tx, &current).await?;
         let session: Option<UploadSession> =
             sqlx::query_as("SELECT * FROM upload_sessions WHERE node_id = ?")
                 .bind(node_id)
@@ -255,6 +258,7 @@ impl Db {
             .bind(node_id)
             .fetch_one(&mut *tx)
             .await?;
+        crate::apps::scraper::data::committed_upload(&mut tx, &ready).await?;
         if let Some(session) = session {
             let node_json = serde_json::to_string(&ready).map_err(anyhow::Error::from)?;
             sqlx::query("INSERT INTO upload_receipts(id,status,display_path,expected_size,sha256,node_json,created_at,expires_at) VALUES(?,'completed',?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING")
@@ -271,6 +275,7 @@ impl Db {
     }
 
     /// 收件箱登记的是用户原始频道消息；登记失败只能回滚元数据，不能删除原消息。
+    #[cfg(test)]
     pub async fn abort_upload_keep_messages(&self, node_id: i64) -> AppResult<()> {
         self.abort_upload_inner(node_id, false).await.map(|_| ())
     }

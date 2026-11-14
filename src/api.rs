@@ -39,8 +39,8 @@ mod search;
 mod security;
 mod session;
 mod shares;
-mod trash;
 mod transfer;
+mod trash;
 mod uploads;
 use self::{
     admin::*, events::*, files::*, media::*, search::*, security::*, session::*, shares::*,

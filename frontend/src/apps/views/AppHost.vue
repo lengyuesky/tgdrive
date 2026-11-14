@@ -18,7 +18,7 @@
     </div>
     <section class="app-stage">
       <div v-if="needsAuthorization" class="host-status">
-        <h2>选择{{ app?.manifest.name }}可以读取的目录</h2>
+        <h2>选择{{ app?.manifest.name }}可以{{ app?.manifest.permissions.includes('scraper.service') ? '整理与刮削' : '读取' }}的目录</h2>
         <p>确认授权后开始使用。可随时在应用设置中修改。</p>
         <el-alert v-if="error" :title="error" type="error" :closable="false" />
         <el-button type="primary" :loading="authorizing" @click="authorizeInitial">选择目录并授权</el-button>
@@ -96,9 +96,10 @@ async function authorizeDirectory(initial: string): Promise<string | null> {
   const current = generation, active = app.value
   try {
     if (!active) throw new Error('应用已经关闭')
-    const path = await picker.value?.open('选择允许应用读取的目录', initial)
+    const scraping = active.manifest.permissions.includes('scraper.service')
+    const path = await picker.value?.open(scraping ? '选择允许整理与刮削的目录' : '选择允许应用读取的目录', initial)
     if (path == null || current !== generation) return null
-    await appConfirm({ title: '授权目录', message: '允许「' + active.manifest.name + '」读取 ' + path + ' 及其子目录？' + (path === '/' ? '根目录包含整个网盘。' : ''), confirmText: '允许读取' })
+    await appConfirm({ title: '授权目录', message: '允许「' + active.manifest.name + '」' + (scraping ? '读取并按确认预览整理视频、配套文件，写入 NFO 和海报：' : '读取 ') + path + ' 及其子目录？' + (path === '/' ? '根目录包含整个网盘。' : ''), confirmText: scraping ? '允许整理与刮削' : '允许读取' })
     if (current !== generation) return null
     app.value = (await api.apps.authorize(active.manifest.id, path, active.revision)).data
     return path
@@ -375,7 +376,7 @@ function onReady(event: MessageEvent) {
     frame.value.contentWindow.postMessage({ channel: 'tgdrive-app-v1', type: 'connect',
       context: { id: active.app.manifest.id, name: active.app.manifest.name, version: active.app.manifest.version, api_version: active.app.manifest.api_version, dark: isDark.value,
         scope: { mode: app.value?.scope_mode ?? 'all', paths: [...(app.value?.scope ?? [])] }, launch: contextFile.value ? { action: 'open', file: { ...contextFile.value } } : undefined, data_schema: active.app.manifest.integration?.data_schema,
-        capabilities: active.app.manifest.api_version >= 2 ? ['files.changes', 'ui.authorizeDirectory', 'ui.showFile', 'ui.fileDetails', 'ui.setTitle', 'ui.setExitMessage', 'ui.task', 'app.lifecycle', 'app.launch','ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope', 'rpc.batch', 'covers', 'library.page', ...(active.app.manifest.id === 'fntv' && active.app.manifest.permissions.includes('fntv.service') ? ['fntv.service'] : [])] : [] } }, '*', [channel.port2])
+        capabilities: active.app.manifest.api_version >= 2 ? ['files.changes', 'ui.authorizeDirectory', 'ui.showFile', 'ui.fileDetails', 'ui.setTitle', 'ui.setExitMessage', 'ui.task', 'app.lifecycle', 'app.launch','ui.setImmersive', 'ui.immersiveBackground', 'media.bytes', 'files.readRanges', 'storage.events', 'files.scope', 'rpc.batch', 'covers', 'library.page', ...(active.app.manifest.id === 'fntv' && active.app.manifest.permissions.includes('fntv.service') ? ['fntv.service'] : []), ...(active.app.manifest.id === 'media-scraper' && active.app.manifest.permissions.includes('scraper.service') ? ['scraper.service'] : [])] : [] } }, '*', [channel.port2])
   }).catch((error) => {
     channel.port2.close()
     if (current === generation && !signal.aborted) fail(errMsg(error))

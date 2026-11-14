@@ -104,6 +104,7 @@ export const permissionLabels: Record<string, string> = {
   'media.read': '读取文件内容（播放、缩略图和下载）',
   'favorites.write': '添加或取消收藏',
   'fntv.service': '向飞牛影视客户端提供已授权媒体库，管理独立账号和服务启停',
+  'scraper.service': '整理已授权的视频与配套文件，调用 MetaTube 并写入 NFO 和海报',
 }
 
 export const APPS_CHANGED = 'tgdrive-apps-changed'

@@ -133,30 +133,7 @@ pub(super) fn episode_name(name: &str) -> Option<(String, u32, u32)> {
 }
 
 fn xml_text(text: &str, tag: &str) -> Option<String> {
-    let value = text
-        .split_once(&format!("<{tag}>"))?
-        .1
-        .split_once(&format!("</{tag}>"))?
-        .0
-        .trim();
-    if value.len() > 4096 {
-        return None;
-    }
-    let value = value
-        .strip_prefix("<![CDATA[")
-        .and_then(|v| v.strip_suffix("]]>"))
-        .unwrap_or(value);
-    if value.contains('<') || value.contains('>') {
-        return None;
-    }
-    Some(
-        value
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'"),
-    )
+    crate::apps::nfo::text(text, tag)
 }
 
 async fn read_nfo(
@@ -164,7 +141,7 @@ async fn read_nfo(
     context: &Context,
     source: &Source,
 ) -> AppResult<Option<String>> {
-    if source.size > 64 * 1024 || source.size < 0 {
+    if source.size > crate::apps::nfo::MAX_BYTES as i64 || source.size < 0 {
         return Ok(None);
     }
     let (node, _) = authorized(state, context, source.id, &source.version).await?;
@@ -172,17 +149,22 @@ async fn read_nfo(
         .vfs
         .open_reader(&node, 0)
         .await?
-        .with_read_limit(64 * 1024);
+        .with_read_limit(crate::apps::nfo::MAX_BYTES as u64);
     let mut bytes = Vec::new();
-    let read = async { reader.take(64 * 1024 + 1).read_to_end(&mut bytes).await };
+    let read = async {
+        reader
+            .take(crate::apps::nfo::MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+    };
     tokio::select! {
         biased;
         _ = context.lease.cancelled.cancelled() => return Err(AppError::AppChanged),
-        result = tokio::time::timeout(std::time::Duration::from_secs(2), read) => {
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), read) => {
             if !matches!(result, Ok(Ok(_))) { return Ok(None); }
         }
     }
-    if bytes.len() > 64 * 1024 {
+    if bytes.len() > crate::apps::nfo::MAX_BYTES {
         return Ok(None);
     }
     let Ok(text) = String::from_utf8(bytes) else {
@@ -283,11 +265,12 @@ async fn refresh_inner(
         .collect();
     let live_libraries: HashSet<_> = roots.iter().map(|(l, _)| l.id.clone()).collect();
     let mut output: BTreeMap<i64, Entry> = BTreeMap::new();
+    let mut staged_bytes = 0;
     for mut e in old.clone() {
         e.libraries
             .retain(|l| live_libraries.contains(l) && !affected.contains(l));
         if !e.libraries.is_empty() {
-            output.insert(e.node_id, e);
+            stage_entry(&mut output, e, &mut staged_bytes)?;
         }
     }
     for (library, root) in roots.iter().filter(|(l, _)| affected.contains(&l.id)) {
@@ -332,19 +315,12 @@ async fn refresh_inner(
                     })
                 })
                 .map(|n| Source::from_node(n));
-            let posters: Vec<_> = [
-                format!("{basename}-poster.jpg"),
-                format!("{basename}.jpg"),
-                "poster.jpg".into(),
-                "folder.jpg".into(),
-                "poster.png".into(),
-                "poster.webp".into(),
-            ]
-            .iter()
-            .filter_map(|name| related.iter().find(|n| n.name.eq_ignore_ascii_case(name)))
-            .filter(|n| n.size > 0 && n.size <= 2 * 1024 * 1024)
-            .map(|n| Source::from_node(n))
-            .collect();
+            let posters: Vec<_> = crate::apps::nfo::poster_names(basename)
+                .iter()
+                .filter_map(|name| related.iter().find(|n| n.name.eq_ignore_ascii_case(name)))
+                .filter(|n| n.size > 0 && n.size <= 2 * 1024 * 1024)
+                .map(|n| Source::from_node(n))
+                .collect();
             let poster = posters.first().cloned();
             let thumbnail = state.vfs.db.first_chunk(node.id).await?.and_then(|c| {
                 c.tg_thumbnail_file_id.map(|file| Thumbnail {
@@ -402,7 +378,7 @@ async fn refresh_inner(
                 entry.path = path.clone();
                 entry.libraries = vec![library.id.clone()];
                 entry.refresh_dates(node);
-                output.insert(node.id, entry);
+                stage_entry(&mut output, entry, &mut staged_bytes)?;
                 continue;
             }
             let mut entry = Entry {
@@ -487,7 +463,7 @@ async fn refresh_inner(
                 entry.show_guid = guid(&["show", &group_id.to_string()]);
                 entry.show_title = if title.is_empty() { group.name } else { title };
             }
-            output.insert(node.id, entry);
+            stage_entry(&mut output, entry, &mut staged_bytes)?;
         }
     }
     let rows: Vec<_> = output
@@ -507,6 +483,25 @@ async fn refresh_inner(
     );
     super::covers::start_worker(state);
     state.vfs.db.fntv.cover_wake.notify_one();
+    Ok(())
+}
+
+/// 在持久化配额之前限制暂存内存，长 NFO 不会随数千个影片积累到无界大小。
+fn stage_entry(
+    output: &mut BTreeMap<i64, Entry>,
+    entry: Entry,
+    bytes: &mut usize,
+) -> AppResult<()> {
+    let size = serde_json::to_vec(&entry)
+        .map_err(anyhow::Error::from)?
+        .len();
+    if size > data::INDEX_VALUE_LIMIT || bytes.saturating_add(size) > 8 * 1024 * 1024 {
+        return Err(AppError::BadRequest(
+            "影视索引资料超过单项或 8 MiB 总预算，请缩小媒体库".into(),
+        ));
+    }
+    *bytes += size;
+    output.insert(entry.node_id, entry);
     Ok(())
 }
 

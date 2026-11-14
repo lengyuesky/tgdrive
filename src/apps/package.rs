@@ -18,6 +18,7 @@ pub const PERMISSIONS: &[&str] = &[
     "media.read",
     "favorites.write",
     "fntv.service",
+    "scraper.service",
 ];
 
 /// 物化完成标记：摘要目录与预压缩目录各有一份，两者齐全才算可用。
@@ -269,6 +270,17 @@ impl Manifest {
         }
         if self.settings.len() > 24 {
             return Err(invalid("每个应用最多声明 24 项设置"));
+        }
+        if self.permissions.iter().any(|p| p == "scraper.service")
+            && (self.id != "media-scraper"
+                || self.api_version < 2
+                || minimum < semver::Version::new(0, 3, 10)
+                || !self.permissions.iter().any(|p| p == "files.read")
+                || !self.permissions.iter().any(|p| p == "media.read"))
+        {
+            return Err(invalid(
+                "影视刮削能力仅供 media-scraper 应用使用，需要 API v2、宿主 0.3.10 以及文件和媒体读取权限",
+            ));
         }
         let mut keys = HashSet::new();
         for field in &self.settings {

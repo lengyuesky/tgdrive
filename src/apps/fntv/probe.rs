@@ -28,7 +28,7 @@ const TIME_LIMIT: Duration = Duration::from_secs(10);
 
 pub(super) fn limits() -> Value {
     json!({"probe_bytes":BYTE_LIMIT,"probe_seconds":10,"probe_concurrency":2,"probe_queue":0,
-        "probe_output_bytes":OUTPUT_LIMIT,"nfo_bytes":64*1024,"poster_bytes":2*1024*1024,"subtitle_bytes":512*1024,
+        "probe_output_bytes":OUTPUT_LIMIT,"nfo_bytes":crate::apps::nfo::MAX_BYTES,"poster_bytes":2*1024*1024,"subtitle_bytes":512*1024,
         "index_videos":3000,"private_data_bytes":8*1024*1024,"private_data_entries":10000})
 }
 

@@ -9,6 +9,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use sqlx::{Sqlite, Transaction};
 
 pub(super) const CONFIG_KEY: &str = "fntv:config";
+// NFO 解码为 JSON 后会转义换行等字符；索引单项需容纳完整 1 MiB 资料及文件引用。
+pub(super) const INDEX_VALUE_LIMIT: usize = 2 * crate::apps::nfo::MAX_BYTES + 64 * 1024;
 pub(super) async fn config(db: &Db) -> AppResult<(Config, Option<String>)> {
     let record = db.app_data_get(APP_ID, CONFIG_KEY).await?;
     match record {
@@ -55,7 +57,12 @@ async fn check(tx: &mut Transaction<'_, Sqlite>, context: &Context) -> AppResult
 }
 
 async fn put(tx: &mut Transaction<'_, Sqlite>, key: &str, value: &str) -> AppResult<()> {
-    if key.len() > 128 || value.len() > 32 * 1024 {
+    let limit = if key.starts_with("fntv:index:") {
+        INDEX_VALUE_LIMIT
+    } else {
+        32 * 1024
+    };
+    if key.len() > 128 || value.len() > limit {
         return Err(AppError::BadRequest("影视数据单项超过上限".into()));
     }
     sqlx::query("INSERT INTO app_data(app_id,key,value,revision,updated_at) VALUES('fntv',?,?,?,?) ON CONFLICT(app_id,key) DO UPDATE SET value=excluded.value,revision=excluded.revision,updated_at=excluded.updated_at")
