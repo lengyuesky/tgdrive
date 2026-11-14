@@ -354,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn resumable_parts_survive_an_interrupted_request() {
-        let (up, _tg, db, _g) = fixture(4, 1024, None).await;
+        let (up, tg, db, _g) = fixture(4, 1024, None).await;
         let data: Vec<u8> = (0..10u8).collect();
         let target = db.storage_targets().await.unwrap()[0].id;
         let session = db
@@ -395,8 +395,22 @@ mod tests {
             .await
             .unwrap();
         drop(interrupted);
-        tokio::task::yield_now().await;
-        db.reset_upload_part_claims().await.unwrap();
+        // 请求断开后的清理是异步的；等待真实占用释放，不能在任务仍运行时
+        // 调用仅供宿主启动恢复使用的全局重置，绕过尚未核实的上传状态。
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = db.upload_session_info(&session.session.id).await.unwrap();
+                if state.in_flight_parts.is_empty() {
+                    break state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("中断请求应及时释放分块占用");
+        assert!(recovered.uncertain_parts.is_empty());
+        assert_eq!(recovered.uploaded_parts, [0]);
+        assert_eq!(tg.sent.lock().unwrap().len(), 1);
 
         for (idx, slice) in [(1, &data[4..8]), (2, &data[8..])] {
             let ResumablePartStart::Upload(handle) = up
@@ -419,6 +433,7 @@ mod tests {
         let mut restored = Vec::new();
         reader.read_to_end(&mut restored).await.unwrap();
         assert_eq!(restored, data);
+        assert_eq!(tg.sent.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
