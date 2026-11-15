@@ -13,6 +13,7 @@ use std::{collections::BTreeMap, io::Cursor, time::Duration};
 
 pub(super) const DEFAULT_URL: &str = "https://metatube-server.hf.space/";
 pub(super) const POSTER_LIMIT: usize = 2 * 1024 * 1024;
+pub(super) const ACTOR_IMAGE_LIMIT: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,6 +40,34 @@ pub(super) struct Movie {
     pub genres: Option<Vec<String>>,
     pub score: Option<f64>,
     pub release_date: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct Person {
+    pub name: String,
+    pub provider: String,
+    pub id: String,
+    pub summary: String,
+}
+
+pub(super) fn exact_person(candidates: Vec<Person>, name: &str) -> Option<Person> {
+    let mut exact: BTreeMap<(String, String), Person> = BTreeMap::new();
+    for person in candidates {
+        if person.name.trim() == name.trim()
+            && identity(&Candidate {
+                provider: person.provider.clone(),
+                id: person.id.clone(),
+                ..Default::default()
+            })
+            .is_ok()
+        {
+            exact
+                .entry((person.provider.clone(), person.id.clone()))
+                .or_insert(person);
+        }
+    }
+    (exact.len() == 1).then(|| exact.into_values().next().unwrap())
 }
 
 pub(super) fn base_url(raw: &str) -> AppResult<reqwest::Url> {
@@ -95,6 +124,14 @@ pub(super) struct Backend {
 }
 
 impl Backend {
+    #[cfg(test)]
+    pub(super) fn synthetic(url: &str) -> Self {
+        Self {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base: base_url(url).unwrap(),
+            token: None,
+        }
+    }
     pub fn new(state: &AppState, url: &str, token: Option<String>) -> AppResult<Self> {
         let client = state
             .rt
@@ -227,6 +264,58 @@ impl Backend {
         Ok(movie)
     }
 
+    pub async fn person(&self, name: &str) -> AppResult<Option<Person>> {
+        let Some(value) = self
+            .data(
+                &["v1", "actors", "search"],
+                &[("q", name), ("fallback", "false")],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let candidates = serde_json::from_value(value)
+            .map_err(|_| AppError::ScraperBackend("人物搜索格式无效".into()))?;
+        let Some(candidate) = exact_person(candidates, name) else {
+            return Ok(None);
+        };
+        let Some(value) = self
+            .data(
+                &["v1", "actors", &candidate.provider, &candidate.id],
+                &[("lazy", "true")],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let person: Person = serde_json::from_value(value)
+            .map_err(|_| AppError::ScraperBackend("人物详情格式无效".into()))?;
+        if person.provider != candidate.provider
+            || person.id != candidate.id
+            || person.name.trim() != name.trim()
+        {
+            return Ok(None);
+        }
+        Ok(Some(person))
+    }
+
+    pub async fn person_image(&self, person: &Person) -> AppResult<Option<Vec<u8>>> {
+        let Some(bytes) = self
+            .get(
+                &["v1", "images", "primary", &person.provider, &person.id],
+                &[],
+                8 * 1024 * 1024,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || encode_poster(&bytes, true))
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?
+            .map(Some)
+    }
+
     pub async fn poster(&self, candidate: &Candidate, preview: bool) -> AppResult<Vec<u8>> {
         identity(candidate)?;
         let bytes = self
@@ -326,6 +415,33 @@ fn escaped(value: &str) -> AppResult<String> {
 
 impl Movie {
     pub fn nfo(&self) -> AppResult<Vec<u8>> {
+        self.nfo_with_actors(
+            &self
+                .actor_names()
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| crate::apps::nfo::Actor {
+                    name,
+                    order: Some(i as u32),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn actor_names(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.actors
+            .iter()
+            .flatten()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter(|s| seen.insert((*s).to_owned()))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub fn nfo_with_actors(&self, actors: &[crate::apps::nfo::Actor]) -> AppResult<Vec<u8>> {
         let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<movie>\n");
         let mut tag = |key: &str, value: &str| -> AppResult<()> {
             if !value.is_empty() {
@@ -362,11 +478,28 @@ impl Movie {
             tag("genre", genre)?;
             tag("tag", genre)?;
         }
-        for actor in self.actors.iter().flatten() {
-            xml.push_str(&format!(
-                "  <actor><name>{}</name></actor>\n",
-                escaped(actor)?
-            ));
+        for actor in actors {
+            xml.push_str(&format!("  <actor><name>{}</name>", escaped(&actor.name)?));
+            for (key, value) in [
+                ("role", &actor.role),
+                ("thumb", &actor.thumb),
+                ("biography", &actor.biography),
+            ] {
+                if !value.is_empty() {
+                    xml.push_str(&format!("<{key}>{}</{key}>", escaped(value)?));
+                }
+            }
+            if let Some(order) = actor.order {
+                xml.push_str(&format!("<order>{order}</order>"));
+            }
+            if !actor.provider.is_empty() && !actor.id.is_empty() {
+                xml.push_str(&format!(
+                    "<uniqueid type=\"metatube\" provider=\"{}\">{}</uniqueid>",
+                    escaped(&actor.provider)?,
+                    escaped(&actor.id)?
+                ));
+            }
+            xml.push_str("</actor>\n");
         }
         if let Some(series) = &self.series
             && !series.is_empty()
@@ -393,6 +526,32 @@ impl Movie {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn person_matching_requires_one_exact_source_identity() {
+        let person = |id: &str, name: &str| Person {
+            provider: "Fixture".into(),
+            id: id.into(),
+            name: name.into(),
+            ..Default::default()
+        };
+        assert!(exact_person(vec![person("one", "甲"), person("two", "甲")], "甲").is_none());
+        assert!(exact_person(vec![person("one", "甲乙")], "甲").is_none());
+        assert_eq!(
+            exact_person(
+                vec![
+                    person("one", " 甲 "),
+                    person("one", "甲"),
+                    person("near", "甲乙")
+                ],
+                "甲"
+            )
+            .unwrap()
+            .id,
+            "one"
+        );
+        assert!(exact_person(vec![person("../escape", "甲")], "甲").is_none());
+    }
     #[test]
     fn writes_complete_fields_and_keeps_unknown_score_scale() {
         let movie = Movie {
@@ -417,10 +576,11 @@ mod tests {
         assert_eq!(crate::apps::nfo::text(&xml, "plot"), movie.summary);
         assert!(xml.contains("<metatube_score") && !xml.contains("<rating>"));
         assert!(xml.contains("<label>发行品牌</label>") && xml.contains("<studio>厂商</studio>"));
-        assert!(
-            xml.contains("<actor><name>演员甲</name></actor>")
-                && xml.contains("<set><name>电影系列</name></set>")
-        );
+        let actors = crate::apps::nfo::actors(&xml);
+        assert_eq!(actors.len(), 1);
+        assert_eq!(actors[0].name, "演员甲");
+        assert_eq!(actors[0].order, Some(0));
+        assert!(xml.contains("<set><name>电影系列</name></set>"));
     }
     #[test]
     fn poster_is_exact_ratio_and_bounded_jpeg() {

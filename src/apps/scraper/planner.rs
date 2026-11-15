@@ -451,6 +451,7 @@ pub(super) async fn build(
         extra_names,
         nfo,
         poster,
+        actor_images: Vec::new(),
         candidate: input.candidate.clone(),
         movie,
         needs_candidate,

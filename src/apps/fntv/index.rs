@@ -24,7 +24,7 @@ pub(super) struct Source {
     pub size: i64,
 }
 impl Source {
-    fn from_node(n: &Node) -> Self {
+    pub(super) fn from_node(n: &Node) -> Self {
         Self {
             id: n.id,
             version: n.content_version(),
@@ -35,6 +35,15 @@ impl Source {
     pub fn guid(&self, kind: &str) -> String {
         guid(&[kind, &self.id.to_string(), &self.version])
     }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct Actor {
+    pub data: crate::apps::nfo::Actor,
+    pub metadata: Source,
+    pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portrait: Option<Source>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -75,6 +84,12 @@ pub(super) struct Entry {
     #[serde(skip)]
     pub cover: Option<String>,
     pub subtitles: Vec<Source>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actors: Vec<Actor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub show_actors: Vec<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_nfo: Option<Source>,
 }
 
 impl Entry {
@@ -170,7 +185,7 @@ async fn read_nfo(
     let Ok(text) = String::from_utf8(bytes) else {
         return Ok(None);
     };
-    // 只提取有限的本地文本标签；不处理外部实体、路径引用和网络 URL。
+    // XML 本身不执行外部实体；人物图片另行解析为受限的网盘本地引用。
     let upper = text.to_ascii_uppercase();
     if upper.contains("<!DOCTYPE") || upper.contains("<!ENTITY") {
         return Ok(None);
@@ -275,6 +290,8 @@ async fn refresh_inner(
     }
     for (library, root) in roots.iter().filter(|(l, _)| affected.contains(&l.id)) {
         let files = scan_library(state, context, library, root).await?;
+        let by_path: HashMap<_, _> = files.iter().map(|(n, p)| (p.as_str(), n)).collect();
+        let mut show_metadata: HashMap<i64, Option<(Source, Vec<Actor>)>> = HashMap::new();
         let mut siblings: HashMap<i64, Vec<&Node>> = HashMap::new();
         for (n, _) in &files {
             siblings
@@ -378,6 +395,27 @@ async fn refresh_inner(
                 entry.path = path.clone();
                 entry.libraries = vec![library.id.clone()];
                 entry.refresh_dates(node);
+                refresh_actor_sources(&mut entry.actors, &files);
+                refresh_actor_sources(&mut entry.show_actors, &files);
+                if let Some(source) = &entry.show_nfo {
+                    let current = files.iter().find(|(n, _)| n.id == source.id);
+                    if current.is_none_or(|(n, _)| n.content_version() != source.version) {
+                        // 剧级 NFO 的变化属于现有文件刷新，不是旧索引迁移。
+                        entry.show_nfo = None;
+                        entry.show_actors.clear();
+                    }
+                }
+                if library.kind == "tv" && entry.kind == "Episode" {
+                    fill_show_actors(
+                        state,
+                        context,
+                        &mut entry,
+                        &files,
+                        &by_path,
+                        &mut show_metadata,
+                    )
+                    .await?;
+                }
                 stage_entry(&mut output, entry, &mut staged_bytes)?;
                 continue;
             }
@@ -411,6 +449,9 @@ async fn refresh_inner(
                 thumbnail,
                 cover: None,
                 subtitles,
+                actors: Vec::new(),
+                show_actors: Vec::new(),
+                show_nfo: None,
             };
             let mut recognized = if library.kind == "tv" {
                 episode_name(&node.name)
@@ -420,6 +461,7 @@ async fn refresh_inner(
             if let Some(source) = nfo
                 && let Some(text) = read_nfo(state, context, &source).await?
             {
+                entry.actors = actor_rows(&text, &source, &files, &by_path);
                 if let Some(title) = xml_text(&text, "title").filter(|s| !s.is_empty()) {
                     entry.title = title;
                 }
@@ -462,6 +504,15 @@ async fn refresh_inner(
                 entry.episode = episode;
                 entry.show_guid = guid(&["show", &group_id.to_string()]);
                 entry.show_title = if title.is_empty() { group.name } else { title };
+                fill_show_actors(
+                    state,
+                    context,
+                    &mut entry,
+                    &files,
+                    &by_path,
+                    &mut show_metadata,
+                )
+                .await?;
             }
             stage_entry(&mut output, entry, &mut staged_bytes)?;
         }
@@ -483,6 +534,103 @@ async fn refresh_inner(
     );
     super::covers::start_worker(state);
     state.vfs.db.fntv.cover_wake.notify_one();
+    Ok(())
+}
+
+fn actor_rows(
+    text: &str,
+    source: &Source,
+    files: &[(Node, String)],
+    by_path: &HashMap<&str, &Node>,
+) -> Vec<Actor> {
+    let Some((metadata, path)) = files.iter().find(|(n, _)| n.id == source.id) else {
+        return Vec::new();
+    };
+    let directory = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/");
+    crate::apps::nfo::actors(text)
+        .into_iter()
+        .map(|data| {
+            let portrait = crate::apps::nfo::local_actor_path(directory, &data.thumb)
+                .and_then(|path| by_path.get(path.as_str()).copied())
+                .filter(|n| {
+                    !n.is_dir
+                        && n.size > 0
+                        && n.size <= 2 * 1024 * 1024
+                        && ["jpg", "jpeg", "png", "webp"].contains(&extension(&n.name).as_str())
+                })
+                .map(Source::from_node);
+            Actor {
+                data,
+                metadata: source.clone(),
+                updated_at: metadata.modified_at.saturating_mul(1000),
+                portrait,
+            }
+        })
+        .collect()
+}
+
+fn refresh_actor_sources(actors: &mut [Actor], files: &[(Node, String)]) {
+    for actor in actors {
+        let directory = files
+            .iter()
+            .find(|(n, _)| n.id == actor.metadata.id)
+            .and_then(|(_, path)| path.rsplit_once('/').map(|(dir, _)| dir));
+        actor.portrait = directory
+            .and_then(|dir| crate::apps::nfo::local_actor_path(dir, &actor.data.thumb))
+            .and_then(|path| files.iter().find(|(_, p)| p == &path).map(|(n, _)| n))
+            .filter(|node| {
+                node.size > 0
+                    && node.size <= 2 * 1024 * 1024
+                    && ["jpg", "jpeg", "png", "webp"].contains(&extension(&node.name).as_str())
+            })
+            .map(Source::from_node);
+    }
+}
+
+async fn fill_show_actors(
+    state: &AppState,
+    context: &Context,
+    entry: &mut Entry,
+    files: &[(Node, String)],
+    by_path: &HashMap<&str, &Node>,
+    cache: &mut HashMap<i64, Option<(Source, Vec<Actor>)>>,
+) -> AppResult<()> {
+    let parent = state
+        .vfs
+        .db
+        .node(entry.node_id)
+        .await?
+        .parent_id
+        .ok_or(AppError::NotFound)?;
+    let mut group = parent;
+    let parent_node = state.vfs.db.node(parent).await?;
+    if guid(&["show", &parent.to_string()]) != entry.show_guid {
+        group = parent_node.parent_id.unwrap_or(parent);
+    }
+    if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(group) {
+        let nfo = files
+            .iter()
+            .find(|(n, _)| n.parent_id == Some(group) && n.name.eq_ignore_ascii_case("tvshow.nfo"));
+        let value = if let Some((node, _)) = nfo {
+            let source = Source::from_node(node);
+            let actors = if let Some(text) = read_nfo(state, context, &source).await? {
+                actor_rows(&text, &source, files, by_path)
+            } else {
+                Vec::new()
+            };
+            Some((source, actors))
+        } else {
+            None
+        };
+        slot.insert(value);
+    }
+    if let Some(Some((source, actors))) = cache.get(&group) {
+        entry.show_nfo = Some(source.clone());
+        entry.show_actors = actors.clone();
+    } else {
+        entry.show_nfo = None;
+        entry.show_actors.clear();
+    }
     Ok(())
 }
 

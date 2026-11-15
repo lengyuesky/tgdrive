@@ -80,6 +80,116 @@ async fn seed_sorting_media(state: &AppState, media: &MemoryMedia, assets: &std:
     }
 }
 
+async fn seed_actor_media(state: &AppState, media: &MemoryMedia, assets: &std::path::Path) {
+    for directory in [
+        "/飞牛合成验证/演员电影",
+        "/飞牛合成验证/演员剧集",
+        "/飞牛合成验证/演员剧集/合成演员剧",
+        "/飞牛合成验证/演员剧集/合成演员剧/Season01",
+    ] {
+        state.vfs.mkdir(directory).await.unwrap();
+    }
+    for (directory, name, color) in [
+        ("/飞牛合成验证/演员电影", "演员甲旧.jpg", [210, 65, 70]),
+        ("/飞牛合成验证/演员电影", "演员甲新.jpg", [45, 155, 110]),
+        (
+            "/飞牛合成验证/演员剧集/合成演员剧",
+            "演员丙.jpg",
+            [60, 115, 210],
+        ),
+    ] {
+        let mut picture = image::RgbImage::from_pixel(120, 180, image::Rgb([235, 240, 245]));
+        for y in 0..180i32 {
+            for x in 0..120i32 {
+                let head = (x - 60).pow(2) + (y - 49).pow(2) < 22 * 22;
+                let body = y > 84
+                    && (x - 60).pow(2) * 48 * 48 + (y - 133).pow(2) * 40 * 40 < 40 * 40 * 48 * 48;
+                if head || body {
+                    picture.put_pixel(x as u32, y as u32, image::Rgb(color));
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90)
+            .encode_image(&picture)
+            .unwrap();
+        seed_file(state, media, &format!("{directory}/{name}"), &bytes, 65536).await;
+    }
+    let video = std::fs::read(assets.join("sample.mp4")).unwrap();
+    for (path, day) in [
+        ("/飞牛合成验证/演员电影/演员验证第一部.mp4", 1),
+        ("/飞牛合成验证/演员电影/演员验证第二部.mp4", 2),
+        (
+            "/飞牛合成验证/演员剧集/合成演员剧/Season01/合成演员剧 S01E01.mp4",
+            3,
+        ),
+        (
+            "/飞牛合成验证/演员剧集/合成演员剧/Season01/合成演员剧 S01E02.mp4",
+            4,
+        ),
+    ] {
+        let id = seed_file(state, media, path, &video, 256 * 1024).await;
+        sqlx::query("UPDATE nodes SET created_at=? WHERE id=?")
+            .bind(1_700_000_000_i64 + day * 86400)
+            .bind(id)
+            .execute(&state.vfs.db.pool)
+            .await
+            .unwrap();
+    }
+    let actor_id = "<uniqueid type=\"metatube\" provider=\"FixturePeople\">synthetic-a</uniqueid>";
+    let first = format!(
+        "<movie><title>演员验证第一部</title><year>2025</year><plot>合成演员、角色和头像的官方客户端验收。</plot><actor><name>合成演员甲</name><role>领航员</role><order>0</order><thumb>演员甲旧.jpg</thumb><biography>第一份合成人物简介。</biography>{actor_id}</actor><actor><name>合成演员乙</name><role>工程师</role><order>1</order></actor></movie>"
+    );
+    let second = format!(
+        "<movie><title>演员验证第二部</title><year>2026</year><actor><name>合成演员甲</name><role>队长</role><thumb>演员甲新.jpg</thumb><biography>这是较新的人物简介。合成演员甲用于验证头像更新、人物页，以及跨电影和电视剧的关联作品。</biography>{actor_id}</actor></movie>"
+    );
+    for (name, text, timestamp) in [
+        ("演员验证第一部.nfo", first, 1_700_000_100_i64),
+        ("演员验证第二部.nfo", second, 1_700_000_200_i64),
+    ] {
+        let id = seed_file(
+            state,
+            media,
+            &format!("/飞牛合成验证/演员电影/{name}"),
+            text.as_bytes(),
+            65536,
+        )
+        .await;
+        sqlx::query("UPDATE nodes SET modified_at=? WHERE id=?")
+            .bind(timestamp)
+            .bind(id)
+            .execute(&state.vfs.db.pool)
+            .await
+            .unwrap();
+    }
+    seed_file(state, media, "/飞牛合成验证/演员剧集/合成演员剧/tvshow.nfo", "<tvshow><actor><name>合成演员丙</name><role>剧级主演</role><order>0</order><thumb>演员丙.jpg</thumb><biography>合成演员丙用于验证剧、季和无独立演员表单集的继承。</biography></actor></tvshow>".as_bytes(), 65536).await;
+    let guest = format!(
+        "<episodedetails><actor><name>合成演员甲</name><role>单集客串</role>{actor_id}</actor></episodedetails>"
+    );
+    seed_file(
+        state,
+        media,
+        "/飞牛合成验证/演员剧集/合成演员剧/Season01/合成演员剧 S01E01.nfo",
+        guest.as_bytes(),
+        65536,
+    )
+    .await;
+    let poster = std::fs::read(assets.join("poster.jpg")).unwrap();
+    for directory in [
+        "/飞牛合成验证/演员电影",
+        "/飞牛合成验证/演员剧集/合成演员剧/Season01",
+    ] {
+        seed_file(
+            state,
+            media,
+            &format!("{directory}/poster.jpg"),
+            &poster,
+            256 * 1024,
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "需显式指定已校验的合成素材和输出目录，提供官方客户端隔离验收窗口"]
 async fn fntv_native_fixture() {
@@ -178,6 +288,10 @@ async fn fntv_native_fixture() {
     if sorting {
         seed_sorting_media(&state, &media, &assets).await;
     }
+    let actors = std::env::var("TGDRIVE_FNTV_FIXTURE_ACTORS").is_ok_and(|value| value == "1");
+    if actors {
+        seed_actor_media(&state, &media, &assets).await;
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let stats_state = state.clone();
@@ -216,13 +330,14 @@ async fn fntv_native_fixture() {
             let log=request_log.clone();async move {
                 let path=request.uri().path().to_owned();let method=request.method().to_string();
                 let agent=request.headers().get("user-agent").and_then(|value|value.to_str().ok()).unwrap_or("").chars().take(256).collect::<String>();
-                let is_list=sorting && method=="POST" && matches!(path.as_str(),"/v/api/v1/item/list"|"/v/api/v1/favorite/list");
+                let is_list=method=="POST" && (sorting && matches!(path.as_str(),"/v/api/v1/item/list"|"/v/api/v1/favorite/list")
+                    || actors && path=="/v/api/v1/person/item/list");
                 let (request,sort)=if is_list {
                     let (parts,body)=request.into_parts();
                     let Ok(bytes)=to_bytes(body,16*1024).await else {return StatusCode::BAD_REQUEST.into_response()};
                     let value=serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
                     let mut fields=serde_json::Map::new();
-                    for key in ["sort_column","sort_type"] {
+                    for key in ["sort_column","sort_type","job","person_guid"] {
                         let safe=value[key].as_str().filter(|s|s.len()<=64 && s.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'_'));
                         fields.insert(key.into(),json!(safe));
                     }
@@ -247,7 +362,7 @@ async fn fntv_native_fixture() {
                 response
             }
         }));
-    let startup = json!({"fixture":"tgdrive-fntv-native","synthetic":true,"telegram":"memory","host_version":env!("CARGO_PKG_VERSION"),"base_url":format!("http://{address}"),"pid":std::process::id(),"database":"temporary","preinstalled_fntv":false,"window_seconds":seconds,"covers_initially_paused":paused,"sorting_samples":sorting});
+    let startup = json!({"fixture":"tgdrive-fntv-native","synthetic":true,"telegram":"memory","host_version":env!("CARGO_PKG_VERSION"),"base_url":format!("http://{address}"),"pid":std::process::id(),"database":"temporary","preinstalled_fntv":false,"window_seconds":seconds,"covers_initially_paused":paused,"sorting_samples":sorting,"actor_samples":actors});
     std::fs::write(
         output.join("startup.json"),
         serde_json::to_vec_pretty(&startup).unwrap(),

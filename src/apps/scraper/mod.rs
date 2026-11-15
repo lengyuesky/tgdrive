@@ -1,5 +1,6 @@
 //! 固定应用的受限手动刮削能力；页面一次显式推进一个步骤，没有后台自动调度器。
 
+mod actors;
 mod backend;
 pub(crate) mod data;
 mod planner;
@@ -31,6 +32,7 @@ const LEASE: i64 = 45;
 
 pub(crate) struct Service {
     controls: Mutex<HashMap<String, Arc<Control>>>,
+    actor_images: Mutex<HashMap<(String, usize), Vec<u8>>>,
     secret_path: PathBuf,
     configure: tokio::sync::Mutex<()>,
 }
@@ -44,11 +46,13 @@ impl Service {
     pub(crate) fn new(db_path: &str) -> Self {
         Self {
             controls: Mutex::new(HashMap::new()),
+            actor_images: Mutex::new(HashMap::new()),
             secret_path: PathBuf::from(format!("{db_path}.scraper-token")),
             configure: tokio::sync::Mutex::new(()),
         }
     }
     pub(crate) fn invalidate(&self) {
+        self.actor_images.lock().unwrap().clear();
         for control in self.controls.lock().unwrap().values() {
             control.cancel.cancel();
         }
@@ -325,6 +329,12 @@ async fn prepare(state: &AppState, app: &InstalledApp, input: Prepare) -> AppRes
                 plan.movie = Some(movie);
             }
             let result = ResultRecord {
+                actors_state: if plan.nfo.action == "keep" {
+                    "skipped"
+                } else {
+                    "pending"
+                }
+                .into(),
                 organize: Step {
                     state: "pending".into(),
                     ..Default::default()
@@ -362,6 +372,7 @@ async fn prepare(state: &AppState, app: &InstalledApp, input: Prepare) -> AppRes
                 } else {
                     String::new()
                 },
+                ..Default::default()
             };
             sqlx::query("INSERT INTO app_scraper_items(id,batch_id,group_key,position,files,plan,result,status) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(batch_id,group_key) DO UPDATE SET files=excluded.files,plan=excluded.plan,result=excluded.result,status=excluded.status")
                 .bind(&id).bind(&batch.id).bind(&key).bind(position).bind(data::encode(&plan.videos)?).bind(data::encode(&plan)?).bind(data::encode(&result)?).bind(if plan.needs_candidate{"needs_user"}else{"pending"}).execute(&mut *tx).await?;
@@ -470,6 +481,7 @@ async fn begin(state: &AppState, app: &InstalledApp, handle: Handle) -> AppResul
     }
     sqlx::query("UPDATE app_scraper_batches SET status='running',generation=?,expires_at=?,updated_at=? WHERE id=?").bind(data::generation()).bind(now_ts()+LEASE).bind(now_ts()).bind(&handle.id).execute(&mut *tx).await?;
     tx.commit().await?;
+    db.scraper.actor_images.lock().unwrap().clear();
     db.scraper.controls.lock().unwrap().insert(
         handle.id.clone(),
         Arc::new(Control {
@@ -546,6 +558,68 @@ async fn phase(state: &AppState, item: &Item, plan: Plan) -> AppResult<()> {
         return Ok(());
     }
     if !matches!(result.nfo.state.as_str(), "done" | "kept" | "skipped") {
+        if !matches!(result.actors_state.as_str(), "done" | "skipped") {
+            let config = configuration(state).await?;
+            let backend = Backend::new(state, &config.url, config.token)?;
+            actors::prepare(state, item, plan, &backend).await?;
+            return Ok(());
+        }
+        if let Some((index, _)) = result
+            .actor_images
+            .iter()
+            .enumerate()
+            .find(|(_, step)| !matches!(step.state.as_str(), "done" | "failed" | "skipped"))
+        {
+            let bytes = state
+                .vfs
+                .db
+                .scraper
+                .actor_images
+                .lock()
+                .unwrap()
+                .get(&(item.id.clone(), index))
+                .cloned();
+            if let Some(bytes) = bytes {
+                let outcome = upload(
+                    state,
+                    &item.batch_id,
+                    &item.id,
+                    &plan,
+                    &format!("actor:{index}"),
+                    bytes,
+                )
+                .await;
+                if let Err(error) = outcome {
+                    // 只有可确认未提交的普通失败可降级；撤权、预览冲突及不确定提交继续停止。
+                    if matches!(error, AppError::Telegram(_) | AppError::TelegramRejected(_)) {
+                        cancel_item_uploads(state, &item.id).await?;
+                        actors::missing_image(state, item, index, error.public_parts().0).await?;
+                    } else {
+                        return Err(error);
+                    }
+                } else {
+                    state
+                        .vfs
+                        .db
+                        .scraper
+                        .actor_images
+                        .lock()
+                        .unwrap()
+                        .remove(&(item.id.clone(), index));
+                }
+            } else {
+                actors::missing_image(
+                    state,
+                    item,
+                    index,
+                    "头像暂存已释放，保留姓名；可重新刮削补充".into(),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+    }
+    if !matches!(result.nfo.state.as_str(), "done" | "kept" | "skipped") {
         let candidate = plan
             .candidate
             .as_ref()
@@ -560,7 +634,12 @@ async fn phase(state: &AppState, item: &Item, plan: Plan) -> AppResult<()> {
         .await?
         .ok_or_else(|| AppError::BadRequest("影片资料记录已失效，请重新预览".into()))?;
         let movie: backend::Movie = data::decode(&saved)?;
-        upload(state, &item.batch_id, &item.id, &plan, "nfo", movie.nfo()?).await?;
+        let bytes = if result.actors_state == "done" {
+            movie.nfo_with_actors(&actors::nfo_actors(&result))?
+        } else {
+            movie.nfo()?
+        };
+        upload(state, &item.batch_id, &item.id, &plan, "nfo", bytes).await?;
         return Ok(());
     }
     if !matches!(result.poster.state.as_str(), "done" | "kept" | "skipped") {
@@ -647,7 +726,10 @@ async fn next(state: &AppState, handle: Handle) -> AppResult<Value> {
         .fetch_one(&mut *tx)
         .await?;
     let mut result: ResultRecord = data::decode(&raw)?;
-    for step in [&mut result.nfo, &mut result.poster] {
+    for step in [&mut result.nfo, &mut result.poster]
+        .into_iter()
+        .chain(result.actor_images.iter_mut())
+    {
         if step.state == "uploading"
             && let Some(id) = &step.upload_id
             && db
@@ -659,6 +741,7 @@ async fn next(state: &AppState, handle: Handle) -> AppResult<Value> {
             step.file = None;
         }
     }
+    result.summarize_actors();
     let mut paused = false;
     let status = if let Err(error) = outcome {
         result.reason = error.public_parts().0;
@@ -744,6 +827,16 @@ async fn stop(state: &AppState, handle: Handle) -> AppResult<Value> {
     if let Some(control) = &control {
         control.cancel.cancel();
     }
+    let item_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM app_scraper_items WHERE batch_id=?")
+            .bind(&handle.id)
+            .fetch_all(&db.pool)
+            .await?;
+    db.scraper
+        .actor_images
+        .lock()
+        .unwrap()
+        .retain(|(id, _), _| !item_ids.contains(id));
     let stopped = control
         .as_ref()
         .is_none_or(|c| !c.executing.load(Ordering::Acquire));
@@ -854,12 +947,16 @@ async fn verify_record(state: &AppState, params: Value) -> AppResult<Value> {
             .fetch_one(&state.vfs.db.pool)
             .await?;
         let mut result: ResultRecord = data::decode(&fresh)?;
-        for step in [&mut result.nfo, &mut result.poster] {
+        for step in [&mut result.nfo, &mut result.poster]
+            .into_iter()
+            .chain(result.actor_images.iter_mut())
+        {
             if step.state == "uploading" {
                 step.state = "cancelled".into();
                 step.file = None;
             }
         }
+        result.summarize_actors();
         result.reason = "已核实宿主提交记录；请重新扫描并预览未完成项".into();
         sqlx::query("UPDATE app_scraper_items SET status='needs_user',result=? WHERE id=?")
             .bind(data::encode(&result)?)

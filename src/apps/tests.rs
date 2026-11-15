@@ -56,6 +56,7 @@ struct MemoryMedia {
     upload_pending: AtomicBool,
     upload_started: tokio::sync::Notify,
     upload_release: tokio::sync::Notify,
+    actor_upload_outcome: AtomicUsize,
 }
 
 struct ActiveRead {
@@ -140,6 +141,13 @@ impl TgApi for MemoryMedia {
             let _pending = PendingUpload(&self.upload_pending);
             self.upload_started.notify_one();
             self.upload_release.notified().await;
+        }
+        if filename.starts_with("tgdrive-actor-") {
+            match self.actor_upload_outcome.load(Ordering::SeqCst) {
+                1 => return Err(AppError::TelegramRejected("合成头像上传被明确拒绝".into())),
+                2 => return Err(AppError::TelegramUncertain("合成头像发送结果不确定".into())),
+                _ => {}
+            }
         }
         let count = self.upload_count.fetch_add(1, Ordering::SeqCst) + 1;
         let file_id = format!("fixture-scraper-{count}");
@@ -1434,6 +1442,8 @@ async fn browser_fixture() {
     let scraper_backend = scraper_tests::backend_fixture().await;
     let scraper_url = scraper_backend.url.clone();
     let scraper_fail = scraper_backend.fail_poster.clone();
+    let scraper_actors = scraper_backend.actor_mode.clone();
+    let scraper_actor_fail = scraper_backend.fail_actor_image.clone();
     let scraper_stats = media.clone();
     let scraper_control = media.clone();
     let scraper_db = state.vfs.db.clone();
@@ -1462,6 +1472,8 @@ async fn browser_fixture() {
             .post(move |Json(input): Json<Value>| {
                 let control = scraper_control.clone();
                 let fail = scraper_fail.clone();
+                let actors = scraper_actors.clone();
+                let actor_fail = scraper_actor_fail.clone();
                 let db = scraper_db.clone();
                 async move {
                     if let Some(block) = input["block_uploads"].as_bool() {
@@ -1469,6 +1481,8 @@ async fn browser_fixture() {
                         if !block && control.upload_pending.load(Ordering::SeqCst) { control.upload_release.notify_one(); }
                     }
                     if let Some(failed) = input["fail_poster"].as_bool() { fail.store(failed, Ordering::SeqCst); }
+                    if let Some(enabled) = input["actor_mode"].as_bool() { actors.store(enabled, Ordering::SeqCst); }
+                    if let Some(failed) = input["fail_actor_image"].as_bool() { actor_fail.store(failed, Ordering::SeqCst); }
                     if input["restore_records"] == true {
                         db.scraper.invalidate();
                         let mut conn = db.pool.acquire().await.unwrap();

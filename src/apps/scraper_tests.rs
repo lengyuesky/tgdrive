@@ -8,6 +8,9 @@ pub(super) struct BackendFixture {
     pub(super) url: String,
     task: tokio::task::JoinHandle<()>,
     pub(super) fail_poster: Arc<AtomicBool>,
+    pub(super) actor_mode: Arc<AtomicBool>,
+    pub(super) fail_actor_image: Arc<AtomicBool>,
+    actor_images: Arc<AtomicUsize>,
     details: Arc<AtomicUsize>,
 }
 impl Drop for BackendFixture {
@@ -28,6 +31,12 @@ pub(super) async fn backend_fixture() -> BackendFixture {
     let picture = jpeg.clone();
     let fails = fail.clone();
     let count = details.clone();
+    let actor_mode = Arc::new(AtomicBool::new(false));
+    let fail_actor_image = Arc::new(AtomicBool::new(false));
+    let actor_images = Arc::new(AtomicUsize::new(0));
+    let actors_enabled = actor_mode.clone();
+    let actor_failures = fail_actor_image.clone();
+    let actor_image_count = actor_images.clone();
     let router = Router::new()
         .route("/v1/providers", get(|| async { Json(json!({"data":{"actor_providers":{},"movie_providers":{"Fixture":"https://fixture.invalid"}}})) }))
         .route("/v1/movies/search", get(|| async { Json(json!({"data":[{"provider":"Fixture","id":"abc123","number":"ABC-123","title":"星海远航"}]})) }))
@@ -37,9 +46,23 @@ pub(super) async fn backend_fixture() -> BackendFixture {
                 Json(json!({"data":{"provider":"Fixture","id":"abc123","number":"ABC-123","title":"星海远航","summary":"完整长简介。".repeat(5000),"actors":["演员甲","演员乙"],"maker":"测试厂商","label":"测试品牌","series":"测试系列","genres":["冒险"],"score":5,"release_date":"2025-06-01T00:00:00Z"}}))
             }
         }))
-        .route("/v1/images/primary/{provider}/{id}", get(move || {
-            let bytes = picture.clone(); let fails = fails.clone(); async move {
-                if fails.load(Ordering::SeqCst) { (StatusCode::SERVICE_UNAVAILABLE, Vec::<u8>::new()).into_response() }
+        .route("/v1/actors/search", get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String,String>>| {
+            let enabled = actors_enabled.clone(); async move {
+                let candidates = if !enabled.load(Ordering::SeqCst) { json!([]) }
+                else if query.get("q").is_some_and(|q| q == "演员甲") { json!([
+                    {"provider":"FixturePeople","id":"actor1","name":"演员甲"},
+                    {"provider":"FixturePeople","id":"actor1","name":" 演员甲 "},
+                    {"provider":"FixturePeople","id":"near","name":"演员甲旧名"}]) }
+                else { json!([{"provider":"FixturePeople","id":"actor2","name":"演员乙"},{"provider":"OtherPeople","id":"actor3","name":"演员乙"}]) };
+                Json(json!({"data":candidates}))
+            }
+        }))
+        .route("/v1/actors/{provider}/{id}", get(|| async { Json(json!({"data":{"provider":"FixturePeople","id":"actor1","name":"演员甲","summary":"合成演员的完整人物简介。"}})) }))
+        .route("/v1/images/primary/{provider}/{id}", get(move |axum::extract::Path((provider,_)): axum::extract::Path<(String,String)>| {
+            let bytes = picture.clone(); let fails = fails.clone(); let actor_fails = actor_failures.clone(); let count = actor_image_count.clone(); async move {
+                let actor = provider == "FixturePeople";
+                if actor { count.fetch_add(1, Ordering::SeqCst); }
+                if (actor && actor_fails.load(Ordering::SeqCst)) || (!actor && fails.load(Ordering::SeqCst)) { (StatusCode::SERVICE_UNAVAILABLE, Vec::<u8>::new()).into_response() }
                 else { ([(header::CONTENT_TYPE, "image/jpeg")], bytes.as_ref().clone()).into_response() }
             }
         }));
@@ -52,6 +75,9 @@ pub(super) async fn backend_fixture() -> BackendFixture {
         url,
         task,
         fail_poster: fail,
+        actor_mode,
+        fail_actor_image,
+        actor_images,
         details,
     }
 }
@@ -332,6 +358,7 @@ async fn dropped_request_can_be_stopped_without_exposing_an_internal_upload_to_t
     prepare(&state, &app, &operation, &[video], false, true, &[]).await;
     start(&state, &app, &operation).await;
     next(&state, &app, &operation).await;
+    next(&state, &app, &operation).await;
     media.upload_block.store(true, Ordering::SeqCst);
     let task_state = state.clone();
     let task_app = app.clone();
@@ -410,6 +437,7 @@ async fn restored_inflight_records_discard_only_uncommitted_shadows_and_allow_a_
     let operation = batch(&state, &app).await;
     prepare(&state, &app, &operation, &[video], false, true, &[]).await;
     start(&state, &app, &operation).await;
+    next(&state, &app, &operation).await;
     next(&state, &app, &operation).await;
     media.upload_block.store(true, Ordering::SeqCst);
     let task_state = state.clone();
@@ -877,6 +905,7 @@ async fn overwrite_commit_cannot_replace_a_file_changed_after_preview() {
     );
     start(&state, &app, &b).await;
     next(&state, &app, &b).await;
+    next(&state, &app, &b).await;
     media.upload_block.store(true, Ordering::SeqCst);
     let executing = {
         let state = state.clone();
@@ -923,6 +952,7 @@ async fn cancelling_inflight_upload_blocks_commit_and_requires_verification() {
     let b = batch(&state, &app).await;
     prepare(&state, &app, &b, &[video], false, true, &[]).await;
     start(&state, &app, &b).await;
+    next(&state, &app, &b).await;
     next(&state, &app, &b).await;
     media.upload_block.store(true, Ordering::SeqCst);
     let executing = {
@@ -981,6 +1011,7 @@ async fn deleting_history_cannot_remove_an_inflight_uploads_commit_fence() {
     let b = batch(&state, &app).await;
     prepare(&state, &app, &b, &[video], false, true, &[]).await;
     start(&state, &app, &b).await;
+    next(&state, &app, &b).await;
     next(&state, &app, &b).await;
     media.upload_block.store(true, Ordering::SeqCst);
     let executing = {
@@ -1209,4 +1240,211 @@ async fn revoked_directory_scope_blocks_next_step_without_moving_original_video(
         video
     );
     assert_eq!(media.upload_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn actor_enrichment_writes_only_confirmed_images_and_preserves_old_portraits_on_rescrape() {
+    let (state, media, _dir, app, backend) = setup().await;
+    backend.actor_mode.store(true, Ordering::SeqCst);
+    let video = seed_file(&state, &media, "/刮削测试/ABC-123.mp4", b"synthetic", 1024).await;
+    let b = batch(&state, &app).await;
+    let preview = prepare(&state, &app, &b, &[video], false, true, &[]).await;
+    assert_eq!(preview["actors"], json!(["演员甲", "演员乙"]));
+    assert_eq!(
+        backend.actor_images.load(Ordering::SeqCst),
+        0,
+        "预览不查询人物头像"
+    );
+    start(&state, &app, &b).await;
+    next(&state, &app, &b).await;
+    let enriched = next(&state, &app, &b).await;
+    assert_eq!(enriched["result"]["actors_state"], "done");
+    assert_eq!(enriched["result"]["actor_images"][0]["state"], "pending");
+    assert_eq!(
+        enriched["result"]["actors"][0]["data"]["thumb"],
+        Value::Null
+    );
+    assert!(
+        state
+            .vfs
+            .resolve("/刮削测试/ABC-123/ABC-123.nfo")
+            .await
+            .is_err()
+    );
+    let uploaded = next(&state, &app, &b).await;
+    assert_eq!(uploaded["result"]["actor_images"][0]["state"], "done");
+    run(&state, &app, &b).await;
+    let xml = String::from_utf8(contents(&state, "/刮削测试/ABC-123/ABC-123.nfo").await).unwrap();
+    let actors = crate::apps::nfo::actors(&xml);
+    assert_eq!(actors.len(), 2);
+    assert_eq!(actors[0].name, "演员甲");
+    assert_eq!(actors[0].biography, "合成演员的完整人物简介。");
+    assert!(!actors[0].thumb.is_empty());
+    assert!(actors[1].thumb.is_empty(), "多身份同名不能自动配头像");
+    let old_image = format!("/刮削测试/ABC-123/{}", actors[0].thumb);
+    let bytes = contents(&state, &old_image).await;
+    assert!(bytes.len() <= 128 * 1024);
+    assert!(image::load_from_memory(&bytes).is_ok());
+    assert_eq!(
+        backend.actor_images.load(Ordering::SeqCst),
+        1,
+        "图片下载在步骤间复用暂存，不重复查询后端"
+    );
+    assert_eq!(media.upload_count.load(Ordering::SeqCst), 3);
+    let record = invoke(&state, &app, "scraper.record", json!({"id":b["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(record["status"], "completed");
+    assert!(
+        record["items"][0]["result"]["actors_summary"]
+            .as_str()
+            .unwrap()
+            .contains("未匹配 1")
+    );
+    let second = batch(&state, &app).await;
+    prepare(&state, &app, &second, &[video], true, false, &[]).await;
+    start(&state, &app, &second).await;
+    run(&state, &app, &second).await;
+    let updated =
+        String::from_utf8(contents(&state, "/刮削测试/ABC-123/ABC-123.nfo").await).unwrap();
+    let new_image = crate::apps::nfo::actors(&updated)[0].thumb.clone();
+    assert_ne!(new_image, actors[0].thumb);
+    assert!(
+        state.vfs.resolve(&old_image).await.is_ok(),
+        "重新刮削保留旧图片"
+    );
+    assert!(
+        state
+            .vfs
+            .resolve(&format!("/刮削测试/ABC-123/{new_image}"))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn actor_image_backend_failure_keeps_names_and_finishes_the_movie() {
+    let (state, media, _dir, app, backend) = setup().await;
+    backend.actor_mode.store(true, Ordering::SeqCst);
+    backend.fail_actor_image.store(true, Ordering::SeqCst);
+    let video = seed_file(&state, &media, "/刮削测试/ABC-123.mp4", b"synthetic", 1024).await;
+    let b = batch(&state, &app).await;
+    prepare(&state, &app, &b, &[video], false, true, &[]).await;
+    start(&state, &app, &b).await;
+    run(&state, &app, &b).await;
+    let xml = String::from_utf8(contents(&state, "/刮削测试/ABC-123/ABC-123.nfo").await).unwrap();
+    let actors = crate::apps::nfo::actors(&xml);
+    assert_eq!(
+        actors.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        ["演员甲", "演员乙"]
+    );
+    assert!(actors.iter().all(|a| a.thumb.is_empty()));
+    assert_eq!(actors[0].biography, "合成演员的完整人物简介。");
+    assert_eq!(media.upload_count.load(Ordering::SeqCst), 2);
+    let record = invoke(&state, &app, "scraper.record", json!({"id":b["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(record["status"], "completed");
+    assert!(
+        record["items"][0]["result"]["actors_summary"]
+            .as_str()
+            .unwrap()
+            .contains("补充失败 1")
+    );
+}
+
+#[tokio::test]
+async fn rejected_actor_upload_does_not_abort_movie_but_uncertain_result_stops() {
+    for (outcome, completed) in [(1usize, true), (2, false)] {
+        let (state, media, _dir, app, backend) = setup().await;
+        backend.actor_mode.store(true, Ordering::SeqCst);
+        media.actor_upload_outcome.store(outcome, Ordering::SeqCst);
+        let video = seed_file(&state, &media, "/刮削测试/ABC-123.mp4", b"synthetic", 1024).await;
+        let b = batch(&state, &app).await;
+        prepare(&state, &app, &b, &[video], false, true, &[]).await;
+        start(&state, &app, &b).await;
+        run(&state, &app, &b).await;
+        let record = invoke(&state, &app, "scraper.record", json!({"id":b["id"]}))
+            .await
+            .unwrap();
+        if completed {
+            assert_eq!(record["status"], "completed");
+            let xml =
+                String::from_utf8(contents(&state, "/刮削测试/ABC-123/ABC-123.nfo").await).unwrap();
+            let actors = crate::apps::nfo::actors(&xml);
+            assert_eq!(actors.len(), 2);
+            assert!(actors.iter().all(|actor| actor.thumb.is_empty()));
+            assert_eq!(
+                record["items"][0]["result"]["actor_images"][0]["state"],
+                "failed"
+            );
+            assert_eq!(media.upload_count.load(Ordering::SeqCst), 2);
+        } else {
+            assert_eq!(record["items"][0]["status"], "needs_verification");
+            assert!(
+                state
+                    .vfs
+                    .resolve("/刮削测试/ABC-123/ABC-123.nfo")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(media.upload_count.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelling_actor_upload_blocks_nfo_references_and_keeps_the_commit_fence() {
+    let (state, media, _dir, app, backend) = setup().await;
+    backend.actor_mode.store(true, Ordering::SeqCst);
+    let video = seed_file(&state, &media, "/刮削测试/ABC-123.mp4", b"synthetic", 1024).await;
+    let b = batch(&state, &app).await;
+    prepare(&state, &app, &b, &[video], false, true, &[]).await;
+    start(&state, &app, &b).await;
+    next(&state, &app, &b).await;
+    next(&state, &app, &b).await;
+    media.upload_block.store(true, Ordering::SeqCst);
+    let executing = {
+        let state = state.clone();
+        let app = app.clone();
+        let b = b.clone();
+        tokio::spawn(async move { next(&state, &app, &b).await })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        media.upload_started.notified(),
+    )
+    .await
+    .unwrap();
+    let role: String = sqlx::query_scalar("SELECT role FROM app_scraper_upload_guards")
+        .fetch_one(&state.vfs.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "actor:0");
+    invoke(&state, &app, "scraper.stop", b.clone())
+        .await
+        .unwrap();
+    media.upload_block.store(false, Ordering::SeqCst);
+    media.upload_release.notify_one();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), executing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped["status"], "needs_verification");
+    assert!(
+        state
+            .vfs
+            .resolve("/刮削测试/ABC-123/ABC-123.nfo")
+            .await
+            .is_err()
+    );
+    assert!(
+        state
+            .vfs
+            .db
+            .visible_upload_sessions()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

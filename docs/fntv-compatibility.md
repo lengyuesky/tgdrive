@@ -1,5 +1,7 @@
 # 飞牛影视兼容插件设计记录
 
+演员扩展：当前工作区宿主 `0.3.12` 与插件 `fntv 0.1.5` 已实现 NFO 演员、人物页及关联作品。电影详情和季详情已用本机官方播放器 `1.12.3 (1123003)` 实际验收；该客户端整剧页不请求演员列表，也没有独立单集演员详情入口，剧／单集规则另通过宿主协议验证。完整共识与实际范围见[演员设计](fntv-actors-design.md)和[演员验收](fntv-actors-verification-20261115.md)。
+
 状态：宿主源码 `0.3.7` 加入无海报视频后台补图，插件 `fntv 0.1.2` 要求最低宿主 `0.3.7`。宿主功能提交为 `6ab85fc57f31b568571ad271ccddfe60b37bded4`，实现及新增客户端证据见 [封面验收记录](fntv-cover-verification-20261107.md)。此前宿主 `0.3.6` 和公开 `fntv 0.1.1` 的核心播放、季页起播与公开目录验收见 [原生记录](fntv-native-verification-20261106.md)和 [插件发布记录](https://github.com/lengyuesky/tgdrive-app/blob/main/docs/fntv-0.1.1-release.md)。日常服务未部署。独立 Node 服务上的首验见 [播放续验记录](fntv-playback-verification-20261104.md)，管理页与程序初验见 [宿主验收记录](fntv-host-verification-20261105.md)。
 
 ## 用户已确认

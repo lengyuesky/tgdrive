@@ -4,6 +4,7 @@ mod covers;
 pub(crate) mod data;
 mod frame;
 mod index;
+mod persons;
 mod probe;
 mod protocol;
 

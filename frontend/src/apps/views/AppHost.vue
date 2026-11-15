@@ -99,7 +99,7 @@ async function authorizeDirectory(initial: string): Promise<string | null> {
     const scraping = active.manifest.permissions.includes('scraper.service')
     const path = await picker.value?.open(scraping ? '选择允许整理与刮削的目录' : '选择允许应用读取的目录', initial)
     if (path == null || current !== generation) return null
-    await appConfirm({ title: '授权目录', message: '允许「' + active.manifest.name + '」' + (scraping ? '读取并按确认预览整理视频、配套文件，写入 NFO 和海报：' : '读取 ') + path + ' 及其子目录？' + (path === '/' ? '根目录包含整个网盘。' : ''), confirmText: scraping ? '允许整理与刮削' : '允许读取' })
+    await appConfirm({ title: '授权目录', message: '允许「' + active.manifest.name + '」' + (scraping ? '读取并按确认预览整理视频、配套文件，写入 NFO、海报和演员头像：' : '读取 ') + path + ' 及其子目录？' + (path === '/' ? '根目录包含整个网盘。' : ''), confirmText: scraping ? '允许整理与刮削' : '允许读取' })
     if (current !== generation) return null
     app.value = (await api.apps.authorize(active.manifest.id, path, active.revision)).data
     return path

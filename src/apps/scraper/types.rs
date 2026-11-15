@@ -56,6 +56,8 @@ pub(super) struct Plan {
     pub extra_names: Vec<String>,
     pub nfo: Artifact,
     pub poster: Artifact,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actor_images: Vec<Artifact>,
     pub candidate: Option<Candidate>,
     /// 同作品资料在批次来源表中只保存一份；预览计算期间暂存。
     #[serde(skip_serializing, default)]
@@ -77,7 +79,102 @@ pub(super) struct ResultRecord {
     pub organize: Step,
     pub nfo: Step,
     pub poster: Step,
+    pub actors_state: String,
+    pub actors_summary: String,
+    pub actors: Vec<ActorResult>,
+    pub actor_images: Vec<Step>,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct ActorResult {
+    pub data: crate::apps::nfo::Actor,
+    pub state: String,
+    pub message: String,
+    pub image_index: Option<usize>,
+}
+
+pub(super) fn image_role(role: &str) -> Option<usize> {
+    role.strip_prefix("actor:")?.parse().ok()
+}
+
+impl Plan {
+    pub fn artifact(&self, role: &str) -> crate::error::AppResult<&Artifact> {
+        match role {
+            "nfo" => Ok(&self.nfo),
+            "poster" => Ok(&self.poster),
+            _ => image_role(role)
+                .and_then(|i| self.actor_images.get(i))
+                .ok_or_else(|| crate::error::AppError::BadRequest("资料上传角色无效".into())),
+        }
+    }
+    pub fn artifact_mut(&mut self, role: &str) -> crate::error::AppResult<&mut Artifact> {
+        match role {
+            "nfo" => Ok(&mut self.nfo),
+            "poster" => Ok(&mut self.poster),
+            _ => image_role(role)
+                .and_then(|i| self.actor_images.get_mut(i))
+                .ok_or_else(|| crate::error::AppError::BadRequest("资料上传角色无效".into())),
+        }
+    }
+}
+
+impl ResultRecord {
+    pub fn step_mut(&mut self, role: &str) -> crate::error::AppResult<&mut Step> {
+        match role {
+            "nfo" => Ok(&mut self.nfo),
+            "poster" => Ok(&mut self.poster),
+            _ => image_role(role)
+                .and_then(|i| self.actor_images.get_mut(i))
+                .ok_or_else(|| crate::error::AppError::BadRequest("资料上传步骤无效".into())),
+        }
+    }
+    pub fn summarize_actors(&mut self) {
+        if self.actors_state.is_empty()
+            || self.actors_state == "pending"
+            || self.actors_state == "skipped"
+        {
+            return;
+        }
+        let count = |state: &str| self.actors.iter().filter(|a| a.state == state).count();
+        let images = self
+            .actors
+            .iter()
+            .filter(|a| {
+                a.image_index
+                    .is_some_and(|i| self.actor_images.get(i).is_some_and(|s| s.state == "done"))
+            })
+            .count();
+        let mut parts = vec![format!("演员头像 {images}/{}", self.actors.len())];
+        for (state, label) in [
+            ("unmatched", "未匹配"),
+            ("timeout", "查询超时"),
+            ("failed", "补充失败"),
+            ("no_image", "来源无头像"),
+        ] {
+            let count = count(state);
+            if count != 0 {
+                parts.push(format!("{label} {count}"));
+            }
+        }
+        let pending = self
+            .actor_images
+            .iter()
+            .filter(|s| s.state == "pending" || s.state == "uploading")
+            .count();
+        if pending != 0 {
+            parts.push(format!("待写入 {pending} 张"));
+        }
+        if self
+            .actors
+            .iter()
+            .any(|a| a.message.contains("简介") && a.data.biography.is_empty())
+        {
+            parts.push("部分人物简介未写入，详见记录".into());
+        }
+        self.actors_summary = parts.join("，");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,8 +315,9 @@ pub(super) fn private_related(name: &str, base: &str) -> bool {
     let value = stem(name).to_ascii_lowercase();
     let base = base.to_ascii_lowercase();
     let ext = extension(name);
-    ["srt", "vtt", "ass", "ssa"].contains(&ext.as_str())
-        && (value == base || value.starts_with(&format!("{base}.")))
+    crate::apps::nfo::is_actor_image(name, &base)
+        || ["srt", "vtt", "ass", "ssa"].contains(&ext.as_str())
+            && (value == base || value.starts_with(&format!("{base}.")))
         || ext == "nfo" && value == base
         || ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str())
             && (value == base || value == format!("{base}-poster"))

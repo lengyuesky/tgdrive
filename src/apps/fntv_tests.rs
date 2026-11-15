@@ -1,4 +1,6 @@
 //! 飞牛服务真实边界测试：临时 SQLite、内存媒体，不读取生产配置或连接 Telegram。
+#[path = "fntv_actor_tests.rs"]
+mod actor_tests;
 #[path = "fntv_cover_tests.rs"]
 mod cover_tests;
 #[path = "fntv_sort_tests.rs"]

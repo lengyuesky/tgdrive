@@ -326,11 +326,17 @@ pub(super) async fn new_upload(
 ) -> AppResult<crate::db::UploadSessionInfo> {
     let UploadContent { size, sha256: sha } = content;
     db.require_background_enabled()?;
-    let artifact = if role == "nfo" {
-        &plan.nfo
-    } else {
-        &plan.poster
-    };
+    let artifact = plan.artifact(role)?;
+    if let Some(index) = image_role(role)
+        && (artifact.name != crate::apps::nfo::actor_image_name(&plan.stem, item_id, index)
+            || artifact.action != "create"
+            || size <= 0
+            || size as usize > backend::ACTOR_IMAGE_LIMIT)
+    {
+        return Err(AppError::BadRequest(
+            "人物头像上传超出已确认资料范围".into(),
+        ));
+    }
     let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
     let batch = active(&mut tx, batch_id).await?;
     check_plan(&mut tx, &batch, plan).await?;
@@ -387,11 +393,7 @@ pub(super) async fn new_upload(
         .fetch_one(&mut *tx)
         .await?;
     let mut result: ResultRecord = decode(&raw)?;
-    let step = if role == "nfo" {
-        &mut result.nfo
-    } else {
-        &mut result.poster
-    };
+    let step = result.step_mut(role)?;
     step.state = "uploading".into();
     step.upload_id = Some(id.clone());
     step.sha256 = Some(sha.into());
@@ -480,18 +482,21 @@ pub(crate) async fn committed_upload(
     let mut plan: Plan = decode(&plan)?;
     let mut result: ResultRecord = decode(&result)?;
     let file = Snapshot::from_node(node, joined(&guard.folder.path, &node.name));
-    let step = if role == "nfo" {
-        &mut result.nfo
-    } else {
-        &mut result.poster
-    };
+    let step = result.step_mut(&role)?;
     step.state = "done".into();
     step.file = Some(file.clone());
-    let artifact = if role == "nfo" {
-        &mut plan.nfo
-    } else {
-        &mut plan.poster
-    };
+    if let Some(index) = image_role(&role) {
+        for actor in result
+            .actors
+            .iter_mut()
+            .filter(|a| a.image_index == Some(index))
+        {
+            actor.data.thumb = file.name.clone();
+            actor.state = "done".into();
+        }
+    }
+    result.summarize_actors();
+    let artifact = plan.artifact_mut(&role)?;
     artifact.existing = Some(file);
     artifact.action = "keep".into();
     plan.watched = watched(tx, &guard.folder, &plan.stem, &plan.extra_names).await?;
@@ -552,13 +557,33 @@ pub(super) async fn discard_restored_uploads(conn: &mut sqlx::SqliteConnection) 
         sqlx::query("UPDATE app_scraper_items SET result=json_set(result,?,'cancelled',?,NULL) WHERE json_extract(result,?)='uploading'")
             .bind(&state_path).bind(format!("$.{role}.file")).bind(&state_path).execute(&mut *conn).await?;
     }
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id,result FROM app_scraper_items WHERE EXISTS (SELECT 1 FROM json_each(result,'$.actor_images') WHERE json_extract(value,'$.state')='uploading')")
+        .fetch_all(&mut *conn).await?;
+    for (id, raw) in rows {
+        let mut result: ResultRecord = decode(&raw)?;
+        for step in result
+            .actor_images
+            .iter_mut()
+            .filter(|s| s.state == "uploading")
+        {
+            step.state = "cancelled".into();
+            step.file = None;
+        }
+        result.summarize_actors();
+        sqlx::query("UPDATE app_scraper_items SET result=? WHERE id=?")
+            .bind(encode(&result)?)
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
     sqlx::query("DELETE FROM nodes WHERE status='uploading' AND id IN(SELECT node_id FROM app_scraper_upload_guards)")
         .execute(&mut *conn).await?;
     Ok(())
 }
 
 pub(super) fn plan_value(item_id: &str, plan: &Plan) -> Value {
-    json!({"id":item_id,"files":plan.videos,"target_path":plan.target_path,"moving":plan.moving,"nfo":plan.nfo,"poster":plan.poster,"candidate":plan.candidate,"needs_candidate":plan.needs_candidate,"ready":!plan.needs_candidate})
+    json!({"id":item_id,"files":plan.videos,"target_path":plan.target_path,"moving":plan.moving,"nfo":plan.nfo,"poster":plan.poster,"candidate":plan.candidate,"needs_candidate":plan.needs_candidate,"ready":!plan.needs_candidate,
+        "actors":plan.movie.as_ref().map(backend::Movie::actor_names).unwrap_or_default()})
 }
 
 /// 只接纳同一批次已确认移动的相同节点及内容，外部新增或修改仍使预览失效。

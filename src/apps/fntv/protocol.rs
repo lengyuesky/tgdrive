@@ -154,7 +154,12 @@ async fn handle_inner(state: &AppState, request: Request) -> AppResult<Response>
         }
     }
     context.lease.check()?;
-    let entries = super::covers::decorate(state, entries).await?;
+    let mut entries = super::covers::decorate(state, entries).await?;
+    if path.starts_with("/v/api/v1/person/")
+        || path.starts_with("/v/api/v1/sys/img/tgdrive-person/")
+    {
+        super::persons::authorize(state, &context, &mut entries).await?;
+    }
     if read {
         return read_request(state, &context, &token, &path, &headers, method, &entries).await;
     }
@@ -233,10 +238,10 @@ fn library_info(library: &super::Library, entries: &[Entry]) -> Value {
         "category":if library.kind=="movie" {"Movie"} else {"TV"},
         "view_type":0,"posters":posters})
 }
-fn season_guid(entry: &Entry) -> String {
+pub(super) fn season_guid(entry: &Entry) -> String {
     guid(&["season", &entry.show_guid, &entry.season.to_string()])
 }
-fn entry_for<'a>(entries: &'a [Entry], reference: &str) -> Option<&'a Entry> {
+pub(super) fn entry_for<'a>(entries: &'a [Entry], reference: &str) -> Option<&'a Entry> {
     entries
         .iter()
         .find(|e| e.guid == reference || e.media_guid == reference)
@@ -263,7 +268,7 @@ fn playback_entry<'a>(entries: &'a [Entry], reference: &str) -> Option<&'a Entry
     })
 }
 
-async fn item(
+pub(super) async fn item(
     state: &AppState,
     context: &Context,
     entry: &Entry,
@@ -515,6 +520,18 @@ async fn read_request(
         }
         _ => {}
     }
+    if let Some(reference) = path.strip_prefix("/v/api/v1/person/list/") {
+        return Ok(envelope(super::persons::cast(
+            entries,
+            reference,
+            &json!({}),
+        )?));
+    }
+    if let Some(reference) = path.strip_prefix("/v/api/v1/person/") {
+        return Ok(envelope(
+            super::persons::detail(state, context, entries, reference).await?,
+        ));
+    }
     if let Some(reference) = path.strip_prefix("/v/api/v1/mdb/") {
         let library = super::roots(state, context)
             .await?
@@ -632,6 +649,9 @@ async fn read_request(
             }
         }
     }
+    if let Some(reference) = path.strip_prefix("/v/api/v1/sys/img/tgdrive-person/") {
+        return super::persons::image(state, context, entries, reference, method).await;
+    }
     let reference = path
         .strip_prefix("/v/api/v1/sys/img/tgdrive-poster/")
         .or_else(|| path.strip_prefix("/tgdrive-poster/"));
@@ -672,6 +692,12 @@ async fn post_request(
     value: &Value,
     entries: &[Entry],
 ) -> AppResult<Response> {
+    if path == "/v/api/v1/person/item/list" {
+        return super::persons::works(state, context, entries, value).await;
+    }
+    if let Some(reference) = path.strip_prefix("/v/api/v1/person/list/") {
+        return Ok(envelope(super::persons::cast(entries, reference, value)?));
+    }
     if path == "/v/api/v1/user/logout" {
         state.vfs.db.fntv.logout(token);
         return Ok(envelope(json!(true)));
@@ -888,7 +914,7 @@ async fn post_request(
     Err(AppError::NotFound)
 }
 
-async fn group_items(
+pub(super) async fn group_items(
     state: &AppState,
     context: &Context,
     entries: &[Entry],
@@ -1019,10 +1045,19 @@ async fn item_list(
     page_rows(context, value, list)
 }
 
-fn page_rows(context: &Context, value: &Value, mut list: Vec<Value>) -> AppResult<Response> {
+fn page_rows(context: &Context, value: &Value, list: Vec<Value>) -> AppResult<Response> {
+    page_rows_with_limit(context, value, list, 128)
+}
+
+pub(super) fn page_rows_with_limit(
+    context: &Context,
+    value: &Value,
+    mut list: Vec<Value>,
+    limit: u64,
+) -> AppResult<Response> {
     let page = value.get("page").and_then(Value::as_u64).unwrap_or(1);
     let page_size = value.get("page_size").and_then(Value::as_u64).unwrap_or(50);
-    if page == 0 || page > 10000 || !(1..=128).contains(&page_size) {
+    if page == 0 || page > 10000 || !(1..=limit).contains(&page_size) {
         return Err(AppError::BadRequest("列表分页超出上限".into()));
     }
     let ancestor = string(value, "ancestor_guid");
