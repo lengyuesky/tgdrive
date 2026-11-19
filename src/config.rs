@@ -91,15 +91,6 @@ pub fn log_filter() -> Option<String> {
     env_opt("RUST_LOG")
 }
 
-/// 应用目录来源：(本地目录, 是否启用远程, GitHub 仓库)。
-pub fn app_catalog_env() -> (Option<PathBuf>, Option<String>, Option<String>) {
-    (
-        env_opt("TGDRIVE_APP_CATALOG_DIR").map(PathBuf::from),
-        env_opt("TGDRIVE_APP_CATALOG_REMOTE_ENABLED"),
-        env_opt("TGDRIVE_APP_GITHUB_REPO"),
-    )
-}
-
 /// 环境变量是否设置了非空值；后台据此标注每项配置来自 .env 还是数据库。
 pub fn env_present(key: &str) -> bool {
     env_opt(key).is_some()

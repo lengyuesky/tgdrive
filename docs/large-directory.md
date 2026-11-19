@@ -63,7 +63,7 @@ Vitest 覆盖请求代次/旧 finally 隔离、防抖、同游标重试/ID 去�
 ## 主站静态资源缓存与预压缩
 
 - 构建时为全部产物预生成 `.gz` / `.br` 变体(vite.config.ts),服务端命中 `Accept-Encoding` 时零压缩开销直发;未命中变体的小文件由运行时压缩兜底,已带编码的响应不会二次压缩。
-- `/assets/*` 带内容哈希,响应 `Cache-Control: public, max-age=31536000, immutable`;缺失的哈希资源真 404,不会被 SPA fallback 用 index.html 顶替。入口 `index.html` 与未哈希的 public 资源(图标、manifest)响应 `no-cache`,每次再验证,避免升级后旧页面引用已替换的哈希资源。应用插件的运行资源继续使用各自带修订的不可变缓存,不受影响。
+- `/assets/*` 带内容哈希,响应 `Cache-Control: public, max-age=31536000, immutable`;缺失的哈希资源真 404,不会被 SPA fallback 用 index.html 顶替。入口 `index.html` 与未哈希的 public 资源(图标、manifest)响应 `no-cache`,每次再验证,避免升级后旧页面引用已替换的哈希资源。
 
 ## 大目录升级注意
 

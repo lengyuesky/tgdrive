@@ -51,7 +51,6 @@ try {
   docker('run', '-d', '--name', app, '--network', prefix, '--network-alias', 'tgdrive',
     '--user', '0:0', '-v', `${prefix}:/bot-api-control`,
     '-e', 'TGDRIVE_USERNAME=test', '-e', 'TGDRIVE_PASSWORD=integration-test-only',
-    '-e', 'TGDRIVE_APP_CATALOG_REMOTE_ENABLED=false',
     '-e', 'TGDRIVE_BOT_API_PROXY_LISTEN=0.0.0.0:1082',
     '-e', 'TGDRIVE_BOT_API_PROXY_CONFIG=/bot-api-control/proxychains.conf', 'tgdrive:latest')
   docker('run', '-d', '--name', bot, '--network', prefix,

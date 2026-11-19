@@ -5,8 +5,6 @@
     "moduleResolution": "bundler",
     "baseUrl": ".",
     "paths": {
-      "@apps/*": ["./src/apps/*"],
-      "@drive/*": ["./src/*"],
       "vue": ["./node_modules/vue"],
       "vue-router": ["./node_modules/vue-router"],
       "element-plus": ["./node_modules/element-plus"],

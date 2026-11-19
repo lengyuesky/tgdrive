@@ -87,9 +87,7 @@ pub(crate) async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         attempts: Default::default(),
         tasks: crate::tasks::TaskManager::new(),
         migration: crate::migration::StorageMigrationManager::new(db, tg),
-        apps_catalog: Arc::new(crate::apps::CatalogManager::disabled()),
         events: crate::events::bus(),
-        range_cache: Arc::new(std::sync::Mutex::new(crate::apps::RangeCache::default())),
     };
     let app = Router::new()
         .nest("/api", crate::api::router(state.clone()))
@@ -464,8 +462,6 @@ async fn metrics_require_auth_and_use_prometheus_text() {
         "tgdrive_http_body_finished_total counter",
         "tgdrive_telegram_attempt_seconds histogram",
         "tgdrive_upload_wait_seconds histogram",
-        "tgdrive_range_cache_hits_total counter",
-        "tgdrive_range_cache_bytes gauge",
     ] {
         assert!(
             text.contains(&format!("# TYPE {metric}\n")),

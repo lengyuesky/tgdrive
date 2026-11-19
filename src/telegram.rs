@@ -36,32 +36,6 @@ const MEDIA_SEND_INTERVAL_STEP: Duration = Duration::from_millis(100);
 /// Telegram 自定义媒体缩略图必须小于该值。
 pub const MAX_THUMBNAIL_SIZE: usize = 200 * 1024;
 
-/// 严格探测的共享读取预算；后端在发出分段请求前计入对齐和预取开销。
-pub struct ReadBudget {
-    limit: u64,
-    remaining: AtomicU64,
-}
-impl ReadBudget {
-    pub(crate) fn new(limit: u64) -> Self {
-        Self {
-            limit,
-            remaining: AtomicU64::new(limit),
-        }
-    }
-    pub(crate) fn reserve(&self, bytes: u64) -> AppResult<()> {
-        #[allow(deprecated)]
-        self.remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(bytes)
-            })
-            .map_err(|_| AppError::BadRequest("严格媒体读取超过累计字节预算".into()))?;
-        Ok(())
-    }
-    pub(crate) fn used(&self) -> u64 {
-        self.limit - self.remaining.load(Ordering::Acquire)
-    }
-}
-
 /// reqwest 错误通常携带完整请求 URL，而 Telegram URL 中含 Bot Token。
 /// 对外只保留故障类别，绝不格式化原始错误对象。
 pub fn reqwest_error_summary(error: &reqwest::Error) -> &'static str {
@@ -279,42 +253,6 @@ pub trait TgApi: Send + Sync + 'static {
             .open_chunk_stream(file_id, message_id, chunk_size, offset)
             .await?;
         Ok(Box::pin(reader.take(length)))
-    }
-
-    /// 仅供有界媒体探测使用；未知后端必须拒绝，不能调用普通读取的整块回退。
-    async fn open_chunk_probe_range(
-        &self,
-        file_id: &str,
-        message_id: i64,
-        chunk_size: u64,
-        offset: u64,
-        length: u64,
-        budget: Arc<ReadBudget>,
-    ) -> AppResult<ByteReader> {
-        self.open_chunk_strict_range(
-            file_id,
-            message_id,
-            chunk_size,
-            offset,
-            length,
-            Some(budget),
-        )
-        .await
-    }
-
-    /// 严格原文件读取，不调用可能准备整块数据的回退。预算为空时用于原文件播放。
-    async fn open_chunk_strict_range(
-        &self,
-        _file_id: &str,
-        _message_id: i64,
-        _chunk_size: u64,
-        _offset: u64,
-        _length: u64,
-        _budget: Option<Arc<ReadBudget>>,
-    ) -> AppResult<ByteReader> {
-        Err(AppError::BadRequest(
-            "当前存储后端不支持严格分段读取".into(),
-        ))
     }
 
     /// 打开 Telegram 小缩略图。默认实现便于测试客户端复用普通读取逻辑；
@@ -1613,51 +1551,6 @@ impl TgApi for TgClient {
         Ok(Box::pin(reader.take(length)))
     }
 
-    async fn open_chunk_strict_range(
-        &self,
-        file_id: &str,
-        message_id: i64,
-        chunk_size: u64,
-        offset: u64,
-        length: u64,
-        budget: Option<Arc<ReadBudget>>,
-    ) -> AppResult<ByteReader> {
-        if offset > chunk_size {
-            return Err(AppError::BadRequest("探测偏移超过分块大小".into()));
-        }
-        let length = length.min(chunk_size - offset);
-        if length == 0 {
-            return Ok(Box::pin(std::io::Cursor::new(Vec::<u8>::new())));
-        }
-        let cached_path = self.path_cache.lock().unwrap().get(file_id);
-        if let Some(path) = cached_path.filter(|p| p.starts_with('/'))
-            && let Some(reader) = self.open_known_path(&path, offset).await?
-        {
-            if let Some(budget) = budget {
-                budget.reserve(length)?;
-            }
-            return Ok(Box::pin(reader.take(length)));
-        }
-        if let Some(mtproto) = &self.mtproto {
-            let reader = if let Some(budget) = budget {
-                mtproto
-                    .open_probe_stream(file_id, message_id, chunk_size, offset, length, budget)
-                    .await?
-            } else {
-                mtproto
-                    .open_stream(file_id, message_id, chunk_size, offset, length)
-                    .await?
-            };
-            if let Some(reader) = reader {
-                return Ok(reader);
-            }
-        }
-        // 绝不调用 getFile 或 HTTP 前缀回退，避免探测先准备整块原文件。
-        Err(AppError::BadRequest(
-            "当前文件无法严格分段读取；需要宿主 MTProto 读取能力或已存在的本地缓存文件".into(),
-        ))
-    }
-
     async fn open_thumbnail_stream(
         &self,
         file_id: &str,
@@ -1708,24 +1601,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_default_never_calls_unbounded_reader() {
+    async fn default_range_respects_requested_length() {
         let api = DefaultOnlyReader(AtomicUsize::new(0));
-        assert!(
-            api.open_chunk_strict_range("synthetic", 1, 1024, 0, 1, None)
-                .await
-                .is_err()
-        );
-        let budget = Arc::new(ReadBudget::new(1));
-        assert!(
-            api.open_chunk_probe_range("synthetic", 1, 1024, 0, 1, budget.clone())
-                .await
-                .is_err()
-        );
-        assert_eq!(api.0.load(Ordering::SeqCst), 0);
-        assert_eq!(budget.used(), 0);
+        let mut reader = api
+            .open_chunk_range("synthetic", 1, 1024, 0, 1)
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, vec![0]);
+        assert_eq!(api.0.load(Ordering::SeqCst), 1);
     }
 
-    async fn strict_read_fixture() -> (
+    async fn local_range_fixture() -> (
         TgClient,
         Arc<AtomicUsize>,
         tokio::task::JoinHandle<()>,
@@ -1756,57 +1644,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_real_client_never_requests_getfile_or_http_fallback() {
-        let (client, requests, server, directory) = strict_read_fixture().await;
-        client
-            .path_cache
-            .lock()
-            .unwrap()
-            .insert("relative".into(), "documents/synthetic.bin".into());
-        client.path_cache.lock().unwrap().insert(
-            "missing".into(),
-            directory
-                .path()
-                .join("missing.bin")
-                .to_string_lossy()
-                .into(),
-        );
-        for file_id in ["unknown", "relative", "missing"] {
-            for offset in [0, 900_000] {
-                assert!(
-                    client
-                        .open_chunk_strict_range(file_id, 1, 1_900_000_000, offset, 1, None)
-                        .await
-                        .is_err()
-                );
-                let budget = Arc::new(ReadBudget::new(8 * 1024 * 1024));
-                assert!(
-                    client
-                        .open_chunk_probe_range(
-                            file_id,
-                            1,
-                            1_900_000_000,
-                            offset,
-                            1,
-                            budget.clone()
-                        )
-                        .await
-                        .is_err()
-                );
-                assert_eq!(budget.used(), 0);
-            }
-        }
-        assert_eq!(
-            requests.load(Ordering::SeqCst),
-            0,
-            "严格读取不得访问 getFile 或 HTTP 文件端点"
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn strict_local_cache_preserves_range_and_shared_budget() {
-        let (client, requests, server, directory) = strict_read_fixture().await;
+    async fn local_cache_preserves_requested_range() {
+        let (client, requests, server, directory) = local_range_fixture().await;
         let path = directory.path().join("known.bin");
         let expected = (0..64).collect::<Vec<u8>>();
         tokio::fs::write(&path, &expected).await.unwrap();
@@ -1815,31 +1654,21 @@ mod tests {
             .lock()
             .unwrap()
             .insert("known".into(), path.to_string_lossy().into());
-        let budget = Arc::new(ReadBudget::new(16));
         let mut reader = client
-            .open_chunk_probe_range("known", 1, 64, 7, 13, budget.clone())
+            .open_chunk_range("known", 1, 64, 7, 13)
             .await
             .unwrap();
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual).await.unwrap();
         assert_eq!(actual, expected[7..20]);
-        assert_eq!(budget.used(), 13);
-        // 尾部范围按实际长度收窄，不多读文件前缀，也不超出共享预算。
+        // 尾部范围按实际长度收窄，不多读文件前缀。
         let mut tail = client
-            .open_chunk_probe_range("known", 1, 64, 61, 99, budget.clone())
+            .open_chunk_range("known", 1, 64, 61, 99)
             .await
             .unwrap();
         actual.clear();
         tail.read_to_end(&mut actual).await.unwrap();
         assert_eq!(actual, expected[61..]);
-        assert_eq!(budget.used(), 16);
-        assert!(
-            client
-                .open_chunk_probe_range("known", 1, 64, 0, 1, budget.clone())
-                .await
-                .is_err()
-        );
-        assert_eq!(budget.used(), 16);
         let outside = tempfile::NamedTempFile::new().unwrap();
         client
             .path_cache
@@ -1848,7 +1677,7 @@ mod tests {
             .insert("outside".into(), outside.path().to_string_lossy().into());
         assert!(
             client
-                .open_chunk_strict_range("outside", 1, 64, 0, 1, None)
+                .open_chunk_range("outside", 1, 64, 0, 1)
                 .await
                 .is_err()
         );

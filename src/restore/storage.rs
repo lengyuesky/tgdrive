@@ -187,7 +187,7 @@ async fn integrity(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 初检只读连接，不运行 Db::open 或打开 covers 旁路库。迁移仅作用于私有下载副本。
+/// 初检只读连接，不运行 Db::open。迁移仅作用于私有下载副本。
 pub(super) async fn validate_candidate(path: &Path) -> anyhow::Result<(i64, i64)> {
     let mut header = [0u8; 16];
     File::open(path)?.read_exact(&mut header)?;
@@ -197,24 +197,17 @@ pub(super) async fn validate_candidate(path: &Path) -> anyhow::Result<(i64, i64)
         "数据库超过 8 GiB 上限"
     );
     // 只在内存库执行可信迁移；候选库里的可执行 schema 必须逐字匹配内置定义。
-    // 不能仅按对象名称放行，否则同名恶意触发器可能在后续迁移时执行。
-    let mut reference = SqliteConnection::connect("sqlite::memory:").await?;
-    sqlx::migrate!("./migrations")
-        .run_direct(None, &mut reference, false)
-        .await?;
-    let expected_schema = schema(&mut reference).await?;
-    reference.close().await?;
+    // 先按备份已执行的迁移校验，再升级；最新 schema 可能已删除历史合法对象。
+    let migrator = sqlx::migrate!("./migrations");
     let mut conn = SqliteConnection::connect_with(&options(path, true)).await?;
     let result = async {
         integrity(&mut conn).await?;
         let executable_schema: Vec<(String, String, String)> = sqlx::query_as("SELECT type,name,sql FROM sqlite_master WHERE type IN ('trigger','view') OR upper(sql) LIKE '%VIRTUAL TABLE%'").fetch_all(&mut conn).await?;
-        anyhow::ensure!(executable_schema.iter().all(|object| expected_schema.contains(object)), "备份包含不受支持或被篡改的触发器、视图或虚拟表");
         for name in ["nodes", "chunks", "settings", "_sqlx_migrations"] {
             let row: Option<(String,)> = sqlx::query_as("SELECT type FROM sqlite_master WHERE name = ?").bind(name).fetch_optional(&mut conn).await?;
             anyhow::ensure!(row.as_ref().is_some_and(|r| r.0 == "table"), "备份缺少必要表 {name}");
         }
         let applied = sqlx::query("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version").fetch_all(&mut conn).await?;
-        let migrator = sqlx::migrate!("./migrations");
         let known: Vec<_> = migrator.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
         anyhow::ensure!(!applied.is_empty() && applied.len() <= known.len(), "备份迁移版本不存在或比当前程序更新");
         for (row, expected) in applied.iter().zip(&known) {
@@ -223,10 +216,18 @@ pub(super) async fn validate_candidate(path: &Path) -> anyhow::Result<(i64, i64)
             let checksum: Vec<u8> = row.try_get("checksum")?;
             anyhow::ensure!(version == expected.version && success && checksum == expected.checksum.as_ref(), "备份迁移记录不连续、未成功或校验和不匹配（版本 {version}）");
         }
-        Ok::<(), anyhow::Error>(())
+        let version: i64 = applied.last().expect("已检查迁移记录非空").try_get("version")?;
+        let mut reference = SqliteConnection::connect("sqlite::memory:").await?;
+        migrator.run_direct(Some(version), &mut reference, false).await?;
+        let historical_schema = schema(&mut reference).await?;
+        anyhow::ensure!(executable_schema.iter().all(|object| historical_schema.contains(object)), "备份包含不受支持或被篡改的触发器、视图或虚拟表");
+        migrator.run_direct(None, &mut reference, false).await?;
+        let expected_schema = schema(&mut reference).await?;
+        reference.close().await?;
+        Ok::<_, anyhow::Error>(expected_schema)
     }.await;
     conn.close().await?;
-    result?;
+    let expected_schema = result?;
     let mut conn = SqliteConnection::connect_with(&options(path, false)).await?;
     let result = async {
         sqlx::migrate!("./migrations").run_direct(None, &mut conn, false).await?;

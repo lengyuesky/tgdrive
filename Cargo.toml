@@ -10,12 +10,10 @@ argon2 = "0.6"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
-brotli = "8.0.4"
 bytes = "1.12.1"
 data-encoding = "2"
 dav-server = "0.11.0"
 dotenvy = "0.15.7"
-flate2 = "1.1.9"
 futures-util = "0.3.34"
 grammers-client = { version = "0.10.0", default-features = false }
 grammers-mtsender = "0.10.0"
@@ -25,15 +23,12 @@ hmac = "0.13.0"
 http = "1.5.0"
 http-body = "1"
 http-body-util = "0.1.4"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.10.2"
 reqwest = { version = "0.13.4", features = ["json", "multipart", "query", "socks", "stream"] }
-roxmltree = "0.21"
-semver = "1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1 = "0.11"
@@ -48,24 +43,17 @@ tower = "0.5.3"
 tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
 
-# 预压缩在安装时运行：压缩库在 dev 构建也按优化编译，浏览器测试夹具安装真实插件包不至于慢几十倍。
+[dev-dependencies]
+# 主站静态资源测试生成真实压缩变体，不进入宿主的直接运行依赖。
+brotli = "8.0.4"
+flate2 = "1.1.9"
+
 [profile.release]
 # 单二进制服务：瘦 LTO 与去符号换更小的镜像，编译时间增加有限。
 lto = "thin"
 strip = true
 
-[profile.dev.package.brotli]
-opt-level = 3
-[profile.dev.package.brotli-decompressor]
-opt-level = 3
-[profile.dev.package.flate2]
-opt-level = 3
-[profile.dev.package.zlib-rs]
-opt-level = 3
-[profile.dev.package.miniz_oxide]
-opt-level = 3
 # argon2 / scrypt 在未优化构建下慢一两个数量级，测试里的登录与备份加密会被拖慢。
 [profile.dev.package.argon2]
 opt-level = 3
@@ -78,8 +66,4 @@ opt-level = 3
 [profile.dev.package.chacha20poly1305]
 opt-level = 3
 [profile.dev.package.chacha20]
-opt-level = 3
-
-# 封面验证使用真实 JPEG 编码，调试构建也遵守与运行时相同的任务期限。
-[profile.dev.package.image]
 opt-level = 3

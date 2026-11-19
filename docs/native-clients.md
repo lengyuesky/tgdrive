@@ -8,7 +8,7 @@ iOS / 其他原生客户端 ── HTTPS REST / SSE / Range ── tgdrive ─�
 
 原生客户端只实现界面、交互、播放阅读及本地传输调度。Telegram 凭据、分块入库、目录树、权限、分享计数、备份恢复和迁移仍由现有 Rust 服务执行。服务端不另起移动业务后端，不把 Telegram 存储逻辑搬到 iOS。
 
-新增接口向后兼容。原有网页 Cookie、WebDAV Basic、插件 API v1/v2 保持不变。旧宿主 0.3.3 **不具备**本页的设备接口；iOS 当前基础版本需要先更新至 0.3.4，尚未实现旧 Cookie 登录降级。源码修改不等于已发布或已部署。
+网页 Cookie、WebDAV Basic 与设备接口的认证行为保持不变。旧应用平台及插件 API v1/v2 已整体删除；新版应用契约独立重写。旧宿主 0.3.3 **不具备**本页的设备接口；设备接口从 0.3.4 起提供，源码修改不等于已发布或已部署。
 
 ## 认证
 
@@ -35,7 +35,7 @@ iOS / 其他原生客户端 ── HTTPS REST / SSE / Range ── tgdrive ─�
 
 Access 有效期 15 分钟；刷新会话从首次登录起最多 30 天，不滑动延期；最多 32 个设备。单设备最多保留 4096 个已消费刷新哈希，超限要求重新登录。凭据哈希与设备表不触发每日数据备份修订，不写入远程快照。密钥轮换、修改账号、开启 TOTP、退出全部会话均使旧签名失效。进程重启保留有效会话。
 
-原生 Bearer 只对 `/api` 有效，**不授权 `/dav`**。媒体票据、应用会话和分享票据不能冒充主账号 Access Token。安全设置接受主账号网页或原生会话，不接受 Basic/WebDAV 应用密码；数据库恢复确认仍保留密码、TOTP 二次认证及恢复确认文本，不因 Bearer 放行而省略。
+原生 Bearer 只对 `/api` 有效，**不授权 `/dav`**。媒体票据和分享票据不能冒充主账号 Access Token。安全设置接受主账号网页或原生会话，不接受 Basic/WebDAV 应用密码；数据库恢复确认仍保留密码、TOTP 二次认证及恢复确认文本，不因 Bearer 放行而省略。
 
 原生开启 TOTP 后会话密钥轮换，当前设备也须重新登录；不会换发网页 Cookie。网页开启 TOTP 仍换发当前 Cookie。
 
@@ -46,7 +46,7 @@ Access 有效期 15 分钟；刷新会话从首次登录起最多 30 天，不�
 - `contract_version: 1`
 - `host_version: 0.3.4`
 - `server_id`：由 `client_identity` 表持久化的随机命名空间。
-- `capabilities`：`auth.device.v1`、`files.entries.v1`、`files.reference.v1`、`media.ticket.v1`、`download.etag.v1`、`uploads.receipts.v1`、`uploads.ticket.v1`、`uploads.conflict-policy.v1`、`apps.rpc.v2`、`events.sse.v1`。
+- `capabilities`：`auth.device.v1`、`files.entries.v1`、`files.reference.v1`、`media.ticket.v1`、`download.etag.v1`、`uploads.receipts.v1`、`uploads.ticket.v1`、`uploads.conflict-policy.v1`、`events.sse.v1`。
 - `limits`：目录分页上限、设备上限及认证 TTL。
 
 `server_id` 用于隔离缓存，不是安全凭据。普通重启保持不变；恢复数据库时随机轮换，防止历史节点 ID / 内容版本与当前本地缓存误绑定。恢复候选中的设备表清空，主签名密钥轮换。
@@ -63,7 +63,7 @@ Access 有效期 15 分钟；刷新会话从首次登录起最多 30 天，不�
 
 媒体用途：`preview` 2 小时、`download` 6 小时、`bytes`/`thumbnail` 10 分钟，均不超过设备会话过期时间。返回根相对 URL（如 `/api/media/...`）和 `expires_at`，客户端必须解析为当前服务器同源地址；反代子路径由客户端加在 `/api` 前，不接受服务端外域 URL。
 
-内容版本与应用 RPC 共用 `Node::content_version()` 算法；移动、改名、收藏不会改变文件内容版本，覆盖写的新节点或不同内容会变。目录版本**不代表**子树修订，阅读全库索引仍使用已有 `reading_tree_revision`。
+内容版本由 `Node::content_version()` 计算；移动、改名、收藏不会改变文件内容版本，覆盖写的新节点或不同内容会变。目录版本**不代表**子树修订。
 
 下载与分享流响应新增强 ETag、`private, no-cache`。`If-None-Match` 命中返回 304；Range 携带不匹配的 `If-Range`（包括弱标签或日期）返回完整 200，不能将旧缓存与新内容拼接。客户端必须核对 200/206、ETag 和 Content-Range。已建立的流在设备撤销后不主动截断，下一次请求立即被拒绝。
 
@@ -128,13 +128,12 @@ Access 有效期 15 分钟；刷新会话从首次登录起最多 30 天，不�
 
 ## 本轮未搬迁的业务
 
-应用 RPC/CAS、Telegram 存储、权限、分享、备份恢复与迁移继续由当前服务负责。未部署服务、访问生产数据库或测试真实 Telegram 文件。旧网页/DAV 契约回归仍需随每次增强运行。
+Telegram 存储、权限、分享、备份恢复与迁移继续由宿主负责，应用平台按新契约独立重写。旧网页/DAV 契约的行为回归仍需随每次增强运行。
 
 ## 隔离验证
 
 ```bash
 cargo test --locked --offline api::native::tests
-cargo test --locked --offline apps::tests::native_downloads
 cargo test --locked --offline api::transfer::tests
 cargo test --locked --offline upload_commit_rejects_trashed_parent_and_can_resume_after_restore
 cargo test --locked --offline engine::tests::failed_restart_keeps_all_interrupted_parts_uncertain
@@ -142,4 +141,4 @@ cargo test --locked --offline snapshot_scrub_removes_credentials_but_keeps_bot_t
 cargo test --locked --offline confirm_preserves_security_and_only_next_start_switches_database
 ```
 
-所有夹具使用临时 SQLite、空或内存 Telegram 注册表，不读取 `.env`。Swift/Xcode 联调工具可显式启动 ignored 测试 `apps::tests::native_client_http::native_client_fixture`，仅绑定随机 loopback 端口，并要求先识别 `/__native_fixture` 标记再使用测试凭据；不启动正常服务、不连接 Telegram。完整回归与 iOS 验证记录在客户端仓库 `docs/verification.md` 维护。
+所有夹具使用临时 SQLite、空或内存 Telegram 注册表，不读取 `.env`。旧应用目录中的原生客户端 HTTP 夹具已随旧平台删除；真实客户端联调须建立新的独立测试替身。完整回归与 iOS 验证记录在客户端仓库 `docs/verification.md` 维护。

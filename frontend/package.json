@@ -6,13 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "vue-tsc --noEmit && tsc --noEmit -p playwright.apps.tsconfig.json",
+    "typecheck": "vue-tsc --noEmit",
     "check": "npm run typecheck && npm run build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "test:mobile": "playwright test --config playwright.mobile.config.ts",
-    "test:apps": "playwright test --config playwright.apps.config.ts"
+    "test:mobile": "playwright test --config playwright.mobile.config.ts"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",

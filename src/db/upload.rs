@@ -155,7 +155,6 @@ impl Db {
                 "上传目标目录已不可见，请恢复目录后重试".into(),
             ));
         }
-        crate::apps::scraper::data::check_upload_guard(self, &mut tx, &current).await?;
         let session: Option<UploadSession> =
             sqlx::query_as("SELECT * FROM upload_sessions WHERE node_id = ?")
                 .bind(node_id)
@@ -258,7 +257,6 @@ impl Db {
             .bind(node_id)
             .fetch_one(&mut *tx)
             .await?;
-        crate::apps::scraper::data::committed_upload(&mut tx, &ready).await?;
         if let Some(session) = session {
             let node_json = serde_json::to_string(&ready).map_err(anyhow::Error::from)?;
             sqlx::query("INSERT INTO upload_receipts(id,status,display_path,expected_size,sha256,node_json,created_at,expires_at) VALUES(?,'completed',?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING")

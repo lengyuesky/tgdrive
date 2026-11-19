@@ -12,16 +12,6 @@ pub enum AppError {
     AlreadyExists,
     #[error("{0}")]
     Conflict(String),
-    #[error("阅读记录已被另一页面更新，请选择使用已保存进度或从当前页继续")]
-    AppDataConflict,
-    #[error("文件树已变化，请刷新全库列表后继续")]
-    ReadingIndexChanged,
-    /// 应用运行会话过期；宿主前端凭 `session_expired` 码静默续签后重试。
-    #[error("应用会话已过期，请重新打开")]
-    SessionExpired,
-    /// 应用停用、卸载或更新导致修订轮换；宿主凭 `app_changed` 码提示重开。
-    #[error("应用已停用、卸载或更新，请重新打开")]
-    AppChanged,
     #[error("非法路径: {0}")]
     InvalidPath(String),
     #[error("目标是目录")]
@@ -49,8 +39,6 @@ pub enum AppError {
     TelegramUncertain(String),
     #[error("上传服务已重启，正在重试")]
     UploadInterrupted,
-    #[error("刮削后端请求失败：{0}")]
-    ScraperBackend(String),
     #[error("数据库错误: {0}")]
     Db(sqlx::Error),
     #[error("IO 错误: {0}")]
@@ -74,10 +62,7 @@ impl AppError {
     pub fn status(&self) -> StatusCode {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND,
-            AppError::AlreadyExists => StatusCode::CONFLICT,
-            AppError::Conflict(_) | AppError::AppDataConflict | AppError::ReadingIndexChanged => {
-                StatusCode::CONFLICT
-            }
+            AppError::AlreadyExists | AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::InvalidPath(_) | AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::IsDirectory | AppError::NotDirectory => StatusCode::UNPROCESSABLE_ENTITY,
@@ -85,13 +70,10 @@ impl AppError {
                 StatusCode::UNAUTHORIZED
             }
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
-            AppError::SessionExpired => StatusCode::FORBIDDEN,
-            AppError::AppChanged => StatusCode::CONFLICT,
             AppError::Telegram(_)
             | AppError::TelegramRejected(_)
             | AppError::TelegramUncertain(_) => StatusCode::BAD_GATEWAY,
             AppError::UploadInterrupted => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::ScraperBackend(_) => StatusCode::BAD_GATEWAY,
             AppError::Db(_) | AppError::Io(_) | AppError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -104,9 +86,7 @@ impl AppError {
     /// 上游 URL：详细信息只进服务端日志，客户端拿到不泄密的提示。
     pub fn public_parts(&self) -> (String, Option<&'static str>) {
         let status = self.status();
-        let message = if matches!(self, AppError::ScraperBackend(_)) {
-            self.to_string()
-        } else if matches!(self, AppError::UploadInterrupted) {
+        let message = if matches!(self, AppError::UploadInterrupted) {
             "上传服务已重启，正在重试".to_string()
         } else if status.is_server_error() {
             match self {
@@ -120,12 +100,7 @@ impl AppError {
         };
         let code = match self {
             AppError::UploadInterrupted => Some("upload_interrupted"),
-            AppError::ScraperBackend(_) => Some("scraper_backend_unavailable"),
             AppError::TelegramUncertain(_) => Some("telegram_uncertain"),
-            AppError::AppDataConflict => Some("storage_conflict"),
-            AppError::ReadingIndexChanged => Some("reading_index_changed"),
-            AppError::SessionExpired => Some("session_expired"),
-            AppError::AppChanged => Some("app_changed"),
             AppError::TotpRequired => Some("totp_required"),
             AppError::TotpInvalid => Some("totp_invalid"),
             _ => None,

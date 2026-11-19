@@ -301,7 +301,7 @@ pub async fn access_log(mut request: Request, next: Next) -> Response {
     response.map(|body| crate::metrics::observe_body(body, route_metrics))
 }
 
-/// 遮蔽路径中充当凭据的段：`/api/share/{token}`、`/api/apps/media/{ticket}`。
+/// 遮蔽分享、媒体和上传票据路径中充当凭据的段。
 fn redact_path(path: &str) -> String {
     let mut out = Vec::new();
     let mut redact_next = false;
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn access_log_masks_credential_segments() {
         assert_eq!(redact_path("/api/share/abc123/list"), "/api/share/***/list");
-        assert_eq!(redact_path("/api/apps/media/tkt"), "/api/apps/media/***");
+        assert_eq!(redact_path("/api/media/tkt"), "/api/media/***");
         assert_eq!(redact_path("/api/fs/list"), "/api/fs/list");
     }
 

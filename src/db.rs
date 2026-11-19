@@ -10,8 +10,6 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[path = "apps/db.rs"]
-pub mod apps;
 mod copy;
 mod delete_jobs;
 pub mod devices;
@@ -19,7 +17,6 @@ pub mod entries;
 pub mod inbox;
 mod logs;
 mod query;
-pub mod reading;
 mod resumable;
 mod revision;
 mod search;
@@ -68,7 +65,7 @@ pub struct Node {
 
 impl Node {
     /// 文件移动或改名不改变版本，覆盖写的新节点以及不同内容必须产生新版本。
-    /// 与应用 RPC 共用同一算法；目录版本不代表子树修订。
+    /// 目录版本不代表子树修订。
     pub fn content_version(&self) -> String {
         use sha2::{Digest, Sha256};
         let source = format!(
@@ -359,14 +356,6 @@ pub fn now_ts() -> i64 {
 #[derive(Clone)]
 pub struct Db {
     pub(crate) pool: SqlitePool,
-    /// 已安装应用记录的进程内缓存；`apps` 表的每条写入路径都会使其失效（见 apps/db.rs）。
-    apps_cache: std::sync::Arc<apps::AppCache>,
-    /// 固定影视服务的可撤销状态，与所有数据库克隆共享。
-    pub(crate) fntv: std::sync::Arc<crate::apps::fntv::Service>,
-    /// 页面驱动的手动刮削控制；与所有数据库克隆共享取消状态。
-    pub(crate) scraper: std::sync::Arc<crate::apps::scraper::Service>,
-    /// 应用封面缓存库（主库旁的独立文件，见 apps/covers_db.rs）。
-    covers: SqlitePool,
     /// 恢复安全模式/维护状态，随所有 Db 克隆共享；后台入口必须检查。
     background_blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -431,24 +420,16 @@ impl Db {
         let initialized = async {
             snapshot_before_migration(&pool, &migrator, db_path).await?;
             migrator.run(&pool).await?;
-            crate::apps::scraper::data::recover_interrupted(&pool).await?;
-            apps::open_covers(db_path).await
+            Ok::<(), anyhow::Error>(())
         }
         .await;
-        let covers = match initialized {
-            Ok(covers) => covers,
-            Err(error) => {
-                // 恢复验证失败必须等主库连接全部关闭，才能离线回滚文件。
-                pool.close().await;
-                return Err(error);
-            }
-        };
+        if let Err(error) = initialized {
+            // 恢复验证失败必须等主库连接全部关闭，才能离线回滚文件。
+            pool.close().await;
+            return Err(error);
+        }
         Ok(Db {
             pool,
-            apps_cache: Default::default(),
-            fntv: Default::default(),
-            scraper: std::sync::Arc::new(crate::apps::scraper::Service::new(db_path)),
-            covers,
             background_blocked: Default::default(),
         })
     }
@@ -459,10 +440,6 @@ impl Db {
     }
 
     pub fn set_background_blocked(&self, blocked: bool) {
-        if blocked {
-            self.fntv.invalidate();
-            self.scraper.invalidate();
-        }
         self.background_blocked
             .store(blocked, std::sync::atomic::Ordering::Release);
     }
@@ -478,7 +455,6 @@ impl Db {
 
     pub async fn close(&self) {
         self.pool.close().await;
-        self.covers.close().await;
     }
 
     pub async fn ping(&self) -> AppResult<()> {
@@ -487,5 +463,7 @@ impl Db {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod migration_tests;
 #[cfg(test)]
 mod tests;

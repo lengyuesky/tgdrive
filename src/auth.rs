@@ -12,8 +12,6 @@ use sha2::Sha256;
 use std::sync::{Arc, Mutex, RwLock};
 use subtle::ConstantTimeEq;
 
-#[path = "apps/auth.rs"]
-mod app_tokens;
 pub(crate) mod native;
 
 const COOKIE_NAME: &str = "tgdrive_token";

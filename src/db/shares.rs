@@ -6,7 +6,7 @@ impl Db {
     /// 节点的完整路径;自身或任一祖先不是 ready(回收站/上传中)时返回 None
     ///
     /// 一条递归查询取回节点到根的整条祖先链（depth 0 为节点自身，自下而上），
-    /// 深目录也只有一次往返；应用媒体与元数据请求每次都经过这里。
+    /// 深目录也只有一次往返；节点媒体与元数据请求每次都经过这里。
     pub async fn full_path_if_visible(&self, id: i64) -> AppResult<Option<String>> {
         let chain: Vec<(i64, Option<i64>, String, String)> = sqlx::query_as(
             "WITH RECURSIVE chain(id, parent_id, name, status, depth) AS (

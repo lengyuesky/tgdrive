@@ -20,7 +20,7 @@ export function holdAuthRedirect() {
   }
 }
 
-/** 网盘与页面应用共用认证和未登录跳转。 */
+/** 网盘接口共用认证和未登录跳转。 */
 export const http = axios.create({ baseURL: '/api' })
 
 http.interceptors.response.use(

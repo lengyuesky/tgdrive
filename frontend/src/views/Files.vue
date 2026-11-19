@@ -223,10 +223,10 @@
     </div>
 
     <div class="layout">
-      <!-- 桌面与窄屏共用同一套侧栏内容，应用区位于分享管理下方。 -->
+      <!-- 桌面与窄屏共用同一套侧栏内容。 -->
       <FilesSidebar v-if="!narrowScreen" :current="cur" :tree-key="treeKey" :file-count="info?.files"
         :favorites-active="searchMode && searchView === 'favorites'" @navigate="navigateSidebar" @mkdir="mkdirFromSidebar"
-        @refresh="treeKey++" @action="sidebarAction" @app-navigate="sidebarVisible = false" />
+        @refresh="treeKey++" @action="sidebarAction" />
 
       <!-- 主内容 -->
       <div class="panel glass" @contextmenu="onBlankCtx">
@@ -332,7 +332,6 @@
                   <el-dropdown v-else trigger="click" @command="(cmd: string) => onTileCmd(cmd, row)">
                     <el-button text size="small" :icon="MoreFilled" aria-label="更多操作" />
                     <template #dropdown><el-dropdown-menu>
-                      <el-dropdown-item command="open-with">打开方式</el-dropdown-item>
                       <el-dropdown-item v-if="!row.is_dir" command="download">下载</el-dropdown-item>
                       <el-dropdown-item command="favorite">{{ row.favorite ? '取消收藏' : '收藏' }}</el-dropdown-item>
                       <el-dropdown-item command="share">分享</el-dropdown-item>
@@ -374,7 +373,7 @@
       <template #footer><el-button type="primary" @click="optionsOpen = false">完成</el-button></template>
     </ResponsivePanel>
     <ResponsivePanel v-model="actionOpen" :title="actionEntry?.name || '文件操作'" sheet>
-      <div class="action-sheet-list"><button @click="runMobileAction('open-with')">打开方式</button><button v-if="!actionEntry?.is_dir" @click="runMobileAction('download')">下载</button><button @click="runMobileAction('favorite')">{{ actionEntry?.favorite ? '取消收藏' : '收藏' }}</button><button @click="runMobileAction('share')">分享</button><button @click="runMobileAction('rename')">重命名</button><button @click="runMobileAction('move')">移动到…</button><button @click="runMobileAction('copy')">复制到…</button><button @click="runMobileAction('properties')">属性</button><button class="danger-text" @click="runMobileAction('delete')">删除…</button></div>
+      <div class="action-sheet-list"><button v-if="!actionEntry?.is_dir" @click="runMobileAction('download')">下载</button><button @click="runMobileAction('favorite')">{{ actionEntry?.favorite ? '取消收藏' : '收藏' }}</button><button @click="runMobileAction('share')">分享</button><button @click="runMobileAction('rename')">重命名</button><button @click="runMobileAction('move')">移动到…</button><button @click="runMobileAction('copy')">复制到…</button><button @click="runMobileAction('properties')">属性</button><button class="danger-text" @click="runMobileAction('delete')">删除…</button></div>
     </ResponsivePanel>
     <BoundedImagePreview v-if="viewerShow" v-model:index="viewerIndex"
       :entries="displayEntries" :count="displayEntries.length" :base="cur" @close="viewerShow = false" />
@@ -385,7 +384,7 @@
     <el-drawer v-if="narrowScreen" v-model="sidebarVisible" :lock-scroll="false" title="导航" direction="ltr" size="min(340px, 92vw)" destroy-on-close>
       <FilesSidebar drawer :current="cur" :tree-key="treeKey" :file-count="info?.files"
         :favorites-active="searchMode && searchView === 'favorites'" @navigate="navigateSidebar" @mkdir="mkdirFromSidebar"
-        @refresh="treeKey++" @action="sidebarAction" @app-navigate="sidebarVisible = false" />
+        @refresh="treeKey++" @action="sidebarAction" />
     </el-drawer>
     <component :is="shareMgrComponent" v-if="shareMgrComponent" ref="shareMgr" />
     <component :is="trashPanelComponent" v-if="trashPanelComponent" ref="trashPanel" @changed="onTrashChanged" />
@@ -540,7 +539,6 @@
       </template>
     </ResponsivePanel>
 
-    <OpenWithDialog ref="openWithDialog" />
     <!-- 自定义右键菜单 -->
     <teleport to="body">
       <div
@@ -567,7 +565,6 @@ import { mobile, compact } from '../mobile/viewport'
 import { closeTopOverlay, useOverlay } from '../mobile/overlays'
 import { isComposingKey } from '../mobile/keyboard'
 import ResponsivePanel from '../components/ResponsivePanel.vue'
-import OpenWithDialog from '@apps/components/OpenWithDialog.vue'
 defineOptions({ name: 'Files' })
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -608,8 +605,6 @@ import type ShareDialog from '../components/ShareDialog.vue'
 import type ShareManager from '../components/ShareManager.vue'
 import type TrashPanel from '../components/TrashPanel.vue'
 
-const openWithDialog = ref<InstanceType<typeof OpenWithDialog>>()
-function openWith(row: Entry) { void openWithDialog.value?.open({ ...row, path: joinPath(cur.value, row.name) }, cur.value) }
 const route = useRoute()
 const router = useRouter()
 const directory = createDirectoryController(async (params, signal) => (await api.entries(params, signal)).data)
@@ -970,8 +965,7 @@ function toggleSelect(row: DirectoryEntry) {
   directory.toggle(row.id)
 }
 function onTileCmd(cmd: string, row: Entry) {
-  if (cmd === 'open-with') openWith(row)
-  else if (cmd === 'download') download(row)
+  if (cmd === 'download') download(row)
   else if (cmd === 'rename') rename(row)
   else onRowCmd(cmd, row)
 }
@@ -1053,7 +1047,6 @@ const ctxItems = computed<CtxItem[]>(() => {
     action: () => openEntry(row),
     divided: items.length > 0,
   })
-  items.push({ label: '打开方式', action: () => openWith(row) })
   if (!row.is_dir) items.push({ label: '下载', action: () => download(row) })
   items.push({
     label: row.favorite ? '取消收藏' : '收藏',

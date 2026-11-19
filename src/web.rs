@@ -77,8 +77,6 @@ mod tests {
         "/files/",
         "/files/%E6%B5%8B%E8%AF%95/a.txt?view=list",
         "/login",
-        "/apps",
-        "/apps/books",
         "/transfers",
         "/me",
         "/s/test-share",

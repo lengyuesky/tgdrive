@@ -5,7 +5,6 @@ import { defineConfig, type Plugin } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
-import { appFileAccess, appResolve } from './app-paths'
 
 // 为构建产物生成 .gz / .br 预压缩变体，服务端 ServeDir 直发、零运行时压缩开销
 //（未命中变体的小文件仍由服务端 CompressionLayer 兜底）。
@@ -59,7 +58,6 @@ function vendorChunks(id: string): string | undefined {
 
 // dev 模式下 API 与 WebDAV 都代理到本地后端
 export default defineConfig({
-  resolve: appResolve,
   plugins: [
     vue(),
     Components({
@@ -69,7 +67,6 @@ export default defineConfig({
     precompress(),
   ],
   server: {
-    fs: { allow: appFileAccess },
     port: 5173,
     proxy: {
       '/api': 'http://127.0.0.1:8080',

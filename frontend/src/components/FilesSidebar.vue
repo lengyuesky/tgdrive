@@ -31,14 +31,12 @@
       <el-icon color="#0ea5e9"><Share /></el-icon>
       <span>分享管理</span>
     </button>
-    <AppsSidebar :from="current" @navigate="emit('appNavigate')" />
   </aside>
 </template>
 
 <script setup lang="ts">
 import { DeleteFilled, Folder, FolderAdd, FolderOpened, Refresh, Share, StarFilled } from '@element-plus/icons-vue'
 import VirtualDirectoryTree from './VirtualDirectoryTree.vue'
-import AppsSidebar from '@apps/components/AppsSidebar.vue'
 
 defineProps<{ current: string; treeKey: number; fileCount?: number; favoritesActive: boolean; drawer?: boolean }>()
 const emit = defineEmits<{
@@ -46,7 +44,6 @@ const emit = defineEmits<{
   mkdir: []
   refresh: []
   action: [name: 'favorites' | 'trash' | 'shares']
-  appNavigate: []
 }>()
 </script>
 

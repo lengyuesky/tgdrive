@@ -24,11 +24,7 @@ use tokio::sync::broadcast;
 use tokio_util::io::ReaderStream;
 
 mod entries;
-pub(crate) use self::media::{
-    downloaded_thumbnail_mime, inline_mime_allowed, parse_range, stream_node, thumbnail_bytes,
-    thumbnail_for_node,
-};
-pub(crate) use self::search::{FavoriteBody, SearchQuery, favorite_set, search};
+pub(crate) use self::media::inline_mime_allowed;
 mod admin;
 mod events;
 mod files;
@@ -59,11 +55,8 @@ pub struct AppState {
     pub tasks: crate::tasks::TaskManager,
     pub migration: crate::migration::StorageMigrationManager,
     pub restore: crate::restore::RestoreManager,
-    pub apps_catalog: Arc<crate::apps::CatalogManager>,
-    /// 进程内事件总线；SSE 向浏览器转发应用与文件树粗粒度变更。
+    /// 进程内事件总线；SSE 向浏览器转发文件树粗粒度变更。
     pub events: crate::events::EventBus,
-    /// 应用媒体端点的共享小范围字节缓存（仅内存）。
-    pub range_cache: Arc<std::sync::Mutex<crate::apps::RangeCache>>,
 }
 
 /// 就绪探针：数据库可用、存储目标已装载且关键后台任务仍有心跳。
@@ -93,7 +86,6 @@ pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .merge(native::public_routes())
         .merge(transfer::public_routes())
-        .merge(crate::apps::public_router())
         .route("/auth/login", post(login))
         // 分享链接:免登录访问
         .route("/share/{token}", get(share_meta))
@@ -104,7 +96,6 @@ pub fn router(state: AppState) -> Router {
         .merge(native::protected_routes())
         .merge(transfer::protected_routes())
         .merge(restore::routes())
-        .merge(crate::apps::protected_router())
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/events", get(events_sse))
@@ -218,7 +209,7 @@ pub fn router(state: AppState) -> Router {
 
 /// 网页 Cookie、原生设备 Bearer 或 Basic 任一通过即放行；不透明沙箱源始终拒绝。
 pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    // 隔离应用只能经宿主的权限网关调用能力，不能借浏览器 Cookie 直连管理接口。
+    // 不透明源不能借浏览器 Cookie 直连管理接口。
     if req
         .headers()
         .get(header::ORIGIN)

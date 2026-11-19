@@ -193,7 +193,7 @@ async fn capabilities(State(state): State<AppState>) -> AppResult<Response> {
     Ok(private_json(serde_json::json!({
         "contract_version":1, "host_version":env!("CARGO_PKG_VERSION"),
         "server_id":state.vfs.db.client_server_id().await?, "minimum_ios":17,
-        "capabilities":["auth.device.v1","files.entries.v1","files.reference.v1","media.ticket.v1","download.etag.v1","uploads.receipts.v1","uploads.ticket.v1","uploads.conflict-policy.v1","apps.rpc.v2","events.sse.v1"],
+        "capabilities":["auth.device.v1","files.entries.v1","files.reference.v1","media.ticket.v1","download.etag.v1","uploads.receipts.v1","uploads.ticket.v1","uploads.conflict-policy.v1","events.sse.v1"],
         "limits":{"directory_page":500,"device_sessions":32,"access_ttl_seconds":DEVICE_ACCESS_TTL,"refresh_ttl_seconds":DEVICE_REFRESH_TTL},
     })))
 }

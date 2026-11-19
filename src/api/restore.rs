@@ -143,7 +143,7 @@ async fn resume(
     ))
 }
 
-/// 外层覆盖 API、WebDAV 及应用网关，安全模式不能绕过管理员端点触发历史任务。
+/// 外层覆盖 API 与 WebDAV，安全模式不能绕过管理员端点触发历史任务。
 pub(crate) async fn write_guard(
     State(state): State<AppState>,
     req: Request,

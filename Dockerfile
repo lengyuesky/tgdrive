@@ -35,12 +35,12 @@ RUN apk add --no-cache curl unzip \
     && unzip /tmp/usque.zip -d /opt/usque \
     && chmod 755 /opt/usque/usque
 
-# ---------- 阶段 4:受限媒体探测和封面取帧组件 ----------
+# ---------- 阶段 4:媒体工具 ----------
 FROM debian:bookworm-slim AS media-probe
 ARG TARGETARCH
 # 依赖按 SONAME 平铺到标准库目录，不依赖构建层的 alternatives 和 ld.so.cache。
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && mkdir -p /probe-root/usr/local/bin /probe-root/usr/share/licenses/fntv-media-probe \
+    && mkdir -p /probe-root/usr/local/bin /probe-root/usr/share/licenses/media-tools \
     && cp /usr/bin/ffprobe /probe-root/usr/local/bin/ffprobe \
     && cp /usr/bin/ffmpeg /probe-root/usr/local/bin/ffmpeg \
     && case "$TARGETARCH" in \
@@ -55,8 +55,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
          esac; \
          cp -L "$library" "/probe-root$library_dir/$(basename "$library")"; \
        done \
-    && dpkg-query -W > /probe-root/usr/share/licenses/fntv-media-probe/packages.txt \
-    && cp -a /usr/share/doc /probe-root/usr/share/licenses/fntv-media-probe/debian-doc \
+    && dpkg-query -W > /probe-root/usr/share/licenses/media-tools/packages.txt \
+    && cp -a /usr/share/doc /probe-root/usr/share/licenses/media-tools/debian-doc \
     && cp -a /usr/share/common-licenses /probe-root/usr/share/common-licenses \
     && rm -rf /var/lib/apt/lists/*
 

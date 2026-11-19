@@ -2,7 +2,6 @@
 //! 子命令:serve(默认)| check(实测 Bot API 链路)| healthcheck(容器健康检查)
 
 mod api;
-mod apps;
 mod auth;
 mod backup;
 mod config;
@@ -216,14 +215,6 @@ async fn serve() -> anyhow::Result<()> {
     let dav_handler = dav::build_handler(vfs.clone());
     let events = crate::events::bus();
     let tasks = crate::tasks::TaskManager::new();
-    let catalog_cache_dir = std::path::Path::new(&env_cfg.db_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("app-catalog-cache");
-    let apps_catalog = Arc::new(crate::apps::CatalogManager::from_env(
-        catalog_cache_dir,
-        rt.clone(),
-    ));
     let state = AppState {
         vfs,
         auth,
@@ -235,9 +226,7 @@ async fn serve() -> anyhow::Result<()> {
         tasks: tasks.clone(),
         migration: migration.clone(),
         restore: restore.clone(),
-        apps_catalog,
         events,
-        range_cache: Arc::new(std::sync::Mutex::new(crate::apps::RangeCache::default())),
     };
     if let Err(error) = db
         .append_backend_log("info", "系统", "tgdrive 服务已启动")
@@ -280,8 +269,7 @@ async fn serve() -> anyhow::Result<()> {
             axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .with_state(state.clone())
-        .nest("/api", api::router(state.clone()))
-        .merge(apps::fntv::router(state.clone()));
+        .nest("/api", api::router(state.clone()));
 
     // 前端静态文件(SPA fallback 到 index.html);候选目录都不存在则只提供 API
     let static_dir = crate::config::static_dir()

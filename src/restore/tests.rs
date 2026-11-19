@@ -81,9 +81,7 @@ async fn fixture_config(dir: &Path, config: Config) -> AppState {
         tasks: crate::tasks::TaskManager::new(),
         migration: crate::migration::StorageMigrationManager::new(db, tg),
         restore: RestoreManager::new(&env.db_path).unwrap(),
-        apps_catalog: Arc::new(crate::apps::CatalogManager::disabled()),
         events: crate::events::bus(),
-        range_cache: Default::default(),
     }
 }
 async fn candidate(root: &Path) -> PathBuf {
@@ -695,16 +693,16 @@ async fn offline_validation_rejects_corruption_future_migrations_and_custom_sche
     assert!(storage::validate_candidate(&path).await.is_err());
 }
 #[tokio::test]
-async fn offline_validation_rejects_same_named_modified_reading_objects() {
+async fn offline_validation_rejects_modified_host_triggers_and_untrusted_views() {
     use sqlx::Connection;
     for (drop_sql, replacement) in [
         (
-            "DROP TRIGGER reading_tree_insert",
-            "CREATE TRIGGER reading_tree_insert AFTER INSERT ON nodes BEGIN DELETE FROM settings; END",
+            Some("DROP TRIGGER data_revision_nodes_insert"),
+            "CREATE TRIGGER data_revision_nodes_insert AFTER INSERT ON nodes BEGIN DELETE FROM settings; END",
         ),
         (
-            "DROP VIEW reading_files",
-            "CREATE VIEW reading_files AS SELECT k AS id, v AS format FROM settings",
+            None,
+            "CREATE VIEW untrusted_view AS SELECT k AS id, v AS value FROM settings",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -714,7 +712,9 @@ async fn offline_validation_rejects_same_named_modified_reading_objects() {
         db.close().await;
         let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
         let mut conn = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
-        sqlx::query(drop_sql).execute(&mut conn).await.unwrap();
+        if let Some(drop_sql) = drop_sql {
+            sqlx::query(drop_sql).execute(&mut conn).await.unwrap();
+        }
         sqlx::query(replacement).execute(&mut conn).await.unwrap();
         conn.close().await.unwrap();
         let error = storage::validate_candidate(&path)
@@ -732,6 +732,41 @@ async fn offline_validation_rejects_same_named_modified_reading_objects() {
         assert_eq!(value, "yes");
         conn.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn offline_validation_migrates_legacy_database_without_losing_drive_data() {
+    use sqlx::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let mut conn = crate::db::migration_tests::legacy_database(&path).await;
+    sqlx::query("INSERT INTO settings(k,v) VALUES('must_survive','yes')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+
+    assert_eq!(storage::validate_candidate(&path).await.unwrap(), (0, 1));
+    let mut conn = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true),
+    )
+    .await
+    .unwrap();
+    let value: String = sqlx::query_scalar("SELECT v FROM settings WHERE k='must_survive'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(value, "yes");
+    let app_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='apps' OR name GLOB 'app_*' OR name='reading_tree_revision'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(app_tables, 0);
+    conn.close().await.unwrap();
 }
 
 #[test]

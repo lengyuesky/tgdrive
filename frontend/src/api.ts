@@ -1,6 +1,5 @@
 import { http } from './http'
 import { invalidateSession } from './session'
-import { appApi } from '@apps/client'
 
 export interface Entry {
   name: string
@@ -549,7 +548,6 @@ async function endSession(path: string) {
 }
 
 export const api = {
-  apps: appApi,
   login: (username: string, password: string, totp?: string) =>
     http.post('/auth/login', { username, password, totp }),
   logout: () => endSession('/auth/logout'),
