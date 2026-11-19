@@ -1,0 +1,64 @@
+<template>
+  <main class="app-center">
+    <header class="center-head"><router-link to="/files/" class="back-link">返回文件</router-link><h1>应用中心</h1><el-button :loading="loading" @click="refresh">刷新目录</el-button><el-button type="primary" @click="input?.click()">上传应用包</el-button><input ref="input" type="file" accept=".tgapp,application/zip" hidden @change="upload" /></header>
+    <el-alert v-if="error" :title="error" type="error" :closable="false" />
+    <section><h2>已安装</h2><p v-if="!installedApps.length" class="empty">尚未安装应用。可以从目录选择，也可以上传 .tgapp 包。</p>
+      <div class="app-grid"><article v-for="app in installedApps" :key="app.manifest.id" class="app-card glass">
+        <div class="app-heading"><img v-if="iconUrl(app)" :src="iconUrl(app)" alt="" crossorigin="anonymous" /><el-icon v-else class="app-icon"><Grid /></el-icon><div><h3>{{ app.manifest.name }}</h3><span>{{ app.manifest.version }} · {{ app.enabled ? '已启用' : '已停用' }}{{ app.pinned ? ' · 已固定' : '' }}</span></div></div>
+        <p>{{ app.manifest.description }}</p><div class="scope-summary">{{ scopeLabel(app) }}</div><p v-if="app.manifest.backend" class="backend-note">此包带应用后端；当前阶段不启动后端。</p>
+        <div class="card-actions"><el-button type="primary" :disabled="!app.enabled || !app.manifest.page" @click="open(app)">打开</el-button><el-button @click="authorize(app)">目录授权</el-button><el-button @click="state(app, { enabled: !app.enabled })">{{ app.enabled ? '停用' : '启用' }}</el-button><el-button @click="state(app, { pinned: !app.pinned })">{{ app.pinned ? '取消固定' : '固定' }}</el-button><el-button @click="showUsage(app)">占用</el-button><el-button @click="clearCache(app)">清缓存</el-button><el-button type="danger" plain @click="uninstallApp = app; purge = false">卸载</el-button></div>
+      </article></div>
+    </section>
+    <section><h2>可安装</h2><p v-if="catalog?.status.state === 'disabled'" class="empty">联网目录未配置，可设置 APP_CATALOG_REPOSITORY；包上传仍可用。</p><p v-if="catalog?.status.state === 'stale'" class="notice">目录读取失败，正在使用上次成功快照；已安装应用不受影响。</p>
+      <div class="app-grid"><article v-for="entry in available" :key="`${entry.manifest.id}-${entry.manifest.version}`" class="app-card glass"><h3>{{ entry.manifest.name }} <small>{{ entry.manifest.version }}</small></h3><p>{{ entry.manifest.description }}</p><p class="scope-summary">{{ entry.manifest.files.write ? '声明文件读写' : entry.manifest.files.read ? '声明文件只读' : '不读取网盘文件' }}</p><el-select v-if="entry.manifest.backend" v-model="targets[entry.manifest.id]" aria-label="后端架构"><el-option label="Linux amd64" value="linux-amd64"/><el-option label="Linux arm64" value="linux-arm64"/></el-select><el-button type="primary" @click="previewCatalog(entry)">安装预览</el-button></article></div>
+      <p v-if="catalog?.status.state === 'unavailable'" class="empty">目录暂时不可用，可以稍后刷新或上传应用包。</p><details v-if="catalog?.result.incompatible.length"><summary>不兼容版本</summary><ul><li v-for="entry in catalog.result.incompatible" :key="`${entry.id}-${entry.version}`">{{ entry.id }} {{ entry.version }}：{{ entry.reason }}</li></ul></details>
+    </section>
+    <ResponsivePanel v-model="previewVisible" title="安装预览" width="600px" append-to-body>
+      <template v-if="preview"><h2>{{ preview.manifest.name }} {{ preview.manifest.version }}</h2><p>{{ preview.manifest.description }}</p><dl class="detail-list"><dt>作者声明</dt><dd>{{ preview.manifest.author }}</dd><dt>应用包</dt><dd>{{ preview.package.target }} · {{ formatBytes(preview.package.size) }}</dd><dt>读取声明</dt><dd>{{ preview.manifest.files.read ? '允许请求读取授权' : '不读取文件' }}{{ preview.added_file_read ? '（本次新增）' : '' }}</dd><dt>写入声明</dt><dd>{{ preview.manifest.files.write ? '允许请求读写授权' : '不写入文件' }}{{ preview.added_file_write ? '（本次新增）' : '' }}</dd><dt>应用后端</dt><dd>{{ preview.manifest.backend ? '包含原生后端，本阶段不启动' : '纯页面应用' }}</dd><dt>外网</dt><dd>{{ preview.external_network ? '声明原生后端，后续可自行访问外网' : '页面不能直接访问外站网络' }}</dd></dl><p>安装不会自动授予网盘目录；更新保留键值与已有目录身份授权，撤掉写入声明时自动降为只读。</p></template>
+      <template #footer><el-button @click="previewVisible = false">取消</el-button><el-button type="primary" :loading="busy" @click="install">确认安装</el-button></template>
+    </ResponsivePanel>
+    <ResponsivePanel :model-value="!!uninstallApp" title="卸载应用" width="500px" append-to-body @update:model-value="(open: boolean) => { if (!open) uninstallApp = undefined }"><p>卸载 {{ uninstallApp?.manifest.name }}，撤销所有页面访问；不会删除网盘文件。</p><el-checkbox v-model="purge">同时清除持久应用数据（默认保留）</el-checkbox><p v-if="purge" class="danger-note">将清除应用 KV 和固定数据库，重新安装不能找回。</p><template #footer><el-button @click="uninstallApp = undefined">取消</el-button><el-button type="danger" :loading="busy" @click="uninstall">确认卸载</el-button></template></ResponsivePanel>
+    <ResponsivePanel v-model="usageVisible" title="应用占用" width="500px" append-to-body><dl v-if="occupancy" class="detail-list"><dt>键值记录</dt><dd>{{ occupancy.kv_entries }} / {{ occupancy.kv_entry_limit }}</dd><dt>键值字节</dt><dd>{{ formatBytes(occupancy.kv_bytes) }} / {{ formatBytes(occupancy.kv_byte_limit) }}</dd><dt>可再生缓存</dt><dd>{{ formatBytes(occupancy.cache_bytes) }} / {{ formatBytes(occupancy.cache_byte_limit) }}</dd><dt v-if="occupancy.database_bytes">后端数据库</dt><dd v-if="occupancy.database_bytes">{{ formatBytes(occupancy.database_bytes) }}</dd></dl></ResponsivePanel>
+    <ScopeEditor ref="scope" />
+  </main>
+</template>
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { Grid } from '@element-plus/icons-vue'
+import ResponsivePanel from '../components/ResponsivePanel.vue'
+import ScopeEditor from './ScopeEditor.vue'
+import { center, installedApps, loadInstalled, iconUrl, formatBytes, usage } from './client'
+import type { InstalledApp, CatalogResponse, CatalogEntry, InstallPreview, PackageTarget, DataUsage, AppStatePatch } from './contract'
+const router = useRouter(), input = ref<HTMLInputElement>(), scope = ref<InstanceType<typeof ScopeEditor>>()
+const loading = ref(false), busy = ref(false), error = ref(''), catalog = ref<CatalogResponse>()
+const targets = ref<Record<string, PackageTarget>>({}), preview = ref<InstallPreview>(), previewVisible = ref(false)
+const uninstallApp = ref<InstalledApp>(), purge = ref(false), occupancy = ref<DataUsage>(), usageVisible = ref(false)
+const available = computed(() => {
+  const latest = new Map<string, CatalogEntry>()
+  for (const entry of catalog.value?.result.catalog.entries ?? []) {
+    const old = latest.get(entry.manifest.id)
+    if (!old || compareVersion(entry.manifest.version, old.manifest.version) > 0) latest.set(entry.manifest.id, entry)
+  }
+  return [...latest.values()].filter((entry) => !installedApps.value.some((app) => app.manifest.id === entry.manifest.id && compareVersion(app.manifest.version, entry.manifest.version) >= 0))
+})
+function compareVersion(a: string, b: string) { const left = a.split('.').map(BigInt), right = b.split('.').map(BigInt); for (let i = 0; i < 3; i++) { if (left[i] !== right[i]) return left[i] > right[i] ? 1 : -1 } return 0 }
+function message(failure: unknown) { return failure instanceof Error ? failure.message : '应用操作失败' }
+async function execute(operation: () => Promise<unknown>) { busy.value = true; error.value = ''; try { await operation() } catch (failure) { error.value = message(failure) } finally { busy.value = false } }
+async function refresh() { loading.value = true; try { await loadInstalled(true); catalog.value = await center.refresh() } catch (failure) { error.value = message(failure) } finally { loading.value = false } }
+onMounted(async () => { loading.value = true; try { await loadInstalled(true); catalog.value = await center.catalog() } catch (failure) { error.value = message(failure) } finally { loading.value = false } })
+async function upload(event: Event) { const file = (event.target as HTMLInputElement).files?.[0]; if (!file) return; await execute(async () => { const receipt = await center.upload(file); preview.value = await center.preview({ type: 'uploaded', package_id: receipt.package_id }); previewVisible.value = true }); if (input.value) input.value.value = '' }
+async function previewCatalog(entry: CatalogEntry) { await execute(async () => { const target = entry.manifest.backend ? targets.value[entry.manifest.id] ?? 'linux-amd64' : 'web'; const artifact = entry.packages[target]; if (!artifact) throw new Error('该目标的包不可用'); preview.value = await center.preview({ type: 'catalog', app_id: entry.manifest.id, version: entry.manifest.version, target, sha256: artifact.sha256 }); previewVisible.value = true }) }
+async function install() { if (!preview.value) return; await execute(async () => { await center.install({ preview_id: preview.value!.preview_id }); previewVisible.value = false; await loadInstalled(true) }) }
+function open(app: InstalledApp) { void router.push(`/apps/${encodeURIComponent(app.manifest.id)}`) }
+async function authorize(app: InstalledApp) { await execute(async () => { await scope.value?.open(app); await loadInstalled(true) }) }
+async function state(app: InstalledApp, change: Pick<AppStatePatch, 'enabled' | 'pinned'>) { await execute(async () => { await center.state(app.manifest.id, { expected_state_revision: app.state_revision, ...change }); await loadInstalled(true) }) }
+async function clearCache(app: InstalledApp) { await execute(async () => { await center.clearCache(app.manifest.id); ElMessage.success('可再生缓存已清空') }) }
+async function showUsage(app: InstalledApp) { await execute(async () => { occupancy.value = await usage(app); usageVisible.value = true }) }
+async function uninstall() { if (!uninstallApp.value) return; await execute(async () => { await center.uninstall(uninstallApp.value!, purge.value); uninstallApp.value = undefined; await loadInstalled(true) }) }
+function scopeLabel(app: InstalledApp) { const scope = app.scope.scope; return scope.mode === 'none' ? '尚未授予目录' : scope.mode === 'all' ? `全部目录 · ${scope.access === 'read_write' ? '读写' : '只读'}` : `指定 ${scope.directories.length} 个目录 · ${scope.directories.some((grant) => grant.access === 'read_write') ? '含读写' : '只读'}` }
+</script>
+<style scoped>
+.app-center { max-width: 1280px; margin: auto; padding: 24px; }.center-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 24px; }.center-head h1 { flex: 1; margin: 0; font-size: 24px; }.back-link { color: var(--el-text-color-secondary); text-decoration: none; }section { margin: 28px 0; }h2 { font-size: 18px; }.app-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(290px,1fr)); gap: 18px; }.app-card { padding: 20px; border-radius: 16px; }.app-card h3 { margin: 0; font-size: 17px; }h3 small { font-weight: 400; font-size: 12px; color: var(--el-text-color-secondary); }.app-heading { display: flex; gap: 12px; align-items: center; }.app-heading img,.app-icon { width: 44px; height: 44px; object-fit: contain; font-size: 32px; }.app-heading span,.scope-summary,.backend-note { color: var(--el-text-color-secondary); font-size: 12px; }.app-card p { line-height: 1.6; }.card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }.card-actions .el-button { margin: 0; }.empty { color: var(--el-text-color-secondary); padding: 20px 0; }.detail-list { display: grid; grid-template-columns: 110px 1fr; gap: 12px; }dd { margin: 0; overflow-wrap: anywhere; }dt { color: var(--el-text-color-secondary); }.notice { color: var(--el-color-warning); }.danger-note { color: var(--el-color-danger); }@media(max-width:600px){.app-center{padding:16px}.center-head h1{order:-1;flex-basis:100%}.app-grid{grid-template-columns:1fr}.detail-list{grid-template-columns:90px 1fr}}
+</style>

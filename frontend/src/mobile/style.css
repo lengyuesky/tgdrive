@@ -5,6 +5,7 @@ button, input, textarea, select { font: inherit; }
 a, button { -webkit-tap-highlight-color: transparent; }
 button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; }
 .mobile-tabs { display: none; }
+.session-shell.with-tabs.app-immersive { padding: 0 !important; }
 .mobile-page { max-width: 900px; margin: auto; padding: 24px; box-sizing: border-box; }
 .page-heading { display: flex; gap: 16px; align-items: center; margin-bottom: 24px; }.page-heading h1 { margin: 0; font-size: 28px; }.page-heading a { text-decoration: none; color: var(--el-color-primary); }
 .group-card { padding: 20px; border: 1px solid var(--glass-border); border-radius: 18px; background: var(--glass-bg-heavy); margin-bottom: 20px; }
@@ -25,7 +26,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
   .glass, .el-card, .el-dialog, .el-drawer { backdrop-filter: none; -webkit-backdrop-filter: none; box-shadow: none; }
   .session-shell.with-tabs { padding: var(--safe-top) var(--safe-right) calc(var(--tab-height) + var(--safe-bottom)) var(--safe-left); min-height: var(--app-height); box-sizing: border-box; }
   .session-shell.is-file-page { height: var(--app-height); min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-  .mobile-tabs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 40; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 0 var(--safe-right) var(--safe-bottom) var(--safe-left); height: var(--tab-height); border-top: 1px solid var(--glass-border); background: color-mix(in srgb, var(--glass-bg-heavy) 94%, transparent); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  .mobile-tabs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 40; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 0 var(--safe-right) var(--safe-bottom) var(--safe-left); height: var(--tab-height); border-top: 1px solid var(--glass-border); background: color-mix(in srgb, var(--glass-bg-heavy) 94%, transparent); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
   .mobile-tabs a { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; min-height: 44px; text-decoration: none; color: var(--el-text-color-secondary); font-size: 11px; }
   .mobile-tabs .el-icon { font-size: 23px; }.mobile-tabs a.active, .mobile-tabs a.router-link-active { color: var(--el-color-primary); }
   .tab-icon { position: relative; display: flex; }.tab-icon b { position: absolute; top: -6px; left: 16px; padding: 1px 4px; background: var(--el-color-danger); border-radius: 10px; color: white; font-size: 10px; }

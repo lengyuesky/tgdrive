@@ -9,11 +9,13 @@ describe('宿主地址边界', () => {
     expect(router.resolve(path).matched.at(-1)?.path).not.toBe('/:catchall(.*)*')
   })
 
-  it('系统设置使用独立路径，不保留旧设置与应用路由', () => {
+  it('系统设置与新应用中心使用独立路径，不保留旧应用别名', () => {
     const paths = router.getRoutes().map((route) => route.path)
     expect(paths).toContain('/settings')
     expect(paths).not.toContain('/admin')
-    expect(paths.some((path) => path.startsWith('/apps') || path === '/shorts')).toBe(false)
+    expect(paths).toContain('/apps')
+    expect(paths).toContain('/apps/:appId')
+    expect(paths).not.toContain('/shorts')
   })
 
   it('主屏幕入口、范围与图标不会请求根地址', () => {

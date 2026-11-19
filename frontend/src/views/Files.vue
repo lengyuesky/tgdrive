@@ -332,6 +332,7 @@
                   <el-dropdown v-else trigger="click" @command="(cmd: string) => onTileCmd(cmd, row)">
                     <el-button text size="small" :icon="MoreFilled" aria-label="更多操作" />
                     <template #dropdown><el-dropdown-menu>
+                      <el-dropdown-item v-for="app in appsFor(row)" :key="app.manifest.id" @click="launchWith(app, row)">打开方式：{{ app.manifest.name }}</el-dropdown-item>
                       <el-dropdown-item v-if="!row.is_dir" command="download">下载</el-dropdown-item>
                       <el-dropdown-item command="favorite">{{ row.favorite ? '取消收藏' : '收藏' }}</el-dropdown-item>
                       <el-dropdown-item command="share">分享</el-dropdown-item>
@@ -373,6 +374,7 @@
       <template #footer><el-button type="primary" @click="optionsOpen = false">完成</el-button></template>
     </ResponsivePanel>
     <ResponsivePanel v-model="actionOpen" :title="actionEntry?.name || '文件操作'" sheet>
+      <div v-if="actionEntry && appsFor(actionEntry).length" class="action-sheet-list"><button v-for="app in appsFor(actionEntry)" :key="app.manifest.id" @click="mobileApp(app)">打开方式：{{ app.manifest.name }}</button></div>
       <div class="action-sheet-list"><button v-if="!actionEntry?.is_dir" @click="runMobileAction('download')">下载</button><button @click="runMobileAction('favorite')">{{ actionEntry?.favorite ? '取消收藏' : '收藏' }}</button><button @click="runMobileAction('share')">分享</button><button @click="runMobileAction('rename')">重命名</button><button @click="runMobileAction('move')">移动到…</button><button @click="runMobileAction('copy')">复制到…</button><button @click="runMobileAction('properties')">属性</button><button class="danger-text" @click="runMobileAction('delete')">删除…</button></div>
     </ResponsivePanel>
     <BoundedImagePreview v-if="viewerShow" v-model:index="viewerIndex"
@@ -591,6 +593,8 @@ import {
 } from '../api'
 import { isDark, toggleDark } from '../theme'
 import FilesSidebar from '../components/FilesSidebar.vue'
+import { center as appCenter, loadInstalled, openWith } from '../apps/client'
+import type { InstalledApp } from '../apps/contract'
 import { useTransfers, useUploadIntake } from '../transfers/context'
 import type PreviewDialog from '../components/PreviewDialog.vue'
 import DirectoryMedia from '../components/DirectoryMedia.vue'
@@ -607,6 +611,15 @@ import type TrashPanel from '../components/TrashPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
+void loadInstalled().catch(() => undefined)
+function appsFor(row: Entry) { return openWith(row.name, row.is_dir) }
+async function launchWith(app: InstalledApp, row: Entry) {
+  try {
+    const node = await appCenter.node({ by: 'path', path: joinPath(cur.value, row.name) })
+    await router.push({ path: `/apps/${encodeURIComponent(app.manifest.id)}`, query: { open: node.id, from: route.fullPath } })
+  } catch (failure) { ElMessage.error(failure instanceof Error ? failure.message : '打开应用失败') }
+}
+function mobileApp(app: InstalledApp) { const row = actionEntry.value; actionEntry.value = null; if (row) void launchWith(app, row) }
 const directory = createDirectoryController(async (params, signal) => (await api.entries(params, signal)).data)
 const { entries, selected, selectedIds, loading, total, hasMore, generation, revision, error: directoryError } = directory
 const scrollOffset = ref(0)
@@ -1047,6 +1060,7 @@ const ctxItems = computed<CtxItem[]>(() => {
     action: () => openEntry(row),
     divided: items.length > 0,
   })
+  for (const app of appsFor(row)) items.push({ label: `打开方式：${app.manifest.name}`, action: () => void launchWith(app, row) })
   if (!row.is_dir) items.push({ label: '下载', action: () => download(row) })
   items.push({
     label: row.favorite ? '取消收藏' : '收藏',

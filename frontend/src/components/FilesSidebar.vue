@@ -18,6 +18,7 @@
       <span v-if="fileCount !== undefined" class="side-count">{{ fileCount }}</span>
     </button>
     <VirtualDirectoryTree :key="treeKey" :current="current" @select="emit('navigate', $event)" />
+    <router-link class="side-root" to="/apps"><el-icon><Grid /></el-icon><span>应用中心</span></router-link>
     <div class="side-sep" />
     <button class="side-root" :class="{ on: favoritesActive }" @click="emit('action', 'favorites')">
       <el-icon color="#f59e0b"><StarFilled /></el-icon>
@@ -35,7 +36,7 @@
 </template>
 
 <script setup lang="ts">
-import { DeleteFilled, Folder, FolderAdd, FolderOpened, Refresh, Share, StarFilled } from '@element-plus/icons-vue'
+import { DeleteFilled, Folder, FolderAdd, FolderOpened, Grid, Refresh, Share, StarFilled } from '@element-plus/icons-vue'
 import VirtualDirectoryTree from './VirtualDirectoryTree.vue'
 
 defineProps<{ current: string; treeKey: number; fileCount?: number; favoritesActive: boolean; drawer?: boolean }>()
@@ -50,7 +51,7 @@ const emit = defineEmits<{
 <style scoped>
 .sidebar { width: 224px; flex-shrink: 0; border-radius: 16px; padding: 12px 10px; position: sticky; top: 76px; max-height: calc(100vh - 100px); overflow: auto; box-sizing: border-box; }
 .side-head { display: flex; align-items: center; gap: 6px; font-weight: 700; font-size: 14px; padding: 0 6px 8px; border-bottom: 1px solid var(--glass-border); margin-bottom: 8px; }
-.side-root { display: flex; align-items: center; gap: 6px; width: 100%; border: 0; background: transparent; color: inherit; font: inherit; padding: 7px 8px; border-radius: 8px; font-size: 14px; text-align: left; cursor: pointer; margin-bottom: 2px; }
+.side-root { text-decoration: none; box-sizing: border-box; display: flex; align-items: center; gap: 6px; width: 100%; border: 0; background: transparent; color: inherit; font: inherit; padding: 7px 8px; border-radius: 8px; font-size: 14px; text-align: left; cursor: pointer; margin-bottom: 2px; }
 .side-root:hover { background: var(--tile-bg-hover); }
 .side-root:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
 .side-root.on { color: var(--el-color-primary); background: rgba(64, 158, 255, 0.12); font-weight: 600; }

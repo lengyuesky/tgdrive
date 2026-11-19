@@ -3,6 +3,8 @@ import { closeAllOverlays, closeTopOverlay } from './mobile/overlays'
 const SessionBoundary = () => import('./components/SessionBoundary.vue')
 const Transfers = () => import('./views/Transfers.vue')
 const Me = () => import('./views/Me.vue')
+const AppCenter = () => import('./apps/AppCenter.vue')
+const AppContainer = () => import('./apps/AppContainer.vue')
 
 // 页面按路由拆包；公开分享页、后台与主文件页不再挤进同一个首屏脚本。
 const Login = () => import('./views/Login.vue')
@@ -21,6 +23,8 @@ export const router = createRouter({
       { path: 'settings', component: Admin },
       { path: 'transfers', component: Transfers },
       { path: 'me', component: Me },
+      { path: 'apps', component: AppCenter },
+      { path: 'apps/:appId', component: AppContainer },
     ] },
     // 公开分享页,免登录
     { path: '/s/:token', component: Share },
