@@ -410,7 +410,7 @@ async fn cache_sources_overwrite_tickets_and_lru_are_generic() {
 async fn kv_byte_pages_do_not_skip_large_records() {
     let (_dir, platform, _) = fixture().await;
     let app = install_page(&platform).await;
-    let value = serde_json::Value::String("x".repeat(32 * 1024 - 2));
+    let value = serde_json::Value::String("x".repeat(MAX_KV_VALUE_BYTES as usize - 2));
     for index in 0..40 {
         platform
             .kv_put(

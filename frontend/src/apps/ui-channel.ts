@@ -12,7 +12,7 @@ export interface UiHandlers {
 }
 const bytes = (text: string) => new TextEncoder().encode(text).length
 const plain = (value: unknown, maximum: number): value is string => typeof value === 'string' && !!value.trim() && bytes(value) <= maximum && !/[\u0000-\u001f\u007f]/.test(value)
-const opaque = (value: unknown, maximum = 128): value is string => typeof value === 'string' && new RegExp(`^[A-Za-z0-9_-]{1,${maximum}}$`).test(value)
+const opaque = (value: unknown, maximum: number = LIMITS.MAX_OPAQUE_ID_BYTES): value is string => typeof value === 'string' && new RegExp(`^[A-Za-z0-9_-]{1,${maximum}}$`).test(value)
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
 function failure(code: keyof typeof ERROR_CODES, message: string, id: string): ApiError { return { code, message, request_id: id } }
 
@@ -42,24 +42,24 @@ export function createUiChannel(frame: () => Window | null, nonce: string, handl
     const params = 'params' in raw && object(raw.params) ? raw.params : {}
     switch (request.method) {
       case 'ui.set_immersive':
-        if (typeof params.active !== 'boolean' || (params.background != null && (typeof params.background !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(params.background)))) throw failure('invalid_request', '沉浸背景只能使用六位十六进制颜色', '')
+        if (typeof params.active !== 'boolean' || (params.background != null && (typeof params.background !== 'string' || !new RegExp(`^#[0-9a-fA-F]{${LIMITS.IMMERSIVE_COLOR_HEX_DIGITS}}$`).test(params.background)))) throw failure('invalid_request', '沉浸背景只能使用六位十六进制颜色', '')
         await handlers.immersive(params.active, params.background as string | undefined); break
       case 'ui.set_title':
-        if (!plain(params.title, 120)) throw failure('invalid_request', '标题必须是有界纯文本', '')
+        if (!plain(params.title, LIMITS.MAX_UI_TITLE_BYTES)) throw failure('invalid_request', '标题必须是有界纯文本', '')
         handlers.title(params.title); break
       case 'ui.pick_directory':
-        if (params.initial_id != null && (typeof params.initial_id !== 'string' || !/^[1-9][0-9]{0,18}$/.test(params.initial_id) || BigInt(params.initial_id) > 9223372036854775807n)) throw failure('invalid_request', '初始目录身份无效', '')
+        if (params.initial_id != null && (typeof params.initial_id !== 'string' || !new RegExp(`^[1-9][0-9]{0,${LIMITS.MAX_NODE_ID_DIGITS - 1}}$`).test(params.initial_id) || BigInt(params.initial_id) > BigInt(LIMITS.MAX_NODE_ID))) throw failure('invalid_request', '初始目录身份无效', '')
         if (dialogOpen) throw failure('rate_limited', '已有一个目录选择或授权窗口', '')
         dialogOpen = true
         try { return { type: 'directory', directory: await handlers.pick(params.initial_id as string | undefined, signal) } } finally { dialogOpen = false }
       case 'ui.request_scope':
-        if (!plain(params.reason, 800) || !['read_only', 'read_write'].includes(String(params.preferred_access))) throw failure('invalid_request', '授权请求文本或权限级别无效', '')
+        if (!plain(params.reason, LIMITS.MAX_AUTHORIZATION_REASON_BYTES) || !['read_only', 'read_write'].includes(String(params.preferred_access))) throw failure('invalid_request', '授权请求文本或权限级别无效', '')
         if (dialogOpen) throw failure('rate_limited', '已有一个目录选择或授权窗口', '')
         dialogOpen = true
         try { return { type: 'authorization', scope: await handlers.scope(params as unknown as ScopeAuthorizationRequest, signal) } } finally { dialogOpen = false }
       case 'ui.task': {
-        const integer = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff
-        if (!opaque(params.id, 64) || !plain(params.title, 160) || !integer(params.completed) ||
+        const integer = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= LIMITS.MAX_TASK_PROGRESS
+        if (!opaque(params.id, LIMITS.MAX_TASK_ID_BYTES) || !plain(params.title, LIMITS.MAX_TASK_TITLE_BYTES) || !integer(params.completed) ||
           (params.total != null && (!integer(params.total) || Number(params.total) < Number(params.completed))) ||
           !['running', 'completed', 'cancelled', 'failed'].includes(String(params.state)) || (params.cancellable != null && typeof params.cancellable !== 'boolean')) throw failure('invalid_request', '任务进度格式无效', '')
         handlers.task({ ...params, cancellable: params.cancellable ?? false } as unknown as TaskProgress); break

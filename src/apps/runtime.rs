@@ -87,8 +87,9 @@ impl Sessions {
         });
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, s| {
-            let valid =
-                !s.cancelled.is_cancelled() && s.expires_at.load(Ordering::Acquire) > now().0;
+            let valid = !s.cancelled.is_cancelled()
+                && s.expires_at.load(Ordering::Acquire) > now().0
+                && s.owner_epoch == session.owner_epoch;
             if !valid {
                 s.cancelled.cancel();
             }

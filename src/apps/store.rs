@@ -209,12 +209,12 @@ pub(crate) async fn file_nodes(
                 created_at: Timestamp(
                     row.created_at
                         .saturating_mul(1000)
-                        .clamp(0, 9_007_199_254_740_991),
+                        .clamp(0, tgdrive_contract::http::MAX_TIMESTAMP_MILLIS as i64),
                 ),
                 modified_at: Timestamp(
                     row.modified_at
                         .saturating_mul(1000)
-                        .clamp(0, 9_007_199_254_740_991),
+                        .clamp(0, tgdrive_contract::http::MAX_TIMESTAMP_MILLIS as i64),
                 ),
                 revision,
                 content_version: row.content_version,

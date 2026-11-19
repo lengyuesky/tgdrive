@@ -77,6 +77,7 @@ impl MediaState {
         let at = now().0;
         inner.leases.retain(|_, lease| {
             lease.expires_at.load(Ordering::Acquire) > at
+                && lease.session.expires_at.load(Ordering::Acquire) > at
                 && !lease.revoked.is_cancelled()
                 && !lease.session.cancelled.is_cancelled()
         });
@@ -93,11 +94,13 @@ impl MediaState {
             .filter(|lease| {
                 lease.session.app_id == session.app_id
                     && lease.session.generation == session.generation
+                    && lease.session.owner_epoch == session.owner_epoch
             })
             .ok_or_else(|| {
                 PlatformError::new(error_code::LEASE_EXPIRED, "读取租约不存在或已撤销")
             })?;
         if lease.expires_at.load(Ordering::Acquire) <= now().0
+            || lease.session.expires_at.load(Ordering::Acquire) <= now().0
             || lease.revoked.is_cancelled()
             || lease.session.cancelled.is_cancelled()
         {
