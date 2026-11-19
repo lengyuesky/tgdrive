@@ -167,6 +167,20 @@ fn order(
                 "游标排序键无效",
             ));
         }
+        if sort == NodeSort::Name {
+            let folded = values[0].as_str().ok_or_else(|| {
+                PlatformError::new(error_code::INVALID_CURSOR, "名称游标主键无效")
+            })?;
+            // SQLite 对表达式索引上的行值比较只做过滤；显式主键范围确保从游标位置寻址。
+            query
+                .push(" AND lower(n.name) COLLATE BINARY")
+                .push(if direction == SortOrder::Asc {
+                    ">="
+                } else {
+                    "<="
+                })
+                .push_bind(folded.to_owned());
+        }
         query
             .push(" AND (")
             .push(sort_expression(sort))
@@ -775,7 +789,14 @@ async fn capture_plan(
         .iter()
         .map(|row| row.get::<String, _>("detail"))
         .collect();
-    PLANS.lock().unwrap().push((label.into(), plan));
+    let captured = if sql.contains(" AND lower(n.name) COLLATE BINARY>=")
+        || sql.contains(" AND lower(n.name) COLLATE BINARY<=")
+    {
+        format!("{label}.cursor")
+    } else {
+        label.into()
+    };
+    PLANS.lock().unwrap().push((captured, plan));
     *query = QueryBuilder::with_arguments(sql, arguments);
     Ok(())
 }

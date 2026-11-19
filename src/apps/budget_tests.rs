@@ -78,7 +78,8 @@ async fn cache_lru_evicts_to_ninety_percent_and_keeps_new_object() {
             .unwrap();
     }
     assert!(
-        platform.cache_usage(&app.manifest.id).await.unwrap() <= DEFAULT_PAGE_CACHE_BYTES / 10 * 9
+        platform.cache_usage(&app.manifest.id).await.unwrap()
+            <= DEFAULT_PAGE_CACHE_BYTES / 100 * CACHE_EVICTION_TARGET_PERCENT
     );
     assert!(
         platform

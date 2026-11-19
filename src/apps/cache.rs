@@ -267,7 +267,7 @@ impl AppPlatform {
         }
         index.usage += length;
         if index.usage > limits.cache_byte_limit.0 {
-            let target = limits.cache_byte_limit.0 / 10 * 9;
+            let target = limits.cache_byte_limit.0 / 100 * CACHE_EVICTION_TARGET_PERCENT;
             let mut victims = index
                 .entries
                 .iter()

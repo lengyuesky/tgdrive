@@ -6,6 +6,14 @@ use tgdrive_contract::files::*;
 
 #[tokio::test]
 async fn two_hundred_thousand_nodes_use_keysets_and_indexed_random() {
+    println!(
+        "性能构建：{}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
     let (_dir, platform, fake) = fixture().await;
     let app = authorize_all(&platform).await;
     let db = &platform.host.vfs.db;
@@ -109,16 +117,48 @@ async fn two_hundred_thousand_nodes_use_keysets_and_indexed_random() {
     let mut page = query;
     let mut total = 0;
     let mut pages = 0;
+    let mut durations = Vec::new();
     loop {
+        let number = pages + 1;
+        if number == 200 {
+            super::query::CAPTURE_PLANS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let page_start = Instant::now();
         let result = platform
             .file_query(&app.manifest.id, &app.generation, page.clone())
             .await
             .unwrap();
+        durations.push(page_start.elapsed());
+        if number == 200 {
+            super::query::CAPTURE_PLANS.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if [1, 100, 200, 300, 400].contains(&number) {
+            println!("分页深度：第 {number} 页 {:.2?}", durations.last().unwrap());
+        }
         total += result.items.len();
         pages += 1;
         page.cursor = result.next_cursor;
         if page.cursor.is_none() {
             break;
+        }
+    }
+    for (index, segment) in durations.chunks(80).enumerate() {
+        let total: std::time::Duration = segment.iter().copied().sum();
+        println!(
+            "分页分段：{}-{} 页平均 {:.2?}",
+            index * 80 + 1,
+            index * 80 + segment.len(),
+            total / segment.len() as u32
+        );
+    }
+    for (label, plan) in super::query::PLANS.lock().unwrap().drain(..) {
+        println!("EXPLAIN 深页 {label}：{}", plan.join("；"));
+        if label == "query.cursor" {
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("SEARCH n USING INDEX app_nodes_name")),
+                "深页必须按游标主键范围寻址"
+            );
         }
     }
     assert_eq!(total, 200000);
