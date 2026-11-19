@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use tokio_util::io::ReaderStream;
 
 mod entries;
-pub(crate) use self::media::inline_mime_allowed;
+pub(crate) use self::media::{inline_mime_allowed, thumbnail_bytes};
 mod admin;
 mod events;
 mod files;

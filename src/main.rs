@@ -2,6 +2,7 @@
 //! 子命令:serve(默认)| check(实测 Bot API 链路)| healthcheck(容器健康检查)
 
 mod api;
+mod apps;
 mod auth;
 mod backup;
 mod config;
@@ -304,6 +305,7 @@ pub(crate) fn http_router(
             axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .with_state(state.clone())
+        .merge(apps::router(state.clone()))
         .nest("/admin/api", api::router(state.clone()));
     let app = match static_directory {
         Some(directory) => app.fallback_service(web::router(directory)),
@@ -320,6 +322,7 @@ pub(crate) fn http_router(
         crate::security::response_headers,
     ))
     .layer(axum::middleware::from_fn(crate::security::access_log))
+    .layer(axum::middleware::from_fn(apps::boundary_guard))
 }
 
 async fn shutdown_signal(

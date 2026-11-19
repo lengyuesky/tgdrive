@@ -649,9 +649,9 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.0"
+version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
 dependencies = [
  "cfg-if",
 ]
@@ -2061,9 +2061,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libsqlite3-sys"
@@ -3736,6 +3736,7 @@ dependencies = [
  "base64 0.23.1",
  "brotli",
  "bytes",
+ "crc32fast",
  "data-encoding",
  "dav-server",
  "dotenvy",
@@ -3749,6 +3750,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "libc",
  "mime_guess",
  "percent-encoding",
  "pin-project-lite",
@@ -3762,6 +3764,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "tempfile",
+ "tgdrive-contract",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -3769,6 +3772,15 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tgdrive-contract"
+version = "1.0.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

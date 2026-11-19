@@ -124,8 +124,9 @@ async fn removal_preserves_all_host_rows_and_objects() {
             .await
             .unwrap();
 
+    // 此测试专门证明 0028 的删除迁移；后续新平台允许给 nodes 增加通用索引。
     sqlx::migrate!("./migrations")
-        .run_direct(None, &mut conn, false)
+        .run_direct(Some(28), &mut conn, false)
         .await
         .unwrap();
 

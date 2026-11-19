@@ -9,6 +9,10 @@ impl Db {
             return Err(AppError::BadRequest("不能删除根目录".into()));
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO app_change_batches(root_id) VALUES(?)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         // 收集整棵子树的节点 id(SQLite 递归 CTE)
         let node_ids: Vec<(i64,)> = sqlx::query_as(
             "WITH RECURSIVE sub(id) AS (
@@ -45,6 +49,10 @@ impl Db {
                 .await?;
         }
         let freed = Self::freed_messages(&mut tx, candidates).await?;
+        sqlx::query("DELETE FROM app_change_batches WHERE root_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(freed)
     }

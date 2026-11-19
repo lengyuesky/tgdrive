@@ -11,6 +11,9 @@ async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
+crc32fast = "1.5.5"
+flate2 = "1.1.9"
+libc = "0.2.191"
 data-encoding = "2"
 dav-server = "0.11.0"
 dotenvy = "0.15.7"
@@ -36,6 +39,7 @@ sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 subtle = "2.6.1"
 tempfile = "3.27.0"
+tgdrive-contract = { path = "../tgdrive-app/contract" }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
@@ -47,7 +51,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 # 主站静态资源测试生成真实压缩变体，不进入宿主的直接运行依赖。
 brotli = "8.0.4"
-flate2 = "1.1.9"
 
 [profile.release]
 # 单二进制服务：瘦 LTO 与去符号换更小的镜像，编译时间增加有限。

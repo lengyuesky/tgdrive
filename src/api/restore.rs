@@ -165,6 +165,12 @@ pub(crate) async fn write_guard(
     } else {
         None
     };
+    let application = path.starts_with(tgdrive_contract::http::APP_API_PREFIX)
+        || path.starts_with(tgdrive_contract::http::APP_CENTER_BASE)
+        || path.starts_with(tgdrive_contract::http::ASSET_BASE);
+    if application && (state.restore.maintenance() || state.vfs.db.background_blocked()) {
+        return crate::apps::maintenance_response(path, req.headers());
+    }
     if state.restore.maintenance()
         && !matches!(path, "/admin/healthz" | "/admin/api/admin/restore/status")
     {

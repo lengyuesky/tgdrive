@@ -358,6 +358,12 @@ pub struct Db {
     pub(crate) pool: SqlitePool,
     /// 恢复安全模式/维护状态，随所有 Db 克隆共享；后台入口必须检查。
     background_blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 所有 SQLite 连接共享的应用授权/树变更 epoch；流只在变化后重新查询祖先链。
+    pub(crate) app_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) app_changes: tokio::sync::watch::Sender<u64>,
+    /// 游标签名域独立于主人/原生设备凭据；恢复后仍能识别旧游标并返回 cursor_expired。
+    pub(crate) app_cursor_key: String,
+    pub(crate) app_cursor_keys: std::sync::Arc<Vec<String>>,
 }
 
 /// 有待执行迁移的既有库先做一份一致性快照：部分迁移会删表重建，无法回退。
@@ -412,14 +418,51 @@ impl Db {
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(10))
             .foreign_keys(true);
+        let app_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (app_changes, _) = tokio::sync::watch::channel(0);
+        let hook_epoch = app_epoch.clone();
+        let hook_changes = app_changes.clone();
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
+            .after_connect(move |connection, _| {
+                let epoch = hook_epoch.clone();
+                let changes = hook_changes.clone();
+                Box::pin(async move {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    let dirty = std::sync::Arc::new(AtomicBool::new(false));
+                    let mut handle = connection.lock_handle().await?;
+                    let update_dirty = dirty.clone();
+                    let update_epoch = epoch.clone();
+                    handle.set_update_hook(move |update| {
+                        if matches!(update.table, "nodes" | "chunks" | "app_installations") {
+                            update_dirty.store(true, Ordering::Release);
+                            // 事务开始改变可读状态时先保守失效，提交时再发布一次，避免读到旧快照后漏检。
+                            update_epoch.fetch_add(1, Ordering::AcqRel);
+                        }
+                    });
+                    handle.set_commit_hook(move || {
+                        if dirty.swap(false, Ordering::AcqRel) {
+                            let value = epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                            changes.send_replace(value);
+                        }
+                        // SQLx 的布尔约定为 true 允许提交，不是 SQLite C 回调的原始返回值。
+                        true
+                    });
+                    Ok(())
+                })
+            })
             .connect_with(opts)
             .await?;
         let migrator = sqlx::migrate!("./migrations");
         let initialized = async {
             snapshot_before_migration(&pool, &migrator, db_path).await?;
             migrator.run(&pool).await?;
+            sqlx::query("UPDATE app_change_state SET retention_ms=?,max_entries=? WHERE id=1")
+                .bind((tgdrive_contract::http::FILE_CHANGE_RETENTION_SECONDS * 1000) as i64)
+                .bind(tgdrive_contract::http::MAX_FILE_CHANGE_JOURNAL_ENTRIES as i64)
+                .execute(&pool)
+                .await?;
+            crate::apps::restore::apply_pending(&pool, db_path).await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -428,9 +471,20 @@ impl Db {
             pool.close().await;
             return Err(error);
         }
+        let app_cursor_key: String =
+            sqlx::query_scalar("SELECT cursor_key FROM app_change_state WHERE id=1")
+                .fetch_one(&pool)
+                .await?;
+        let app_cursor_keys: Vec<String> = sqlx::query_scalar("SELECT key FROM app_cursor_keys")
+            .fetch_all(&pool)
+            .await?;
         Ok(Db {
             pool,
             background_blocked: Default::default(),
+            app_epoch,
+            app_changes,
+            app_cursor_key,
+            app_cursor_keys: std::sync::Arc::new(app_cursor_keys),
         })
     }
 

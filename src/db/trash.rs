@@ -11,6 +11,10 @@ impl Db {
         let node = self.node(id).await?;
         let parent_id = node.parent_id.ok_or(AppError::NotFound)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO app_change_batches(root_id) VALUES(?)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "WITH RECURSIVE sub(id) AS (
                SELECT ? UNION ALL
@@ -40,6 +44,10 @@ impl Db {
         .bind(now_ts())
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM app_change_batches WHERE root_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -91,6 +99,10 @@ impl Db {
         }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO app_change_batches(root_id) VALUES(?)")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
         // 先改名/挪位置:此时根仍是 trashed,不受 ready 部分唯一索引约束;
         // 随后整树置 ready 时根已用新名字入索引,不会与占名者冲突
         sqlx::query("UPDATE nodes SET parent_id = ?, name = ?, modified_at = ? WHERE id = ?")
@@ -111,6 +123,10 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM trash WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM app_change_batches WHERE root_id=?")
             .bind(node_id)
             .execute(&mut *tx)
             .await?;

@@ -81,6 +81,11 @@ pub fn static_dir() -> Option<String> {
     env_opt("TGDRIVE_STATIC_DIR")
 }
 
+/// 应用目录的公共 GitHub owner/repo；未配置时关闭联网目录，仍可上传包安装。
+pub fn app_catalog_repository() -> String {
+    env_opt("APP_CATALOG_REPOSITORY").unwrap_or_default()
+}
+
 /// 监听地址原文；健康检查子命令不加载完整配置，只需要端口。
 pub fn listen_raw() -> String {
     env_opt("TGDRIVE_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into())

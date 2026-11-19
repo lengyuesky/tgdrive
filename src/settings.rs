@@ -715,6 +715,10 @@ impl Runtime {
                 .set_account_and_secret(&next.username, &next.password, secret);
         }
         *self.current.write().unwrap() = Arc::new(next);
+        // 只唤醒应用存储状态观察，不把普通配置写入计为文件树变化。
+        self.db
+            .app_changes
+            .send_replace(self.db.app_epoch.load(std::sync::atomic::Ordering::Acquire));
         Ok(account_changed)
     }
 

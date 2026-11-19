@@ -87,6 +87,8 @@ pub struct Auth {
     factor_update: tokio::sync::Mutex<()>,
     pending_totp: Mutex<Option<(String, i64)>>,
     cookie_secure: bool,
+    /// 凭据撤销信号：应用在途读取不能等下一段数据或事件心跳才察觉密钥轮换。
+    revocations: tokio::sync::watch::Sender<u64>,
 }
 
 /// 已验证提取码后签发的短期分享票据。
@@ -151,6 +153,7 @@ impl Auth {
             factor_update: tokio::sync::Mutex::new(()),
             pending_totp: Mutex::new(None),
             cookie_secure,
+            revocations: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -166,12 +169,21 @@ impl Auth {
             factor_update: tokio::sync::Mutex::new(()),
             pending_totp: Mutex::new(None),
             cookie_secure: false,
+            revocations: tokio::sync::watch::channel(0).0,
         }
     }
 
     /// guard 立即释放,不跨 await
     fn creds(&self) -> Arc<Creds> {
         self.creds.read().unwrap().clone()
+    }
+
+    pub(crate) fn revocation_signal(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revocations.subscribe()
+    }
+    fn signal_revocation(&self) {
+        self.revocations
+            .send_modify(|value| *value = value.wrapping_add(1));
     }
 
     pub fn username(&self) -> String {
@@ -190,6 +202,7 @@ impl Auth {
     pub fn set_account_and_secret(&self, username: &str, password: &str, secret: &str) {
         *self.creds.write().unwrap() =
             Arc::new(Creds::new(username, password, secret.as_bytes().to_vec()));
+        self.signal_revocation();
     }
 
     /// 换一把新签名密钥并持久化:所有已签发的 cookie 立刻失效
@@ -199,6 +212,7 @@ impl Auth {
         let old = self.creds();
         *self.creds.write().unwrap() =
             Arc::new(Creds::new(&old.username, &old.password, s.into_bytes()));
+        self.signal_revocation();
         Ok(())
     }
 

@@ -760,7 +760,7 @@ async fn offline_validation_migrates_legacy_database_without_losing_drive_data()
         .unwrap();
     assert_eq!(value, "yes");
     let app_tables: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name='apps' OR name GLOB 'app_*' OR name='reading_tree_revision'",
+        "SELECT COUNT(*) FROM sqlite_master WHERE name IN('apps','app_settings','app_data','app_recovery','app_lifecycle','app_services','app_cleanup_jobs','app_scraper_batches','app_scraper_sources','app_scraper_items','app_scraper_directories','app_scraper_upload_guards','reading_tree_revision') OR name GLOB 'reading_*'",
     )
     .fetch_one(&mut conn)
     .await

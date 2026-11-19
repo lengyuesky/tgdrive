@@ -537,6 +537,7 @@ async fn scrub_snapshot(path: &str) -> AppResult<()> {
         }
     }
     crate::db::inbox::invalidate_restored_inbox(&mut conn).await?;
+    crate::apps::restore::mark_snapshot(&mut conn).await?;
     // 重写文件，确保被删的值不残留在空闲页里。
     sqlx::query("VACUUM").execute(&mut conn).await?;
     conn.close().await?;
@@ -551,6 +552,7 @@ pub(crate) async fn prepare_inbox_snapshot(path: &str) -> AppResult<()> {
     )
     .await?;
     crate::db::inbox::invalidate_restored_inbox(&mut conn).await?;
+    crate::apps::restore::mark_snapshot(&mut conn).await?;
     conn.close().await?;
     Ok(())
 }
