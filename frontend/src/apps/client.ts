@@ -1,16 +1,23 @@
 import { shallowRef } from 'vue'
 import { invalidateSession } from '../session'
-import { ENDPOINTS, ASSET_BASE, type ApiError, type ErrorResponse, type InstalledApp, type InstalledAppsResponse,
+import { ENDPOINTS, APP_CENTER_BASE, ASSET_BASE, type ApiError, type ErrorResponse, type InstalledApp, type InstalledAppsResponse,
   type InstallPreview, type InstallSource, type InstallRequest, type ScopeInfo, type ScopeUpdateRequest,
   type AppStatePatch, type CatalogResponse, type PackageUploadReceipt, type LaunchPageRequest,
   type LaunchPageResponse, type NodeReference, type FileNode, type DataUsage } from './contract'
+
+// 只有宿主自己的前端调用；不向应用 SDK 宣告，也不混入契约注册表完整性检查。
+const INTERNAL_ENDPOINTS = [
+  { name: 'center.nodes.stat', methods: ['POST'], path: `${APP_CENTER_BASE}/nodes/stat` },
+  { name: 'center.app.usage', methods: ['GET'], path: `${APP_CENTER_BASE}/apps/{app_id}/data/usage` },
+] as const
+const definitionOf = (name: string) => ENDPOINTS.find((entry) => entry.name === name) ?? INTERNAL_ENDPOINTS.find((entry) => entry.name === name)
 
 export class AppApiError extends Error {
   constructor(readonly error: ApiError) { super(error.message) }
   get code() { return this.error.code }
 }
 export function endpoint(name: string, parameters: Record<string, string> = {}) {
-  const definition = ENDPOINTS.find((entry) => entry.name === name)
+  const definition = definitionOf(name)
   if (!definition) throw new Error('宿主契约未提供所需接口')
   return definition.path.replace(/\{([^}]+)\}/g, (_, key: string) => {
     const value = parameters[key]
@@ -19,7 +26,7 @@ export function endpoint(name: string, parameters: Record<string, string> = {}) 
   })
 }
 async function owner<T>(name: string, parameters: Record<string, string> = {}, body?: unknown, init: RequestInit = {}, query = ''): Promise<T> {
-  const definition = ENDPOINTS.find((entry) => entry.name === name)
+  const definition = definitionOf(name)
   if (!definition) throw new Error('宿主契约未提供所需接口')
   const headers = new Headers(init.headers)
   if (body !== undefined && !(body instanceof Blob)) headers.set('Content-Type', 'application/json')
@@ -81,7 +88,7 @@ export const center = {
 
 // 宿主仅检查页面生命周期或关闭会话，不经此函数转发页面的数据请求。
 export async function pageLifecycle<T>(token: string, name: 'runtime.info' | 'session.close') {
-  const definition = ENDPOINTS.find((entry) => entry.name === name)!
+  const definition = definitionOf(name)!
   const response = await fetch(endpoint(name), { method: definition.methods[0], credentials: 'omit', redirect: 'error', headers: { Authorization: `Bearer ${token}` } })
   if (!response.ok) { const error = await response.json() as ErrorResponse; throw new AppApiError(error.error) }
   return (response.status === 204 ? undefined : await response.json()) as T

@@ -480,7 +480,7 @@ async fn snapshot_restore_changes_generations_and_expires_old_change_cursor() {
     let db = crate::db::Db::open(path.to_str().unwrap()).await.unwrap();
     let mut host = platform.host.clone();
     host.vfs.db = db;
-    let restored = AppPlatform::new(host);
+    let restored = AppPlatform::with_repository(host, String::new());
     let installed = restored.installed(&app.manifest.id).await.unwrap();
     assert_ne!(installed.generation, app.generation);
     assert_eq!(

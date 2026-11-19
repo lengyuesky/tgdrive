@@ -12,6 +12,8 @@ mod cursor;
 mod error;
 mod events;
 mod http;
+#[cfg(test)]
+mod internal_tests;
 mod kv;
 mod manager;
 mod media;
@@ -50,6 +52,9 @@ pub(crate) struct AppPlatform {
 
 impl AppPlatform {
     pub fn new(host: AppState) -> Self {
+        Self::with_repository(host, crate::config::app_catalog_repository())
+    }
+    fn with_repository(host: AppState, repository: String) -> Self {
         let database = PathBuf::from(&host.rt.env.db_path);
         let parent = database
             .parent()
@@ -60,7 +65,7 @@ impl AppPlatform {
             package_root: root.join("packages"),
             download_root: root.join("downloads"),
             root,
-            repository: crate::config::app_catalog_repository(),
+            repository,
             root_revision: opaque(),
             lifecycle: Mutex::new(()),
             catalog_client: OnceCell::new(),

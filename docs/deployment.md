@@ -19,6 +19,14 @@ Compose 保持单端口映射 `3358:8080`，本机访问 `http://localhost:3358/
 
 旧地址没有别名，已发出的旧分享链接失效；WebDAV 和原生客户端须改用新地址。登录及注销 Cookie 的 Path 均为 `/admin`，不会随浏览器请求发往根地址；旧根路径登录 Cookie 的签名立即失效，需要重新网页登录，不轮换数据库密钥或原生设备会话。分享提取码票据进一步限定在对应的 `/admin/api/share/{token}` 下。
 
+## 应用目录与页面应用
+
+应用中心位于 `/admin/apps`。`TGDRIVE_APP_CATALOG_REPOSITORY` 默认 `lengyuesky/tgdrive-app`，只接受合法的 GitHub `owner/repo`；宿主读取该仓库 `main/catalog.json`，按预览绑定的版本、目标、摘要和长度下载精确 Release 包，不需要 GitHub Token。
+
+显式配置 `TGDRIVE_APP_CATALOG_REPOSITORY=` 可禁用联网目录；未设置变量不是禁用。修改后需重启宿主。目录失败保留上次成功快照，不影响已安装应用；也可以在应用中心上传 `.tgapp` 包，预览并确认安装。
+
+当前阶段支持沙箱页面、目录 ID 授权、只读查询/字节、KV 和可再生缓存。带后端包可校验并安装，但不会启动后端，也不开放写入、根地址或本机读取能力。新装应用默认不授权；目录只读/读写级别必须由主人确认，声明写入不等于已经获得授权。缓存不备份，KV 和安装/授权记录随主数据库备份；恢复会重新生成会话相关 generation 和游标 epoch。
+
 ## 官方端点与自建端点
 
 官方 Bot API 下载单块上限 20MB,分块只能 ≤18MB,而 bot 发消息到同一频道约 20 条/分钟的限流让大文件吞吐约 6MB/s。自建 `telegram-bot-api` 后分块可到 GB 级(默认使用更稳妥的 256MB 分块),local 模式直读磁盘,速度更快。
@@ -76,6 +84,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_SECRET` | | 自动生成并存库 | | cookie 签名密钥,**仅首次启动时作为初始值**,之后以库中值为准 |
 | `TGDRIVE_COOKIE_SECURE` | | `false` | | 通过 HTTPS(含反向代理)访问时设为 `true`,为 Cookie 启用 Secure 并发送 HSTS 响应头;修改需重启 |
 | `TGDRIVE_TRUSTED_PROXIES` | | 空 | | 反向代理的 IP 或 CIDR(逗号分隔)。仅来自这些地址的 `X-Forwarded-For` 会被采信,用于登录与提取码限速;不配置时反代后所有人共用一个限速额度;修改需重启 |
+| `TGDRIVE_APP_CATALOG_REPOSITORY` | | `lengyuesky/tgdrive-app` | | 应用目录 GitHub 仓库；只接受 owner/repo，显式空值禁用联网目录，包上传仍可用 |
 | `TGDRIVE_STATIC_DIR` | | `/app/static`(镜像内) | | 前端静态文件目录 |
 | `RUST_LOG` | | `info` | | 日志级别 |
 

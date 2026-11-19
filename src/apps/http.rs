@@ -18,6 +18,24 @@ use std::sync::atomic::Ordering;
 use tgdrive_contract::{error_code, files::*, http::*, runtime::*, validation::parse_unique_json};
 use tokio::io::AsyncWriteExt;
 
+// 主人专用内部接口不属于应用契约，但复用契约 DTO 与同一套 Cookie/CSRF 防护。
+const INTERNAL_ENDPOINTS: &[EndpointSpec] = &[
+    EndpointSpec {
+        name: "center.nodes.stat",
+        methods: &["POST"],
+        path: "/admin/api/app-center/v1/nodes/stat",
+        access: EndpointAccess::OwnerOnly,
+        capability: None,
+    },
+    EndpointSpec {
+        name: "center.app.usage",
+        methods: &["GET"],
+        path: "/admin/api/app-center/v1/apps/{app_id}/data/usage",
+        access: EndpointAccess::OwnerOnly,
+        capability: None,
+    },
+];
+
 pub(crate) fn router(host: crate::api::AppState) -> Router {
     let platform = Arc::new(AppPlatform::new(host));
     router_platform(platform)
@@ -26,7 +44,7 @@ pub(super) fn router_platform(platform: Arc<AppPlatform>) -> Router {
     super::sse::start(&platform);
     let mut routes = Router::new();
     let mut paths = BTreeSet::new();
-    for endpoint in ENDPOINTS {
+    for endpoint in ENDPOINTS.iter().chain(INTERNAL_ENDPOINTS) {
         if matches!(endpoint.access, EndpointAccess::DeviceKv) || endpoint.name == "local.ticket" {
             continue;
         }
@@ -100,6 +118,7 @@ pub(crate) fn maintenance_response(path: &str, headers: &HeaderMap) -> Response 
 fn specifications(path: &str) -> Vec<&'static EndpointSpec> {
     ENDPOINTS
         .iter()
+        .chain(INTERNAL_ENDPOINTS)
         .filter(|endpoint| endpoint.path.replace("{path}", "{*path}") == path)
         .collect()
 }

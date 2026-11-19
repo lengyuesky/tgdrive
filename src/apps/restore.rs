@@ -90,8 +90,9 @@ pub(crate) async fn apply_pending(pool: &SqlitePool, path: &str) -> anyhow::Resu
 pub(crate) async fn preserve_history(
     connection: &mut SqliteConnection,
     live: &Db,
-) -> anyhow::Result<()> {
-    // 合并签名域后保留当前实例的活动密钥：旧实例/备份游标可验签，但恢复 epoch 阻止复活。
+) -> anyhow::Result<Vec<String>> {
+    // 灾难恢复优先恢复网盘；绑定冲突保留备份事实，仅记录提示，不阻断切库。
+    let mut warnings = std::collections::BTreeSet::new();
     let mut keys = live.app_cursor_keys.as_ref().clone();
     let candidate: String =
         sqlx::query_scalar("SELECT cursor_key FROM app_change_state WHERE id=1")
@@ -116,14 +117,14 @@ pub(crate) async fn preserve_history(
     for (id, version, target, manifest, sha, size) in bindings {
         let existing:Option<(String,String,i64)>=sqlx::query_as("SELECT manifest,sha256,size FROM app_package_bindings WHERE app_id=? AND version=? AND target=?").bind(&id).bind(&version).bind(&target).fetch_optional(&mut *connection).await?;
         if let Some((old, old_sha, old_size)) = existing {
-            anyhow::ensure!(
-                parse_unique_json(old.as_bytes())? == parse_unique_json(manifest.as_bytes())?
-                    && old_sha == sha
-                    && old_size == size,
-                "备份与当前实例的不可变包绑定冲突"
-            );
+            if !same_manifest(&old, &manifest) || old_sha != sha || old_size != size {
+                warnings.insert(format!(
+                    "恢复保留备份应用包绑定：{id} {version} {target}（当前实例记录不同）"
+                ));
+            }
+            continue;
         }
-        sqlx::query("INSERT INTO app_package_bindings(app_id,version,target,manifest,sha256,size) VALUES(?,?,?,?,?,?) ON CONFLICT(app_id,version,target) DO NOTHING").bind(id).bind(version).bind(target).bind(manifest).bind(sha).bind(size).execute(&mut *connection).await?;
+        sqlx::query("INSERT INTO app_package_bindings(app_id,version,target,manifest,sha256,size) VALUES(?,?,?,?,?,?)").bind(id).bind(version).bind(target).bind(manifest).bind(sha).bind(size).execute(&mut *connection).await?;
     }
     let history: Vec<(String, String, String, String, String)> = sqlx::query_as(
         "SELECT repository,app_id,version,manifest,packages FROM app_release_history",
@@ -132,31 +133,59 @@ pub(crate) async fn preserve_history(
     .await?;
     for (repository, id, version, manifest, packages) in history {
         let existing:Option<(String,String)>=sqlx::query_as("SELECT manifest,packages FROM app_release_history WHERE repository=? AND app_id=? AND version=?").bind(&repository).bind(&id).bind(&version).fetch_optional(&mut *connection).await?;
-        let mut packages: std::collections::BTreeMap<
-            String,
-            tgdrive_contract::manifest::PackageArtifact,
-        > = serde_json::from_value(parse_unique_json(packages.as_bytes())?)?;
-        if let Some((old, old_packages)) = existing {
-            anyhow::ensure!(
-                parse_unique_json(old.as_bytes())? == parse_unique_json(manifest.as_bytes())?,
-                "备份与当前实例的不可变清单冲突"
-            );
-            let old_packages: std::collections::BTreeMap<
-                String,
-                tgdrive_contract::manifest::PackageArtifact,
-            > = serde_json::from_value(parse_unique_json(old_packages.as_bytes())?)?;
-            for (target, artifact) in old_packages {
-                if let Some(current) = packages.get(&target) {
-                    anyhow::ensure!(current == &artifact, "备份与当前实例的不可变架构包冲突");
-                } else {
-                    packages.insert(target, artifact);
-                }
+        let (kept_manifest, kept_packages) = if let Some((old, old_packages)) = existing {
+            if !same_manifest(&old, &manifest) {
+                warnings.insert(format!(
+                    "恢复保留备份应用清单：{id} {version}（当前实例记录不同）"
+                ));
             }
-        }
-        sqlx::query("INSERT INTO app_release_history(repository,app_id,version,manifest,packages) VALUES(?,?,?,?,?) ON CONFLICT(repository,app_id,version) DO UPDATE SET packages=excluded.packages").bind(repository).bind(id).bind(version).bind(manifest).bind(serde_json::to_string(&packages)?).execute(&mut *connection).await?;
+            let saved = serde_json::from_str::<
+                std::collections::BTreeMap<String, tgdrive_contract::manifest::PackageArtifact>,
+            >(&old_packages);
+            let current = serde_json::from_str::<
+                std::collections::BTreeMap<String, tgdrive_contract::manifest::PackageArtifact>,
+            >(&packages);
+            let merged = match (saved, current) {
+                (Ok(mut saved), Ok(current)) => {
+                    for (target, artifact) in current {
+                        if let Some(previous) = saved.get(&target) {
+                            if previous != &artifact {
+                                warnings.insert(format!("恢复保留备份发布绑定：{id} {version} {target}（当前实例记录不同）"));
+                            }
+                        } else {
+                            saved.insert(target, artifact);
+                        }
+                    }
+                    serde_json::to_string(&saved)?
+                }
+                _ => {
+                    warnings.insert(format!(
+                        "恢复保留备份发布历史：{id} {version}（无法合并当前实例记录）"
+                    ));
+                    old_packages
+                }
+            };
+            (old, merged)
+        } else {
+            (manifest, packages)
+        };
+        sqlx::query("INSERT INTO app_release_history(repository,app_id,version,manifest,packages) VALUES(?,?,?,?,?) ON CONFLICT(repository,app_id,version) DO UPDATE SET packages=excluded.packages").bind(repository).bind(id).bind(version).bind(kept_manifest).bind(kept_packages).execute(&mut *connection).await?;
+    }
+    for message in &warnings {
+        sqlx::query("INSERT INTO backend_logs(level,category,message,created_at) VALUES('warn','应用平台',?,?)").bind(message).bind(crate::db::now_ts()).execute(&mut *connection).await?;
+        tracing::warn!("{message}");
     }
     mark_snapshot(connection).await?;
-    Ok(())
+    Ok(warnings.into_iter().collect())
+}
+fn same_manifest(left: &str, right: &str) -> bool {
+    match (
+        parse_unique_json(left.as_bytes()),
+        parse_unique_json(right.as_bytes()),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 pub(crate) async fn prune_changes(db: &Db) -> PlatformResult<()> {

@@ -248,9 +248,10 @@ impl RestoreManager {
         if inner.journal.digest.as_deref() != Some(&digest) {
             return Err(bad("候选摘要不一致，请重新准备"));
         }
-        storage::preserve_settings(&candidate, state).await?;
+        let warnings = storage::preserve_settings(&candidate, state).await?;
         let digest = storage::digest(&candidate).await?;
         let mut journal = inner.journal.clone();
+        journal.status.warnings.extend(warnings);
         journal.digest = Some(digest);
         journal.stage = "pending".into();
         journal.status.phase = "restarting".into();

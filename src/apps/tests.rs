@@ -145,7 +145,11 @@ pub(crate) async fn fixture() -> (tempfile::TempDir, Arc<AppPlatform>, Arc<Synth
         restore: crate::restore::RestoreManager::new(&env.db_path).unwrap(),
         events: crate::events::bus(),
     };
-    (dir, Arc::new(AppPlatform::new(host)), fake)
+    (
+        dir,
+        Arc::new(AppPlatform::with_repository(host, String::new())),
+        fake,
+    )
 }
 pub(crate) async fn install_page(platform: &AppPlatform) -> InstalledApp {
     let upload = tempfile::tempdir().unwrap();

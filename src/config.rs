@@ -81,9 +81,19 @@ pub fn static_dir() -> Option<String> {
     env_opt("TGDRIVE_STATIC_DIR")
 }
 
-/// 应用目录的公共 GitHub owner/repo；未配置时关闭联网目录，仍可上传包安装。
+/// 应用目录默认沿用公共仓库；显式空值关闭联网目录，不能用过滤空值的 env_opt。
 pub fn app_catalog_repository() -> String {
-    env_opt("APP_CATALOG_REPOSITORY").unwrap_or_default()
+    parse_app_catalog_repository(
+        std::env::var("TGDRIVE_APP_CATALOG_REPOSITORY")
+            .ok()
+            .as_deref(),
+    )
+}
+fn parse_app_catalog_repository(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .unwrap_or("lengyuesky/tgdrive-app")
+        .to_owned()
 }
 
 /// 监听地址原文；健康检查子命令不加载完整配置，只需要端口。
@@ -291,6 +301,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_repository_distinguishes_unset_empty_and_explicit_source() {
+        assert_eq!(parse_app_catalog_repository(None), "lengyuesky/tgdrive-app");
+        assert_eq!(parse_app_catalog_repository(Some("")), "");
+        assert_eq!(parse_app_catalog_repository(Some("  ")), "");
+        assert_eq!(
+            parse_app_catalog_repository(Some(" example/apps ")),
+            "example/apps"
+        );
+    }
 
     #[test]
     fn test_parse_size() {

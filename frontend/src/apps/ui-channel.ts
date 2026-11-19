@@ -11,7 +11,7 @@ export interface UiHandlers {
   leave(): Promise<void>
 }
 const bytes = (text: string) => new TextEncoder().encode(text).length
-const plain = (value: unknown, maximum: number): value is string => typeof value === 'string' && !!value.trim() && bytes(value) <= maximum && !/[\u0000-\u001f\u007f]/.test(value)
+const plain = (value: unknown, maximum: number): value is string => typeof value === 'string' && !!value.trim() && bytes(value) <= maximum && !/\p{Cc}/u.test(value)
 const opaque = (value: unknown, maximum: number = LIMITS.MAX_OPAQUE_ID_BYTES): value is string => typeof value === 'string' && new RegExp(`^[A-Za-z0-9_-]{1,${maximum}}$`).test(value)
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
 function failure(code: keyof typeof ERROR_CODES, message: string, id: string): ApiError { return { code, message, request_id: id } }

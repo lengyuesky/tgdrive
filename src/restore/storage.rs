@@ -259,7 +259,10 @@ async fn checkpoint(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) async fn preserve_settings(candidate: &Path, state: &AppState) -> anyhow::Result<()> {
+pub(super) async fn preserve_settings(
+    candidate: &Path,
+    state: &AppState,
+) -> anyhow::Result<Vec<String>> {
     let cfg = state.rt.current();
     let security_keys = [
         crate::auth::TOTP_SECRET_KEY,
@@ -304,7 +307,7 @@ pub(super) async fn preserve_settings(candidate: &Path, state: &AppState) -> any
         sqlx::query("DELETE FROM upload_receipts").execute(&mut *tx).await?;
         // 恢复到旧请求状态不能重放可能已经发生的 Telegram 转存。
         crate::db::inbox::invalidate_restored_inbox(&mut tx).await?;
-        crate::apps::restore::preserve_history(&mut tx, &state.vfs.db).await?;
+        let warnings=crate::apps::restore::preserve_history(&mut tx, &state.vfs.db).await?;
         sqlx::query("DELETE FROM device_refresh_tokens").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM device_sessions").execute(&mut *tx).await?;
         sqlx::query("UPDATE client_identity SET server_id = lower(hex(randomblob(16))) WHERE id = 1").execute(&mut *tx).await?;
@@ -314,12 +317,13 @@ pub(super) async fn preserve_settings(candidate: &Path, state: &AppState) -> any
         }
         tx.commit().await?;
         checkpoint(&mut conn).await?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<Vec<String>, anyhow::Error>(warnings)
     }.await;
     conn.close().await?;
-    result?;
+    let warnings = result?;
     File::open(candidate)?.sync_all()?;
-    sync_dir(candidate.parent().unwrap())
+    sync_dir(candidate.parent().unwrap())?;
+    Ok(warnings)
 }
 
 /// 持锁且没有任何 Db/worker 时调用。任意切换中断都回滚，不重复应用候选。
