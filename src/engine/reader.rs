@@ -5,7 +5,7 @@
 
 use crate::db::Chunk;
 use crate::error::AppResult;
-use crate::telegram::{ByteReader, TgRegistry};
+use crate::telegram::{ByteReader, ReadBudget, TgRegistry};
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use std::io;
@@ -41,6 +41,8 @@ pub struct ChunkedReader {
     read_end: u64,
     pos: u64,
     state: State,
+    strict_ranges: bool,
+    read_budget: Option<Arc<ReadBudget>>,
 }
 
 impl ChunkedReader {
@@ -64,6 +66,8 @@ impl ChunkedReader {
             read_end: off,
             pos: start_pos.min(off),
             state: State::Idle,
+            strict_ranges: false,
+            read_budget: None,
         }
     }
 
@@ -74,6 +78,14 @@ impl ChunkedReader {
     /// 将本次读取限制到指定长度，并把 Range 终点传递给底层预取器。
     pub fn with_read_limit(mut self, length: u64) -> Self {
         self.read_end = self.pos.saturating_add(length).min(self.total);
+        self.state = State::Idle;
+        self
+    }
+
+    /// 应用读取只能走恢复的严格入口；普通网盘下载仍保留既有回退行为。
+    pub(crate) fn with_strict_ranges(mut self, budget: Option<Arc<ReadBudget>>) -> Self {
+        self.strict_ranges = true;
+        self.read_budget = budget;
         self.state = State::Idle;
         self
     }
@@ -105,6 +117,8 @@ impl AsyncRead for ChunkedReader {
                     let message_id = chunk.message_id;
                     let chunk_size = chunk.size;
                     let target_id = chunk.storage_target_id;
+                    let strict = self.strict_ranges;
+                    let budget = self.read_budget.clone();
                     let fut = async move {
                         let target_id = target_id.ok_or_else(|| {
                             crate::error::AppError::BadRequest(
@@ -112,10 +126,19 @@ impl AsyncRead for ChunkedReader {
                             )
                         })?;
                         let binding = tg.binding(target_id)?;
-                        binding
-                            .api
-                            .open_chunk_range(&fid, message_id, chunk_size, in_off, remain)
-                            .await
+                        if strict {
+                            binding
+                                .api
+                                .open_chunk_strict_range(
+                                    &fid, message_id, chunk_size, in_off, remain, budget,
+                                )
+                                .await
+                        } else {
+                            binding
+                                .api
+                                .open_chunk_range(&fid, message_id, chunk_size, in_off, remain)
+                                .await
+                        }
                     }
                     .boxed();
                     self.state = State::Opening { fut, remain };

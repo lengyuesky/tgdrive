@@ -12,7 +12,7 @@ use crate::config::{
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::proxy::{DcTunnel, ProxyClient, ProxyConfig};
-use crate::telegram::ByteReader;
+use crate::telegram::{ByteReader, ReadBudget};
 use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::Semaphore;
 
 /// 当前 grammers 下载接口支持的最大分段；Telegram 协议本身可支持更大的请求。
-const REQUEST_SIZE: i32 = 512 * 1024;
+pub(crate) const REQUEST_SIZE: i32 = 512 * 1024;
 const SESSION_VERSION: u8 = 1;
 
 const WEB_LOCATION_FLAG: i32 = 1 << 24;
@@ -200,6 +200,33 @@ impl MtprotoClient {
         offset: u64,
         length: u64,
     ) -> AppResult<Option<ByteReader>> {
+        self.open_stream_policy(file_id, message_id, size, offset, length, None)
+            .await
+    }
+
+    pub(crate) async fn open_probe_stream(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        size: u64,
+        offset: u64,
+        length: u64,
+        budget: Arc<ReadBudget>,
+    ) -> AppResult<Option<ByteReader>> {
+        self.open_stream_policy(file_id, message_id, size, offset, length, Some(budget))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_stream_policy(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        size: u64,
+        offset: u64,
+        length: u64,
+        budget: Option<Arc<ReadBudget>>,
+    ) -> AppResult<Option<ByteReader>> {
         if offset > size {
             return Err(AppError::Telegram(format!(
                 "分块偏移 {offset} 超过分块大小 {size}"
@@ -215,11 +242,12 @@ impl MtprotoClient {
         let state = self.state().await?;
         let location = Arc::new(location);
         let storage_target_id = self.storage_target_id;
-        let reader = open_parallel_stream(
+        let reader = open_parallel_stream_policy(
             offset.saturating_add(length).min(size),
             offset,
             self.config.download_concurrency(),
             self.request_slots.clone(),
+            budget,
             move |part_offset| {
                 let state = state.clone();
                 let location = location.clone();
@@ -255,11 +283,27 @@ impl MtprotoClient {
 
 /// 按需填充固定大小的请求窗口，乱序完成的数据仍按文件偏移输出。
 /// 没有独立预取任务：暂停读取不再补充请求，丢弃 reader 同时丢弃全部待取分段。
+#[cfg(test)]
 async fn open_parallel_stream<F, Fut>(
     end: u64,
     offset: u64,
     concurrency: usize,
     request_slots: Arc<Semaphore>,
+    fetch: F,
+) -> AppResult<ByteReader>
+where
+    F: Fn(u64) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = AppResult<Vec<u8>>> + Send + 'static,
+{
+    open_parallel_stream_policy(end, offset, concurrency, request_slots, None, fetch).await
+}
+
+async fn open_parallel_stream_policy<F, Fut>(
+    end: u64,
+    offset: u64,
+    concurrency: usize,
+    request_slots: Arc<Semaphore>,
+    budget: Option<Arc<ReadBudget>>,
     fetch: F,
 ) -> AppResult<ByteReader>
 where
@@ -276,16 +320,20 @@ where
     let first_part = offset / part_size;
     let part_count = end.div_ceil(part_size);
     let fetch = Arc::new(fetch);
+    // 有预算的严格读取不并行预取，每个上游请求先预留整个对齐分段。
+    let concurrency = if budget.is_some() { 1 } else { concurrency };
     let mut parts = stream::iter(first_part..part_count)
         .map(move |index| {
             let fetch = fetch.clone();
             let request_slots = request_slots.clone();
+            let budget = budget.clone();
             async move {
                 let _permit = request_slots.acquire_owned().await.map_err(|_| {
                     AppError::Telegram("下载并发控制已关闭".into())
                 })?;
                 let part_offset = index * part_size;
                 let expected = (end - part_offset).min(part_size) as usize;
+                if let Some(budget) = budget { budget.reserve(part_size)?; }
                 let bytes = fetch(part_offset).await?;
                 if bytes.len() < expected {
                     return Err(AppError::Io(std::io::Error::new(

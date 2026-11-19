@@ -36,6 +36,32 @@ const MEDIA_SEND_INTERVAL_STEP: Duration = Duration::from_millis(100);
 /// Telegram 自定义媒体缩略图必须小于该值。
 pub const MAX_THUMBNAIL_SIZE: usize = 200 * 1024;
 
+/// 严格读取的共享上游预算；请求发出前预留对齐及预取的实际开销。
+pub struct ReadBudget {
+    limit: u64,
+    remaining: AtomicU64,
+}
+impl ReadBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            remaining: AtomicU64::new(limit),
+        }
+    }
+    pub(crate) fn reserve(&self, bytes: u64) -> AppResult<()> {
+        #[allow(deprecated)]
+        self.remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(bytes)
+            })
+            .map_err(|_| AppError::BadRequest("严格读取超过累计上游字节预算".into()))?;
+        Ok(())
+    }
+    pub(crate) fn used(&self) -> u64 {
+        self.limit - self.remaining.load(Ordering::Acquire)
+    }
+}
+
 /// reqwest 错误通常携带完整请求 URL，而 Telegram URL 中含 Bot Token。
 /// 对外只保留故障类别，绝不格式化原始错误对象。
 pub fn reqwest_error_summary(error: &reqwest::Error) -> &'static str {
@@ -253,6 +279,21 @@ pub trait TgApi: Send + Sync + 'static {
             .open_chunk_stream(file_id, message_id, chunk_size, offset)
             .await?;
         Ok(Box::pin(reader.take(length)))
+    }
+
+    /// 严格范围入口独立于普通下载；没有真实实现时拒绝，不调用整块回退。
+    async fn open_chunk_strict_range(
+        &self,
+        _file_id: &str,
+        _message_id: i64,
+        _chunk_size: u64,
+        _offset: u64,
+        _length: u64,
+        _budget: Option<Arc<ReadBudget>>,
+    ) -> AppResult<ByteReader> {
+        Err(AppError::BadRequest(
+            "当前存储后端不支持严格分段读取".into(),
+        ))
     }
 
     /// 打开 Telegram 小缩略图。默认实现便于测试客户端复用普通读取逻辑；
@@ -1549,6 +1590,51 @@ impl TgApi for TgClient {
         );
         let reader = self.open_http_stream(&file_path, offset).await?;
         Ok(Box::pin(reader.take(length)))
+    }
+
+    async fn open_chunk_strict_range(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        chunk_size: u64,
+        offset: u64,
+        length: u64,
+        budget: Option<Arc<ReadBudget>>,
+    ) -> AppResult<ByteReader> {
+        if offset > chunk_size {
+            return Err(AppError::BadRequest("严格读取偏移超过分块大小".into()));
+        }
+        let length = length.min(chunk_size - offset);
+        if length == 0 {
+            return Ok(Box::pin(std::io::Cursor::new(Vec::<u8>::new())));
+        }
+        let cached_path = self.path_cache.lock().unwrap().get(file_id);
+        if let Some(path) = cached_path.filter(|path| path.starts_with('/'))
+            && let Some(reader) = self.open_known_path(&path, offset).await?
+        {
+            if let Some(budget) = budget {
+                budget.reserve(length)?;
+            }
+            return Ok(Box::pin(reader.take(length)));
+        }
+        if let Some(mtproto) = &self.mtproto {
+            let reader = if let Some(budget) = budget {
+                mtproto
+                    .open_probe_stream(file_id, message_id, chunk_size, offset, length, budget)
+                    .await?
+            } else {
+                mtproto
+                    .open_stream(file_id, message_id, chunk_size, offset, length)
+                    .await?
+            };
+            if let Some(reader) = reader {
+                return Ok(reader);
+            }
+        }
+        // 不调用 getFile 或 HTTP 前缀回退；已有 Telegram 内容缓存不等于本地网盘后端。
+        Err(AppError::BadRequest(
+            "当前文件无法严格分段读取；需要 MTProto 或已存在的 Telegram 内容缓存".into(),
+        ))
     }
 
     async fn open_thumbnail_stream(
