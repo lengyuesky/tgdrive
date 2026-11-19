@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0009
 ---
 
 # 安装式服务插件使用宿主提供的受限后台能力

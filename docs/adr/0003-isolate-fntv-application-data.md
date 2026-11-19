@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0010
 ---
 
 # 飞牛插件与原影视页面应用隔离业务数据
