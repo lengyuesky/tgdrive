@@ -4,6 +4,32 @@
 
 后续 `media-scraper 0.1.1` 按用户修订将交互简化为“选择目录 → 开始刮削”，整目录自动处理、不确定项跳过、关闭页面停止。本文保留 0.1.0 的实现验收历史；当前交互以[设计记录中的简化决策](media-scraper-design.md#2026-11-14-简化交互后的当前决策)为准，新版验证记录位于插件仓库 `docs/media-scraper-simple-validation.md`。
 
+## 2026-11-19 展示标题前置番号
+
+新刮削及主动重刮生成的 NFO 将 `title` 写为“番号 片名”，例如 `ABC-123 星海远航`；`originaltitle` 完整保存后端原始标题。开头已有本片番号时先去重，兼容大小写、既有同番号格式比较和常见外围括号；完整的其他番号及片名正文保留。去重后没有片名时直接显示番号。身份字段继续保留后端值，目录和视频文件命名沿用既有规则。
+
+修改位于宿主 `src/apps/scraper/backend.rs` 的 NFO 生成逻辑。初轮补丁阶段，插件仓只同步使用说明及实际 Cinema／飞牛链路的标题断言，应用脚本和接口无需变更。当时五个临时构建包与根目录现有发布包逐字节一致，未改动插件版本、清单或分发资产。旧数据由用户主动重新刮削更新，未增加 NFO 迁移或消费端补前缀；重刮需开启覆盖已有资料及 NFO 更新。
+
+用户随后授权提交、推送及修订版本标签。发布版本为宿主 `0.3.13`、影视刮削 `0.1.5`（最低宿主 `0.3.13`），插件仓库标签为 `v1.0.1`。以下表格保留初轮补丁阶段的实际验证；发布阶段的已提交宿主、完整本机集成及最终插件包摘要另记录在插件仓库 `docs/media-scraper-0.1.5-validation.md`。
+
+宿主基线为 `de57959d8b3c09fdae97eb5ebbd1e868768aa564`，插件基线为 `a4a970a4a228a20d2dc163d7096dda937d63d91a`，以下验证在这两个基线上的未提交补丁中完成。宿主验证使用仅应用本次补丁的隔离工作区，排除原目录未跟踪的搜索迁移及源码；原文件保留。编译依赖复用原仓库的 `target` 缓存，源码和迁移来自隔离工作区。交付前逐字节核对两份修改后的 Rust 源码一致。
+
+| 实际命令或核验 | 本轮结果 |
+|---|---|
+| `cargo test --locked apps::scraper::backend::tests` | 退出 0，4 项通过；新 NFO 回归覆盖 27 组来源标题、原名保留及番号身份 |
+| `cargo test --locked --quiet` | 退出 0，448 项通过，6 项显式输入的集成夹具按原配置忽略 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 退出 0，全目标零警告 |
+| `cargo fmt --all --check` | 退出 0 |
+| 宿主前端 `npm ci`、`npm run build` | Node.js 22.22.0，均退出 0，提供本轮浏览器夹具前端 |
+| 插件 `npm ci`、`npm run check`、`npm test` | 经 `fnm exec --using 22.22.0` 执行，均退出 0；类型检查和五包构建通过，67 个测试文件、719 项通过 |
+| 插件 `npm run catalog verify ./catalog.json`、`sha256sum -c SHA256SUMS` | 均退出 0，五包、清单及摘要通过 |
+| `npm run test:e2e -- tests/browser/media-scraper.spec.ts --grep '选择目录后一次开始完成全部视频'` | Node.js 22.22.0，退出 0，1 项通过；实际插件完成三条合成视频刮削，Cinema 卡片／详情／播放标题和飞牛影片接口均为 `ABC-123 星海远航` |
+| 两仓 `git diff --check` | 均退出 0 |
+
+插件构建使用本轮新空 `TGDRIVE_APP_BUILD_OUTPUT`。浏览器验证显式指定隔离宿主、新构建包目录、独立输出目录和本机 Chromium，关闭已有夹具复用及公共 MetaTube 验收开关；仅使用临时数据库、本机模拟后端和合成网盘。既有 Rust 回归同时确认主动覆盖大写 `.NFO` 后获得新标题、原名仍保留。
+
+已核对手机截图中的标题完整显示：[Cinema 番号标题截图](images/media-scraper/cinema-title-number-20261119.png)。初轮补丁验证未运行其余浏览器场景、公共后端、真实 Telegram 或官方飞牛客户端界面，未生成发布标签或部署服务。
+
 ## 实现与代码基线
 
 宿主独立 worktree 基于完整提交 `3ad8b3f6b86dd23c49569b2bc2ad41a8cb882ff9`（源码版本 0.3.9），base tree 为 `2e1ee725297f69f5577f85ef28f87db3b145c684`。插件独立 worktree 基于 `9ae5727fd4d76a5acc8f3d4b0e9b99d8efdf5434`。这些 SHA 标识开发基线；本次提交后的宿主完整 SHA 与集成结果记录在插件仓库的 `compatibility.json` 和 `docs/media-scraper-validation.md`。原宿主目录的其他改动保留。

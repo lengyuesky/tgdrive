@@ -277,6 +277,14 @@ async fn manual_batch_moves_whole_group_and_writes_complete_sidecars() {
     );
     let nfo = String::from_utf8(contents(&state, "/刮削测试/ABC-123/ABC-123.nfo").await).unwrap();
     assert_eq!(
+        crate::apps::nfo::text(&nfo, "title").as_deref(),
+        Some("ABC-123 星海远航")
+    );
+    assert_eq!(
+        crate::apps::nfo::text(&nfo, "originaltitle").as_deref(),
+        Some("星海远航")
+    );
+    assert_eq!(
         crate::apps::nfo::text(&nfo, "plot").unwrap(),
         "完整长简介。".repeat(5000)
     );
@@ -334,7 +342,7 @@ async fn manual_batch_moves_whole_group_and_writes_complete_sidecars() {
     assert_eq!(rows.len(), 2);
     for row in rows {
         let item: Value = serde_json::from_str(&row).unwrap();
-        assert_eq!(item["title"], "星海远航");
+        assert_eq!(item["title"], "ABC-123 星海远航");
         assert_eq!(item["year"], "2025");
         assert_eq!(item["overview"], "完整长简介。".repeat(5000));
     }
@@ -554,6 +562,10 @@ async fn rescraping_replaces_the_reviewed_uppercase_nfo_at_its_actual_name() {
     let xml = String::from_utf8(contents(&state, "/刮削测试/ABC-123/ABC-123.NFO").await).unwrap();
     assert_eq!(
         crate::apps::nfo::text(&xml, "title").as_deref(),
+        Some("ABC-123 星海远航")
+    );
+    assert_eq!(
+        crate::apps::nfo::text(&xml, "originaltitle").as_deref(),
         Some("星海远航")
     );
     assert!(

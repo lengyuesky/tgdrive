@@ -413,7 +413,47 @@ fn escaped(value: &str) -> AppResult<String> {
         .replace('\'', "&apos;"))
 }
 
+fn strip_number_prefix<'a>(title: &'a str, number: &str) -> Option<&'a str> {
+    let first = title.chars().next()?;
+    let closing = match first {
+        '[' => Some(']'),
+        '(' => Some(')'),
+        '{' => Some('}'),
+        '【' => Some('】'),
+        '（' => Some('）'),
+        '「' => Some('」'),
+        '『' => Some('』'),
+        _ => None,
+    };
+    let (prefix, rest) = if let Some(closing) = closing {
+        let inner = &title[first.len_utf8()..];
+        let end = inner.find(closing)?;
+        (&inner[..end], &inner[end + closing.len_utf8()..])
+    } else {
+        let end = title
+            .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
+            .unwrap_or(title.len());
+        (&title[..end], &title[end..])
+    };
+    // 只移除完整的同番号前缀，保留其他番号和片名正文。
+    let prefix = valid_number(prefix).ok()?;
+    (normalized_number(&prefix) == normalized_number(number)).then_some(rest)
+}
+
 impl Movie {
+    fn display_title(&self) -> AppResult<String> {
+        let number = valid_number(&self.number)?;
+        let mut title = self.title.trim();
+        while let Some(rest) = strip_number_prefix(title, &number) {
+            title = rest.trim_start();
+        }
+        Ok(if title.is_empty() {
+            number
+        } else {
+            format!("{number} {title}")
+        })
+    }
+
     pub fn nfo(&self) -> AppResult<Vec<u8>> {
         self.nfo_with_actors(
             &self
@@ -442,6 +482,7 @@ impl Movie {
     }
 
     pub fn nfo_with_actors(&self, actors: &[crate::apps::nfo::Actor]) -> AppResult<Vec<u8>> {
+        let title = self.display_title()?;
         let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<movie>\n");
         let mut tag = |key: &str, value: &str| -> AppResult<()> {
             if !value.is_empty() {
@@ -450,7 +491,7 @@ impl Movie {
             Ok(())
         };
         tag("num", &self.number)?;
-        tag("title", &self.title)?;
+        tag("title", &title)?;
         tag("originaltitle", &self.title)?;
         for (key, value) in [
             ("plot", &self.summary),
@@ -571,6 +612,10 @@ mod tests {
         let xml = String::from_utf8(movie.nfo().unwrap()).unwrap();
         assert_eq!(
             crate::apps::nfo::text(&xml, "title").as_deref(),
+            Some("ABC-123 甲 & 乙")
+        );
+        assert_eq!(
+            crate::apps::nfo::text(&xml, "originaltitle").as_deref(),
             Some("甲 & 乙")
         );
         assert_eq!(crate::apps::nfo::text(&xml, "plot"), movie.summary);
@@ -582,6 +627,80 @@ mod tests {
         assert_eq!(actors[0].order, Some(0));
         assert!(xml.contains("<set><name>电影系列</name></set>"));
     }
+
+    #[test]
+    fn nfo_titles_prefix_the_number_once_and_preserve_the_original_title() {
+        for (number, original, expected) in [
+            ("ABC-123", "影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "  影片名称  ", "ABC-123 影片名称"),
+            ("ABC-123", "ABC-123 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "abc-123 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "abc123 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "ABC_123 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "[abc-123] 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "[ ABC-123 ]影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "(ABC-123)影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "{abc-123} 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "【abc-123】 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "（ABC-123） 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "「abc-123」 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "『ABC-123』 影片名称", "ABC-123 影片名称"),
+            ("ABC-123", "ABC-123影片名称", "ABC-123 影片名称"),
+            (
+                "ABC-123",
+                "ABC-123 [abc-123] ABC_123 影片名称",
+                "ABC-123 影片名称",
+            ),
+            ("ABC-123", "ABC-123", "ABC-123"),
+            ("ABC-123", "[abc-123]", "ABC-123"),
+            ("ABC-123", "[abc-123] ABC-123", "ABC-123"),
+            (
+                "ABC-123",
+                "讲述 ABC-123 的影片",
+                "ABC-123 讲述 ABC-123 的影片",
+            ),
+            ("ABC-123", "DEF-456 影片名称", "ABC-123 DEF-456 影片名称"),
+            ("ABC-123", "ABC-1234 影片名称", "ABC-123 ABC-1234 影片名称"),
+            (
+                "ABC-123",
+                "ABC-123-CD1 影片名称",
+                "ABC-123 ABC-123-CD1 影片名称",
+            ),
+            (
+                "ABC-123",
+                "[ABC-123 影片名称] 后续",
+                "ABC-123 [ABC-123 影片名称] 后续",
+            ),
+            ("abc_123", "[ABC-123] 影片名称", "ABC_123 影片名称"),
+            (
+                "FC2-PPV-1234567",
+                "[fc2_ppv_1234567] 影片名称",
+                "FC2-PPV-1234567 影片名称",
+            ),
+            ("123456-001", "123456-001 影片名称", "123456-001 影片名称"),
+        ] {
+            let movie = Movie {
+                number: number.into(),
+                title: original.into(),
+                ..Default::default()
+            };
+            let xml = String::from_utf8(movie.nfo().unwrap()).unwrap();
+            assert_eq!(
+                crate::apps::nfo::text(&xml, "title").as_deref(),
+                Some(expected),
+                "来源标题：{original}"
+            );
+            let document = crate::apps::nfo::document(&xml).unwrap();
+            let raw_title = document
+                .root_element()
+                .children()
+                .find(|node| node.has_tag_name("originaltitle"))
+                .and_then(|node| node.text());
+            assert_eq!(raw_title, Some(original), "来源标题：{original}");
+            assert_eq!(crate::apps::nfo::number(&xml).as_deref(), Some(number));
+        }
+    }
+
     #[test]
     fn poster_is_exact_ratio_and_bounded_jpeg() {
         let image = image::RgbImage::from_pixel(358, 538, image::Rgb([20, 130, 210]));
