@@ -1,6 +1,6 @@
 # 性能指标与诊断
 
-`GET /api/metrics` 仍要求登录或 Basic Auth，不新增公开监控入口。原有指标保留兼容。新增计数全部为进程内状态，重启归零，不持久化文件、用户、票据或 Bot 标识。
+`GET /admin/api/metrics` 仍要求登录或 Basic Auth，不新增公开监控入口。原有指标保留兼容。新增计数全部为进程内状态，重启归零，不持久化文件、用户、票据或 Bot 标识。
 
 ## HTTP 与正文
 
@@ -12,7 +12,7 @@
 | `tgdrive_http_body_bytes_total` | counter | 正文交给 HTTP 层的累计字节，每帧更新 |
 | `tgdrive_http_body_finished_total` | counter | `outcome=complete/error/cancelled` 的正文结束次数 |
 
-路由标签只使用注册模板（例如 `/api/apps/media/{ticket}`），不使用实际请求路径或查询参数。最多 128 个模板桶，包含 `other` 溢出桶；未匹配请求统一使用 `unmatched`。模板值按 Prometheus 标签规则转义。
+路由标签只使用注册模板（例如 `/admin/api/media/{ticket}`），不使用实际请求路径或查询参数。最多 128 个模板桶，包含 `other` 溢出桶；未匹配请求统一使用 `unmatched`。模板值按 Prometheus 标签规则转义。
 
 正文监测透传原始帧、trailers、长度提示及取消，不缓存或预读内容。`cancelled` 只表示正文没被读完就释放，可能是切片/切书、用户取消、连接断开或上层丢弃，不一定是故障。传给 HTTP 层不等于客户端已收到，也不等于物理网卡传输量。SSE 长连接直到关闭才记录正文耗时，不能和普通接口混合判断卡顿。
 

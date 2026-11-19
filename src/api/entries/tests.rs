@@ -89,12 +89,7 @@ pub(crate) async fn fixture() -> (Router, AppState, tempfile::TempDir) {
         migration: crate::migration::StorageMigrationManager::new(db, tg),
         events: crate::events::bus(),
     };
-    let app = Router::new()
-        .nest("/api", crate::api::router(state.clone()))
-        .route(
-            "/dav/{*path}",
-            axum::routing::any(crate::dav::dav_handler).with_state(state.clone()),
-        );
+    let app = crate::http_router(state.clone(), None);
     (app, state, dir)
 }
 
@@ -130,7 +125,7 @@ async fn entries_api_auth_pagination_normalization_and_old_list_compatibility() 
             .unwrap();
     }
     let path = "/%E7%9B%AE%E5%BD%95";
-    let uri = format!("/api/fs/entries?path={path}//./");
+    let uri = format!("/admin/api/fs/entries?path={path}//./");
     assert_eq!(request(&app, &uri, false).await.0, StatusCode::UNAUTHORIZED);
     let (status, first) = request(&app, &uri, true).await;
     assert_eq!(status, StatusCode::OK);
@@ -148,7 +143,7 @@ async fn entries_api_auth_pagination_normalization_and_old_list_compatibility() 
     assert!(entry["sha256"].is_null());
     assert_eq!(entry["has_thumbnail"], false);
     let cursor = first["next_cursor"].as_str().unwrap();
-    let next_uri = format!("/api/fs/entries?path={path}&cursor={cursor}");
+    let next_uri = format!("/admin/api/fs/entries?path={path}&cursor={cursor}");
     assert_eq!(
         request(&app, &next_uri, false).await.0,
         StatusCode::UNAUTHORIZED
@@ -160,7 +155,7 @@ async fn entries_api_auth_pagination_normalization_and_old_list_compatibility() 
     assert_eq!(next["has_more"], false);
     assert!(next["next_cursor"].is_null());
     assert_ne!(next["entries"][0]["id"], first["entries"][199]["id"]);
-    let (status, old) = request(&app, &format!("/api/fs/list?path={path}"), true).await;
+    let (status, old) = request(&app, &format!("/admin/api/fs/list?path={path}"), true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(old["entries"].as_array().unwrap().len(), 201);
     assert!(old["entries"][0].get("id").is_none());
@@ -174,7 +169,7 @@ async fn entries_api_auth_pagination_normalization_and_old_list_compatibility() 
     assert_eq!(
         request(
             &app,
-            &format!("/api/fs/entries?path=/&cursor={cursor}"),
+            &format!("/admin/api/fs/entries?path=/&cursor={cursor}"),
             true
         )
         .await
@@ -211,7 +206,7 @@ async fn entries_api_validation_filters_and_file_thumbnail_metadata_without_tele
     db.create_uploading(1, "hidden").await.unwrap();
     let (_, files) = request(
         &app,
-        "/api/fs/entries?path=/&kind=file&q=a%25_&sort=mtime&order=desc",
+        "/admin/api/fs/entries?path=/&kind=file&q=a%25_&sort=mtime&order=desc",
         true,
     )
     .await;
@@ -219,10 +214,15 @@ async fn entries_api_validation_filters_and_file_thumbnail_metadata_without_tele
     assert_eq!(files["entries"][0]["id"], id);
     assert_eq!(files["entries"][0]["size"], 7);
     assert_eq!(files["entries"][0]["has_thumbnail"], true);
-    let (_, dirs) = request(&app, "/api/fs/entries?path=/&kind=dir&limit=500", true).await;
+    let (_, dirs) = request(
+        &app,
+        "/admin/api/fs/entries?path=/&kind=dir&limit=500",
+        true,
+    )
+    .await;
     assert_eq!(dirs["total"], 1);
     assert_eq!(dirs["entries"][0]["name"], "folder");
-    let (_, empty) = request(&app, "/api/fs/entries?path=/folder", true).await;
+    let (_, empty) = request(&app, "/admin/api/fs/entries?path=/folder", true).await;
     assert_eq!(empty["total"], 0);
     assert_eq!(empty["has_more"], false);
     for suffix in [
@@ -239,17 +239,21 @@ async fn entries_api_validation_filters_and_file_thumbnail_metadata_without_tele
         "cursor=bad!",
     ] {
         assert_eq!(
-            request(&app, &format!("/api/fs/entries?path=/&{suffix}"), true)
-                .await
-                .0,
+            request(
+                &app,
+                &format!("/admin/api/fs/entries?path=/&{suffix}"),
+                true
+            )
+            .await
+            .0,
             StatusCode::BAD_REQUEST,
             "{suffix}"
         );
     }
     for uri in [
-        "/api/fs/entries",
-        "/api/fs/entries?path=/../",
-        "/api/fs/entries?path=/a%00",
+        "/admin/api/fs/entries",
+        "/admin/api/fs/entries?path=/../",
+        "/admin/api/fs/entries?path=/a%00",
     ] {
         assert_eq!(
             request(&app, uri, true).await.0,
@@ -260,7 +264,7 @@ async fn entries_api_validation_filters_and_file_thumbnail_metadata_without_tele
     assert_eq!(
         request(
             &app,
-            &format!("/api/fs/entries?path=/&q={}", "a".repeat(256)),
+            &format!("/admin/api/fs/entries?path=/&q={}", "a".repeat(256)),
             true
         )
         .await
@@ -270,7 +274,7 @@ async fn entries_api_validation_filters_and_file_thumbnail_metadata_without_tele
     assert_eq!(
         request(
             &app,
-            &format!("/api/fs/entries?path={}", "/".repeat(4097)),
+            &format!("/admin/api/fs/entries?path={}", "/".repeat(4097)),
             true
         )
         .await
@@ -278,15 +282,19 @@ async fn entries_api_validation_filters_and_file_thumbnail_metadata_without_tele
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        request(&app, "/api/fs/entries?path=/missing", true).await.0,
+        request(&app, "/admin/api/fs/entries?path=/missing", true)
+            .await
+            .0,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        request(&app, "/api/fs/entries?path=/hidden", true).await.0,
+        request(&app, "/admin/api/fs/entries?path=/hidden", true)
+            .await
+            .0,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        request(&app, "/api/fs/entries?path=/A%25_%E6%96%87.jpg", true)
+        request(&app, "/admin/api/fs/entries?path=/A%25_%E6%96%87.jpg", true)
             .await
             .0,
         StatusCode::UNPROCESSABLE_ENTITY
@@ -297,7 +305,7 @@ async fn entries_api_validation_filters_and_file_thumbnail_metadata_without_tele
         .unwrap();
     db.finalize_upload(no_first, 1, None).await.unwrap();
     assert_eq!(
-        request(&app, "/api/fs/thumbnail?path=/no-first.jpg", true)
+        request(&app, "/admin/api/fs/thumbnail?path=/no-first.jpg", true)
             .await
             .0,
         StatusCode::NOT_FOUND
@@ -320,7 +328,7 @@ async fn entries_migration_preserves_webdav_full_directory_listing() {
     let basic = base64::engine::general_purpose::STANDARD.encode("entries-test:entries-test-only");
     let request = Request::builder()
         .method("PROPFIND")
-        .uri("/dav/dav-test/")
+        .uri("/admin/dav/dav-test/")
         .header("Authorization", format!("Basic {basic}"))
         .header("Depth", "1")
         .body(Body::empty())
@@ -357,7 +365,7 @@ async fn dav_requires_basic_and_ignores_session_cookie() {
     let response = send(
         &app,
         Request::builder()
-            .uri("/dav/d")
+            .uri("/admin/dav/d")
             .body(Body::empty())
             .unwrap(),
     )
@@ -365,12 +373,12 @@ async fn dav_requires_basic_and_ignores_session_cookie() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(response.headers().contains_key("www-authenticate"));
 
-    // 浏览器登录 Cookie 对 /api 有效，但不能借 /dav 读写网盘。
+    // 浏览器登录 Cookie 对 /admin/api 有效，但不能借 /admin/dav 读写网盘。
     let cookie = format!("tgdrive_token={}", state.auth.issue_token());
     let response = send(
         &app,
         Request::builder()
-            .uri("/api/auth/me")
+            .uri("/admin/api/auth/me")
             .header("cookie", &cookie)
             .body(Body::empty())
             .unwrap(),
@@ -380,7 +388,7 @@ async fn dav_requires_basic_and_ignores_session_cookie() {
     let response = send(
         &app,
         Request::builder()
-            .uri("/dav/d")
+            .uri("/admin/dav/d")
             .header("cookie", &cookie)
             .body(Body::empty())
             .unwrap(),
@@ -396,7 +404,7 @@ async fn basic_auth_failures_lock_out_even_correct_password() {
     let dav = |auth: String| {
         Request::builder()
             .method("PROPFIND")
-            .uri("/dav/d")
+            .uri("/admin/dav/d")
             .header("authorization", auth)
             .header("depth", "0")
             .body(Body::empty())
@@ -420,7 +428,7 @@ async fn cross_site_writes_are_rejected_before_auth() {
     let mkdir = |site: &str| {
         Request::builder()
             .method("POST")
-            .uri("/api/fs/mkdir")
+            .uri("/admin/api/fs/mkdir")
             .header("cookie", &cookie)
             .header("sec-fetch-site", site)
             .header("content-type", "application/json")
@@ -440,14 +448,138 @@ async fn cross_site_writes_are_rejected_before_auth() {
 }
 
 #[tokio::test]
+async fn host_routes_and_root_fallback_share_the_production_router() {
+    let (app, state, _dir) = fixture().await;
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(to_bytes(health.into_body(), 16).await.unwrap(), "ok");
+    assert_eq!(
+        request(&app, "/admin/api/auth/me", false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let dav = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/dav")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dav.status(), StatusCode::UNAUTHORIZED);
+    assert!(dav.headers().contains_key("www-authenticate"));
+
+    state.vfs.db.set_background_blocked(true);
+    for path in [
+        "/",
+        "/api/auth/me",
+        "/dav",
+        "/dav/file.txt",
+        "/healthz",
+        "/readyz",
+        "/s/token",
+        "/administrator/",
+    ] {
+        for method in ["GET", "POST", "PUT", "DELETE", "PROPFIND"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{method} {path}");
+            assert_eq!(response.headers()["location"], "/admin/");
+        }
+    }
+    let absent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        absent.status(),
+        StatusCode::NOT_FOUND,
+        "没有前端时不能自跳转"
+    );
+}
+
+#[tokio::test]
+async fn login_and_logout_cookies_are_scoped_to_admin() {
+    let (app, _state, _dir) = fixture().await;
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api/auth/login")
+                .extension(axum::extract::ConnectInfo(
+                    "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"username":"entries-test","password":"entries-test-only"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login.headers()["set-cookie"].to_str().unwrap();
+    assert!(
+        cookie.contains("; Path=/admin; HttpOnly; SameSite=Lax;"),
+        "{cookie}"
+    );
+    let session = cookie.split(';').next().unwrap();
+    let logout = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api/auth/logout")
+                .header("cookie", session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::OK);
+    assert!(
+        logout.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=0")
+    );
+}
+
+#[tokio::test]
 async fn metrics_require_auth_and_use_prometheus_text() {
     let (app, state, _dir) = fixture().await;
     state.vfs.db.mkdir(1, "m").await.unwrap();
     assert_eq!(
-        request(&app, "/api/metrics", false).await.0,
+        request(&app, "/admin/api/metrics", false).await.0,
         StatusCode::UNAUTHORIZED
     );
-    let (status, body) = request(&app, "/api/metrics", true).await;
+    let (status, body) = request(&app, "/admin/api/metrics", true).await;
     assert_eq!(status, StatusCode::OK);
     let text = body.as_str().unwrap();
     assert!(

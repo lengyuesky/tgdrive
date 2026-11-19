@@ -2,9 +2,9 @@
 
 # 大目录性能与分页接口
 
-## `GET /api/fs/entries` 分页接口
+## `GET /admin/api/fs/entries` 分页接口
 
-`GET /api/fs/entries` 是文件页、侧栏目录树和目录选择器使用的连续滚动接口,需要与其他文件接口相同的登录 Cookie 或 Basic 认证;旧 `/api/fs/list`、分享目录接口与 WebDAV 仍保持全量列表兼容。已有实例需要重新构建并升级 tgdrive 服务后才会生效。
+`GET /admin/api/fs/entries` 是文件页、侧栏目录树和目录选择器使用的连续滚动接口,需要与其他文件接口相同的登录 Cookie 或 Basic 认证;旧 `/admin/api/fs/list`、分享目录接口与 WebDAV 仍保持全量列表兼容。已有实例需要重新构建并升级 tgdrive 服务后才会生效。
 
 - 参数:`path` 必填,规范化后返回;`limit` 默认 `200`,允许 `1..500`;`sort=name|size|mtime` 默认 `name`;`order=asc|desc` 默认 `asc`;`kind=all|dir|file` 默认 `all`;`q` 默认空字符串;`cursor` 首批省略。非法参数返回 `400`。
 - `q` 在整个直接子目录范围内按名称字面子串匹配,仅 ASCII 忽略大小写,`%`、`_` 没有通配符含义。不做递归搜索。`q` 最多 255 UTF-8 字节且不能含控制字符,`path` 最多 4096 字节(每段仍最多 255 字节)。
@@ -28,7 +28,7 @@ cargo test --locked
 
 ## 网页目录分批与虚拟视图
 
-文件页、侧栏目录树和移动/复制目录选择器现已接入 `/api/fs/entries`,不再通过旧全量 `/fs/list` 读取目录:
+文件页、侧栏目录树和移动/复制目录选择器现已接入 `/admin/api/fs/entries`,不再通过旧全量 `/fs/list` 读取目录:
 
 - 文件页每批 200 项,滚动到末尾两视口内续载,每代最多一个请求;显示"已加载 X / 匹配 Y"。失败保留已加载项目,点击"重试"继续;空/全重复续批会停住自动续载,避免动态目录在后台被遍历。
 - 名称过滤覆盖整个直接子目录,输入防抖 250ms;列表表头和排序菜单均由后端排序。切目录、查询、排序或进入/离开时间线都会取消旧请求、换代、清游标/选择/已加载项目。后端名称顺序是 SQLite NOCASE/BINARY,不是中文拼音排序。
@@ -63,7 +63,7 @@ Vitest 覆盖请求代次/旧 finally 隔离、防抖、同游标重试/ID 去�
 ## 主站静态资源缓存与预压缩
 
 - 构建时为全部产物预生成 `.gz` / `.br` 变体(vite.config.ts),服务端命中 `Accept-Encoding` 时零压缩开销直发;未命中变体的小文件由运行时压缩兜底,已带编码的响应不会二次压缩。
-- `/assets/*` 带内容哈希,响应 `Cache-Control: public, max-age=31536000, immutable`;缺失的哈希资源真 404,不会被 SPA fallback 用 index.html 顶替。入口 `index.html` 与未哈希的 public 资源(图标、manifest)响应 `no-cache`,每次再验证,避免升级后旧页面引用已替换的哈希资源。
+- `/admin/assets/*` 带内容哈希,响应 `Cache-Control: public, max-age=31536000, immutable`;缺失的哈希资源真 404,不会被 SPA fallback 用 index.html 顶替。入口 `index.html` 与未哈希的 public 资源(图标、manifest)响应 `no-cache`,每次再验证,避免升级后旧页面引用已替换的哈希资源。
 
 ## 大目录升级注意
 

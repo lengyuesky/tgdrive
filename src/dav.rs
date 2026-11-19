@@ -24,7 +24,7 @@ use std::io::SeekFrom;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
-pub const DAV_PREFIX: &str = "/dav";
+pub const DAV_PREFIX: &str = "/admin/dav";
 
 pub fn build_handler(vfs: Vfs) -> DavHandler {
     DavHandler::builder()
@@ -34,9 +34,9 @@ pub fn build_handler(vfs: Vfs) -> DavHandler {
         .build_handler()
 }
 
-/// axum 入口:/dav 全部方法(含 PROPFIND 等扩展方法),Basic 认证失败回 401+挑战头
+/// axum 入口:/admin/dav 全部方法(含 PROPFIND 等扩展方法),Basic 认证失败回 401+挑战头
 ///
-/// 只接受 Basic,不认浏览器登录 Cookie:跨站导航带上的 Cookie 不能借 /dav 读写网盘。
+/// 只接受 Basic,不认浏览器登录 Cookie:跨站导航带上的 Cookie 不能借 /admin/dav 读写网盘。
 pub async fn dav_handler(State(state): State<AppState>, req: Request) -> Response {
     match crate::api::authorize(
         &state,
@@ -66,7 +66,7 @@ pub async fn dav_handler(State(state): State<AppState>, req: Request) -> Respons
     resp
 }
 
-/// 用户文件与网盘同源:浏览器直接打开 /dav 下的 HTML/SVG/脚本时不得在本站执行。
+/// 用户文件与网盘同源:浏览器直接打开 /admin/dav 下的 HTML/SVG/脚本时不得在本站执行。
 /// 一律按附件下载并沙箱化;主动内容改报二进制类型,配合 nosniff 也无法被 `<script>` 引用。
 fn harden_download(resp: &mut Response) {
     let headers = resp.headers_mut();

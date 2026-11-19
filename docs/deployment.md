@@ -2,6 +2,23 @@
 
 # Telegram 存储、部署与自建 Bot API
 
+## 对外地址
+
+宿主全部地址固定在 `/admin` 下：
+
+| 用途 | 地址 |
+|---|---|
+| 网页入口 | `/admin/` |
+| 文件页、登录、系统设置 | `/admin/files/`、`/admin/login`、`/admin/settings` |
+| REST 与事件流 | `/admin/api/*`、`/admin/api/events` |
+| WebDAV | `/admin/dav` |
+| 公开分享页 | `/admin/s/{token}` |
+| 存活与就绪检查 | `/admin/healthz`、`/admin/readyz` |
+
+Compose 保持单端口映射 `3358:8080`，本机访问 `http://localhost:3358/admin/`；直接运行二进制时默认监听 8080。反向代理必须原样转发 `/admin` 前缀，不能剥离。根地址当前统一跳转至 `/admin/`，后续由应用平台接管。
+
+旧地址没有别名，已发出的旧分享链接失效；WebDAV 和原生客户端须改用新地址。登录及注销 Cookie 的 Path 均为 `/admin`，不会随浏览器请求发往根地址；旧根路径登录 Cookie 的签名立即失效，需要重新网页登录，不轮换数据库密钥或原生设备会话。分享提取码票据进一步限定在对应的 `/admin/api/share/{token}` 下。
+
 ## 官方端点与自建端点
 
 官方 Bot API 下载单块上限 20MB,分块只能 ≤18MB,而 bot 发消息到同一频道约 20 条/分钟的限流让大文件吞吐约 6MB/s。自建 `telegram-bot-api` 后分块可到 GB 级(默认使用更稳妥的 256MB 分块),local 模式直读磁盘,速度更快。
@@ -97,7 +114,7 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 ## 后台管理详情
 
-手机从「我的」→ **系统设置**(`/admin`);桌面仍可使用右上角用户名菜单。未保存的修改会在离开时二次确认。
+手机从「我的」→ **系统设置**(`/admin/settings`);桌面仍可使用右上角用户名菜单。未保存的修改会在离开时二次确认。
 
 - **系统状态**:bot、端点、分块、文件数与占用、元数据库体积、运行时长、待删除任务、收件死信与后台任务健康度
 - **Telegram 存储**:bot token、存储频道、接口端点、分块大小、上传并发、视频消息模式

@@ -41,7 +41,7 @@ async fn call(
     (status, headers, value)
 }
 async fn login(app: &Router, totp: Option<&str>) -> Value {
-    let (status, headers, body) = call(app, "POST", "/api/auth/device/login", None, json!({
+    let (status, headers, body) = call(app, "POST", "/admin/api/auth/device/login", None, json!({
         "username":"entries-test","password":"entries-test-only","device_name":"隔离测试 iPhone","totp":totp,
     })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -59,7 +59,7 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
     let initial = login(&app, None).await;
     let access = initial["access_token"].as_str().unwrap();
     assert_eq!(
-        call(&app, "GET", "/api/auth/me", Some(access), Value::Null)
+        call(&app, "GET", "/admin/api/auth/me", Some(access), Value::Null)
             .await
             .0,
         StatusCode::OK
@@ -67,14 +67,21 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
     let (_, _, capabilities) = call(
         &app,
         "GET",
-        "/api/client/capabilities",
+        "/admin/api/client/capabilities",
         Some(access),
         Value::Null,
     )
     .await;
     assert_eq!(capabilities["contract_version"], 1);
     assert_eq!(capabilities["server_id"], initial["server_id"]);
-    let (_, _, devices) = call(&app, "GET", "/api/auth/devices", Some(access), Value::Null).await;
+    let (_, _, devices) = call(
+        &app,
+        "GET",
+        "/admin/api/auth/devices",
+        Some(access),
+        Value::Null,
+    )
+    .await;
     assert_eq!(devices["items"].as_array().unwrap().len(), 1);
     assert!(devices["items"][0].get("auth_epoch").is_none());
     let raw = initial["refresh_token"].as_str().unwrap();
@@ -96,7 +103,7 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
     let (status, _, next) = call(
         &app,
         "POST",
-        "/api/auth/device/refresh",
+        "/admin/api/auth/device/refresh",
         None,
         json!({"refresh_token":raw}),
     )
@@ -108,7 +115,7 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
         call(
             &app,
             "POST",
-            "/api/auth/device/refresh",
+            "/admin/api/auth/device/refresh",
             None,
             json!({"refresh_token":raw})
         )
@@ -120,7 +127,7 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
         call(
             &app,
             "GET",
-            "/api/auth/me",
+            "/admin/api/auth/me",
             Some(next["access_token"].as_str().unwrap()),
             Value::Null
         )
@@ -132,7 +139,7 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
         call(
             &app,
             "POST",
-            "/api/auth/device/refresh",
+            "/admin/api/auth/device/refresh",
             None,
             json!({"refresh_token":next["refresh_token"]})
         )
@@ -145,7 +152,7 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
         call(
             &app,
             "POST",
-            "/api/auth/device/logout",
+            "/admin/api/auth/device/logout",
             Some(fresh["access_token"].as_str().unwrap()),
             json!({})
         )
@@ -157,7 +164,7 @@ async fn devices_rotate_refresh_detect_replay_and_revoke_access() {
         call(
             &app,
             "GET",
-            "/api/auth/me",
+            "/admin/api/auth/me",
             Some(fresh["access_token"].as_str().unwrap()),
             Value::Null
         )
@@ -182,7 +189,7 @@ async fn devices_share_login_limit_and_honor_totp_and_key_rotation() {
     let (_, _, error) = call(
         &app,
         "POST",
-        "/api/auth/device/login",
+        "/admin/api/auth/device/login",
         None,
         json!({
             "username":"entries-test","password":"entries-test-only","device_name":"测试设备",
@@ -191,7 +198,7 @@ async fn devices_share_login_limit_and_honor_totp_and_key_rotation() {
     .await;
     assert_eq!(error["code"], "totp_required");
     let token = login(&app, Some(&codes[0])).await;
-    let (_, _, error) = call(&app, "POST", "/api/auth/device/login", None, json!({
+    let (_, _, error) = call(&app, "POST", "/admin/api/auth/device/login", None, json!({
         "username":"entries-test","password":"entries-test-only","device_name":"测试设备","totp":codes[0],
     })).await;
     assert_eq!(error["code"], "totp_invalid");
@@ -200,7 +207,7 @@ async fn devices_share_login_limit_and_honor_totp_and_key_rotation() {
         call(
             &app,
             "GET",
-            "/api/auth/me",
+            "/admin/api/auth/me",
             Some(token["access_token"].as_str().unwrap()),
             Value::Null
         )
@@ -212,7 +219,7 @@ async fn devices_share_login_limit_and_honor_totp_and_key_rotation() {
         call(
             &app,
             "POST",
-            "/api/auth/device/refresh",
+            "/admin/api/auth/device/refresh",
             None,
             json!({"refresh_token":token["refresh_token"]})
         )
@@ -226,7 +233,7 @@ async fn devices_share_login_limit_and_honor_totp_and_key_rotation() {
             call(
                 &app,
                 "POST",
-                "/api/auth/login",
+                "/admin/api/auth/login",
                 None,
                 json!({"username":"entries-test","password":"wrong"})
             )
@@ -235,7 +242,7 @@ async fn devices_share_login_limit_and_honor_totp_and_key_rotation() {
             StatusCode::UNAUTHORIZED
         );
     }
-    assert_eq!(call(&app, "POST", "/api/auth/device/login", None, json!({
+    assert_eq!(call(&app, "POST", "/admin/api/auth/device/login", None, json!({
         "username":"entries-test","password":"entries-test-only","device_name":"测试设备","totp":codes[1],
     })).await.0, StatusCode::TOO_MANY_REQUESTS);
 }
@@ -255,7 +262,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
     let (status, _, stat) = call(
         &app,
         "GET",
-        &format!("/api/fs/stat?id={id}"),
+        &format!("/admin/api/fs/stat?id={id}"),
         Some(token),
         Value::Null,
     )
@@ -266,7 +273,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
         call(
             &app,
             "GET",
-            &format!("/api/fs/stat?id={id}&path=/empty.txt"),
+            &format!("/admin/api/fs/stat?id={id}&path=/empty.txt"),
             Some(token),
             Value::Null
         )
@@ -277,7 +284,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
     let (status, _, ticket) = call(
         &app,
         "POST",
-        "/api/fs/media-ticket",
+        "/admin/api/fs/media-ticket",
         Some(token),
         json!({"id":id,"content_version":version,"kind":"preview"}),
     )
@@ -317,8 +324,8 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
         call(
             &app,
             "GET",
-            "/api/auth/me",
-            Some(url.trim_start_matches("/api/media/")),
+            "/admin/api/auth/me",
+            Some(url.trim_start_matches("/admin/api/media/")),
             Value::Null
         )
         .await
@@ -333,7 +340,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
     let (_, _, moved) = call(
         &app,
         "GET",
-        &format!("/api/fs/stat?id={id}"),
+        &format!("/admin/api/fs/stat?id={id}"),
         Some(token),
         Value::Null,
     )
@@ -344,7 +351,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
         call(
             &app,
             "GET",
-            "/api/admin/restore/status",
+            "/admin/api/admin/restore/status",
             Some(token),
             Value::Null
         )
@@ -357,7 +364,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
         call(
             &app,
             "POST",
-            "/api/admin/restore/resume",
+            "/admin/api/admin/restore/resume",
             Some(token),
             json!({"password":"wrong"})
         )
@@ -367,7 +374,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
     );
     let basic = base64::engine::general_purpose::STANDARD.encode("entries-test:entries-test-only");
     use base64::Engine as _;
-    for path in ["/api/admin/restore/status", "/api/auth/devices"] {
+    for path in ["/admin/api/admin/restore/status", "/admin/api/auth/devices"] {
         let response = app
             .clone()
             .oneshot(
@@ -385,7 +392,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/dav/renamed.txt")
+                .uri("/admin/dav/renamed.txt")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -417,7 +424,7 @@ async fn stable_file_references_tickets_etags_and_strong_auth_boundaries() {
         call(
             &app,
             "GET",
-            &format!("/api/fs/stat?id={id}"),
+            &format!("/admin/api/fs/stat?id={id}"),
             Some(token),
             Value::Null
         )
@@ -433,8 +440,14 @@ async fn refresh_is_atomic_under_concurrency_and_survives_restart() {
     let initial = login(&app, None).await;
     let body = json!({"refresh_token":initial["refresh_token"]});
     let (a, b) = tokio::join!(
-        call(&app, "POST", "/api/auth/device/refresh", None, body.clone()),
-        call(&app, "POST", "/api/auth/device/refresh", None, body)
+        call(
+            &app,
+            "POST",
+            "/admin/api/auth/device/refresh",
+            None,
+            body.clone()
+        ),
+        call(&app, "POST", "/admin/api/auth/device/refresh", None, body)
     );
     let mut statuses = [a.0.as_u16(), b.0.as_u16()];
     statuses.sort();

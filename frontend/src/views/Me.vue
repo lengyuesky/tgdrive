@@ -11,7 +11,7 @@
     <section class="group-card menu-group" aria-label="偏好设置">
       <button @click="toggleDark"><el-icon><component :is="isDark ? Sunny : Moon" /></el-icon>{{ isDark ? '切换亮色' : '切换暗色' }}<span>›</span></button>
       <button v-if="!isStandalone" @click="installOpen = true"><el-icon><Plus /></el-icon>添加到主屏幕<span>›</span></button>
-      <router-link to="/admin"><el-icon><Setting /></el-icon>系统设置<span>›</span></router-link>
+      <router-link to="/settings"><el-icon><Setting /></el-icon>系统设置<span>›</span></router-link>
       <button class="danger-text" @click="logout"><el-icon><SwitchButton /></el-icon>退出登录<span>›</span></button>
     </section>
     <p class="page-note">主屏幕模式依然需要联网；iOS 锁屏或切到后台可能暂停上传。</p>

@@ -167,7 +167,7 @@
           <span
             class="status-dot"
             :class="info?.configured ? 'ok' : 'bad'"
-            @click="router.push('/admin')"
+            @click="router.push('/settings')"
             ><i />TG</span
           >
         </el-tooltip>
@@ -186,7 +186,7 @@
       <span class="vsep" />
 
       <el-tooltip content="系统设置">
-        <el-button class="icon-btn" :icon="Setting" @click="router.push('/admin')" />
+        <el-button class="icon-btn" :icon="Setting" @click="router.push('/settings')" />
       </el-tooltip>
       <el-tooltip :content="info ? `退出登录(${info.username})` : '退出登录'">
         <el-button class="icon-btn" :icon="SwitchButton" @click="logout" />
@@ -202,7 +202,7 @@
       class="setup-hint"
     >
       <div>上传下载暂时用不了。去「系统设置」填好 Bot Token 与存储频道即可,不用重启服务。</div>
-      <el-button type="primary" size="small" style="margin-top: 8px" @click="router.push('/admin')">
+      <el-button type="primary" size="small" style="margin-top: 8px" @click="router.push('/settings')">
         去配置
       </el-button>
     </el-alert>
@@ -1119,7 +1119,7 @@ const segments = computed(() => {
   return arr.filter((s) => s !== '')
 })
 const cur = computed(() => '/' + segments.value.join('/'))
-const davUrl = computed(() => `${location.origin}/dav`)
+const davUrl = computed(() => `${location.origin}/admin/dav`)
 const tgTip = computed(() => {
   if (!info.value) return 'Telegram 存储'
   if (!info.value.configured) return 'Telegram 存储未配置,点击去设置'

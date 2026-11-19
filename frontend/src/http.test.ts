@@ -25,6 +25,15 @@ beforeEach(() => {
 })
 afterEach(() => { unsubscribe(); http.defaults.adapter = originalAdapter })
 
+describe('宿主接口地址', () => {
+  it('接口、下载、小图和备份地址均在 /admin 下', () => {
+    expect(http.defaults.baseURL).toBe('/admin/api')
+    expect(api.downloadUrl('/a.txt')).toBe('/admin/api/fs/download?path=%2Fa.txt')
+    expect(api.thumbnailUrl('/a.jpg')).toBe('/admin/api/fs/thumbnail?path=%2Fa.jpg')
+    expect(api.admin.backupUrl).toBe('/admin/api/admin/backup')
+  })
+})
+
 describe('认证与会话清理', () => {
   it('恢复二次认证 401 留在向导，不误跳登录页', async () => {
     http.defaults.adapter = adapter(401)
@@ -50,7 +59,7 @@ describe('认证与会话清理', () => {
     expect(router.replace).toHaveBeenCalledWith('/login')
   })
 
-  it.each(['/share/公开链接/authorize', '/api/share/公开链接/list', '/auth/login'])(
+  it.each(['/share/公开链接/authorize', '/admin/api/share/公开链接/list', '/auth/login'])(
     '%s 的提取码或登录错误不能清除已登录会话', async (url) => {
       http.defaults.adapter = adapter(401)
       await expect(http.post(url)).rejects.toBeInstanceOf(AxiosError)

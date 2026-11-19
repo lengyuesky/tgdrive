@@ -5,10 +5,12 @@
 ```
 浏览器 SPA ──┐                             ┌─> SQLite(元数据:目录树 / 分块映射)
              ├─> axum HTTP 服务(单进程)────┤
-WebDAV 客户端─┘   ├ /api/*  REST+SSE       └─> Telegram Bot API
-                  ├ /dav/*  WebDAV(Class 2)      ├ 官方 api.telegram.org(分块≤18MB)
-                  └ /       Vue 3 前端            └ 自部署 telegram-bot-api(分块可达 GB 级)
+WebDAV 客户端─┘   ├ /admin/api/* REST+SSE   └─> Telegram Bot API
+                  ├ /admin/dav/* WebDAV(Class 2) ├ 官方 api.telegram.org(分块≤18MB)
+                  └ /admin/      Vue 3 前端        └ 自部署 telegram-bot-api(分块可达 GB 级)
 ```
+
+宿主界面与接口全部位于 `/admin` 下：系统设置为 `/admin/settings`，公开分享页为 `/admin/s/{token}`，静态资源为 `/admin/assets/*`。`/admin` 之外的请求当前统一跳转到 `/admin/`，旧接口、WebDAV 和分享地址不保留别名。登录 Cookie 的 Path 为 `/admin`，不会带到根地址请求；应用平台按新契约另行重写。
 
 ## 特性
 
@@ -44,7 +46,7 @@ docker compose up -d   # 拉取发布镜像;首次使用或镜像拉不到时改
 
 **先手动创建 data 目录再启动**(`mkdir -p data`)。镜像以非 root 用户 `1000:1000` 运行;如果省略 mkdir 让 Docker 自动建目录,它会属于 root,容器将无权写入,启动日志出现 `Permission denied (os error 13)`。宿主机用户不是 `1000:1000` 时,把 `.env` 中的 `TGDRIVE_UID` / `TGDRIVE_GID` 改为 `id -u` / `id -g` 的输出,或直接 `sudo chown -R 1000:1000 data`。启用自建 Bot API profile 时同样需要 `mkdir -p bot-api-control && chown 1000:1000 bot-api-control`(tgdrive 要往里写 proxychains 配置);`telegram-bot-api-data` 由服务自行管理属主,无需手动 chown。
 
-打开 <http://localhost:8080> 登录,页面会提示「还没配置 Telegram 存储」,点「去配置」填好 **Bot Token** 与**存储频道**,保存即生效(不用重启容器)。也可以在 `.env` 里预先填好 `TGDRIVE_BOT_TOKEN` / `TGDRIVE_CHAT_ID`。
+打开 <http://localhost:3358/admin/> 登录（Compose 默认映射；直接运行二进制时使用 <http://localhost:8080/admin/>）,页面会提示「还没配置 Telegram 存储」,点「去配置」填好 **Bot Token** 与**存储频道**,保存即生效(不用重启容器)。也可以在 `.env` 里预先填好 `TGDRIVE_BOT_TOKEN` / `TGDRIVE_CHAT_ID`。
 
 配置优先级:**后台修改 > 环境变量 > 内置默认**。绝大多数配置(bot token、频道、端点、分块大小、代理、备份、收件规则等)都能在网页「系统设置」中修改并立即生效;环境变量只在启动时读取一次。
 
@@ -54,10 +56,10 @@ docker compose up -d   # 拉取发布镜像;首次使用或镜像拉不到时改
 
 ## WebDAV
 
-地址 `http://<host>:8080/dav`,Basic 认证,账号密码同 Web;启用两步验证后需使用「账号安全」里生成的应用密码。
+地址 `http://<host>:8080/admin/dav`（Compose 默认宿主端口为 3358）,Basic 认证,账号密码同 Web;启用两步验证后需使用「账号安全」里生成的应用密码。
 
 ```bash
-rclone config create tgdrive webdav url=http://localhost:8080/dav vendor=other \
+rclone config create tgdrive webdav url=http://localhost:3358/admin/dav vendor=other \
     user=admin pass=$(rclone obscure '你的密码')
 ```
 
@@ -76,7 +78,7 @@ printf '%s' '新密码' | docker compose run --rm -T tgdrive hash-password
 docker compose stop tgdrive && docker compose run --rm tgdrive reset-2fa && docker compose up -d tgdrive
 ```
 
-探针:`GET /healthz`(存活)、`GET /readyz`(就绪)、`GET /api/metrics`(Prometheus 指标,需登录)。镜像基于 distroless,排查问题请用 `docker compose logs` 或 `docker cp`。
+探针:`GET /admin/healthz`(存活)、`GET /admin/readyz`(就绪)、`GET /admin/api/metrics`(Prometheus 指标,需登录)。镜像基于 distroless,排查问题请用 `docker compose logs` 或 `docker cp`。
 
 ## 手动构建镜像
 

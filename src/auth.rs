@@ -419,11 +419,17 @@ impl Auth {
         b64(&mac.finalize().into_bytes())
     }
 
+    /// 宿主网页登录使用独立签名上下文。旧 Path=/ Cookie 即使仍在浏览器中，
+    /// 也不能被根地址应用重放；不轮换主密钥，原生设备与分享票据不受影响。
+    fn sign_session_cookie(&self, payload: &str) -> String {
+        self.sign(&format!("admin-cookie-v1:{payload}"))
+    }
+
     /// token 形如 "过期时间戳.签名"
     pub fn issue_token(&self) -> String {
         let exp = crate::db::now_ts() + TOKEN_TTL_SECS;
         let payload = exp.to_string();
-        format!("{payload}.{}", self.sign(&payload))
+        format!("{payload}.{}", self.sign_session_cookie(&payload))
     }
 
     pub fn verify_token(&self, token: &str) -> bool {
@@ -436,7 +442,7 @@ impl Auth {
         if exp < crate::db::now_ts() {
             return false;
         }
-        Self::ct_eq(&self.sign(payload), sig)
+        Self::ct_eq(&self.sign_session_cookie(payload), sig)
     }
 
     /// 签发只对一个分享有效的短期票据。随机 ID 同时用于合并 Range 请求的计数。
@@ -488,14 +494,14 @@ impl Auth {
 
     pub fn cookie_header(&self, token: &str) -> String {
         format!(
-            "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={TOKEN_TTL_SECS}{}",
+            "{COOKIE_NAME}={token}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age={TOKEN_TTL_SECS}{}",
             self.secure_cookie_suffix()
         )
     }
 
     pub fn clear_cookie_header(&self) -> String {
         format!(
-            "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+            "{COOKIE_NAME}=; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=0{}",
             self.secure_cookie_suffix()
         )
     }
@@ -503,7 +509,7 @@ impl Auth {
     /// 分享票据使用独立、窄路径 Cookie，不会被发往后台和其他分享。
     pub fn share_cookie_header(&self, token: &str, share_token: &str) -> String {
         format!(
-            "{SHARE_COOKIE_NAME}={token}; Path=/api/share/{share_token}; HttpOnly; SameSite=Lax; Max-Age={SHARE_TICKET_TTL_SECS}{}",
+            "{SHARE_COOKIE_NAME}={token}; Path=/admin/api/share/{share_token}; HttpOnly; SameSite=Lax; Max-Age={SHARE_TICKET_TTL_SECS}{}",
             self.secure_cookie_suffix()
         )
     }
@@ -602,8 +608,23 @@ mod tests {
         assert!(!a.verify_token("bogus"));
         // 过期 token
         let payload = (crate::db::now_ts() - 10).to_string();
-        let expired = format!("{payload}.{}", a.sign(&payload));
+        let expired = format!("{payload}.{}", a.sign_session_cookie(&payload));
         assert!(!a.verify_token(&expired));
+    }
+
+    #[test]
+    fn legacy_root_cookie_cannot_be_replayed_as_an_admin_session() {
+        let a = auth();
+        let payload = (crate::db::now_ts() + TOKEN_TTL_SECS).to_string();
+        let legacy = format!("{payload}.{}", a.sign(&payload));
+        assert!(!a.verify_token(&legacy));
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!("{COOKIE_NAME}={legacy}").parse().unwrap(),
+        );
+        assert!(!a.session_cookie_valid(&headers));
+        assert!(a.verify_token(&a.issue_token()));
     }
 
     #[test]
@@ -620,6 +641,18 @@ mod tests {
         a.cookie_secure = true;
         assert!(a.cookie_header("x").ends_with("; Secure"));
         assert!(a.share_cookie_header("x", "abc").contains("; Secure"));
+    }
+
+    #[test]
+    fn host_and_share_cookies_stay_inside_admin() {
+        let a = auth();
+        assert!(a.cookie_header("x").contains("; Path=/admin;"));
+        assert!(a.clear_cookie_header().contains("; Path=/admin;"));
+        assert!(
+            a.share_cookie_header("x", "token")
+                .contains("; Path=/admin/api/share/token;")
+        );
+        assert!(!a.cookie_header("x").contains("; Path=/;"));
     }
 
     #[test]

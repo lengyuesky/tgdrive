@@ -201,7 +201,6 @@ async fn serve() -> anyhow::Result<()> {
         .await?,
     );
     let listen = env_cfg.listen;
-    let cookie_secure = env_cfg.cookie_secure;
     let (api_base, chunk_size, official) =
         (cfg.api_base.clone(), cfg.chunk_size, cfg.is_official_api());
     let rt = Arc::new(Runtime::new(
@@ -253,51 +252,19 @@ async fn serve() -> anyhow::Result<()> {
         )
     });
 
-    let mut app = axum::Router::new()
-        .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .route("/readyz", axum::routing::get(api::readyz))
-        .route(
-            "/dav",
-            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
-        )
-        .route(
-            "/dav/",
-            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
-        )
-        .route(
-            "/dav/{*rest}",
-            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
-        )
-        .with_state(state.clone())
-        .nest("/api", api::router(state.clone()));
-
-    // 前端静态文件(SPA fallback 到 index.html);候选目录都不存在则只提供 API
+    // 前端静态文件只在 /admin 下提供；候选目录都不存在则只提供宿主接口。
     let static_dir = crate::config::static_dir()
         .into_iter()
         .chain(["static".to_string(), "frontend/dist".to_string()])
         .find(|d| std::path::Path::new(d).is_dir());
-    match static_dir {
-        Some(dir) => {
-            tracing::info!("静态前端目录: {dir}");
-            app = app.fallback_service(web::router(&dir));
-        }
-        None => {
-            tracing::warn!("未找到静态前端目录,仅提供 API(开发模式请用 vite dev server)");
-        }
+    match &static_dir {
+        Some(dir) => tracing::info!("静态前端目录: {dir}"),
+        None => tracing::warn!("未找到静态前端目录,仅提供 API(开发模式请用 vite dev server)"),
     }
-
-    let app = app
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            api::restore::write_guard,
-        ))
-        // JSON/表单默认最多 1MiB；只有文件上传与 WebDAV 写入在各自路由放开。
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
-        .layer(axum::middleware::from_fn_with_state(
-            cookie_secure,
-            crate::security::response_headers,
-        ))
-        .layer(axum::middleware::from_fn(crate::security::access_log));
+    let app = http_router(
+        state.clone(),
+        static_dir.as_deref().map(std::path::Path::new),
+    );
 
     tracing::info!(
         listen = %listen,
@@ -314,6 +281,45 @@ async fn serve() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal(tasks, migration, restore.shutdown.clone()))
     .await?;
     Ok(())
+}
+
+/// 正式服务与 HTTP 回归共用宿主路由，所有宿主地址限定在 /admin。
+pub(crate) fn http_router(
+    state: AppState,
+    static_directory: Option<&std::path::Path>,
+) -> axum::Router {
+    let app = axum::Router::new()
+        .route("/admin/healthz", axum::routing::get(|| async { "ok" }))
+        .route("/admin/readyz", axum::routing::get(api::readyz))
+        .route(
+            "/admin/dav",
+            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/admin/dav/",
+            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/admin/dav/{*rest}",
+            axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .with_state(state.clone())
+        .nest("/admin/api", api::router(state.clone()));
+    let app = match static_directory {
+        Some(directory) => app.fallback_service(web::router(directory)),
+        None => app.fallback(web::root_address_fallback),
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        api::restore::write_guard,
+    ))
+    // JSON/表单默认最多 1MiB；只有文件上传与 WebDAV 写入在各自路由放开。
+    .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+    .layer(axum::middleware::from_fn_with_state(
+        state.rt.env.cookie_secure,
+        crate::security::response_headers,
+    ))
+    .layer(axum::middleware::from_fn(crate::security::access_log))
 }
 
 async fn shutdown_signal(
@@ -476,7 +482,7 @@ async fn check() -> anyhow::Result<()> {
 async fn healthcheck() -> anyhow::Result<()> {
     let listen = crate::config::listen_raw();
     let port = listen.rsplit(':').next().unwrap_or("8080");
-    let url = format!("http://127.0.0.1:{port}/healthz");
+    let url = format!("http://127.0.0.1:{port}/admin/healthz");
     let resp = reqwest::Client::builder()
         .no_proxy()
         .build()?

@@ -7,7 +7,7 @@
     <nav class="mobile-tabs" aria-label="主导航">
       <router-link :to="lastFiles" :class="{ active: filePage }" :aria-current="filePage ? 'page' : undefined"><el-icon><Folder /></el-icon><span>文件</span></router-link>
       <router-link to="/transfers" :class="{ active: route.path === '/transfers' }"><span class="tab-icon"><el-icon><UploadFilled /></el-icon><b v-if="queue.activeCount.value" aria-label="活动上传数量">{{ queue.activeCount.value > 99 ? '99+' : queue.activeCount.value }}</b></span><span>传输</span></router-link>
-      <router-link to="/me" :class="{ active: route.path === '/me' || route.path === '/admin' }"><el-icon><User /></el-icon><span>我的</span></router-link>
+      <router-link to="/me" :class="{ active: route.path === '/me' || route.path === '/settings' }"><el-icon><User /></el-icon><span>我的</span></router-link>
     </nav>
     <input ref="fileInput" type="file" multiple hidden @change="intake.onPick" />
     <input ref="dirInput" type="file" webkitdirectory hidden @change="intake.onDirPick" />

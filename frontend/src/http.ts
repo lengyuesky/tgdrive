@@ -21,14 +21,14 @@ export function holdAuthRedirect() {
 }
 
 /** 网盘接口共用认证和未登录跳转。 */
-export const http = axios.create({ baseURL: '/api' })
+export const http = axios.create({ baseURL: '/admin/api' })
 
 http.interceptors.response.use(
   (response) => response,
   (error) => {
     const path = String(error.config?.url ?? '')
     // 公开分享的提取码校验与登录错误不代表登录会话失效。
-    const publicRequest = /(?:^|\/api)\/share\//.test(path) || /\/auth\/login$/.test(path)
+    const publicRequest = /^(?:\/admin\/api)?\/share\//.test(path) || /\/auth\/login$/.test(path)
     if (error.response?.status === 401 && !publicRequest && !error.config?.handleAuthLocally && !authRedirectHolds) {
       invalidateSession()
       if (router.currentRoute.value.path !== '/login') void router.replace('/login')

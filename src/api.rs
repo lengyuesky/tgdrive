@@ -188,8 +188,6 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/env-export", get(admin_env_export))
         .route("/admin/backup", get(admin_backup))
         .route("/admin/backup-now", post(admin_backup_now))
-        // 保留旧地址，升级前已打开的管理端仍可触发新版多渠道备份。
-        .route("/admin/backup-to-channel", post(admin_backup_now))
         .route("/admin/extras", get(extras_get).post(extras_set))
         .route("/admin/queues/delete/run", post(admin_run_delete_queue))
         .route(

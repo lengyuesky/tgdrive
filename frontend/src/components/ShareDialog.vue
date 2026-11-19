@@ -91,7 +91,7 @@ async function create() {
       expires_hours: expiresHours.value || undefined,
       max_downloads: maxDownloads.value || undefined,
     })
-    url.value = `${location.origin}/s/${data.share.token}`
+    url.value = `${location.origin}/admin/s/${data.share.token}`
     created.value = true
   } catch (e) {
     ElMessage.error(errMsg(e))

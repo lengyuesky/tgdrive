@@ -18,9 +18,9 @@ async function mockDrive(page: Page, options: { media?: boolean; failSecond?: bo
   let fail = options.failSecond
   page.on('pageerror', (error) => errors.push(error.message))
   // 所有 API 在浏览器层拦截，绝不访问生产数据库和用户原图。
-  await page.route('**/api/**', async (route) => {
+  await page.route('**/admin/api/**', async (route) => {
     const url = new URL(route.request().url())
-    if (url.pathname === '/api/fs/entries') {
+    if (url.pathname === '/admin/api/fs/entries') {
       requests.push(url)
       if (url.searchParams.get('kind') === 'dir') {
         return route.fulfill({ json: { path: '/', entries: [{ ...file(900000), name: '大目录', is_dir: true }], has_more: false, next_cursor: null, total: 1 } })
@@ -41,21 +41,21 @@ async function mockDrive(page: Page, options: { media?: boolean; failSecond?: bo
       return route.fulfill({ json: { path: url.searchParams.get('path'), entries,
         has_more: !q && start + count < TOTAL, next_cursor: q ? null : String(start + count), ...(start === 0 ? { total: q ? 1 : TOTAL } : {}) } })
     }
-    if (url.pathname === '/api/fs/download' || url.pathname === '/api/fs/thumbnail') {
+    if (url.pathname === '/admin/api/fs/download' || url.pathname === '/admin/api/fs/thumbnail') {
       files.push(url.pathname + '?' + url.searchParams.toString())
       active++; peak = Math.max(peak, active)
       await new Promise((resolve) => setTimeout(resolve, 25))
       try {
-        if (url.pathname === '/api/fs/thumbnail') return await route.fulfill({ status: 404, body: '' })
+        if (url.pathname === '/admin/api/fs/thumbnail') return await route.fulfill({ status: 404, body: '' })
         await route.fulfill({ contentType: 'image/png', body: png })
       } finally { active-- }
       return
     }
-    if (url.pathname === '/api/info') return route.fulfill({ json: { username: '测试', files: TOTAL,
+    if (url.pathname === '/admin/api/info') return route.fulfill({ json: { username: '测试', files: TOTAL,
       dirs: 1, total_size: 1000000, configured: true, official_api: false, api_base: '', chunk_size: 100 } })
-    if (url.pathname === '/api/uploads') return route.fulfill({ json: { sessions: [] } })
-    if (url.pathname === '/api/auth/me') return route.fulfill({ json: { username: '测试' } })
-    if (url.pathname === '/api/fs/list') throw new Error('主目录不应调用旧全量接口')
+    if (url.pathname === '/admin/api/uploads') return route.fulfill({ json: { sessions: [] } })
+    if (url.pathname === '/admin/api/auth/me') return route.fulfill({ json: { username: '测试' } })
+    if (url.pathname === '/admin/api/fs/list') throw new Error('主目录不应调用旧全量接口')
     return route.fulfill({ json: { ok: true, items: [] } })
   })
   return { requests, files, errors, peak: () => peak }
@@ -70,7 +70,7 @@ async function bottom(page: Page) {
 test('76万条目录首屏有界、连续加载、已加载全选、四视图与响应式锚点', async ({ page }) => {
   const state = await mockDrive(page)
   const begin = Date.now()
-  await page.goto('/files/大目录')
+  await page.goto('/admin/files/大目录')
   await expect(page.locator('.crumb-count')).toHaveText(`已加载 200 / 匹配 ${TOTAL}`)
   expect(Date.now() - begin).toBeLessThan(5000)
   expect(state.requests.filter((u) => u.searchParams.get('kind') !== 'dir')).toHaveLength(1)
@@ -99,7 +99,7 @@ test('76万条目录首屏有界、连续加载、已加载全选、四视图与
 
 test('失败续批可重试，服务器过滤及旧请求隔离', async ({ page }) => {
   const state = await mockDrive(page, { failSecond: true, slow: true })
-  await page.goto('/files/大目录')
+  await page.goto('/admin/files/大目录')
   await expect(page.locator('.crumb-count')).toContainText('已加载 200')
   await bottom(page)
   await expect(page.locator('.directory-status')).toContainText('加载失败')
@@ -119,11 +119,11 @@ test('失败续批可重试，服务器过滤及旧请求隔离', async ({ page 
 
 test('原图限流、超限降级、视频无原片、预览最多三张以及往返滚动资源稳定', async ({ page }, testInfo) => {
   const state = await mockDrive(page, { media: true })
-  await page.goto('/files/大目录')
+  await page.goto('/admin/files/大目录')
   await expect(page.locator('.directory-media img').first()).toBeVisible()
   expect(state.peak()).toBeLessThanOrEqual(4)
   expect(state.files.some((u) => decodeURIComponent(u).includes('0000005.jpg'))).toBe(false)
-  expect(state.files.some((u) => u.startsWith('/api/fs/download') && decodeURIComponent(u).includes('.mp4'))).toBe(false)
+  expect(state.files.some((u) => u.startsWith('/admin/api/fs/download') && decodeURIComponent(u).includes('.mp4'))).toBe(false)
   await page.locator('.panel [data-entry-id="3"] .name-cell').click()
   await expect(page.getByRole('dialog', { name: '图片预览' })).toBeVisible()
   expect(await page.locator('.image-preview img').count()).toBe(3)
@@ -167,7 +167,7 @@ test('原图限流、超限降级、视频无原片、预览最多三张以及�
 
 test('键盘操作：方向键焦点、范围选择、翻页滚动、网格左右与退格返回', async ({ page }) => {
   const state = await mockDrive(page)
-  await page.goto('/files/大目录')
+  await page.goto('/admin/files/大目录')
   await expect(page.locator('.crumb-count')).toContainText('已加载 200')
   const list = viewport(page)
   await list.focus()

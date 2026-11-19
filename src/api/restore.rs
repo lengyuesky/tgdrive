@@ -150,8 +150,12 @@ pub(crate) async fn write_guard(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    let restore = path.starts_with("/api/admin/restore/");
-    let auth = path.starts_with("/api/auth/");
+    if !crate::web::is_admin_path(path) {
+        // 根地址回退不属于宿主写入入口，维护期间也应走同一个回退处理。
+        return next.run(req).await;
+    }
+    let restore = path.starts_with("/admin/api/admin/restore/");
+    let auth = path.starts_with("/admin/api/auth/");
     let read = matches!(
         *req.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
@@ -161,18 +165,20 @@ pub(crate) async fn write_guard(
     } else {
         None
     };
-    if state.restore.maintenance() && !matches!(path, "/healthz" | "/api/admin/restore/status") {
+    if state.restore.maintenance()
+        && !matches!(path, "/admin/healthz" | "/admin/api/admin/restore/status")
+    {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error":"恢复维护中，应用正在退出重启"})),
+            Json(serde_json::json!({"error":"恢复维护中，宿主正在退出重启"})),
         )
             .into_response();
     }
     // 安全模式允许修复网络/账号配置，但所有数据写入与后台执行入口保持关闭。
     let config = matches!(
         path,
-        "/api/admin/config" | "/api/admin/config/reset" | "/api/admin/test"
-    ) || path.starts_with("/api/admin/security/");
+        "/admin/api/admin/config" | "/admin/api/admin/config/reset" | "/admin/api/admin/test"
+    ) || path.starts_with("/admin/api/admin/security/");
     if state.vfs.db.background_blocked() && !read && !restore && !auth && !config {
         return AppError::Forbidden(
             "恢复安全模式：数据写入和后台任务已暂停，请先核对历史任务，再到备份页确认恢复后台任务"

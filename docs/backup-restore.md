@@ -67,6 +67,6 @@ docker run --rm -i -v "$PWD:/work" -w /work --entrypoint tgdrive tgdrive:latest 
 
 - **密码哈希**:后台设置的登录密码以 argon2id 哈希存进数据库;旧版明文会在启动时自动迁移。「导出 .env」导出的也是哈希(带单引号,可直接使用)。
 - **两步验证**:在「账号安全」中扫码绑定任意 TOTP 验证器(Google Authenticator、Microsoft Authenticator、1Password 等),绑定成功会显示 10 个一次性恢复码,并登出其他设备。之后网页登录需输入 6 位验证码,手机丢失时可用恢复码代替。
-- **WebDAV 应用密码**:随机生成,只显示一次,用户名不变。启用两步验证后,WebDAV 与 `/api` 的 Basic 认证**不再接受登录密码**,只能用应用密码,避免借 WebDAV 绕过两步验证。
+- **WebDAV 应用密码**:随机生成,只显示一次,用户名不变。启用两步验证后,WebDAV 与 `/admin/api` 的 Basic 认证**不再接受登录密码**,只能用应用密码,避免借 WebDAV 绕过两步验证。
 - **找回**:验证器和恢复码都丢失时,先 `docker compose stop tgdrive`,再运行 `docker compose run --rm tgdrive reset-2fa` 关闭两步验证,最后 `docker compose up -d tgdrive`。服务与写库命令共用实例锁,不能在服务运行时直接执行重置。
 - 两步验证密钥、恢复码和应用密码与登录密码一样,不会写进离开本机的备份;从备份恢复后需要重新绑定。

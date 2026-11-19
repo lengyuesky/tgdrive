@@ -211,7 +211,7 @@ fn is_cross_site(headers: &axum::http::HeaderMap) -> bool {
 
 const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// 进程内 HTTP 指标（Prometheus 文本格式由 /api/metrics 输出）。
+/// 进程内 HTTP 指标（Prometheus 文本格式由 /admin/api/metrics 输出）。
 /// 保留原有总计数；路由直方图和正文生命周期指标见 metrics 模块。
 static HTTP_BY_CLASS: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -375,9 +375,12 @@ mod tests {
 
     #[test]
     fn access_log_masks_credential_segments() {
-        assert_eq!(redact_path("/api/share/abc123/list"), "/api/share/***/list");
-        assert_eq!(redact_path("/api/media/tkt"), "/api/media/***");
-        assert_eq!(redact_path("/api/fs/list"), "/api/fs/list");
+        assert_eq!(
+            redact_path("/admin/api/share/abc123/list"),
+            "/admin/api/share/***/list"
+        );
+        assert_eq!(redact_path("/admin/api/media/tkt"), "/admin/api/media/***");
+        assert_eq!(redact_path("/admin/api/fs/list"), "/admin/api/fs/list");
     }
 
     #[test]

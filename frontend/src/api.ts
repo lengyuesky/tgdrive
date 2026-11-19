@@ -587,9 +587,9 @@ export const api = {
     })
   },
   downloadUrl: (path: string, inline = false) =>
-    `/api/fs/download?path=${encodeURIComponent(path)}${inline ? '&inline=1' : ''}`,
+    `/admin/api/fs/download?path=${encodeURIComponent(path)}${inline ? '&inline=1' : ''}`,
   /** 只请求 Telegram 小图，不会读取原视频。 */
-  thumbnailUrl: (path: string) => `/api/fs/thumbnail?path=${encodeURIComponent(path)}`,
+  thumbnailUrl: (path: string) => `/admin/api/fs/thumbnail?path=${encodeURIComponent(path)}`,
   /** 上传前批量查重:返回目录下已存在的名字 */
   exists: (dir: string, names: string[], signal?: AbortSignal) =>
     http.post<{ existing: string[] }>('/fs/exists', { dir, names }, { signal }),
@@ -682,7 +682,7 @@ export const api = {
       if (path) p.set('path', path)
       if (inline) p.set('inline', '1')
       const qs = p.toString()
-      return `/api/share/${token}/download${qs ? '?' + qs : ''}`
+      return `/admin/api/share/${token}/download${qs ? '?' + qs : ''}`
     },
   },
 
@@ -747,7 +747,7 @@ export const api = {
       resume: (body: RestoreAuth) => http.post<RestoreStatus>('/admin/restore/resume', body, { handleAuthLocally: true }),
     },
     envExport: () => http.get<string>('/admin/env-export', { responseType: 'text' }),
-    backupUrl: '/api/admin/backup',
+    backupUrl: '/admin/api/admin/backup',
     backupNow: () => http.post<BackupOutcome>('/admin/backup-now'),
     extras: () =>
       http.get<{

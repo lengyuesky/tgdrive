@@ -11,14 +11,14 @@ const Admin = () => import('./views/Admin.vue')
 const Share = () => import('./views/Share.vue')
 
 export const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
     { path: '/login', component: Login },
     { path: '/', component: SessionBoundary, children: [
       { path: '', redirect: '/files/' },
       // /files 之后的部分即当前目录路径，登录外壳跨页面保留上传任务。
       { path: 'files/:path(.*)*', component: Files },
-      { path: 'admin', component: Admin },
+      { path: 'settings', component: Admin },
       { path: 'transfers', component: Transfers },
       { path: 'me', component: Me },
     ] },

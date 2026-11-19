@@ -82,7 +82,7 @@ function open() {
 }
 
 async function copy(row: ShareItem) {
-  const url = `${location.origin}/s/${row.token}`
+  const url = `${location.origin}/admin/s/${row.token}`
   const text = row.password ? `${url}  提取码: ${row.password}` : url
   await copyText(text)
 }

@@ -10,6 +10,7 @@ services:
       - "${TGDRIVE_BOT_API_GID:-101}"
     restart: unless-stopped
     ports:
+      # 宿主界面位于 http://localhost:3358/admin/；健康检查使用二进制的 /admin/healthz 探针。
       - "3358:8080"
     env_file:
       - path: .env

@@ -300,7 +300,7 @@ async fn media_ticket(
         content_version: Some(node.content_version()),
     })?;
     Ok(private_json(
-        serde_json::json!({"url":format!("/api/media/{ticket}"),"expires_at":expires_at}),
+        serde_json::json!({"url":format!("/admin/api/media/{ticket}"),"expires_at":expires_at}),
     ))
 }
 async fn device_media(

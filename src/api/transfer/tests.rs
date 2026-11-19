@@ -53,7 +53,7 @@ async fn upload_receipts_are_atomic_idempotent_and_scoped_tickets_are_revocable(
     let (_, login) = send(
         &app,
         "POST",
-        "/api/auth/device/login",
+        "/admin/api/auth/device/login",
         None,
         json!({"username":"entries-test","password":"entries-test-only","device_name":"传输测试"}),
     )
@@ -62,7 +62,7 @@ async fn upload_receipts_are_atomic_idempotent_and_scoped_tickets_are_revocable(
     let (status, legacy) = send(
         &app,
         "GET",
-        &format!("/api/uploads/{}", info.session.id),
+        &format!("/admin/api/uploads/{}", info.session.id),
         Some(token),
         Value::Null,
     )
@@ -73,14 +73,14 @@ async fn upload_receipts_are_atomic_idempotent_and_scoped_tickets_are_revocable(
         legacy.get("receipt").is_none(),
         "旧网页状态成功响应始终含会话"
     );
-    let lookup = format!("/api/uploads/lookup?path=%2Fempty.txt&size=0&sha256={sha}");
+    let lookup = format!("/admin/api/uploads/lookup?path=%2Fempty.txt&size=0&sha256={sha}");
     let (status, located) = send(&app, "GET", &lookup, Some(token), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(located["id"], info.session.id);
     let (status, ticket) = send(
         &app,
         "POST",
-        &format!("/api/uploads/{}/ticket", info.session.id),
+        &format!("/admin/api/uploads/{}/ticket", info.session.id),
         Some(token),
         json!({}),
     )
@@ -98,7 +98,7 @@ async fn upload_receipts_are_atomic_idempotent_and_scoped_tickets_are_revocable(
     let (status, native_result) = send(
         &app,
         "GET",
-        &format!("/api/uploads/{}/result", info.session.id),
+        &format!("/admin/api/uploads/{}/result", info.session.id),
         Some(token),
         Value::Null,
     )
@@ -109,7 +109,7 @@ async fn upload_receipts_are_atomic_idempotent_and_scoped_tickets_are_revocable(
         send(
             &app,
             "GET",
-            &format!("/api/uploads/{}", info.session.id),
+            &format!("/admin/api/uploads/{}", info.session.id),
             Some(token),
             Value::Null
         )
@@ -347,12 +347,12 @@ async fn instant_conflict_policy_prevents_replacement_and_keeps_legacy_idempoten
     db.finalize_upload(existing, 0, Some(&"b".repeat(64)))
         .await
         .unwrap();
-    let (_, login) = send(&app, "POST", "/api/auth/device/login", None, json!({"username":"entries-test","password":"entries-test-only","device_name":"冲突策略测试"})).await;
+    let (_, login) = send(&app, "POST", "/admin/api/auth/device/login", None, json!({"username":"entries-test","password":"entries-test-only","device_name":"冲突策略测试"})).await;
     let token = login["access_token"].as_str().unwrap();
     let (status, error) = send(
         &app,
         "POST",
-        "/api/fs/instant",
+        "/admin/api/fs/instant",
         Some(token),
         json!({"dir":"/","name":"target.txt","size":0,"sha256":hash,"overwrite":false}),
     )
@@ -362,7 +362,7 @@ async fn instant_conflict_policy_prevents_replacement_and_keeps_legacy_idempoten
     let (status, value) = send(
         &app,
         "POST",
-        "/api/fs/instant",
+        "/admin/api/fs/instant",
         Some(token),
         json!({"dir":"/","name":"target.txt","size":0,"sha256":hash}),
     )

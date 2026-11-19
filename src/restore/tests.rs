@@ -111,7 +111,7 @@ async fn ready(state: &AppState) -> String {
 }
 fn app(state: &AppState) -> axum::Router {
     axum::Router::new()
-        .nest("/api", crate::api::router(state.clone()))
+        .nest("/admin/api", crate::api::router(state.clone()))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::api::restore::write_guard,
@@ -126,7 +126,7 @@ async fn request(
 ) -> (StatusCode, serde_json::Value) {
     let mut request = Request::builder()
         .method(method)
-        .uri(format!("/api/admin/restore/{route}"))
+        .uri(format!("/admin/api/admin/restore/{route}"))
         .header("content-type", "application/json");
     if cookie {
         request = request.header(
@@ -997,7 +997,7 @@ async fn cookie_only_history_and_safe_mode_entry_guards() {
         let response = app(&state)
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/admin/restore/{route}"))
+                    .uri(format!("/admin/api/admin/restore/{route}"))
                     .header("authorization", format!("Basic {basic}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -1036,7 +1036,7 @@ async fn cookie_only_history_and_safe_mode_entry_guards() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/fs/mkdir")
+                .uri("/admin/api/fs/mkdir")
                 .header("content-type", "application/json")
                 .body(Body::from("{\"path\":\"/bad\"}"))
                 .unwrap(),

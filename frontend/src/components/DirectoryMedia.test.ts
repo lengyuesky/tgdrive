@@ -20,7 +20,7 @@ describe('虚拟条目媒体绑定', () => {
     })
     const item = ({ ...entry(1), ...{ name: 'one.jpg', has_thumbnail: true } })
     view = mount(DirectoryMedia, { props: { entry: item, path: '/one.jpg', video: false, generation: 1 }, global: { stubs: { ElIcon: true } } })
-    expect(mocks.acquire.mock.calls[0]![0]).toMatchObject({ path: '/one.jpg', thumbnailUrl: '/api/fs/thumbnail?path=%2Fone.jpg' })
+    expect(mocks.acquire.mock.calls[0]![0]).toMatchObject({ path: '/one.jpg', thumbnailUrl: '/admin/api/fs/thumbnail?path=%2Fone.jpg' })
     await view.setProps({ path: '/other/one.jpg', generation: 2 })
     expect(jobs[0]!.release).toHaveBeenCalledTimes(1)
     jobs[1]!.resolve('blob:new'); await flushPromises()

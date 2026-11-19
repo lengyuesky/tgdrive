@@ -79,7 +79,7 @@ ENV TGDRIVE_STATIC_DIR=/app/static \
 VOLUME /data
 EXPOSE 8080
 USER 1000:1000
-# 健康检查用二进制自带子命令,无需安装 curl
+# 健康检查用二进制自带子命令请求 /admin/healthz，无需安装 curl
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s CMD ["tgdrive", "healthcheck"]
 ENTRYPOINT ["tgdrive"]
 CMD ["serve"]

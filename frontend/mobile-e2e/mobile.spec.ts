@@ -6,26 +6,25 @@ async function mock(page: Page, options: { slowUpload?: boolean } = {}) {
   const uploads: { dir: string }[] = []
   page.on('pageerror', (error) => errors.push(error.message))
   await page.addInitScript(() => localStorage.setItem('tgdrive.install-dismissed', String(Date.now())))
-  await page.route('**/api/**', async (route) => {
+  await page.route('**/admin/api/**', async (route) => {
     const url = new URL(route.request().url())
-    if (url.pathname === '/api/auth/me') return route.fulfill({ json: { username: '手机测试' } })
-    if (url.pathname === '/api/info') return route.fulfill({ json: { username: '手机测试', configured: true, files: 10000, dirs: 2, total_size: 1280000 } })
-    if (url.pathname === '/api/fs/entries') {
+    if (url.pathname === '/admin/api/auth/me') return route.fulfill({ json: { username: '手机测试' } })
+    if (url.pathname === '/admin/api/info') return route.fulfill({ json: { username: '手机测试', configured: true, files: 10000, dirs: 2, total_size: 1280000 } })
+    if (url.pathname === '/admin/api/fs/entries') {
       const start = Number(url.searchParams.get('cursor') || 0)
       const entries = url.searchParams.get('kind') === 'dir' ? [] : Array.from({ length: 200 }, (_, index) => entry(start + index + 1))
       return route.fulfill({ json: { path: url.searchParams.get('path'), entries, total: 10000, has_more: entries.length > 0, next_cursor: String(start + 200) } })
     }
-    if (url.pathname === '/api/uploads') return route.fulfill({ json: { sessions: [], concurrency: 2, bot_count: 1, retry_after: 0 } })
-    if (url.pathname === '/api/fs/exists') return route.fulfill({ json: { existing: [] } })
-    if (url.pathname === '/api/fs/instant') {
+    if (url.pathname === '/admin/api/uploads') return route.fulfill({ json: { sessions: [], concurrency: 2, bot_count: 1, retry_after: 0 } })
+    if (url.pathname === '/admin/api/fs/exists') return route.fulfill({ json: { existing: [] } })
+    if (url.pathname === '/admin/api/fs/instant') {
       uploads.push(route.request().postDataJSON())
       if (options.slowUpload) await new Promise((resolve) => setTimeout(resolve, 2000))
       return route.fulfill({ json: { linked: true, pending: false, entry: entry(1) } })
     }
-    if (url.pathname === '/api/apps') return route.fulfill({ json: { installed: [], available: [] } })
-    if (url.pathname === '/api/shares') return route.fulfill({ json: { items: [{ id: 1, name: '很长的分享文件名'.repeat(8), path: '/文件.txt', token: 'mobile-test', downloads: 0 }] } })
-    if (url.pathname === '/api/trash') return route.fulfill({ json: { items: [{ id: 1, name: '已删除文件.txt', orig_path: '/文件夹/已删除文件.txt', size: 128, trashed_at: 1700000000 }] } })
-    if (url.pathname === '/api/fs/search') return route.fulfill({ json: { results: [{ ...entry(1), path: '/测试/收藏文件.txt' }] } })
+    if (url.pathname === '/admin/api/shares') return route.fulfill({ json: { items: [{ id: 1, name: '很长的分享文件名'.repeat(8), path: '/文件.txt', token: 'mobile-test', downloads: 0 }] } })
+    if (url.pathname === '/admin/api/trash') return route.fulfill({ json: { items: [{ id: 1, name: '已删除文件.txt', orig_path: '/文件夹/已删除文件.txt', size: 128, trashed_at: 1700000000 }] } })
+    if (url.pathname === '/admin/api/fs/search') return route.fulfill({ json: { results: [{ ...entry(1), path: '/测试/收藏文件.txt' }] } })
     return route.fulfill({ json: { ok: true } })
   })
   return { errors, uploads }
@@ -35,10 +34,10 @@ async function noOverflow(page: Page) {
 }
 const list = (page: Page) => page.locator('.panel [data-testid="virtual-viewport"]')
 
-test('小屏四标签、视图、多选、操作面板与窄屏管理卡片', async ({ page }, info) => {
+test('小屏三标签、视图、多选、操作面板与窄屏管理卡片', async ({ page }, info) => {
   const state = await mock(page)
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.goto('/files/测试')
+  await page.goto('/admin/files/测试')
   await expect(page.getByRole('navigation', { name: '主导航' })).toBeVisible()
   await expect(page.locator('[data-entry-id]').first()).toBeVisible()
   for (const width of [320, 375, 390, 430]) {
@@ -73,7 +72,7 @@ test('小屏四标签、视图、多选、操作面板与窄屏管理卡片', as
 
 test('标签切换保留文件滚动与视图，常驻上传保持目标目录', async ({ page }, info) => {
   const state = await mock(page, { slowUpload: true })
-  await page.goto('/files/目标目录')
+  await page.goto('/admin/files/目标目录')
   await expect(page.locator('[data-entry-id]').first()).toBeVisible()
   await list(page).evaluate((element) => { element.scrollTop = 900 })
   const offset = await list(page).evaluate((element) => element.scrollTop)
@@ -88,10 +87,10 @@ test('标签切换保留文件滚动与视图，常驻上传保持目标目录',
   await expect(page.locator('#transfers-panel')).toContainText('秒传成功')
   expect(state.uploads).toHaveLength(1)
   expect(state.uploads[0]!.dir).toBe('/目标目录')
-  await page.getByRole('navigation').getByText('应用', { exact: true }).click()
-  await expect(page).toHaveURL(/\/apps$/)
+  await page.getByRole('navigation').getByText('我的', { exact: true }).click()
+  await expect(page).toHaveURL(/\/admin\/me$/)
   await page.getByRole('navigation').getByText('文件', { exact: true }).click()
-  await expect(page).toHaveURL(/\/files\//)
+  await expect(page).toHaveURL(/\/admin\/files\//)
   await expect.poll(() => list(page).evaluate((element) => element.scrollTop)).toBe(offset)
   await noOverflow(page)
   await page.screenshot({ path: info.outputPath('手机文件页.png'), animations: 'disabled' })
@@ -100,7 +99,7 @@ test('标签切换保留文件滚动与视图，常驻上传保持目标目录',
 
 test('主屏幕配置、暗色、断网提示和安装说明', async ({ page }) => {
   const state = await mock(page)
-  await page.goto('/me')
+  await page.goto('/admin/me')
   expect(await page.locator('meta[name="viewport"]').getAttribute('content')).toContain('viewport-fit=cover')
   await page.getByRole('button', { name: '添加到主屏幕' }).click()
   await expect(page.getByRole('dialog')).toContainText('Safari')
@@ -116,7 +115,7 @@ test('主屏幕配置、暗色、断网提示和安装说明', async ({ page }) 
 
 test('平板、桌面和手机横屏没有横向溢出，模拟安全区不遮挡列表', async ({ page }) => {
   const state = await mock(page)
-  await page.goto('/files/适配目录')
+  await page.goto('/admin/files/适配目录')
   for (const [width, height] of [[768, 1024], [844, 390], [1024, 768], [1440, 1000], [390, 844]] as const) {
     await page.setViewportSize({ width, height })
     await expect(page.locator('.mobile-file-header')).toHaveCount(width <= 767 ? 1 : 0)
@@ -142,7 +141,7 @@ test('平板、桌面和手机横屏没有横向溢出，模拟安全区不遮�
 
 test('嵌套弹层约束焦点，浏览器返回逐层关闭且不增加历史记录', async ({ page }) => {
   const state = await mock(page)
-  await page.goto('/files/')
+  await page.goto('/admin/files/')
   await page.getByRole('navigation', { name: '主导航' }).getByText('我的', { exact: true }).click()
   const trigger = page.getByRole('button', { name: /分享管理/ })
   await trigger.click()
@@ -171,7 +170,7 @@ test('嵌套弹层约束焦点，浏览器返回逐层关闭且不增加历史�
   expect(await page.evaluate(() => document.body.style.overflow)).toBe('')
   expect(await page.evaluate(() => history.length)).toBe(historyLength)
   await page.goBack()
-  await expect(page).toHaveURL(/\/files\/$/)
+  await expect(page).toHaveURL(/\/admin\/files\/$/)
   expect(state.errors).toEqual([])
 })
 
@@ -192,8 +191,8 @@ test('模拟软键盘隐藏底栏并保持表单可见，输入法确认不误�
     ;(window as unknown as { setTestViewport: (value: number) => void }).setTestViewport(value)
   }, height)
   let created = 0
-  page.on('request', (request) => { if (new URL(request.url()).pathname === '/api/fs/mkdir') created++ })
-  await page.goto('/files/')
+  page.on('request', (request) => { if (new URL(request.url()).pathname === '/admin/api/fs/mkdir') created++ })
+  await page.goto('/admin/files/')
   await visualHeight(480)
   await expect(page.locator('html')).not.toHaveClass(/keyboard-open/)
   await page.getByRole('button', { name: '搜索文件', exact: true }).click()
@@ -230,13 +229,13 @@ test('注销立即关闭上传与确认弹层，重新登录不接收旧会话�
   let release!: () => void
   const pending = new Promise<void>((resolve) => { release = resolve })
   let started = false
-  await page.route('**/api/fs/instant', async (route) => {
+  await page.route('**/admin/api/fs/instant', async (route) => {
     started = true
     await pending
     await route.fulfill({ json: { linked: true, pending: false, entry: entry(1) } }).catch(() => {})
   })
   try {
-    await page.goto('/files/注销前目录')
+    await page.goto('/admin/files/注销前目录')
     await page.getByRole('button', { name: '上传或新建' }).click()
     const chooser = page.waitForEvent('filechooser')
     await page.getByRole('button', { name: '上传文件或照片' }).click()
@@ -247,7 +246,7 @@ test('注销立即关闭上传与确认弹层，重新登录不接收旧会话�
     await page.getByRole('button', { name: /退出登录/ }).click()
     const dialog = page.getByRole('dialog', { name: '退出登录', exact: true })
     await dialog.getByRole('button', { name: '退出登录', exact: true }).click()
-    await expect(page).toHaveURL(/\/login$/)
+    await expect(page).toHaveURL(/\/admin\/login$/)
     await expect(page.getByRole('dialog')).not.toBeVisible()
     expect(await page.evaluate(() => document.body.style.overflow)).toBe('')
     release()
@@ -263,12 +262,12 @@ test('注销立即关闭上传与确认弹层，重新登录不接收旧会话�
 
 test('管理接口 401 不被弹层阻挡，直接回到无滚动锁的登录页', async ({ page }) => {
   const state = await mock(page)
-  await page.route('**/api/shares/1', (route) => route.fulfill({ status: 401, json: { error: '会话已失效' } }))
-  await page.goto('/me')
+  await page.route('**/admin/api/shares/1', (route) => route.fulfill({ status: 401, json: { error: '会话已失效' } }))
+  await page.goto('/admin/me')
   await page.getByRole('button', { name: /分享管理/ }).click()
   await page.getByRole('dialog', { name: '分享管理', exact: true }).getByRole('button', { name: '取消分享' }).click()
   await page.getByRole('dialog', { name: '取消分享', exact: true }).getByRole('button', { name: '取消分享' }).click()
-  await expect(page).toHaveURL(/\/login$/)
+  await expect(page).toHaveURL(/\/admin\/login$/)
   await expect(page.getByRole('dialog')).not.toBeVisible()
   expect(await page.evaluate(() => [document.body.style.overflow, document.documentElement.style.overflow])).toEqual(['', ''])
   expect(state.errors).toEqual([])
@@ -277,7 +276,7 @@ test('管理接口 401 不被弹层阻挡，直接回到无滚动锁的登录页
 test('公开分享的错误提取码不跳登录，中文输入与窄屏目录卡片可用', async ({ page }) => {
   const state = await mock(page)
   let attempts = 0
-  await page.route('**/api/share/**', async (route) => {
+  await page.route('**/admin/api/share/**', async (route) => {
     const path = new URL(route.request().url()).pathname
     if (path.endsWith('/authorize')) {
       attempts++
@@ -289,7 +288,7 @@ test('公开分享的错误提取码不跳登录，中文输入与窄屏目录�
     return route.fulfill({ json: { name: '手机公开分享', is_dir: true, need_password: true, downloads: 0 } })
   })
   await page.setViewportSize({ width: 320, height: 700 })
-  await page.goto('/s/mobile-test')
+  await page.goto('/admin/s/mobile-test')
   await expect(page.getByRole('navigation')).not.toBeVisible()
   const input = page.getByPlaceholder('请输入提取码')
   await input.fill('错误提取码')
@@ -312,13 +311,13 @@ test('视频全屏能力缺失时提供可退出的页面沉浸，返回只退�
     Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', { value: undefined, configurable: true })
     Object.defineProperty(HTMLVideoElement.prototype, 'webkitEnterFullscreen', { value: undefined, configurable: true })
   })
-  await page.route('**/api/fs/entries?**', (route) => {
+  await page.route('**/admin/api/fs/entries?**', (route) => {
     const url = new URL(route.request().url())
     return route.fulfill({ json: { path: url.searchParams.get('path'), entries: url.searchParams.get('kind') === 'dir' ? [] : [{ ...entry(1), name: '测试视频.mp4' }], total: 1, has_more: false, next_cursor: null } })
   })
   let mediaRequests = 0
-  page.on('request', (request) => { if (request.url().includes('/api/fs/download')) mediaRequests++ })
-  await page.goto('/files/')
+  page.on('request', (request) => { if (request.url().includes('/admin/api/fs/download')) mediaRequests++ })
+  await page.goto('/admin/files/')
   await page.locator('[data-entry-id="1"] .name-cell').click()
   const preview = page.getByRole('dialog', { name: '测试视频.mp4', exact: true })
   await expect(preview).toBeVisible()
@@ -346,8 +345,8 @@ test('视频全屏能力缺失时提供可退出的页面沉浸，返回只退�
 
 test('注销请求失败时保留当前页面并明确提示，不假装已退出', async ({ page }) => {
   const state = await mock(page)
-  await page.route('**/api/auth/logout', (route) => route.fulfill({ status: 503, json: { error: '服务暂时不可用' } }))
-  await page.goto('/me')
+  await page.route('**/admin/api/auth/logout', (route) => route.fulfill({ status: 503, json: { error: '服务暂时不可用' } }))
+  await page.goto('/admin/me')
   await page.getByRole('button', { name: /退出登录/ }).click()
   await page.getByRole('dialog', { name: '退出登录', exact: true }).getByRole('button', { name: '退出登录', exact: true }).click()
   await expect(page.getByText('退出登录失败：服务暂时不可用', { exact: true })).toBeVisible()

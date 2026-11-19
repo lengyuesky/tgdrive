@@ -8,7 +8,7 @@ export default defineConfig({
   reporter: 'list',
   outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR ?? '/tmp/tgdrive-playwright-results',
   use: {
-    baseURL: 'http://127.0.0.1:4178',
+    baseURL: 'http://127.0.0.1:4178/admin/',
     viewport: { width: 1440, height: 1000 },
     launchOptions: {
       ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
@@ -18,7 +18,7 @@ export default defineConfig({
   },
   webServer: {
     command: 'npm run preview -- --host 127.0.0.1 --port 4178 --strictPort',
-    url: 'http://127.0.0.1:4178',
+    url: 'http://127.0.0.1:4178/admin/',
     reuseExistingServer: false,
     timeout: 30_000,
   },

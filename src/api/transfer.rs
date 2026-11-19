@@ -36,7 +36,7 @@ async fn issue(
     };
     let ticket = state.auth.sign_native_claims(&claims)?;
     Ok(Json(
-        serde_json::json!({"url":format!("/api/transfer/{ticket}"),"expires_at":expires_at}),
+        serde_json::json!({"url":format!("/admin/api/transfer/{ticket}"),"expires_at":expires_at}),
     ))
 }
 async fn verify(state: &AppState, ticket: &str) -> AppResult<String> {

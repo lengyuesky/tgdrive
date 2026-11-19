@@ -24,12 +24,12 @@ function node(script) {
 }
 function configure(patch, reset = false) {
   node(`(async()=>{
-    const login=await fetch('http://tgdrive:8080/api/auth/login',{
+    const login=await fetch('http://tgdrive:8080/admin/api/auth/login',{
       method:'POST',headers:{'content-type':'application/json'},
       body:JSON.stringify({username:'test',password:'integration-test-only'})
     });
     if(!login.ok) throw new Error('测试登录失败');
-    const response=await fetch('http://tgdrive:8080/api/admin/config${reset ? '/reset' : ''}',{
+    const response=await fetch('http://tgdrive:8080/admin/api/admin/config${reset ? '/reset' : ''}',{
       method:'POST',headers:{'content-type':'application/json',cookie:login.headers.get('set-cookie').split(';')[0]},
       body:JSON.stringify(${JSON.stringify(patch)})
     });
@@ -38,7 +38,7 @@ function configure(patch, reset = false) {
 }
 function probe() {
   return docker('exec', bot, 'sh', '-c',
-    'cfg=$(ls /tmp/tgdrive-proxy.*); proxychains4 -q -f "$cfg" wget -T 5 -qO- http://tgdrive:8080/healthz')
+    'cfg=$(ls /tmp/tgdrive-proxy.*); proxychains4 -q -f "$cfg" wget -T 5 -qO- http://tgdrive:8080/admin/healthz')
 }
 function connections() {
   return Number(docker('exec', upstream, 'node', '-e',
