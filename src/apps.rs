@@ -9,6 +9,8 @@ mod catalog_tests;
 #[cfg(test)]
 mod conformance_tests;
 mod cursor;
+#[cfg(test)]
+mod cursor_plan_tests;
 mod error;
 mod events;
 mod http;

@@ -229,6 +229,8 @@ impl AppPlatform {
         query
             .push(" ORDER BY key COLLATE BINARY LIMIT ")
             .push_bind(i64::from(request.limit) + 1);
+        #[cfg(test)]
+        super::query::capture_plan(&mut query, &mut tx, "kv/list", &app.generation).await?;
         let rows: Vec<KvRow> = query.build_query_as().fetch_all(&mut *tx).await?;
         let mut records = rows
             .iter()

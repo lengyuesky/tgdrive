@@ -137,7 +137,7 @@ fn sort_expression(sort: NodeSort) -> &'static str {
         NodeSort::Id => "n.id",
     }
 }
-fn last_key(row: &NodeRow, sort: NodeSort) -> serde_json::Value {
+pub(super) fn last_key(row: &NodeRow, sort: NodeSort) -> serde_json::Value {
     match sort {
         NodeSort::Name => serde_json::json!([row.name.to_ascii_lowercase(), row.name, row.id]),
         NodeSort::Size => serde_json::json!([row.size, row.id]),
@@ -304,7 +304,7 @@ impl AppPlatform {
             .push(" LIMIT ")
             .push_bind(i64::from(request.limit) + 1);
         #[cfg(test)]
-        capture_plan(&mut query, &mut tx, "query").await?;
+        capture_plan(&mut query, &mut tx, "query", &app.generation).await?;
         let rows: Vec<NodeRow> = query.build_query_as().fetch_all(&mut *tx).await?;
         let page = self
             .page(
@@ -475,7 +475,13 @@ impl AppPlatform {
             .push(" LIMIT ")
             .push_bind(i64::from(request.limit) + 1);
         #[cfg(test)]
-        capture_plan(&mut query, &mut tx, "directories-with-files").await?;
+        capture_plan(
+            &mut query,
+            &mut tx,
+            "directories-with-files",
+            &app.generation,
+        )
+        .await?;
         let rows: Vec<NodeRow> = query.build_query_as().fetch_all(&mut *tx).await?;
         let result = self
             .page(
@@ -573,7 +579,7 @@ impl AppPlatform {
                     }
                     query.push(")");
                     #[cfg(test)]
-                    capture_plan(&mut query, &mut tx, "random").await?;
+                    capture_plan(&mut query, &mut tx, "random", &app.generation).await?;
                     let (steps, key, id, hits): (i64, i64, i64, String) =
                         query.build_query_as().fetch_one(&mut *tx).await?;
                     budget -= steps as usize;
@@ -677,14 +683,16 @@ impl AppPlatform {
             return Err(error);
         }
         let high_water = cursor.high_water.unwrap_or(maximum);
-        let rows: Vec<ChangeRow> = sqlx::query_as(
-            "SELECT * FROM app_file_changes WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?",
-        )
-        .bind(position)
-        .bind(high_water)
-        .bind(i64::from(request.limit))
-        .fetch_all(&mut *tx)
-        .await?;
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM app_file_changes WHERE seq>");
+        query
+            .push_bind(position)
+            .push(" AND seq<=")
+            .push_bind(high_water)
+            .push(" ORDER BY seq LIMIT ")
+            .push_bind(i64::from(request.limit));
+        #[cfg(test)]
+        capture_plan(&mut query, &mut tx, "changes", &app.generation).await?;
+        let rows: Vec<ChangeRow> = query.build_query_as().fetch_all(&mut *tx).await?;
         let mut checked = position;
         let mut changes = Vec::new();
         let mut before_change = Vec::new();
@@ -758,18 +766,26 @@ impl AppPlatform {
 }
 
 #[cfg(test)]
+pub(crate) static PLAN_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+pub(crate) static CAPTURE_GENERATION: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
 pub(crate) static CAPTURE_PLANS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static PLANS: std::sync::Mutex<Vec<(String, Vec<String>)>> =
     std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
-async fn capture_plan(
+pub(crate) async fn capture_plan(
     query: &mut QueryBuilder<Sqlite>,
     connection: &mut SqliteConnection,
     label: &str,
+    generation: &str,
 ) -> PlatformResult<()> {
-    if !CAPTURE_PLANS.load(std::sync::atomic::Ordering::Relaxed) {
+    if !CAPTURE_PLANS.load(std::sync::atomic::Ordering::Relaxed)
+        || CAPTURE_GENERATION.lock().unwrap().as_deref() != Some(generation)
+    {
         return Ok(());
     }
     use sqlx::{Execute, Row};

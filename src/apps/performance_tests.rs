@@ -15,7 +15,9 @@ async fn two_hundred_thousand_nodes_use_keysets_and_indexed_random() {
         }
     );
     let (_dir, platform, fake) = fixture().await;
+    let _plan_guard = super::query::PLAN_CAPTURE_LOCK.lock().await;
     let app = authorize_all(&platform).await;
+    *super::query::CAPTURE_GENERATION.lock().unwrap() = Some(app.generation.clone());
     let db = &platform.host.vfs.db;
     let start = Instant::now();
     let root = db.mkdir(1, "benchmark").await.unwrap();
