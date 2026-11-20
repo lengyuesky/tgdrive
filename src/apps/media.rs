@@ -648,6 +648,24 @@ impl AppPlatform {
         )
         .await
     }
+    pub(crate) fn validate_backend_ticket(
+        &self,
+        caller: &CallerSession,
+        id: &str,
+    ) -> PlatformResult<()> {
+        let ticket = self.media.ticket(id)?;
+        if ticket.session.is_page()
+            || ticket.session.app_id != caller.app_id
+            || ticket.session.id != caller.id
+            || ticket.session.generation != caller.generation
+        {
+            return Err(PlatformError::new(
+                error_code::CALLER_NOT_ALLOWED,
+                "套接字只能读取本应用本轮后端票据",
+            ));
+        }
+        Ok(())
+    }
     pub async fn ticket_bytes(
         self: &Arc<Self>,
         id: &str,
@@ -784,7 +802,12 @@ impl AppPlatform {
                 effective.remove(header::IF_RANGE);
             }
         }
-        let plan = match plan_budget(&effective, size, &etag, local.as_ref().map(|_| local_remaining)) {
+        let plan = match plan_budget(
+            &effective,
+            size,
+            &etag,
+            local.as_ref().map(|_| local_remaining),
+        ) {
             Ok(plan) => plan,
             Err(error) => return Ok(range_error(error, size)),
         };
@@ -1096,7 +1119,12 @@ struct ReadPlan {
 fn plan(headers: &HeaderMap, size: u64, etag: &str) -> PlatformResult<ReadPlan> {
     plan_budget(headers, size, etag, None)
 }
-fn plan_budget(headers: &HeaderMap, size: u64, etag: &str, local_budget: Option<u64>) -> PlatformResult<ReadPlan> {
+fn plan_budget(
+    headers: &HeaderMap,
+    size: u64,
+    etag: &str,
+    local_budget: Option<u64>,
+) -> PlatformResult<ReadPlan> {
     if super::http::etag_matches(headers, etag) {
         return Ok(ReadPlan {
             status: StatusCode::NOT_MODIFIED,
@@ -1122,7 +1150,9 @@ fn plan_budget(headers: &HeaderMap, size: u64, etag: &str, local_budget: Option<
     };
     let range = if let Some(budget) = local_budget {
         tgdrive_contract::validation::resolve_local_range(range, size, budget)?
-    } else { resolve_single_range(range, size)? };
+    } else {
+        resolve_single_range(range, size)?
+    };
     Ok(ReadPlan {
         status: if range.partial {
             StatusCode::PARTIAL_CONTENT

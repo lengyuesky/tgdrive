@@ -26,6 +26,7 @@ const INTERNAL_ENDPOINTS: &[EndpointSpec] = &[
         path: "/admin/api/app-center/v1/nodes/stat",
         access: EndpointAccess::OwnerOnly,
         capability: None,
+        backend_socket: false,
     },
     EndpointSpec {
         name: "center.app.usage",
@@ -33,12 +34,26 @@ const INTERNAL_ENDPOINTS: &[EndpointSpec] = &[
         path: "/admin/api/app-center/v1/apps/{app_id}/data/usage",
         access: EndpointAccess::OwnerOnly,
         capability: None,
+        backend_socket: false,
     },
 ];
 
-pub(crate) fn router(host: crate::api::AppState) -> Router {
+pub(crate) fn router(
+    host: crate::api::AppState,
+    static_directory: Option<&std::path::Path>,
+) -> Router {
     let platform = Arc::new(AppPlatform::new(host));
-    router_platform(platform)
+    let routes = router_platform(platform.clone());
+    if let Some(directory) = static_directory {
+        routes.fallback_service(
+            crate::web::router(directory).fallback(move |request: Request| {
+                let platform = platform.clone();
+                async move { super::forward::root(platform, request).await }
+            }),
+        )
+    } else {
+        routes
+    }
 }
 pub(super) fn router_platform(platform: Arc<AppPlatform>) -> Router {
     super::sse::start(&platform);
@@ -55,6 +70,15 @@ pub(super) fn router_platform(platform: Arc<AppPlatform>) -> Router {
         }
     }
     routes
+        .route(
+            &format!("{SELF_API_BASE}/backend"),
+            axum::routing::any(dispatch),
+        )
+        .route(
+            &format!("{SERVICE_BASE}/{{app_id}}"),
+            axum::routing::any(dispatch),
+        )
+        .fallback(root_dispatch)
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(platform.clone(), envelope))
         .with_state(platform)
@@ -65,7 +89,7 @@ pub(crate) fn self_router(platform: Arc<AppPlatform>, caller: Arc<CallerSession>
     let mut paths = BTreeSet::new();
     for endpoint in ENDPOINTS
         .iter()
-        .filter(|endpoint| endpoint.path.starts_with(SELF_API_BASE))
+        .filter(|endpoint| endpoint.path.starts_with(SELF_API_BASE) || endpoint.backend_socket)
     {
         let path = endpoint.path.replace("{path}", "{*path}");
         if paths.insert(path.clone()) {
@@ -81,7 +105,14 @@ pub(crate) fn self_router(platform: Arc<AppPlatform>, caller: Arc<CallerSession>
         .with_state(platform)
 }
 
+async fn root_dispatch(State(platform): State<Arc<AppPlatform>>, request: Request) -> Response {
+    super::forward::root(platform, request).await
+}
+
 pub(crate) async fn boundary_guard(request: Request, next: Next) -> Response {
+    if let Err(error) = super::forward::validate_path(request.uri().path()) {
+        return super::forward::secure(error.into_response());
+    }
     if request.uri().path() == LOCAL_MEDIA_BASE
         || request
             .uri()
@@ -138,6 +169,13 @@ pub(crate) fn maintenance_response(path: &str, headers: &HeaderMap) -> Response 
 }
 
 fn specifications(path: &str) -> Vec<&'static EndpointSpec> {
+    let path = if path == format!("{SELF_API_BASE}/backend") {
+        format!("{SELF_API_BASE}/backend/{{*path}}")
+    } else if path == format!("{SERVICE_BASE}/{{app_id}}") {
+        format!("{SERVICE_BASE}/{{app_id}}/{{*path}}")
+    } else {
+        path.to_owned()
+    };
     ENDPOINTS
         .iter()
         .chain(INTERNAL_ENDPOINTS)
@@ -186,7 +224,13 @@ async fn envelope(
     {
         PlatformError::new(error_code::PAYLOAD_TOO_LARGE, "请求地址或请求头超过上限")
             .into_response()
-    } else if request.method() == Method::OPTIONS {
+    } else if request.method() == Method::OPTIONS
+        && access != Some(EndpointAccess::External)
+        && !(specs.iter().any(|spec| spec.name == "backend.proxy")
+            && !request
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD))
+    {
         if access == Some(EndpointAccess::OwnerOnly)
             && (origin.as_deref() == Some("null")
                 || !platform.host.auth.session_cookie_valid(request.headers()))
@@ -278,7 +322,12 @@ async fn dispatch(State(platform): State<Arc<AppPlatform>>, request: Request) ->
         .map(|path| path.as_str())
         .unwrap_or("");
     let names = specifications(matched);
-    let seconds = if names.iter().any(|spec| {
+    let seconds = if names
+        .iter()
+        .any(|spec| matches!(spec.name, "backend.proxy" | "external.prefix"))
+    {
+        PROXY_FIRST_RESPONSE_SECONDS
+    } else if names.iter().any(|spec| {
         matches!(
             spec.name,
             "center.package.upload" | "center.install.preview" | "center.install"
@@ -347,7 +396,7 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
         .extensions()
         .get::<super::runtime::TrustedBackendCaller>()
     {
-        if !spec.path.starts_with(SELF_API_BASE) || spec.access == EndpointAccess::OwnerOnly {
+        if !spec.backend_socket {
             return Err(PlatformError::new(
                 error_code::CALLER_NOT_ALLOWED,
                 "后端套接字不提供主人或外部接口",
@@ -363,7 +412,13 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
         let mut connection = platform.host.vfs.db.pool.acquire().await?;
         let app = store::installation(&mut connection, &session.app_id).await?;
         app.check(&session.generation)?;
-        session.rate_limit()?;
+        if spec.access != EndpointAccess::Ticket {
+            session.rate_limit()?;
+        }
+        if spec.access == EndpointAccess::Ticket {
+            platform
+                .validate_backend_ticket(&session, uri.path().rsplit('/').next().unwrap_or(""))?;
+        }
         Some(session)
     } else if spec.access == EndpointAccess::OwnerOnly {
         if headers.get(header::ORIGIN).is_some_and(|v| v == "null")
@@ -434,7 +489,10 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
         ));
     }
     let _slot = if let Some(session) = &session {
-        if matches!(spec.name, "events" | "files.bytes") {
+        if matches!(
+            spec.name,
+            "events" | "files.bytes" | "backend.proxy" | "files.upload.body"
+        ) {
             None
         } else {
             Some(session.control_slot()?)
@@ -442,6 +500,18 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
     } else {
         None
     };
+    if spec.name == "backend.proxy" {
+        return super::forward::page(platform.clone(), caller(&session)?.clone(), request).await;
+    }
+    if spec.name == "external.prefix" {
+        let prefix = request
+            .uri()
+            .path()
+            .strip_prefix(&format!("{SERVICE_BASE}/"))
+            .unwrap_or("");
+        let id = prefix.split('/').next().unwrap_or("").to_owned();
+        return super::forward::prefix(platform, id, request).await;
+    }
     let (mut parts, body) = request.into_parts();
     let Path(parameters) = Path::<BTreeMap<String, String>>::from_request_parts(&mut parts, &())
         .await
@@ -632,17 +702,30 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                     if let Some(run) = platform.backends.run(&app.id) {
                         info.limits.backend = Some(run.limits.read().unwrap().clone());
                     }
-                    let root_assigned = platform.root_selection().await?.app_id.as_deref() == Some(app.id.as_str());
+                    let root_assigned =
+                        platform.root_selection().await?.app_id.as_deref() == Some(app.id.as_str());
                     let prefix_path = format!("{SERVICE_BASE}/{}", app.id);
-                    let public = (session.is_page() && !origin.is_empty()).then_some(origin.as_str());
+                    let public =
+                        (session.is_page() && !origin.is_empty()).then_some(origin.as_str());
                     info.external_service = Some(ExternalServiceInfo {
                         declared: backend.external_service,
-                        available: app.enabled && backend.external_service && super::backend_system::available()
-                            && info.backend.as_ref().is_some_and(|status| status.state != BackendState::Failed)
-                            && platform.package_root.join(&app.package_sha256).join(&backend.entry).is_file(),
+                        available: app.enabled
+                            && backend.external_service
+                            && super::backend_system::available()
+                            && info
+                                .backend
+                                .as_ref()
+                                .is_some_and(|status| status.state != BackendState::Failed)
+                            && platform
+                                .package_root
+                                .join(&app.package_sha256)
+                                .join(&backend.entry)
+                                .is_file(),
                         root_assigned,
                         root_url: public.filter(|_| root_assigned).map(str::to_owned),
-                        prefix_url: public.filter(|_| backend.external_service).map(|origin| format!("{origin}{prefix_path}")),
+                        prefix_url: public
+                            .filter(|_| backend.external_service)
+                            .map(|origin| format!("{origin}{prefix_path}")),
                         prefix_path,
                     });
                 }

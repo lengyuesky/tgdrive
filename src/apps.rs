@@ -17,6 +17,9 @@ mod cursor;
 mod cursor_plan_tests;
 mod error;
 mod events;
+mod forward;
+#[cfg(test)]
+mod forward_tests;
 mod http;
 #[cfg(test)]
 mod internal_tests;

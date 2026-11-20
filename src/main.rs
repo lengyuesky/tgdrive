@@ -320,12 +320,8 @@ pub(crate) fn http_router(
             axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .with_state(state.clone())
-        .merge(apps::router(state.clone()))
+        .merge(apps::router(state.clone(), static_directory))
         .nest("/admin/api", api::router(state.clone()));
-    let app = match static_directory {
-        Some(directory) => app.fallback_service(web::router(directory)),
-        None => app.fallback(web::root_address_fallback),
-    };
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         api::restore::write_guard,

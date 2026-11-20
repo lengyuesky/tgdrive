@@ -28,8 +28,8 @@ impl AppPlatform {
         request: RootAppUpdateRequest,
     ) -> PlatformResult<RootAppSelection> {
         let mut tx = self.host.vfs.db.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let current: String =
-            sqlx::query_scalar("SELECT revision FROM app_root_selection WHERE id=1")
+        let (previous, current): (Option<String>, String) =
+            sqlx::query_as("SELECT app_id,revision FROM app_root_selection WHERE id=1")
                 .fetch_one(&mut *tx)
                 .await?;
         if current != request.expected_revision {
@@ -59,6 +59,15 @@ impl AppPlatform {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        if previous != request.app_id {
+            for id in previous.iter().chain(request.app_id.iter()) {
+                self.events.emit(
+                    id,
+                    tgdrive_contract::events::event_name::EXTERNAL_SERVICE_CHANGED,
+                    &tgdrive_contract::EmptyResponse {},
+                )?;
+            }
+        }
         Ok(RootAppSelection {
             app_id: request.app_id,
             revision,
@@ -481,7 +490,10 @@ impl AppPlatform {
             ),
             host_origin: host_origin.clone(),
             api_base: format!("{host_origin}{SELF_API_BASE}"),
-            backend_base: None,
+            backend_base: manifest
+                .backend
+                .as_ref()
+                .map(|_| format!("{host_origin}{SELF_API_BASE}/backend")),
             ui_nonce: session.id.clone(),
             theme: Theme::Light,
             launch,

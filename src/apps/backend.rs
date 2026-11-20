@@ -21,6 +21,7 @@ struct Slot {
     run: RwLock<Option<Arc<Run>>>,
     failures: StdMutex<Vec<i64>>,
     disk_blocked: AtomicBool,
+    pending_starts: Arc<tokio::sync::Semaphore>,
 }
 pub(crate) struct Run {
     pub caller: Arc<CallerSession>,
@@ -73,6 +74,9 @@ impl Manager {
                     run: RwLock::new(None),
                     failures: StdMutex::new(Vec::new()),
                     disk_blocked: AtomicBool::new(false),
+                    pending_starts: Arc::new(tokio::sync::Semaphore::new(
+                        BACKEND_CONTROL_CONCURRENCY as usize,
+                    )),
                 })
             })
             .clone()
@@ -100,6 +104,11 @@ impl Manager {
     }
     pub async fn ensure(&self, platform: &Arc<AppPlatform>, id: &str) -> PlatformResult<Arc<Run>> {
         let slot = self.slot(id);
+        let _pending = slot
+            .pending_starts
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| unavailable())?;
         let _gate = slot.gate.lock().await;
         let mut connection = platform.host.vfs.db.pool.acquire().await?;
         let app = store::installation(&mut connection, id).await?;
@@ -178,6 +187,11 @@ impl Manager {
                         state: BackendState::Ready,
                         run_id: Some(run.caller.id.clone()),
                     },
+                );
+                let _ = platform.events.emit(
+                    id,
+                    tgdrive_contract::events::event_name::EXTERNAL_SERVICE_CHANGED,
+                    &tgdrive_contract::EmptyResponse {},
                 );
                 Ok(run)
             }
@@ -309,6 +323,9 @@ impl Manager {
             negotiated: RwLock::new(CONTRACT_VERSION),
             limits: RwLock::new(context.limits.clone()),
             active: AtomicUsize::new(0),
+            proxy_slots: Arc::new(tokio::sync::Semaphore::new(
+                BACKEND_CONTROL_CONCURRENCY as usize,
+            )),
             last_activity: AtomicI64::new(now().0),
             keep_until: AtomicI64::new(0),
             finished: CancellationToken::new(),
@@ -349,6 +366,11 @@ impl Manager {
                         },
                         run_id: None,
                     },
+                );
+                let _ = platform.events.emit(
+                    &id,
+                    tgdrive_contract::events::event_name::EXTERNAL_SERVICE_CHANGED,
+                    &tgdrive_contract::EmptyResponse {},
                 );
                 let _ = result;
             }
@@ -535,20 +557,64 @@ pub(crate) async fn connect(run: &Run) -> PlatformResult<UnixStream> {
 pub(crate) async fn request(
     run: &Arc<Run>,
     request: hyper::Request<axum::body::Body>,
-) -> PlatformResult<hyper::Response<hyper::body::Incoming>> {
+) -> PlatformResult<hyper::Response<axum::body::Body>> {
     let stream = connect(run).await?;
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
             .await
             .map_err(|_| unavailable())?;
     let cancelled = run.caller.cancelled.clone();
+    let stopped = CancellationToken::new();
+    let connection_stop = stopped.clone();
+    let mut abort = ConnectionAbort(Some(stopped.clone()));
     tokio::spawn(async move {
-        tokio::select! {_=cancelled.cancelled()=>{},_=connection=>{}}
+        tokio::select! { _ = cancelled.cancelled() => {}, _ = connection_stop.cancelled() => {}, _ = connection => {} }
     });
-    sender
+    let response = sender
         .send_request(request)
         .await
-        .map_err(|_| unavailable())
+        .map_err(|_| unavailable())?;
+    let (parts, body) = response.into_parts();
+    abort.0.take();
+    Ok(hyper::Response::from_parts(
+        parts,
+        axum::body::Body::new(ConnectionBody { body, stopped }),
+    ))
+}
+struct ConnectionAbort(Option<CancellationToken>);
+impl Drop for ConnectionAbort {
+    fn drop(&mut self) {
+        if let Some(token) = &self.0 {
+            token.cancel();
+        }
+    }
+}
+
+// 丢弃正文即关闭私有连接；Hyper 不能在客户端取消后继续替它排空无限 SSE。
+struct ConnectionBody {
+    body: hyper::body::Incoming,
+    stopped: CancellationToken,
+}
+impl http_body::Body for ConnectionBody {
+    type Data = bytes::Bytes;
+    type Error = hyper::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+impl Drop for ConnectionBody {
+    fn drop(&mut self) {
+        self.stopped.cancel();
+    }
 }
 fn unavailable() -> PlatformError {
     PlatformError::new(
@@ -656,10 +722,12 @@ fn serve_host(platform: Arc<AppPlatform>, run: Arc<Run>, listener: UnixListener)
                         let weak = weak.clone();
                         let current = caller.clone();
                         async move {
-                            use futures_util::StreamExt;
                             use axum::response::IntoResponse;
+                            use futures_util::StreamExt;
                             let Some(platform) = weak.upgrade() else {
-                                return Ok::<_, std::convert::Infallible>(hyper::StatusCode::SERVICE_UNAVAILABLE.into_response());
+                                return Ok::<_, std::convert::Infallible>(
+                                    hyper::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                                );
                             };
                             let router = super::http::self_router(platform, current.caller.clone());
                             let activity =

@@ -31,10 +31,13 @@ impl Auth {
         let Some((payload, signature)) = token.split_once('.') else {
             return false;
         };
-        Self::ct_eq(
-            &sign_with(&self.creds(), &format!("native-v1:{payload}")),
-            signature,
-        )
+        [
+            format!("native-v1:{payload}"),
+            format!("admin-cookie-v1:{payload}"),
+            payload.to_owned(),
+        ]
+        .iter()
+        .any(|payload| Self::ct_eq(&sign_with(&self.creds(), payload), signature))
     }
 
     pub(crate) fn device_epoch(&self) -> String {

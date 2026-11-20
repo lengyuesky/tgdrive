@@ -515,7 +515,7 @@ async fn management_requires_cookie_and_page_cors_has_no_credentials() {
         )
         .await
         .unwrap();
-    let router = http::router(platform.host.clone());
+    let router = http::router(platform.host.clone(), None);
     let response = router
         .clone()
         .oneshot(

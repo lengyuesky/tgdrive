@@ -245,16 +245,7 @@ pub(crate) fn capabilities() -> Vec<&'static str> {
     CAPABILITIES
         .iter()
         .copied()
-        .filter(|name| {
-            !matches!(
-                *name,
-                "files.mutate"
-                    | "files.upload"
-                    | "kv.device"
-                    | "backend.proxy"
-                    | "backend.external"
-            )
-        })
+        .filter(|name| !matches!(*name, "files.mutate" | "files.upload" | "kv.device"))
         .filter(|name| !name.starts_with("backend.") || super::backend_system::available())
         .collect()
 }
@@ -340,6 +331,17 @@ pub(crate) fn info(
         capabilities: capabilities()
             .into_iter()
             .filter(|name| {
+                if name.starts_with("backend.") && manifest.backend.is_none() {
+                    return false;
+                }
+                if *name == "backend.external"
+                    && !manifest
+                        .backend
+                        .as_ref()
+                        .is_some_and(|backend| backend.external_service)
+                {
+                    return false;
+                }
                 if caller == RuntimeCaller::Page {
                     *name != "backend.keepalive" && *name != "files.local_url"
                 } else {
