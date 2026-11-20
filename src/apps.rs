@@ -6,6 +6,8 @@ mod archive_conformance_tests;
 #[cfg(test)]
 mod archive_tests;
 mod backend;
+#[cfg(test)]
+mod backend_management_tests;
 pub(crate) mod backend_system;
 #[cfg(test)]
 mod backend_tests;
@@ -120,6 +122,22 @@ impl AppPlatform {
     }
     fn data_root(&self) -> PathBuf {
         self.root.join("data")
+    }
+    async fn backend_disk_usage(&self, id: &str) -> PlatformResult<(u64, u64)> {
+        let uid: Option<i64> =
+            sqlx::query_scalar("SELECT uid FROM app_runtime_identities WHERE app_id=?")
+                .bind(id)
+                .fetch_optional(&self.host.vfs.db.pool)
+                .await?;
+        let uid = if backend_system::real_isolation() {
+            uid.unwrap_or(0) as u32
+        } else {
+            unsafe { libc::geteuid() }
+        };
+        backend_system::disk_usage(
+            &self.data_root().join(id),
+            backend_system::Identity { uid, gid: uid },
+        )
     }
     async fn catalog(&self) -> PlatformResult<&catalog::CatalogClient> {
         self.catalog_client

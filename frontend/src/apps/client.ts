@@ -3,12 +3,17 @@ import { invalidateSession } from '../session'
 import { ENDPOINTS, APP_CENTER_BASE, ASSET_BASE, type ApiError, type ErrorResponse, type InstalledApp, type InstalledAppsResponse,
   type InstallPreview, type InstallSource, type InstallRequest, type ScopeInfo, type ScopeUpdateRequest,
   type AppStatePatch, type CatalogResponse, type PackageUploadReceipt, type LaunchPageRequest,
-  type LaunchPageResponse, type NodeReference, type FileNode, type DataUsage } from './contract'
+  type LaunchPageResponse, type NodeReference, type FileNode, type DataUsage, type BackendStatus, type BackendResourceLimits, type RootAppSelection, type RootAppUpdateRequest } from './contract'
+
+export interface BackendManagementInfo { status: BackendStatus; limits: BackendResourceLimits }
+export interface BackendLogs { stdout: string; stderr: string; truncated: boolean }
 
 // 只有宿主自己的前端调用；不向应用 SDK 宣告，也不混入契约注册表完整性检查。
 const INTERNAL_ENDPOINTS = [
   { name: 'center.nodes.stat', methods: ['POST'], path: `${APP_CENTER_BASE}/nodes/stat` },
   { name: 'center.app.usage', methods: ['GET'], path: `${APP_CENTER_BASE}/apps/{app_id}/data/usage` },
+  { name: 'center.app.backend', methods: ['GET'], path: `${APP_CENTER_BASE}/apps/{app_id}/backend` },
+  { name: 'center.app.logs', methods: ['GET'], path: `${APP_CENTER_BASE}/apps/{app_id}/backend/logs` },
 ] as const
 const definitionOf = (name: string) => ENDPOINTS.find((entry) => entry.name === name) ?? INTERNAL_ENDPOINTS.find((entry) => entry.name === name)
 
@@ -44,6 +49,7 @@ async function owner<T>(name: string, parameters: Record<string, string> = {}, b
 }
 
 export const installedApps = shallowRef<InstalledApp[]>([])
+export const rootSelection = shallowRef<RootAppSelection>()
 let lastLoad = 0
 let loading: Promise<InstalledApp[]> | undefined
 export function loadInstalled(force = false) {
@@ -51,7 +57,7 @@ export function loadInstalled(force = false) {
   if (loading) return loading
   loading = owner<InstalledAppsResponse>('center.apps').then((response) => {
     if (!Array.isArray(response.apps)) throw new Error('安装列表响应无效')
-    installedApps.value = response.apps; lastLoad = Date.now(); return response.apps
+    installedApps.value = response.apps; rootSelection.value = response.root_app; lastLoad = Date.now(); return response.apps
   }).finally(() => { loading = undefined })
   return loading
 }
@@ -82,6 +88,11 @@ export const center = {
   uninstall: (app: InstalledApp, purge: boolean) => owner<void>('center.app.uninstall', { app_id: app.manifest.id }, undefined,
     { headers: { 'If-Match': `"${app.state_revision}"` } }, purge ? '?purge_data=true' : ''),
   clearCache: (id: string) => owner<void>('center.app.cache.clear', { app_id: id }),
+  restart: (id: string) => owner<BackendStatus>('center.app.restart', { app_id: id }),
+  root: () => owner<RootAppSelection>('center.root.read'),
+  setRoot: (body: RootAppUpdateRequest) => owner<RootAppSelection>('center.root.update', {}, body),
+  backend: (id: string) => owner<BackendManagementInfo>('center.app.backend', { app_id: id }),
+  logs: (id: string) => owner<BackendLogs>('center.app.logs', { app_id: id }),
   launch: (id: string, body: LaunchPageRequest) => owner<LaunchPageResponse>('center.app.launch', { app_id: id }, body),
   node: (reference: NodeReference) => owner<FileNode>('center.nodes.stat', {}, reference),
 }

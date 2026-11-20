@@ -286,7 +286,14 @@ impl AppPlatform {
         let limits = super::runtime::limits(&app)?;
         let (entries, bytes) = usage.unwrap_or((0, 0));
         tx.commit().await?;
-        let cache = self.cache_usage(app_id).await?;
+        let mut cache = self.cache_usage(app_id).await?;
+        let database = if limits.backend.is_some() {
+            let (database, combined) = self.backend_disk_usage(app_id).await?;
+            cache = combined;
+            Some(tgdrive_contract::ByteCount(database))
+        } else {
+            None
+        };
         Ok(DataUsage {
             kv_entries: entries as u32,
             kv_bytes: tgdrive_contract::ByteCount(bytes as u64),
@@ -294,7 +301,7 @@ impl AppPlatform {
             kv_byte_limit: limits.kv_byte_limit,
             cache_bytes: tgdrive_contract::ByteCount(cache),
             cache_byte_limit: limits.cache_byte_limit,
-            database_bytes: None,
+            database_bytes: database,
             database_byte_limit: limits.backend.map(|b| b.database_bytes),
         })
     }

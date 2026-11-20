@@ -10,7 +10,34 @@ use tgdrive_contract::runtime::*;
 use tgdrive_contract::validation::{check_manifest_compatibility, stable_version, valid_app_id};
 use tgdrive_contract::{CONTRACT_VERSION, Timestamp, error_code};
 
+#[derive(serde::Serialize)]
+pub(crate) struct BackendManagementInfo {
+    pub status: BackendStatus,
+    pub limits: BackendResourceLimits,
+}
+
 impl AppPlatform {
+    pub(crate) async fn backend_management(
+        &self,
+        id: &str,
+    ) -> PlatformResult<BackendManagementInfo> {
+        let mut connection = self.host.vfs.db.pool.acquire().await?;
+        let app = installation(&mut connection, id).await?;
+        let backend = app
+            .manifest()?
+            .backend
+            .ok_or_else(|| PlatformError::new(error_code::CALLER_NOT_ALLOWED, "应用没有后端"))?;
+        let mut limits = super::runtime::limits(&app)?
+            .backend
+            .expect("已核对后端声明");
+        if let Some(run) = self.backends.run(id) {
+            limits = run.limits.read().unwrap().clone();
+        }
+        Ok(BackendManagementInfo {
+            status: self.backends.status(id, backend.run_mode),
+            limits,
+        })
+    }
     fn decorate_backend(&self, app: &mut InstalledApp) {
         if let Some(backend) = &app.manifest.backend {
             app.backend = Some(self.backends.status(&app.manifest.id, backend.run_mode));
@@ -72,6 +99,57 @@ impl AppPlatform {
             app_id: request.app_id,
             revision,
         })
+    }
+    pub(crate) async fn backend_logs(&self, id: &str) -> PlatformResult<serde_json::Value> {
+        let app = self.installed(id).await?;
+        if app.manifest.backend.is_none() {
+            return Err(PlatformError::new(
+                error_code::CALLER_NOT_ALLOWED,
+                "应用没有后端日志",
+            ));
+        }
+        let empty = || serde_json::json!({"stdout":"","stderr":"","truncated":false});
+        let root = self.root.join("logs");
+        if !root.is_dir() {
+            return Ok(empty());
+        }
+        let directory = match super::safe_fs::Directory::open(&root, false)?.child(id, false) {
+            Ok(directory) => directory,
+            Err(error) if error.code == error_code::NOT_FOUND => return Ok(empty()),
+            Err(error) => return Err(error),
+        };
+        let mut truncated = false;
+        let mut read = |source: &str| -> PlatformResult<String> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut output = Vec::new();
+            for name in [
+                format!("{source}.log"),
+                format!("{source}.1.log"),
+                format!("{source}.2.log"),
+            ] {
+                let mut file = match directory.read(&name) {
+                    Ok(file) => file,
+                    Err(error) if error.code == error_code::NOT_FOUND => continue,
+                    Err(error) => return Err(error),
+                };
+                let left = 64 * 1024 - output.len();
+                let size = file.metadata()?.len();
+                let length = size.min(left as u64);
+                truncated |= length < size;
+                file.seek(SeekFrom::End(-(length as i64)))?;
+                let mut bytes = Vec::new();
+                file.take(length).read_to_end(&mut bytes)?;
+                bytes.extend(output);
+                output = bytes;
+                if output.len() == 64 * 1024 {
+                    break;
+                }
+            }
+            Ok(String::from_utf8_lossy(&output).into_owned())
+        };
+        let stdout = read("stdout")?;
+        let stderr = read("stderr")?;
+        Ok(serde_json::json!({"stdout":stdout,"stderr":stderr,"truncated":truncated}))
     }
     pub async fn installed(&self, id: &str) -> PlatformResult<InstalledApp> {
         if !valid_app_id(id) {
@@ -407,6 +485,11 @@ impl AppPlatform {
                 "应用状态已改变",
             ));
         }
+        let was_root: bool =
+            sqlx::query_scalar("SELECT COALESCE(app_id=?,0) FROM app_root_selection WHERE id=1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
         self.backends.stop(id).await?;
         sqlx::query("DELETE FROM app_installations WHERE id=?")
             .bind(id)
@@ -424,7 +507,15 @@ impl AppPlatform {
         }
         tx.commit().await?;
         self.sessions.revoke_app(id);
+        if was_root {
+            self.events.emit(
+                id,
+                tgdrive_contract::events::event_name::EXTERNAL_SERVICE_CHANGED,
+                &tgdrive_contract::EmptyResponse {},
+            )?;
+        }
         self.clear_app_cache(id).await?;
+        super::safe_fs::remove_tree(&self.root.join("logs"), id)?;
         let identity: Option<i64> =
             sqlx::query_scalar("SELECT uid FROM app_runtime_identities WHERE app_id=?")
                 .bind(id)
