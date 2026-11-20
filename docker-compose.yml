@@ -1,13 +1,14 @@
 services:
   tgdrive:
-    # 优先使用发布镜像;拉不到时回退本地构建(保留 build 字段即可 fallback)
+    # 默认使用发布镜像；本地构建用 docker compose build tgdrive。
     image: ${TGDRIVE_IMAGE:-ghcr.io/lengyuesky/tgdrive:latest}
-    build: .
-    # 与宿主机 data 目录保持同一 UID/GID；默认桌面 Linux 用户通常是 1000。
-    user: "${TGDRIVE_UID:-1000}:${TGDRIVE_GID:-1000}"
-    # Bot API 的 local 文件默认属于 101:101 且目录权限为 750；补充该组才能只读缩略图。
-    group_add:
-      - "${TGDRIVE_BOT_API_GID:-101}"
+    build:
+      context: .
+      additional_contexts:
+        tgdrive-app: ../tgdrive-app
+    # 宿主以 root 管理应用身份，应用进程由宿主单独降权。
+    user: "0:0"
+    init: true
     restart: unless-stopped
     ports:
       # 宿主界面位于 http://localhost:3358/admin/；健康检查使用二进制的 /admin/healthz 探针。

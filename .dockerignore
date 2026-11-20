@@ -7,6 +7,9 @@ frontend/dist
 *.db-wal
 .claude
 .git
+.build-context
 data
 telegram-bot-api-data
 bot-api-control
+tmp
+docker/app-platform-probe/target

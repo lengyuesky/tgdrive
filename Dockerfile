@@ -1,5 +1,8 @@
+# syntax=docker/dockerfile:1.7
+# 必须提供 --build-context tgdrive-app=../tgdrive-app，两个仓库均无需推送。
 # ---------- 阶段 1:构建前端 ----------
 FROM node:22.22-alpine AS frontend
+COPY --from=tgdrive-app /contract/types /tgdrive-app/contract/types
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
@@ -8,7 +11,11 @@ RUN npm run build
 
 # ---------- 阶段 2:构建后端 ----------
 # 注意:构建与运行阶段必须同一 Debian 版本,否则 glibc 不匹配
-FROM rust:1.97-slim-bookworm AS backend
+FROM rust:1.99-slim-bookworm AS backend
+# 契约与测试 SDK 通过附加上下文提供；Cargo 的 workspace 继承需要根清单。
+COPY --from=tgdrive-app /Cargo.toml /tgdrive-app/Cargo.toml
+COPY --from=tgdrive-app /contract /tgdrive-app/contract
+COPY --from=tgdrive-app /backend-sdk /tgdrive-app/backend-sdk
 WORKDIR /app
 # 先编译一个空 main 缓存依赖层,源码变更时无需重编全部依赖
 COPY Cargo.toml Cargo.lock ./
@@ -18,7 +25,7 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
 COPY migrations ./migrations
 COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked \
-    && mkdir /app/empty-data
+    && mkdir /app/empty-data && chmod 711 /app/empty-data
 
 # ---------- 阶段 3:校验并安装 usque ----------
 FROM alpine:3.22 AS usque
@@ -59,13 +66,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && cp -a /usr/share/doc /probe-root/usr/share/licenses/media-tools/debian-doc \
     && cp -a /usr/share/common-licenses /probe-root/usr/share/common-licenses \
     && rm -rf /var/lib/apt/lists/*
+# 与依赖下载分层；共享临时目录只读，后端只写自己的 tmp/。
+RUN mkdir -p /probe-root/tmp /probe-root/var/tmp \
+    && chmod 555 /probe-root/tmp /probe-root/var/tmp
 
 # ---------- 阶段 5:运行时 ----------
 # distroless:无 shell 与包管理器,自带 glibc 与 CA 证书(与构建阶段同为 bookworm)。
-# 镜像内无法 mkdir/chown,/data 由构建阶段建好后以 1000:1000 复制进来,
-# 这样新建的命名卷也继承正确属主。
+# root 宿主管理独立应用 UID、私有套接字和只读配置；应用后端绝不继承 root。
 FROM gcr.io/distroless/cc-debian12
-COPY --from=backend --chown=1000:1000 /app/empty-data /data
+COPY --from=backend --chown=0:0 /app/empty-data /data
 WORKDIR /app
 COPY --from=backend /app/target/release/tgdrive /usr/local/bin/tgdrive
 COPY --from=usque /opt/usque/usque /usr/local/bin/usque
@@ -78,7 +87,7 @@ ENV TGDRIVE_STATIC_DIR=/app/static \
     TGDRIVE_LISTEN=0.0.0.0:8080
 VOLUME /data
 EXPOSE 8080
-USER 1000:1000
+USER 0:0
 # 健康检查用二进制自带子命令请求 /admin/healthz，无需安装 curl
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s CMD ["tgdrive", "healthcheck"]
 ENTRYPOINT ["tgdrive"]

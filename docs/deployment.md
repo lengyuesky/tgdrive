@@ -15,17 +15,119 @@
 | 公开分享页 | `/admin/s/{token}` |
 | 存活与就绪检查 | `/admin/healthz`、`/admin/readyz` |
 
-Compose 保持单端口映射 `3358:8080`，本机访问 `http://localhost:3358/admin/`；直接运行二进制时默认监听 8080。反向代理必须原样转发 `/admin` 前缀，不能剥离。根地址当前统一跳转至 `/admin/`，后续由应用平台接管。
+Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/admin/`；直接运行二进制时默认监听 8080。反向代理必须原样转发 `/admin` 前缀，不能剥离。
+
+`/admin` 以外的地址属于主人在应用中心指定的一个根地址应用，原路径和查询不变；固定应用服务入口是 `/admin/api/apps/v1/services/<app_id>/<path>`。它们与管理界面共用同一端口，不另开应用端口。只有已启用、声明 `backend.external_service=true` 的带后端应用可被指定。尚未指定时 GET/HEAD 返回 302 到 `/admin/`，其他方法返回 303；指定应用停用或失败时返回 `backend_unavailable`，不会偷偷改分给另一个应用；卸载时原子清除选择。
 
 旧地址没有别名，已发出的旧分享链接失效；WebDAV 和原生客户端须改用新地址。登录及注销 Cookie 的 Path 均为 `/admin`，不会随浏览器请求发往根地址；旧根路径登录 Cookie 的签名立即失效，需要重新网页登录，不轮换数据库密钥或原生设备会话。分享提取码票据进一步限定在对应的 `/admin/api/share/{token}` 下。
 
-## 应用目录与页面应用
+## 应用平台与后端部署
 
 应用中心位于 `/admin/apps`。`TGDRIVE_APP_CATALOG_REPOSITORY` 默认 `lengyuesky/tgdrive-app`，只接受合法的 GitHub `owner/repo`；宿主读取该仓库 `main/catalog.json`，按预览绑定的版本、目标、摘要和长度下载精确 Release 包，不需要 GitHub Token。
 
 显式配置 `TGDRIVE_APP_CATALOG_REPOSITORY=` 可禁用联网目录；未设置变量不是禁用。修改后需重启宿主。目录失败保留上次成功快照，不影响已安装应用；也可以在应用中心上传 `.tgapp` 包，预览并确认安装。
 
-当前阶段支持沙箱页面、目录 ID 授权、只读查询/字节、KV 和可再生缓存。带后端包可校验并安装，但不会启动后端，也不开放写入、根地址或本机读取能力。新装应用默认不授权；目录只读/读写级别必须由主人确认，声明写入不等于已经获得授权。缓存不备份，KV 和安装/授权记录随主数据库备份；恢复会重新生成会话相关 generation 和游标 epoch。
+平台提供沙箱页面、目录授权、文件查询/读取/条件写入、KV、缓存、媒体票据和本机读取。新装应用默认不授权，目录只读/读写级别必须由主人确认；声明写入不等于获得授权。带后端应用使用与容器架构一致的 Linux 静态 ELF 包。`resident` 随宿主启动，`on_demand` 首次页面代理或服务请求时启动；管理界面可查看状态、资源实际强制标记、日志和执行重启。页面请求经 `/admin/api/apps/v1/self/backend/` 转发，主人身份由宿主上下文确认，不接受外部请求冒用。
+
+正式镜像仍只使用 Telegram 存储；自建 Bot API 的 local 文件是 Telegram 下载缓存，不是本地存储后端。仅测试构建中的合成文件替身不进入发布构建，见 [ADR-0013](adr/0013-local-files-only-in-tests.md)。
+
+### 镜像构建与系统身份
+
+镜像附带 `ffmpeg`、`ffprobe`、运行库和 CA 证书。宿主必须以 root 启动：它直接维护 `/etc/passwd`、`/etc/group` 的无登录应用账号，清空附加组并切换每应用独立 UID/GID，不依赖镜像内的 shell 或 `useradd`。默认 Compose 保留 `user: "0:0"` 和 `init: true`；不要改成统一的非 root 用户，也不要让应用继承宿主的 Docker capabilities。容器需要能写应用数据、账号文件，并保留切换身份/设置所有权的权限；Linux 内核还须支持进程收养和 pidfd 身份绑定/回收（通常为 Linux 5.4+）。硬隔离无法满足时后端拒绝启动，不假装成功。主库及凭据只允许 root 读取，镜像的共享 `/tmp` 和 `/var/tmp` 只读，应用使用各自的私有临时目录。
+
+本地和工作流共用根目录的同一份 `Dockerfile` 与同名附加上下文 `tgdrive-app`。唯一版本记录是 `docker/tgdrive-app-revision`，Rust 与前端必须共用该提交的同一份源码，不跟随浮动分支。当前记录应用仓库本地 main 的提交 `430b6e621252fe64c9f7a409042445d9c516ab03`，该提交尚未推送到远端。
+
+**推送宿主前必须先推送应用仓库，并把 `docker/tgdrive-app-revision` 更新为已推送的确定提交。** 两个镜像工作流读取这一个文件，以无令牌 HTTPS 获取公开应用仓库的精确提交；本次没有运行远端工作流或推送。
+
+```bash
+# 两个仓库为相邻目录 tgdrive/ 与 tgdrive-app/；从宿主记录的提交取只读源码快照。
+read -r app_revision < docker/tgdrive-app-revision
+app_context="$(mktemp -d)"
+git -C ../tgdrive-app archive "$app_revision" | tar -x -C "$app_context"
+docker build --build-context tgdrive-app="$app_context" -t tgdrive:local .
+# Compose 共用同一 Dockerfile 与 tgdrive-app 上下文；应用检出须处于上述提交且工作树干净。
+# 需要支持 additional_contexts 的 Docker Compose 2.17+。
+docker compose build tgdrive
+# 只使用临时卷和内部网络的正式镜像冒烟；不读取 .env，不连接 Telegram/GitHub。
+node docker/test-platform-image.mjs tgdrive:local
+```
+
+Bot API 镜像无需应用契约上下文。
+
+### cgroup v2 限额
+
+内存和 CPU 限额是尽力而为，不是后端启动的硬条件。默认容器的 `/sys/fs/cgroup` 通常只读，此时后端照常启动，并在 `RuntimeInfo.limits.backend.enforced` 及启动上下文中报告 `memory=false,cpu=false`、记录告警。独立 UID 下的 `RLIMIT_NPROC`、`RLIMIT_NOFILE` 分别控制进程数和打开文件数，并各自报告 `pids`、`open_files` 的实际设置结果；core dump 禁用。配置目标不等于实际强制。
+
+要强制内存/CPU，Linux Docker 宿主必须使用 cgroup v2 并把一个**空的专用管理子树**委派给 TGDrive。先由宿主管理员创建 `/sys/fs/cgroup/tgdrive-apps`，在它的父级启用 `memory`、`cpu` 控制器；该专用子树本身不放进程，符合 cgroup v2 的 no-internal-process 规则。然后增加 Compose 覆盖文件，例如 `compose.cgroup.yml`。
+
+```yaml
+services:
+  tgdrive:
+    cgroup: host
+    environment:
+      TGDRIVE_APP_CGROUP_ROOT: /sys/fs/cgroup/tgdrive-apps
+    volumes:
+      - type: bind
+        source: /sys/fs/cgroup/tgdrive-apps
+        target: /sys/fs/cgroup/tgdrive-apps
+        read_only: false
+```
+
+```bash
+docker compose -f docker-compose.yml -f compose.cgroup.yml up -d tgdrive
+```
+
+不要把整个宿主 cgroup 树开放给容器，也不需要 `privileged: true`。宿主会按 `<UID>/<run_id>` 创建子组，将真实后端 PID 加入后设置 `memory.max`、`cpu.max`；只有相应文件实际设置成功才报告 `true`。委派权限、控制器或设置失败仍是 `false`，不会因为提供了覆盖文件就宣称生效。Docker Desktop、rootless/受管容器平台的委派条件由平台决定；不能提供可写子树时保持默认运行方式。
+
+数据库与 `cache/work`、`tmp` 的磁盘用量是监督式计量：超额可能短暂发生，宿主发现后停止后端、阻止重启，等待主人清理或调整；不会静默删除业务 SQLite，也不是实时文件系统配额。
+
+### 应用数据与备份
+
+应用目录与主库同级；镜像默认布局如下，进程上下文提供实际绝对路径。
+
+```text
+/data/tgdrive.db                 # 主库：安装、授权、KV、根地址选择和宿主配置
+/data/apps-v1/packages/<sha256>/ # root 物化的不可变应用包
+/data/apps-v1/data/<app_id>/      # root 管理，仅该应用可读/遍历
+  state/app.sqlite3             # 该应用持久业务状态，唯一纳入备份的应用数据库
+  cache/objects/                # 宿主管理的可再生对象缓存
+  cache/work/                   # 后端可再生工作缓存
+  tmp/                          # 该应用私有临时目录
+  run/context.json              # root 写、应用只读；不含宿主秘密
+  run/host.sock                 # 宿主监听，仅核验该应用 UID 与 run_id
+  run/backend/backend.sock      # 应用监听，宿主核验类型、所有者和连接身份
+```
+
+使用宿主的 [备份与恢复](backup-restore.md)，不要在线裸复制运行中的 `app.sqlite3` 而遗漏 WAL。宿主主库/KV 与各应用数据库分别取得一致快照；应用库由清空敏感环境、以该应用 UID/GID 运行的辅助进程使用 SQLite Online Backup API 读取，通过有界管道返回。失败保留上次成功快照，后端无需停机；不承诺多个数据库之间同一事务时点。备份包含应用库里的私有 Token 等秘密，必须与主库同等保护。
+
+恢复前停止所有应用和在途写入，只恢复已验证记录及对应固定数据库；恢复后更换 generation/run_id，清除缓存、临时文件、旧票据与游标 epoch。`cache/`、`tmp/`、`run/` 不备份，包可重新物化。卸载是否保留数据由主人确认，保留数据的应用身份不会分给另一应用。
+
+### Linux 隔离与真实包端到端验收
+
+需要 Docker、本地构建的宿主镜像、与之同架构的 `app-native-builder:arm64` 或 `app-native-builder:amd64` 镜像，以及已缓存的 Cargo registry。原生构建镜像来自应用仓库的原生包工具；可用 `--builder-image` 指定已有等价镜像。首次测试镜像构建从 Rust 官方源补齐 rustfmt/Clippy；源码编译、全量测试及验收容器均离线，不连接 Telegram 或 GitHub。
+
+```bash
+# 先按上文构建 tgdrive:local；仅验证 Linux 硬隔离及资源实际标记。
+node docker/test-app-platform.mjs --runtime-image tgdrive:local
+
+# 真实 example-backend 和可选 cinema 静态包须与容器架构一致。
+node docker/test-app-platform.mjs --runtime-image tgdrive:local \
+  --example /绝对路径/example-backend-1.0.0-linux-arm64.tgapp \
+  --cinema /绝对路径/cinema-1.0.0-linux-arm64.tgapp
+
+# 仅在 Linux Docker 宿主上，另测预先委派的专用可写 cgroup 子树。
+node docker/test-app-platform.mjs --runtime-image tgdrive:local \
+  --cgroup-root /sys/fs/cgroup/tgdrive-apps
+```
+
+入口只复制已跟踪的 Rust 源码与明确列出的验收文件；不会把工作区未跟踪迁移嵌入二进制。应用仓库源码复制后只读挂载，不在那里构建，不读取 `.env` 或挂载真实数据。输出为新建的临时目录（`--output` 只接受空目录），保留源码快照、编译产物与日志；结束自动清理它创建的容器和测试镜像。镜像冒烟入口另外清理临时内部网络与数据卷。
+
+普通 `cargo test --locked` 不执行以下两项显式验收，且在非 Linux 平台根本不编译它们。
+
+- `apps::linux_acceptance_tests::linux_root_isolation`：真实生产 `internal-app-run`、`internal-app-backup` 辅助二进制与独立 UID 探针；检查文件/套接字/环境隔离、RLIMIT 的实际失败、禁用转储、停止/崩溃/卸载时子孙与僵尸回收、被取消的停止请求、1/2/4/8/16 秒退避及重启上限。探针包含忽略 SIGTERM、setsid、伪造进程名 Uid 行的子孙进程，不在测试中模拟降权。
+- `apps::linux_end_to_end_tests::linux_static_packages_end_to_end`：使用真实静态包，经 TCP HTTP 登录、原始 ZIP 上传、预览、安装、目录授权、页面 owner 代理、external 固定前缀/根入口、真实 204 直传指令、条件建目录、在线快照和停用/卸载回收；可选影视包另测安装、启动就绪与页面接口。示例只输出直传指令，因此轮次媒体票据额外用同一生产签发函数验证撤销，不宣称示例实现了票据接口。
+
+没有可写 cgroup 时验收明确报告内存/CPU 未强制，不把它写成实际硬限额通过；提供 `--cgroup-root` 后要求两个 enforced 都为 true，并验证内存 OOM kill 和 CPU 节流。测试的合成网盘文件位于 `#[cfg(test)]` 模块，探针为独立测试 workspace；发布镜像只运行普通 `cargo build --release --locked`，不启用任何本地存储替身或测试开关。
 
 ## 官方端点与自建端点
 
@@ -51,7 +153,7 @@ docker compose --profile local-bot-api up -d --build tgdrive telegram-bot-api
 > (compose 的 `${VAR}` 插值取自宿主机 `.env`)。所以这两项无论在哪改,都要先导出并
 > 覆盖宿主机 `.env`,再重启/重建 tgdrive 与 telegram-bot-api。
 
-compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相同路径只读挂到 tgdrive 容器(local 模式下 `getFile` 返回容器内绝对路径,tgdrive 自动探测并直读磁盘,失败才回退 HTTP)。默认还会把 Bot API 的文件组 `101` 作为 tgdrive 的补充组;若换用 UID/GID 不同的镜像,请把 `TGDRIVE_BOT_API_GID` 改为该镜像中文件所属的组 ID。
+Compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相同路径只读挂到 tgdrive 容器（local 模式下 `getFile` 返回容器内绝对路径，tgdrive 自动探测并直读磁盘，失败才回退 HTTP）。root 宿主可读取这些文件；应用后端不继承 Bot API 文件组，也不能直接访问该共享卷。
 
 > 注意:bot 在官方与自建服务器之间迁移时,Telegram 要求先对旧端点调用 `logOut`,详见 telegram-bot-api 文档。
 
@@ -77,14 +179,13 @@ compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_TMP_DIR` | | 系统临时目录 | ✔ | 大分块暂存目录,需 ≥ 分块大小×(并发+1) 的空间 |
 | `TGDRIVE_LOCAL_DATA_ROOT` | | `/var/lib/telegram-bot-api` | | 自建 Bot API local 模式允许读取的根目录;必须与 Compose 共享卷的容器内路径一致,修改需重启 |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | | — | ✔* | 在 <https://my.telegram.org> 申请;tgdrive 用于 MTProto Range 流式下载,自建 Bot API 也使用;\*后台可编辑并导出,修改后必须重启/重建两个服务 |
-| `TGDRIVE_UID` / `TGDRIVE_GID` | | `1000` / `1000` | | Compose 中 tgdrive 进程的 UID/GID;应对 `./data` 有写权限 |
-| `TGDRIVE_BOT_API_GID` | | `101` | | 自建 Bot API 数据文件的组 ID;tgdrive 以补充组身份只读 local 文件和缩略图 |
 | `TGDRIVE_LISTEN` | | `0.0.0.0:8080` | | 监听地址(端口由 compose 映射,改需重启) |
 | `TGDRIVE_DB_PATH` | | `/data/tgdrive.db`(镜像内) | | SQLite 路径(设置本身存在这个库里) |
 | `TGDRIVE_SECRET` | | 自动生成并存库 | | cookie 签名密钥,**仅首次启动时作为初始值**,之后以库中值为准 |
 | `TGDRIVE_COOKIE_SECURE` | | `false` | | 通过 HTTPS(含反向代理)访问时设为 `true`,为 Cookie 启用 Secure 并发送 HSTS 响应头;修改需重启 |
 | `TGDRIVE_TRUSTED_PROXIES` | | 空 | | 反向代理的 IP 或 CIDR(逗号分隔)。仅来自这些地址的 `X-Forwarded-For` 会被采信,用于登录与提取码限速;不配置时反代后所有人共用一个限速额度;修改需重启 |
 | `TGDRIVE_APP_CATALOG_REPOSITORY` | | `lengyuesky/tgdrive-app` | | 应用目录 GitHub 仓库；只接受 owner/repo，显式空值禁用联网目录，包上传仍可用 |
+| `TGDRIVE_APP_CGROUP_ROOT` | | `/sys/fs/cgroup/tgdrive-apps` | | cgroup v2 专用委派根目录；必须可写且控制器实际可用才能强制内存/CPU |
 | `TGDRIVE_STATIC_DIR` | | `/app/static`(镜像内) | | 前端静态文件目录 |
 | `RUST_LOG` | | `info` | | 日志级别 |
 

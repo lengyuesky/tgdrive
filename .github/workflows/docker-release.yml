@@ -44,6 +44,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.source.outputs.sha }}
+      app_revision: ${{ steps.source.outputs.app_revision }}
       tag: ${{ steps.source.outputs.tag }}
       publish: ${{ steps.source.outputs.publish }}
       repository: ${{ steps.source.outputs.repository }}
@@ -83,6 +84,9 @@ jobs:
             echo "::error::手动发布必须指定已有版本标签"
             exit 1
           fi
+          read -r app_revision < docker/tgdrive-app-revision
+          [[ "$app_revision" =~ ^[a-f0-9]{40}$ ]]
+          echo "app_revision=$app_revision" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
@@ -123,6 +127,20 @@ jobs:
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
 
+      - name: 检出固定提交的应用平台契约构建上下文
+        if: matrix.image == 'tgdrive'
+        env:
+          APP_REVISION: ${{ needs.prepare.outputs.app_revision }}
+        shell: bash
+        run: |
+          # 推送宿主前必须先推送应用仓库，并将 docker/tgdrive-app-revision 更新为已推送的提交。
+          # 公开仓库使用无令牌 HTTPS；Rust 与前端共用这一份确定提交的源码。
+          git init .build-context/tgdrive-app
+          git -C .build-context/tgdrive-app remote add origin https://github.com/lengyuesky/tgdrive-app.git
+          git -C .build-context/tgdrive-app fetch --depth=1 origin "$APP_REVISION"
+          git -C .build-context/tgdrive-app checkout --detach FETCH_HEAD
+          [[ "$(git -C .build-context/tgdrive-app rev-parse HEAD)" == "$APP_REVISION" ]]
+
       - name: 核验原生架构并记录免费 runner 资源
         env:
           ARCH: ${{ matrix.arch }}
@@ -151,6 +169,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          build-contexts: ${{ matrix.image == 'tgdrive' && 'tgdrive-app=.build-context/tgdrive-app' || '' }}
           file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
           tags: ${{ needs.prepare.outputs.publish != 'true' && format('{0}:ci', env.IMAGE) || '' }}
