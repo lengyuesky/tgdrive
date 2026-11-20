@@ -52,7 +52,7 @@
         <template #help>
           设置后,发往 Telegram、WebDAV、S3 的快照都先用 age 加密(文件名以 .age 结尾),
           至少 8 个字符;清空后保存即关闭加密。<b>密码丢失后备份无法解密</b>,请另行妥善保存。
-          「下载数据库备份」是完整的明文数据库,不受此设置影响。
+          「下载数据库备份」是包含主库和各应用库的明文归档，不受此设置影响。
         </template>
       </SettingField>
     </div>
@@ -208,7 +208,7 @@
       <el-icon><InfoFilled /></el-icon>
       <div>
         Telegram 备份请使用上方恢复向导：提供完整一组消息后，由服务端合并分块、解密和预检。
-        WebDAV 与 S3 保存完整 .db 或 .db.age；下载数据库备份仍是明文，请妥善保管。
+        WebDAV 与 S3 保存完整 .tar 或 .tar.age；明文下载包含主库、应用键值和各应用 SQLite。旧 .db 备份仍可恢复。
       </div>
     </div>
   </template>

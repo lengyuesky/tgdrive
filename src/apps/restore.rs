@@ -49,7 +49,7 @@ pub(crate) async fn apply_pending(pool: &SqlitePool, path: &str) -> anyhow::Resu
             "恢复的包目标与清单不一致"
         );
         validate_scope(&record.directory_scope()?, &manifest.files)?;
-        // 后端轮次留给第二阶段；新平台不恢复任何在途句柄或未知写入。
+        // 恢复不续跑旧轮次的任何在途句柄或未知写入。
         sqlx::query("UPDATE app_installations SET generation=?,state_revision=?,scope_revision=? WHERE id=?").bind(super::opaque()).bind(super::opaque()).bind(super::opaque()).bind(record.id).execute(&mut *tx).await?;
     }
     let staged: Vec<i64> = sqlx::query_scalar("SELECT staging_node_id FROM app_uploads WHERE staging_node_id IS NOT NULL AND state IN('awaiting_body','receiving','ready')").fetch_all(&mut *tx).await?;
@@ -96,9 +96,13 @@ pub(crate) async fn apply_pending(pool: &SqlitePool, path: &str) -> anyhow::Resu
         for id in directory.names()? {
             if valid_app_id(&id) {
                 let app = root.join(id);
-                super::safe_fs::remove_tree(&app, "cache")?;
-                super::safe_fs::remove_tree(&app, "tmp")?;
-                super::safe_fs::remove_tree(&app, "run")?;
+                use std::os::unix::fs::MetadataExt;
+                let owner = std::fs::symlink_metadata(&app)
+                    .ok()
+                    .map(|metadata| metadata.gid());
+                super::safe_fs::remove_tree_owner(&app, "cache", owner)?;
+                super::safe_fs::remove_tree_owner(&app, "tmp", owner)?;
+                super::safe_fs::remove_tree_owner(&app, "run", owner)?;
             }
         }
     }
@@ -194,6 +198,27 @@ pub(crate) async fn preserve_history(
     for message in &warnings {
         sqlx::query("INSERT INTO backend_logs(level,category,message,created_at) VALUES('warn','应用平台',?,?)").bind(message).bind(crate::db::now_ts()).execute(&mut *connection).await?;
         tracing::warn!("{message}");
+    }
+    // UID 是当前机器的保留命名空间事实，不能信任备份中的数值或复用其他应用身份。
+    let identities: Vec<(String, i64, i64, i64)> =
+        sqlx::query_as("SELECT app_id,uid,gid,created_at FROM app_runtime_identities")
+            .fetch_all(&live.pool)
+            .await?;
+    sqlx::query("DELETE FROM app_runtime_identities")
+        .execute(&mut *connection)
+        .await?;
+    for (id, uid, gid, created) in identities {
+        anyhow::ensure!(
+            valid_app_id(&id) && (20000..=i32::MAX as i64).contains(&uid) && uid == gid,
+            "当前应用系统身份无效"
+        );
+        sqlx::query("INSERT INTO app_runtime_identities VALUES(?,?,?,?)")
+            .bind(id)
+            .bind(uid)
+            .bind(gid)
+            .bind(created)
+            .execute(&mut *connection)
+            .await?;
     }
     mark_snapshot(connection).await?;
     Ok(warnings.into_iter().collect())

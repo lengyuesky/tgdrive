@@ -15,17 +15,17 @@ pub(super) async fn backend_fixture() -> (
         .prefix("tg-backend-")
         .tempdir_in("/tmp")
         .unwrap();
-    let mut platform = AppPlatform::with_repository(original.host.clone(), String::new());
-    platform.root = short.path().join("apps");
-    platform.package_root = platform.root.join("packages");
-    platform.download_root = platform.root.join("downloads");
-    let platform = Arc::new(platform);
-    let package = platform.package_root.join("test-package").join("backend");
+    let platform = Arc::new(AppPlatform::with_repository(
+        original.host.clone(),
+        String::new(),
+    ));
+    let package_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let package = platform.package_root.join(package_sha).join("backend");
     std::fs::create_dir_all(&package).unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), package.join("app")).unwrap();
     let manifest: Manifest = serde_json::from_value(serde_json::json!({"id":"test-backend","name":"测试后端","version":"1.0.0","contract":{"major":1,"minor":0},"description":"只在测试里运行","author":"测试","files":{"read":true,"write":true},"page":{"entry":"page/index.html"},"backend":{"entry":"backend/app","run_mode":"on_demand","external_service":true}})).unwrap();
-    sqlx::query("INSERT INTO app_installations(id,manifest,generation,state_revision,enabled,pinned,scope,scope_revision,target,package_sha256,package_size,installed_at,updated_at) VALUES(?,?,?, ?,1,0,?,?,'linux-arm64','test-package',1,?,?)")
-        .bind(&manifest.id).bind(serde_json::to_string(&manifest).unwrap()).bind("generation-1").bind("state-1").bind(r#"{"mode":"all","access":"read_write"}"#).bind("scope-1").bind(now().0).bind(now().0).execute(&platform.host.vfs.db.pool).await.unwrap();
+    sqlx::query("INSERT INTO app_installations(id,manifest,generation,state_revision,enabled,pinned,scope,scope_revision,target,package_sha256,package_size,installed_at,updated_at) VALUES(?,?,?, ?,1,0,?,?,'linux-arm64',?,1,?,?)")
+        .bind(&manifest.id).bind(serde_json::to_string(&manifest).unwrap()).bind("generation-1").bind("state-1").bind(r#"{"mode":"all","access":"read_write"}"#).bind("scope-1").bind(package_sha).bind(now().0).bind(now().0).execute(&platform.host.vfs.db.pool).await.unwrap();
     (db_dir, short, platform, fake)
 }
 

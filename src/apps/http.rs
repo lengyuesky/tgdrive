@@ -38,11 +38,17 @@ const INTERNAL_ENDPOINTS: &[EndpointSpec] = &[
     },
 ];
 
+#[cfg(test)]
 pub(crate) fn router(
     host: crate::api::AppState,
     static_directory: Option<&std::path::Path>,
 ) -> Router {
-    let platform = Arc::new(AppPlatform::new(host));
+    router_with_platform(Arc::new(AppPlatform::new(host)), static_directory)
+}
+pub(crate) fn router_with_platform(
+    platform: Arc<AppPlatform>,
+    static_directory: Option<&std::path::Path>,
+) -> Router {
     let routes = router_platform(platform.clone());
     if let Some(directory) = static_directory {
         routes.fallback_service(
@@ -680,7 +686,7 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                     .ok_or_else(|| {
                         PlatformError::new(error_code::BACKEND_UNAVAILABLE, "后端启动轮次已改变")
                     })?;
-                run.keep_until.store(
+                run.keep_until.fetch_max(
                     super::now().0 + i64::from(request.ttl_seconds) * 1000,
                     Ordering::Release,
                 );

@@ -41,7 +41,10 @@ use crate::vfs::Vfs;
 use std::sync::Arc;
 
 fn main() {
-    dotenvy::dotenv().ok();
+    let cmd = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
+    if !cmd.starts_with("internal-app-") {
+        dotenvy::dotenv().ok();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -49,9 +52,11 @@ fn main() {
         )
         .init();
 
-    let cmd = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
     // 锁活到进程结束（不能随 serve future 返回释放，后台线程此时未必退出）。
-    let _instance_lock = if matches!(cmd.as_str(), "serve" | "check" | "reset-2fa") {
+    let _instance_lock = if matches!(
+        cmd.as_str(),
+        "serve" | "check" | "reset-2fa" | "restore-backup"
+    ) {
         match Config::from_env().and_then(|cfg| {
             let lock = restore::InstanceLock::acquire(&cfg.db_path)?;
             if cmd != "serve" {
@@ -68,6 +73,17 @@ fn main() {
     } else {
         None
     };
+    if cmd == "internal-app-backup" {
+        let path = std::env::args().nth(2).expect("备份辅助入口缺少私有配置");
+        match apps::snapshot::helper(std::path::Path::new(&path)) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => std::process::exit(3),
+            Err(_) => {
+                tracing::error!("应用在线快照失败");
+                std::process::exit(1);
+            }
+        }
+    }
     if cmd == "internal-app-run" {
         let path = std::env::args()
             .nth(2)
@@ -84,9 +100,24 @@ fn main() {
         "hash-password" => hash_password(),
         "reset-2fa" => rt.block_on(reset_2fa()),
         "decrypt-backup" => decrypt_backup(),
+        "restore-backup" => {
+            let source = std::env::args().nth(2).ok_or_else(|| {
+                anyhow::anyhow!("用法：tgdrive restore-backup <明文归档或旧数据库>")
+            });
+            source.and_then(|source| {
+                anyhow::ensure!(
+                    read_stdin_line("离线恢复会覆盖当前索引和应用库，输入“恢复”确认: ")? == "恢复",
+                    "已取消恢复"
+                );
+                rt.block_on(restore::restore_file(
+                    &Config::from_env()?,
+                    std::path::Path::new(&source),
+                ))
+            })
+        }
         other => {
             eprintln!(
-                "未知子命令: {other}\n用法: tgdrive [serve|check|healthcheck|hash-password|reset-2fa|decrypt-backup]"
+                "未知子命令: {other}\n用法: tgdrive [serve|check|healthcheck|hash-password|reset-2fa|decrypt-backup|restore-backup]"
             );
             std::process::exit(2);
         }
@@ -277,9 +308,11 @@ async fn serve() -> anyhow::Result<()> {
         Some(dir) => tracing::info!("静态前端目录: {dir}"),
         None => tracing::warn!("未找到静态前端目录,仅提供 API(开发模式请用 vite dev server)"),
     }
-    let app = http_router(
+    let platform = Arc::new(apps::AppPlatform::new(state.clone()));
+    let app = http_router_with_platform(
         state.clone(),
         static_dir.as_deref().map(std::path::Path::new),
+        platform.clone(),
     );
 
     tracing::info!(
@@ -294,15 +327,30 @@ async fn serve() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(tasks, migration, restore.shutdown.clone()))
+    .with_graceful_shutdown(shutdown_signal(
+        tasks,
+        migration,
+        restore.shutdown.clone(),
+        platform.clone(),
+    ))
     .await?;
+    platform.shutdown().await?;
     Ok(())
 }
 
 /// 正式服务与 HTTP 回归共用宿主路由，所有宿主地址限定在 /admin。
+#[cfg(test)]
 pub(crate) fn http_router(
     state: AppState,
     static_directory: Option<&std::path::Path>,
+) -> axum::Router {
+    let platform = Arc::new(apps::AppPlatform::new(state.clone()));
+    http_router_with_platform(state, static_directory, platform)
+}
+fn http_router_with_platform(
+    state: AppState,
+    static_directory: Option<&std::path::Path>,
+    platform: Arc<apps::AppPlatform>,
 ) -> axum::Router {
     let app = axum::Router::new()
         .route("/admin/healthz", axum::routing::get(|| async { "ok" }))
@@ -320,7 +368,7 @@ pub(crate) fn http_router(
             axum::routing::any(dav::dav_handler).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .with_state(state.clone())
-        .merge(apps::router(state.clone(), static_directory))
+        .merge(apps::router_with_platform(platform, static_directory))
         .nest("/admin/api", api::router(state.clone()));
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),
@@ -340,6 +388,7 @@ async fn shutdown_signal(
     tasks: crate::tasks::TaskManager,
     migration: crate::migration::StorageMigrationManager,
     restore_shutdown: tokio_util::sync::CancellationToken,
+    platform: Arc<apps::AppPlatform>,
 ) {
     #[cfg(unix)]
     let terminate = async {
@@ -368,6 +417,9 @@ async fn shutdown_signal(
     });
     tracing::info!("收到退出信号，正在停止后台任务并等待连接结束");
     tasks.cancel();
+    if let Err(error) = platform.shutdown().await {
+        tracing::warn!(code = %error.code, "应用平台停止收尾失败");
+    }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), migration.shutdown()).await;
 }
 

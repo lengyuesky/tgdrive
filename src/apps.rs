@@ -1,5 +1,10 @@
 //! 新应用平台；线上定义只来自契约库，宿主只实现通用存储与生命周期。
 
+pub(crate) mod archive;
+#[cfg(test)]
+mod archive_conformance_tests;
+#[cfg(test)]
+mod archive_tests;
 mod backend;
 pub(crate) mod backend_system;
 #[cfg(test)]
@@ -33,6 +38,7 @@ mod query;
 pub(crate) mod restore;
 mod runtime;
 mod safe_fs;
+pub(crate) mod snapshot;
 mod sse;
 mod store;
 #[cfg(test)]
@@ -106,6 +112,12 @@ impl AppPlatform {
             host,
         }
     }
+    pub(crate) async fn shutdown(&self) -> PlatformResult<()> {
+        self.sessions.revoke_all();
+        self.backends.stop_all().await?;
+        self.prune_uploads().await?;
+        Ok(())
+    }
     fn data_root(&self) -> PathBuf {
         self.root.join("data")
     }
@@ -159,7 +171,7 @@ impl AppPlatform {
 }
 
 pub(crate) use error::{PlatformError, PlatformResult};
-pub(crate) use http::{boundary_guard, maintenance_response, router};
+pub(crate) use http::{boundary_guard, maintenance_response, router_with_platform};
 
 fn endpoint_path(name: &str, parameters: &[(&str, &str)]) -> String {
     let mut path = tgdrive_contract::http::ENDPOINTS

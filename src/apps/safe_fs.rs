@@ -3,7 +3,7 @@
 use super::{PlatformError, PlatformResult, opaque};
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -187,6 +187,13 @@ impl Directory {
         Ok(bytes)
     }
     pub fn write_atomic(&self, value: &str, bytes: &[u8]) -> PlatformResult<()> {
+        self.write_atomic_reader(value, &mut std::io::Cursor::new(bytes))
+    }
+    pub(crate) fn write_atomic_reader(
+        &self,
+        value: &str,
+        reader: &mut impl Read,
+    ) -> PlatformResult<()> {
         let target = name(value)?;
         let temporary = name(&format!("tmp-{}", opaque()))?;
         let fd = unsafe {
@@ -199,7 +206,7 @@ impl Directory {
         };
         let mut file = checked_file(fd, false)?;
         let result = (|| {
-            file.write_all(bytes)?;
+            std::io::copy(reader, &mut file)?;
             file.sync_all()?;
             let renamed = unsafe {
                 libc::renameat(

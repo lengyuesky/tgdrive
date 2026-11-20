@@ -138,6 +138,10 @@ pub(super) fn remove_candidate(root: &Path) -> anyhow::Result<()> {
             std::fs::remove_file(path)?;
         }
     }
+    let apps = root.join("candidate-apps");
+    if apps.exists() {
+        std::fs::remove_dir_all(&apps)?;
+    }
     // 清理上次进程崩溃遗留的下载明文，只遍历本模块生成的目录。
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -148,6 +152,14 @@ pub(super) fn remove_candidate(root: &Path) -> anyhow::Result<()> {
         }
     }
     sync_dir(root)
+}
+pub(super) async fn candidate_digest(root: &Path) -> anyhow::Result<String> {
+    let apps = root.join("candidate-apps");
+    if apps.is_dir() {
+        Ok(crate::apps::archive::bundle_digest(&root.join("candidate.db"), &apps).await?)
+    } else {
+        digest(&root.join("candidate.db")).await
+    }
 }
 pub(super) async fn digest(path: &Path) -> anyhow::Result<String> {
     let mut file = tokio::fs::File::open(path).await?;
@@ -263,13 +275,19 @@ pub(super) async fn preserve_settings(
     candidate: &Path,
     state: &AppState,
 ) -> anyhow::Result<Vec<String>> {
-    let cfg = state.rt.current();
+    preserve_settings_from(candidate, &state.vfs.db, &state.rt.current()).await
+}
+pub(super) async fn preserve_settings_from(
+    candidate: &Path,
+    live: &Db,
+    cfg: &crate::settings::RuntimeCfg,
+) -> anyhow::Result<Vec<String>> {
     let security_keys = [
         crate::auth::TOTP_SECRET_KEY,
         crate::auth::TOTP_RECOVERY_KEY,
         crate::auth::WEBDAV_PASSWORD_KEY,
     ];
-    let old = state.vfs.db.settings_get(&security_keys).await?;
+    let old = live.settings_get(&security_keys).await?;
     let password = if crate::password::is_hash(&cfg.password) {
         cfg.password.clone()
     } else {
@@ -307,7 +325,7 @@ pub(super) async fn preserve_settings(
         sqlx::query("DELETE FROM upload_receipts").execute(&mut *tx).await?;
         // 恢复到旧请求状态不能重放可能已经发生的 Telegram 转存。
         crate::db::inbox::invalidate_restored_inbox(&mut tx).await?;
-        let warnings=crate::apps::restore::preserve_history(&mut tx, &state.vfs.db).await?;
+        let warnings=crate::apps::restore::preserve_history(&mut tx, live).await?;
         sqlx::query("DELETE FROM device_refresh_tokens").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM device_sessions").execute(&mut *tx).await?;
         sqlx::query("UPDATE client_identity SET server_id = lower(hex(randomblob(16))) WHERE id = 1").execute(&mut *tx).await?;
@@ -396,7 +414,7 @@ async fn apply(
 ) -> anyhow::Result<()> {
     let candidate = root.join("candidate.db");
     anyhow::ensure!(
-        journal.digest.as_deref() == Some(&digest(&candidate).await?),
+        journal.digest.as_deref() == Some(&candidate_digest(root).await?),
         "候选摘要不一致"
     );
     // pending 阶段发生崩溃可安全重做快照，仍未替换旧库。
@@ -424,6 +442,25 @@ async fn apply(
     .await;
     conn.close().await?;
     result?;
+    let rollback_apps = PathBuf::from(format!("{}.apps", rollback_path.display()));
+    if rollback_apps.exists() {
+        std::fs::remove_dir_all(&rollback_apps)?;
+    }
+    let live = Db::open(
+        db_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("主库路径编码无效"))?,
+    )
+    .await?;
+    let app_snapshot = crate::apps::archive::snapshot_apps(
+        &live,
+        db_path.to_str().unwrap(),
+        &rollback_path,
+        &rollback_apps,
+    )
+    .await;
+    live.close().await;
+    app_snapshot?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -438,7 +475,8 @@ async fn apply(
     install_copy(&candidate, db_path)?;
     journal.stage = "verifying".into();
     save(root, journal)?;
-    validate_startup(db_path, env).await?;
+    let apps = root.join("candidate-apps");
+    validate_startup(db_path, env, apps.is_dir().then_some(apps.as_path())).await?;
     journal.stage = "done".into();
     journal.status.phase = "succeeded".into();
     journal.status.safe_mode = true;
@@ -451,7 +489,11 @@ async fn apply(
     remove_candidate(root)?;
     Ok(())
 }
-async fn validate_startup(db_path: &Path, env: &crate::config::Config) -> anyhow::Result<()> {
+async fn validate_startup(
+    db_path: &Path,
+    env: &crate::config::Config,
+    apps: Option<&Path>,
+) -> anyhow::Result<()> {
     let db = Db::open(
         db_path
             .to_str()
@@ -460,6 +502,7 @@ async fn validate_startup(db_path: &Path, env: &crate::config::Config) -> anyhow
     .await?;
     db.set_background_blocked(true);
     let result = async {
+        crate::apps::archive::restore_apps(&db, db_path.to_str().unwrap(), apps).await?;
         let cfg = crate::settings::RuntimeCfg::load(&db, env).await?;
         anyhow::ensure!(
             !cfg.username.is_empty() && crate::password::is_hash(&cfg.password),
@@ -530,6 +573,23 @@ async fn rollback(
     save(root, journal)?;
     remove_sidecars(db_path)?;
     install_copy(&path, db_path)?;
+    let rollback_apps = PathBuf::from(format!("{}.apps", path.display()));
+    if rollback_apps.is_dir() {
+        let db = Db::open(
+            db_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("回滚路径编码无效"))?,
+        )
+        .await?;
+        let restored = crate::apps::archive::restore_apps(
+            &db,
+            db_path.to_str().unwrap(),
+            Some(&rollback_apps),
+        )
+        .await;
+        db.close().await;
+        restored?;
+    }
     journal.stage = "done".into();
     journal.status.phase = "rolled_back".into();
     journal.status.safe_mode = journal.previous_safe_mode;

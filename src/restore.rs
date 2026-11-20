@@ -93,6 +93,100 @@ pub struct RestoreManager {
     pub shutdown: tokio_util::sync::CancellationToken,
 }
 
+/// 持实例锁的离线恢复入口；与网页向导使用同一候选校验、回滚、应用库恢复及安全模式。
+pub async fn restore_file(
+    env: &crate::config::Config,
+    source: &std::path::Path,
+) -> anyhow::Result<()> {
+    require_cli_idle(&env.db_path, false)?;
+    let metadata = std::fs::symlink_metadata(source)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_BYTES,
+        "备份输入必须是最多 8 GiB 的普通文件"
+    );
+    let root = storage::root(&env.db_path)?;
+    let previous = storage::load(&root)?;
+    storage::remove_candidate(&root)?;
+    let staging = tempfile::Builder::new()
+        .prefix("download-")
+        .tempdir_in(&root)?;
+    let main = staging.path().join("host.db");
+    let apps = staging.path().join("apps");
+    let archive = crate::apps::archive::extract(source, &main, &apps).await?;
+    let (files, directories) = storage::validate_candidate(&main).await?;
+    let candidate = root.join("candidate.db");
+    storage::install_copy(&main, &candidate)?;
+    if archive {
+        let output = root.join("candidate-apps");
+        std::fs::create_dir(&output)?;
+        for entry in std::fs::read_dir(&apps)? {
+            let entry = entry?;
+            storage::install_copy(&entry.path(), &output.join(entry.file_name()))?;
+        }
+    }
+    let live = crate::db::Db::open(&env.db_path).await?;
+    let result = async {
+        let cfg = crate::settings::RuntimeCfg::load(&live, env).await?;
+        let identities: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT uid,gid FROM app_runtime_identities")
+                .fetch_all(&live.pool)
+                .await?;
+        for (uid, gid) in identities {
+            anyhow::ensure!(
+                (20000..=i32::MAX as i64).contains(&uid) && gid == uid,
+                "当前应用系统身份无效"
+            );
+            crate::apps::backend_system::signal_identity(
+                crate::apps::backend_system::Identity {
+                    uid: uid as u32,
+                    gid: gid as u32,
+                },
+                libc::SIGKILL,
+            );
+        }
+        storage::preserve_settings_from(&candidate, &live, &cfg).await
+    }
+    .await;
+    live.close().await;
+    let warnings = result?;
+    let mut journal = Journal {
+        status: RestoreStatus {
+            phase: "restarting".into(),
+            id: Some(crate::auth::random_secret()),
+            summary: Some(Summary {
+                name: source
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                bytes: std::fs::metadata(source)?.len(),
+                files,
+                directories,
+                encrypted: false,
+            }),
+            warnings,
+            safe_mode: previous.status.safe_mode,
+            ..Default::default()
+        },
+        stage: "pending".into(),
+        digest: Some(storage::candidate_digest(&root).await?),
+        updated: now_ts(),
+        previous_safe_mode: previous.status.safe_mode,
+    };
+    storage::save(&root, &journal)?;
+    Box::pin(storage::startup(env)).await?;
+    journal = storage::load(&root)?;
+    anyhow::ensure!(
+        journal.status.phase == "succeeded",
+        "{}",
+        journal
+            .status
+            .message
+            .unwrap_or_else(|| "离线恢复未完成，原数据已保留或回滚".into())
+    );
+    Ok(())
+}
+
 impl RestoreManager {
     pub fn new(db_path: &str) -> anyhow::Result<Self> {
         let root = storage::root(db_path)?;
@@ -244,12 +338,12 @@ impl RestoreManager {
             return Err(AppError::Conflict("候选不再可确认，请重新准备".into()));
         }
         let candidate = self.root.join("candidate.db");
-        let digest = storage::digest(&candidate).await?;
+        let digest = storage::candidate_digest(&self.root).await?;
         if inner.journal.digest.as_deref() != Some(&digest) {
             return Err(bad("候选摘要不一致，请重新准备"));
         }
         let warnings = storage::preserve_settings(&candidate, state).await?;
-        let digest = storage::digest(&candidate).await?;
+        let digest = storage::candidate_digest(&self.root).await?;
         let mut journal = inner.journal.clone();
         journal.status.warnings.extend(warnings);
         journal.digest = Some(digest);
@@ -366,7 +460,7 @@ impl RestoreManager {
         self.check_cancel(deadline)?;
         docs.sort_by_key(|(part, _, _)| part.index);
         let name = docs[0].0.base.clone();
-        let encrypted = name.ends_with(".db.age");
+        let encrypted = name.ends_with(crate::backup::ENCRYPTED_SUFFIX);
         let merged = temp.path().join("merged");
         let mut output = tokio::fs::File::create(&merged).await?;
         for (_, path, _) in &docs {
@@ -392,12 +486,23 @@ impl RestoreManager {
             tokio::fs::rename(&merged, &plain).await?;
         }
         self.check_cancel(deadline)?;
-        let (files, directories) = storage::validate_candidate(&plain).await?;
+        let main = temp.path().join("host.db");
+        let app_files = temp.path().join("apps");
+        let archive = crate::apps::archive::extract(&plain, &main, &app_files).await?;
+        let (files, directories) = storage::validate_candidate(&main).await?;
         self.check_cancel(deadline)?;
         let bytes = tokio::fs::metadata(&plain).await?.len();
         let candidate = self.root.join("candidate.db");
-        storage::install_copy(&plain, &candidate)?;
-        let digest = storage::digest(&candidate).await?;
+        storage::install_copy(&main, &candidate)?;
+        if archive {
+            let destination = self.root.join("candidate-apps");
+            std::fs::create_dir(&destination)?;
+            for entry in std::fs::read_dir(&app_files)? {
+                let entry = entry?;
+                storage::install_copy(&entry.path(), &destination.join(entry.file_name()))?;
+            }
+        }
+        let digest = storage::candidate_digest(&self.root).await?;
         // 清理告警已加入任务状态，不在成功路径重复加入。
         Ok((
             Summary {
@@ -689,8 +794,11 @@ fn parse_part(name: &str) -> anyhow::Result<Part> {
         (name, 1, 1)
     };
     anyhow::ensure!(
-        base.ends_with(".db") || base.ends_with(".db.age"),
-        "只接受 .db / .db.age 数据库备份"
+        base.ends_with(".db")
+            || base.ends_with(".db.age")
+            || base.ends_with(".tar")
+            || base.ends_with(".tar.age"),
+        "只接受 .db / .db.age / .tar / .tar.age 备份"
     );
     anyhow::ensure!(
         index > 0 && index <= total && total <= MAX_PARTS,

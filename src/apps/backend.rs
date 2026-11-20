@@ -21,6 +21,7 @@ struct Slot {
     run: RwLock<Option<Arc<Run>>>,
     failures: StdMutex<Vec<i64>>,
     disk_blocked: AtomicBool,
+    crash_blocked: AtomicBool,
     pending_starts: Arc<tokio::sync::Semaphore>,
 }
 pub(crate) struct Run {
@@ -74,6 +75,7 @@ impl Manager {
                     run: RwLock::new(None),
                     failures: StdMutex::new(Vec::new()),
                     disk_blocked: AtomicBool::new(false),
+                    crash_blocked: AtomicBool::new(false),
                     pending_starts: Arc::new(tokio::sync::Semaphore::new(
                         BACKEND_CONTROL_CONCURRENCY as usize,
                     )),
@@ -130,8 +132,13 @@ impl Manager {
                 "应用磁盘超额，需要主人清理后重启",
             ));
         }
-        if let Some(run) = self.run(id) {
-            if run.caller.generation == app.generation
+        if slot.crash_blocked.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        let previous = slot.run.read().unwrap().clone();
+        if let Some(run) = previous {
+            if !run.caller.cancelled.is_cancelled()
+                && run.caller.generation == app.generation
                 && self.status(id, backend.run_mode).state == BackendState::Ready
             {
                 return Ok(run);
@@ -149,6 +156,7 @@ impl Manager {
             let mut failures = slot.failures.lock().unwrap();
             failures.retain(|at| *at > now().0 - BACKEND_RESTART_WINDOW_SECONDS as i64 * 1000);
             if failures.len() as u64 >= MAX_BACKEND_RESTARTS {
+                slot.crash_blocked.store(true, Ordering::Release);
                 return Err(PlatformError::new(
                     error_code::BACKEND_UNAVAILABLE,
                     "后端已达到自动重启上限",
@@ -170,6 +178,7 @@ impl Manager {
             run_id: None,
             error_code: None,
         });
+        let failure_count = slot.failures.lock().unwrap().len();
         let result = self.start(platform, &app, backend.run_mode).await;
         match result {
             Ok(run) => {
@@ -196,7 +205,15 @@ impl Manager {
                 Ok(run)
             }
             Err(error) => {
-                slot.failures.lock().unwrap().push(now().0);
+                {
+                    let mut failures = slot.failures.lock().unwrap();
+                    if failures.len() == failure_count {
+                        failures.push(now().0);
+                    }
+                    if failures.len() as u64 >= MAX_BACKEND_RESTARTS {
+                        slot.crash_blocked.store(true, Ordering::Release);
+                    }
+                }
                 *slot.state.write().unwrap() = Some(BackendStatus {
                     state: BackendState::Failed,
                     run_mode: backend.run_mode,
@@ -214,12 +231,27 @@ impl Manager {
         mode: RunMode,
     ) -> PlatformResult<Arc<Run>> {
         let identity = system::identity(&platform.host.vfs.db, &app.id).await?;
+        // 宿主异常退出后可能仍有旧 UID 子进程，首次启动也要先回收，而不只依赖内存 Run。
+        system::signal_identity(identity, libc::SIGKILL);
         system::harden_host(&platform.host.rt.env.db_path)?;
         let root = super::safe_fs::Directory::open(&platform.root, true)?;
         root.permissions(
             unsafe { libc::geteuid() },
             unsafe { libc::getegid() },
             0o711,
+        )?;
+        let packages = super::safe_fs::Directory::open(&platform.package_root, false)?;
+        packages.permissions(
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            0o711,
+        )?;
+        let package = packages.child(&app.package_sha256, false)?;
+        package.permissions(unsafe { libc::geteuid() }, identity.gid, 0o550)?;
+        package.child("backend", false)?.permissions(
+            unsafe { libc::geteuid() },
+            identity.gid,
+            0o550,
         )?;
         let data = system::prepare_layout(&platform.data_root(), &app.id, identity)?;
         let limits = super::runtime::limits(app)?.backend.ok_or_else(|| {
@@ -286,7 +318,7 @@ impl Manager {
             run_dir.write_atomic("context.json", &serde_json::to_vec(&context)?)?;
         }
         let mut command = tokio::process::Command::new(if system::real_isolation() {
-            std::env::current_exe()?
+            system::helper_executable()?
         } else {
             std::path::PathBuf::from(&config.executable)
         });
@@ -346,15 +378,27 @@ impl Manager {
         tokio::spawn(async move {
             let result = child.wait().await;
             let expected = monitored.caller.cancelled.is_cancelled();
+            if let Some(platform) = weak.upgrade() {
+                platform.backends.exited(&id, &monitored, mode, expected);
+            }
             monitored.caller.cancelled.cancel();
             system::kill_group(monitored.pid, monitored.identity, libc::SIGKILL);
             if let Some(cgroup) = &monitored.cgroup {
                 let _ = std::fs::write(std::path::Path::new(cgroup).join("cgroup.kill"), "1");
                 let _ = std::fs::remove_dir(cgroup);
             }
+            if let Some(platform) = weak.upgrade() {
+                let slot = platform.backends.slot(&id);
+                let mut current = slot.run.write().unwrap();
+                if current
+                    .as_ref()
+                    .is_some_and(|run| run.caller.id == monitored.caller.id)
+                {
+                    current.take();
+                }
+            }
             monitored.finished.cancel();
             if let Some(platform) = weak.upgrade() {
-                platform.backends.exited(&id, &monitored, mode, expected);
                 let _ = platform.events.emit(
                     &id,
                     tgdrive_contract::events::event_name::BACKEND_CHANGED,
@@ -386,6 +430,20 @@ impl Manager {
         attempt.0.take();
         Ok(run)
     }
+    pub async fn stop_all(&self) -> PlatformResult<()> {
+        let ids = self
+            .slots
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let results = futures_util::future::join_all(ids.iter().map(|id| self.stop(id))).await;
+        for result in results {
+            result?;
+        }
+        Ok(())
+    }
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
         let slot = self.slot(id);
         let _gate = slot.gate.lock().await;
@@ -401,7 +459,9 @@ impl Manager {
         Ok(())
     }
     pub fn reset_failures(&self, id: &str) {
-        self.slot(id).failures.lock().unwrap().clear();
+        let slot = self.slot(id);
+        slot.failures.lock().unwrap().clear();
+        slot.crash_blocked.store(false, Ordering::Release);
     }
     pub async fn restart(
         &self,
@@ -433,7 +493,7 @@ impl Manager {
             }
             slot.disk_blocked.store(false, Ordering::Release);
         }
-        slot.failures.lock().unwrap().clear();
+        self.reset_failures(id);
         let run = self.ensure(platform, id).await?;
         let mode = platform
             .installed(id)
@@ -455,9 +515,13 @@ impl Manager {
         if !current {
             return;
         }
-        *slot.run.write().unwrap() = None;
         if !expected && run.ready.load(Ordering::Acquire) {
-            slot.failures.lock().unwrap().push(now().0);
+            let mut failures = slot.failures.lock().unwrap();
+            failures.retain(|at| *at > now().0 - BACKEND_RESTART_WINDOW_SECONDS as i64 * 1000);
+            failures.push(now().0);
+            if failures.len() as u64 >= MAX_BACKEND_RESTARTS {
+                slot.crash_blocked.store(true, Ordering::Release);
+            }
         }
         *slot.state.write().unwrap() = Some(BackendStatus {
             state: if expected {
@@ -486,7 +550,15 @@ impl Drop for StartAttempt {
         }
     }
 }
+struct StoppingGroup<'a>(&'a Run);
+impl Drop for StoppingGroup<'_> {
+    fn drop(&mut self) {
+        system::kill_group(self.0.pid, self.0.identity, libc::SIGKILL);
+    }
+}
 async fn terminate(run: &Run) {
+    // 停止 future 被宿主退出或 HTTP 取消丢弃时也必须回收整个进程组。
+    let _group = StoppingGroup(run);
     run.caller.cancelled.cancel();
     system::kill_group(run.pid, run.identity, libc::SIGTERM);
     let _ = tokio::time::timeout(
@@ -494,7 +566,6 @@ async fn terminate(run: &Run) {
         run.finished.cancelled(),
     )
     .await;
-    system::kill_group(run.pid, run.identity, libc::SIGKILL);
 }
 
 fn configure_test_command(command: &mut tokio::process::Command, context: &BackendStartContext) {

@@ -333,6 +333,7 @@ impl AppPlatform {
             }
         }
         self.backends.stop(&preview.manifest.id).await?;
+        self.backends.reset_failures(&preview.manifest.id);
         let at = now();
         let generation = opaque();
         let state_revision = opaque();

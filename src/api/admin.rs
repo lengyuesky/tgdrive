@@ -536,33 +536,9 @@ pub(super) async fn admin_env_export(State(state): State<AppState>) -> Response 
 
 // ---------- 备份 / 维护配置 ----------
 
-/// 下载数据库一致性快照(VACUUM INTO 临时文件后流式返回)
+/// 下载包含主库与各应用库的一致性快照归档。
 pub(super) async fn admin_backup(State(state): State<AppState>) -> AppResult<Response> {
-    let ts = crate::db::now_ts();
-    let cfg = state.rt.current();
-    let temp_dir = tempfile::Builder::new()
-        .prefix("tgdrive-download-")
-        .tempdir_in(&cfg.tmp_dir)?;
-    let tmp = temp_dir.path().join("snapshot.db");
-    let tmp_str = tmp
-        .to_str()
-        .ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
-    state.vfs.db.vacuum_into(tmp_str).await?;
-    crate::backup::prepare_inbox_snapshot(tmp_str).await?;
-    let file = tokio::fs::File::open(&tmp).await?;
-    let len = file.metadata().await?.len();
-    // Linux 下先删路径,fd 继续有效到流结束,不留残件
-    let _ = std::fs::remove_file(&tmp);
-    let body = axum::body::Body::from_stream(ReaderStream::new(file));
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, len)
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"tgdrive-backup-{ts}.db\""),
-        )
-        .body(body)
-        .expect("响应构造失败"))
+    crate::backup::download(&state.vfs, &state.rt).await
 }
 
 /// 立即把同一份数据库快照投递到全部已启用渠道。

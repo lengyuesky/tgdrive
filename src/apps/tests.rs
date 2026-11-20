@@ -90,7 +90,11 @@ impl TgApi for Synthetic {
 }
 
 pub(crate) async fn fixture() -> (tempfile::TempDir, Arc<AppPlatform>, Arc<Synthetic>) {
-    let dir = tempfile::tempdir().unwrap();
+    // 数据根与真实启动上下文一致，同时让套接字路径在 macOS 和 Linux 都短于 107 字节。
+    let dir = tempfile::Builder::new()
+        .prefix("tg-platform-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let path = dir.path();
     let env = Arc::new(Config {
         proxy: Default::default(),

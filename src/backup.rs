@@ -177,6 +177,31 @@ pub async fn backup_now(vfs: &Vfs, runtime: &Runtime) -> AppResult<BackupOutcome
     backup_selected(vfs, runtime, &extras, Selection::enabled(&extras)).await
 }
 
+/// 本地下载使用明文归档；下载结束后删除私有暂存，不受远端备份加密设置影响。
+pub(crate) async fn download(vfs: &Vfs, runtime: &Runtime) -> AppResult<axum::response::Response> {
+    use futures_util::StreamExt;
+    let _guard = BACKUP_LOCK
+        .try_lock()
+        .map_err(|_| AppError::Conflict("备份或恢复任务正在运行".into()))?;
+    let snapshot = Box::pin(create_snapshot(vfs, runtime, None)).await?;
+    let file = tokio::fs::File::open(&snapshot.path).await?;
+    let len = snapshot.len;
+    let name = snapshot.name.clone();
+    let body = axum::body::Body::from_stream(ReaderStream::new(file).map(move |bytes| {
+        let _ = &snapshot;
+        bytes
+    }));
+    Ok(axum::response::Response::builder()
+        .header("content-type", "application/octet-stream")
+        .header("content-length", len)
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{name}\""),
+        )
+        .body(body)
+        .expect("备份响应有效"))
+}
+
 /// 自动任务：只投递已超过 24 小时或从未成功过的渠道。
 pub async fn automatic_if_due(
     vfs: &Vfs,
@@ -203,7 +228,14 @@ pub async fn automatic_if_due(
     // 基准键在排除清单里，备份写它不会自增修订号；stored 为 None（从未成功
     // 备份过，含老库升级与新启用渠道）视为已变化，保证先拿到一份完整备份。
     // 与各渠道自己的基准比较，失败渠道不会拖累健康渠道的跳过判定。
+    let has_app_database = crate::apps::archive::has_databases(&vfs.db, &runtime.env.db_path)
+        .await
+        .map_err(crate::error::AppError::from)?;
     let unchanged = |destination: Destination| async move {
+        // 应用 schema 由应用管理，没有宿主修订号；不能只凭主库无变化漏备业务库。
+        if has_app_database {
+            return Ok(false);
+        }
         let current = vfs.db.data_revision().await?;
         setting_i64(&vfs.db, destination.revision_key())
             .await
@@ -263,7 +295,7 @@ async fn backup_selected(
         .try_lock()
         .map_err(|_| AppError::Conflict("备份或恢复任务正在运行".into()))?;
     vfs.db.require_background_enabled()?;
-    let snapshot = create_snapshot(vfs, runtime, extras).await?;
+    let snapshot = create_snapshot(vfs, runtime, Some(extras)).await?;
     let proxy = runtime.current().proxy.clone();
     let _proxy_snapshot = crate::proxy::ProxySnapshot::new(proxy.clone())?;
 
@@ -366,25 +398,38 @@ fn destination_error_summary(destination: Destination, error: &AppError) -> Stri
     }
 }
 
-async fn create_snapshot(vfs: &Vfs, runtime: &Runtime, extras: &Extras) -> AppResult<Snapshot> {
+async fn create_snapshot(
+    vfs: &Vfs,
+    runtime: &Runtime,
+    remote: Option<&Extras>,
+) -> AppResult<Snapshot> {
     let cfg = runtime.current();
     // 在 VACUUM INTO 之前读修订号：这是本快照覆盖的数据状态。
     let revision = vfs.db.data_revision().await?;
     let temp_dir = tempfile::Builder::new()
         .prefix("tgdrive-backup-")
         .tempdir_in(&cfg.tmp_dir)?;
-    let path = temp_dir.path().join("snapshot.db");
-    let path_str = path
+    let main = temp_dir.path().join("snapshot.db");
+    let path_str = main
         .to_str()
         .ok_or_else(|| AppError::BadRequest("临时目录路径无效".into()))?;
     vfs.db.vacuum_into(path_str).await?;
-    scrub_snapshot(path_str).await?;
-    let ts = now_ts();
-    let mut name = format!("tgdrive-backup-{}.db", fmt_compact_utc8(ts));
-    let path = if extras.backup_encryption_password.is_empty() {
-        path
+    if remote.is_some() {
+        scrub_snapshot(path_str).await?;
     } else {
-        let encrypted = temp_dir.path().join("snapshot.db.age");
+        prepare_inbox_snapshot(path_str).await?;
+    }
+    let path = temp_dir.path().join("snapshot.tar");
+    crate::apps::archive::create(&vfs.db, &runtime.env.db_path, &main, &path)
+        .await
+        .map_err(crate::error::AppError::from)?;
+    tokio::fs::remove_file(&main).await?;
+    let ts = now_ts();
+    let mut name = format!("tgdrive-backup-{}.tar", fmt_compact_utc8(ts));
+    let path = if let Some(extras) =
+        remote.filter(|extras| !extras.backup_encryption_password.is_empty())
+    {
+        let encrypted = temp_dir.path().join("snapshot.tar.age");
         encrypt_file_blocking(
             path.clone(),
             encrypted.clone(),
@@ -395,6 +440,8 @@ async fn create_snapshot(vfs: &Vfs, runtime: &Runtime, extras: &Extras) -> AppRe
         tokio::fs::remove_file(&path).await?;
         name.push_str(ENCRYPTED_SUFFIX);
         encrypted
+    } else {
+        path
     };
     let len = tokio::fs::metadata(&path).await?.len();
     Ok(Snapshot {

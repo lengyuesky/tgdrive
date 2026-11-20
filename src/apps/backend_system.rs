@@ -29,6 +29,21 @@ pub(crate) fn available() -> bool {
     cfg!(target_os = "linux") && unsafe { libc::geteuid() } == 0
 }
 
+pub(crate) fn helper_executable() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if real_isolation() {
+        return std::env::var_os("TGDRIVE_TEST_HOST_EXECUTABLE")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "真实隔离测试需要生产辅助可执行文件",
+                )
+            });
+    }
+    std::env::current_exe()
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct Identity {
     pub uid: u32,
@@ -56,6 +71,12 @@ pub(crate) async fn identity(db: &Db, id: &str) -> PlatformResult<Identity> {
             .fetch_optional(&mut *tx)
             .await?;
     let assigned = if let Some((uid, gid)) = old {
+        if !(20000..=i32::MAX as i64).contains(&uid) || gid != uid {
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "应用系统身份无效",
+            ));
+        }
         Identity {
             uid: uid as u32,
             gid: gid as u32,
@@ -65,7 +86,14 @@ pub(crate) async fn identity(db: &Db, id: &str) -> PlatformResult<Identity> {
             sqlx::query_scalar("SELECT max(uid) FROM app_runtime_identities")
                 .fetch_one(&mut *tx)
                 .await?;
-        let mut uid = maximum.unwrap_or(19999).saturating_add(1).max(20000) as u32;
+        let maximum = maximum
+            .unwrap_or(19999)
+            .checked_add(1)
+            .filter(|uid| *uid <= i32::MAX as i64)
+            .ok_or_else(|| {
+                PlatformError::new(error_code::CAPABILITY_UNAVAILABLE, "后端系统身份已耗尽")
+            })?;
+        let mut uid = maximum.max(20000) as u32;
         // 系统已有账号/组也不能借用；这里只读取 libc 数据库，不执行 shell 或应用指令。
         while unsafe { !libc::getpwuid(uid).is_null() || !libc::getgrgid(uid).is_null() } {
             uid = uid.checked_add(1).ok_or_else(|| {
@@ -98,7 +126,17 @@ pub(crate) async fn identity(db: &Db, id: &str) -> PlatformResult<Identity> {
 fn register_user(identity: Identity) -> PlatformResult<()> {
     use std::io::Write;
     let user = format!("tgapp{}", identity.uid);
-    if unsafe { libc::getpwuid(identity.uid).is_null() } {
+    let existing = unsafe { libc::getpwuid(identity.uid) };
+    if !existing.is_null() {
+        let name = unsafe { std::ffi::CStr::from_ptr((*existing).pw_name) }.to_bytes();
+        if name != user.as_bytes() {
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "应用 UID 已被其他系统账号使用",
+            ));
+        }
+    }
+    if existing.is_null() {
         let mut passwd = std::fs::OpenOptions::new()
             .append(true)
             .open("/etc/passwd")?;
@@ -307,7 +345,9 @@ pub(crate) fn launch_helper(path: &Path) -> anyhow::Result<std::convert::Infalli
         };
         enforced.pids = libc::setrlimit(libc::RLIMIT_NPROC, &pids) == 0;
     }
-    if let Some(cgroup) = &config.cgroup {
+    if let Some(cgroup) = &config.cgroup
+        && is_cgroup_v2(Path::new(cgroup))
+    {
         // 在管理父组启用控制器；失败只是尽力而为限制不可用，不阻止硬隔离启动。
         if let Some(uid_group) = Path::new(cgroup).parent()
             && let Some(root) = uid_group.parent()
@@ -391,6 +431,74 @@ pub(crate) fn launch_helper(path: &Path) -> anyhow::Result<std::convert::Infalli
     Err(error.into())
 }
 
+pub(crate) fn drop_identity(identity: Identity) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } == 0 && identity.uid >= 20000 && identity.gid == identity.uid,
+        "应用辅助身份无效"
+    );
+    #[cfg(target_os = "linux")]
+    unsafe {
+        anyhow::ensure!(
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0,
+            "不能禁止权限提升"
+        );
+        anyhow::ensure!(
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0
+            ) == 0,
+            "不能清空环境 capabilities"
+        );
+    }
+    unsafe {
+        anyhow::ensure!(
+            libc::setgroups(0, std::ptr::null()) == 0
+                && libc::setgid(identity.gid) == 0
+                && libc::setuid(identity.uid) == 0,
+            "不能降权或清空附加组"
+        );
+        let core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        anyhow::ensure!(
+            libc::setrlimit(libc::RLIMIT_CORE, &core) == 0,
+            "不能禁用进程转储"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    clear_capabilities()?;
+    Ok(())
+}
+
+fn is_cgroup_v2(mut path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        while !path.exists() {
+            let Some(parent) = path.parent() else {
+                return false;
+            };
+            path = parent;
+        }
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+            return false;
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        unsafe {
+            libc::statfs(path.as_ptr(), stat.as_mut_ptr()) == 0
+                && stat.assume_init().f_type == 0x6367_7270
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &mut path;
+        false
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn clear_capabilities() -> anyhow::Result<()> {
     #[repr(C)]
@@ -422,9 +530,11 @@ pub(crate) fn kill_group(pid: u32, identity: Identity, signal: i32) {
     unsafe {
         libc::kill(-(pid as i32), signal);
     }
+    signal_identity(identity, signal);
+}
+pub(crate) fn signal_identity(identity: Identity, signal: i32) {
     #[cfg(target_os = "linux")]
-    if real_isolation() {
-        // UID 不与其他保留数据应用共享；进程组之外的恶意脱离子进程也一并撤销。
+    if real_isolation() && identity.uid >= 20000 && identity.gid == identity.uid {
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
                 let Some(process) = entry
@@ -455,5 +565,5 @@ pub(crate) fn kill_group(pid: u32, identity: Identity, signal: i32) {
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = identity;
+    let _ = (identity, signal);
 }
