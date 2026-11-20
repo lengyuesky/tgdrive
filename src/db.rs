@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod app_upload;
 mod copy;
 mod delete_jobs;
 pub mod devices;

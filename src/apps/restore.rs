@@ -52,6 +52,26 @@ pub(crate) async fn apply_pending(pool: &SqlitePool, path: &str) -> anyhow::Resu
         // 后端轮次留给第二阶段；新平台不恢复任何在途句柄或未知写入。
         sqlx::query("UPDATE app_installations SET generation=?,state_revision=?,scope_revision=? WHERE id=?").bind(super::opaque()).bind(super::opaque()).bind(super::opaque()).bind(record.id).execute(&mut *tx).await?;
     }
+    let staged: Vec<i64> = sqlx::query_scalar("SELECT staging_node_id FROM app_uploads WHERE staging_node_id IS NOT NULL AND state IN('awaiting_body','receiving','ready')").fetch_all(&mut *tx).await?;
+    for node in staged {
+        let messages: Vec<(i64, i64)> = sqlx::query_as("SELECT storage_target_id,tg_message_id FROM chunks WHERE node_id=? AND storage_target_id IS NOT NULL").bind(node).fetch_all(&mut *tx).await?;
+        sqlx::query("DELETE FROM nodes WHERE id=? AND status='uploading'")
+            .bind(node)
+            .execute(&mut *tx)
+            .await?;
+        Db::freed_messages(
+            &mut tx,
+            messages
+                .into_iter()
+                .map(|(storage_target_id, message_id)| crate::db::StoredMessage {
+                    storage_target_id,
+                    message_id,
+                })
+                .collect(),
+        )
+        .await?;
+    }
+    sqlx::query("UPDATE app_uploads SET state='cancelled',error_code='upload_expired' WHERE state IN('awaiting_body','receiving','ready')").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM app_file_changes")
         .execute(&mut *tx)
         .await?;

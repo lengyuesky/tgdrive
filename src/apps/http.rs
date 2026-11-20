@@ -342,17 +342,21 @@ async fn dispatch(State(platform): State<Arc<AppPlatform>>, request: Request) ->
     } else {
         CONTROL_TIMEOUT_SECONDS
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(seconds),
-        dispatch_inner(platform, request),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(PlatformError::new(
-            error_code::REQUEST_TIMEOUT,
-            "应用请求超过时限",
-        ))
-    });
+    let result = if names.iter().any(|spec| spec.name == "files.upload.body") {
+        dispatch_inner(platform, request).await
+    } else {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(seconds),
+            dispatch_inner(platform, request),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(PlatformError::new(
+                error_code::REQUEST_TIMEOUT,
+                "应用请求超过时限",
+            ))
+        })
+    };
     match result {
         Ok(response) => response,
         Err(error) => error.into_response(),
@@ -592,9 +596,7 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                 owner_json(platform.state_patch(id, strict_json(body).await?).await?)
             }
             "center.app.scope" => {
-                let result =
-                    super::store::update_scope(&platform.host.vfs.db, id, strict_json(body).await?)
-                        .await?;
+                let result = platform.update_scope(id, strict_json(body).await?).await?;
                 platform.events.emit(
                     id,
                     tgdrive_contract::events::event_name::SCOPE_CHANGED,
@@ -816,6 +818,59 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                         )
                         .await?,
                 )
+            }
+            "files.mutate" => {
+                let key = headers
+                    .get(IDEMPOTENCY_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| PlatformError::new(error_code::INVALID_REQUEST, "缺少幂等键"))?;
+                json(
+                    platform
+                        .mutate(caller(&session)?, key, strict_json(body).await?)
+                        .await?,
+                )
+            }
+            "files.mutate.receipt" => {
+                json(platform.mutation_receipt(caller(&session)?, key).await?)
+            }
+            "files.upload.create" => {
+                let key = headers
+                    .get(IDEMPOTENCY_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| PlatformError::new(error_code::INVALID_REQUEST, "缺少幂等键"))?;
+                let info = platform
+                    .create_upload(caller(&session)?, key, strict_json(body).await?)
+                    .await?;
+                let mut response = json(info);
+                *response.status_mut() = StatusCode::CREATED;
+                response
+            }
+            "files.upload.body" => json(
+                platform
+                    .upload_body(
+                        caller(&session)?,
+                        parameters.get("id").map(String::as_str).unwrap_or(""),
+                        body,
+                        &headers,
+                    )
+                    .await?,
+            ),
+            "files.upload.status" => json(
+                platform
+                    .upload_status(
+                        caller(&session)?,
+                        parameters.get("id").map(String::as_str).unwrap_or(""),
+                    )
+                    .await?,
+            ),
+            "files.upload.cancel" => {
+                platform
+                    .cancel_upload(
+                        caller(&session)?,
+                        parameters.get("id").map(String::as_str).unwrap_or(""),
+                    )
+                    .await?;
+                StatusCode::NO_CONTENT.into_response()
             }
             "kv.get" => {
                 let session = caller(&session)?;
@@ -1055,7 +1110,9 @@ fn json<T: serde::Serialize>(value: T) -> Response {
     }
 }
 
-pub(crate) async fn strict_json<T: DeserializeOwned>(body: Body) -> PlatformResult<T> {
+pub(crate) async fn strict_json<T: DeserializeOwned + serde::Serialize>(
+    body: Body,
+) -> PlatformResult<T> {
     let bytes = to_bytes(body, MAX_JSON_REQUEST_BYTES as usize)
         .await
         .map_err(|_| PlatformError::new(error_code::PAYLOAD_TOO_LARGE, "JSON 正文超过上限"))?;
@@ -1071,8 +1128,44 @@ pub(crate) async fn strict_json<T: DeserializeOwned>(body: Body) -> PlatformResu
             "请求必须是 JSON 对象",
         ));
     }
-    check_objects(&value)?;
-    Ok(serde_json::from_value(value)?)
+    decode_object(value)
+}
+pub(crate) fn decode_object<T: DeserializeOwned + serde::Serialize>(
+    value: serde_json::Value,
+) -> PlatformResult<T> {
+    if !value.is_object() {
+        return Err(PlatformError::new(
+            error_code::INVALID_REQUEST,
+            "请求必须是 JSON 对象",
+        ));
+    }
+    let decoded: T = serde_json::from_value(value.clone())?;
+    check_shapes(&value, &serde_json::to_value(&decoded)?)?;
+    Ok(decoded)
+}
+fn check_shapes(raw: &serde_json::Value, canonical: &serde_json::Value) -> PlatformResult<()> {
+    match (raw, canonical) {
+        (serde_json::Value::Array(_), serde_json::Value::Object(_)) => {
+            return Err(PlatformError::new(
+                error_code::INVALID_REQUEST,
+                "结构字段不能使用位置数组",
+            ));
+        }
+        (serde_json::Value::Object(raw), serde_json::Value::Object(canonical)) => {
+            for (key, value) in canonical {
+                if let Some(raw) = raw.get(key) {
+                    check_shapes(raw, value)?;
+                }
+            }
+        }
+        (serde_json::Value::Array(raw), serde_json::Value::Array(canonical)) => {
+            for (raw, value) in raw.iter().zip(canonical) {
+                check_shapes(raw, value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 fn check_objects(value: &serde_json::Value) -> PlatformResult<()> {
     if let Some(object) = value.as_object() {

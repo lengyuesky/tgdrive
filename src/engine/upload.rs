@@ -104,6 +104,7 @@ pub struct UploadHandle {
     tx: mpsc::Sender<UploadMsg>,
     join: tokio::task::JoinHandle<AppResult<Node>>,
     cancel: AbortHandle,
+    abort_on_drop: bool,
 }
 
 pub struct ResumablePartHandle {
@@ -166,7 +167,10 @@ impl UploadHandle {
 
 impl Drop for UploadHandle {
     fn drop(&mut self) {
-        self.cancel.abort();
+        if self.abort_on_drop {
+            self.cancel.abort();
+        }
+        // 应用暂存上传关闭输入后等待已发出的分块落定并入清理队列，不能丢弃消息 ID。
     }
 }
 
@@ -399,7 +403,15 @@ impl Uploader {
         let pipeline_pending = upstream_pending.clone();
         let join = tokio::spawn(async move {
             let result = match Abortable::new(
-                this.pipeline(node_id, &name, thumbnail, target, pipeline_pending, rx),
+                this.pipeline(
+                    node_id,
+                    &name,
+                    thumbnail,
+                    target,
+                    pipeline_pending,
+                    rx,
+                    false,
+                ),
                 abort_registration,
             )
             .await
@@ -429,7 +441,56 @@ impl Uploader {
                 }
             }
         });
-        Ok(UploadHandle { tx, join, cancel })
+        Ok(UploadHandle {
+            tx,
+            join,
+            cancel,
+            abort_on_drop: true,
+        })
+    }
+
+    /// 使用同一套分块、背压和 Telegram 上传管线，只把最终可见提交留给应用事务。
+    pub(crate) async fn start_staging(&self, node_id: i64, name: &str) -> AppResult<UploadHandle> {
+        let target = self.tg.next_upload()?;
+        let (tx, rx) = mpsc::channel::<UploadMsg>(4);
+        let this = self.clone();
+        let name = name.to_owned();
+        let (cancel, registration) = AbortHandle::new_pair();
+        let join = tokio::spawn(async move {
+            let result = match Abortable::new(
+                this.pipeline(
+                    node_id,
+                    &name,
+                    None,
+                    target,
+                    Arc::new(AtomicU64::new(0)),
+                    rx,
+                    true,
+                ),
+                registration,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(AppError::BadRequest("应用上传已取消".into())),
+            };
+            if let Err(error) = &result {
+                let uncertain = matches!(error, AppError::TelegramUncertain(_));
+                let _ = sqlx::query("UPDATE app_uploads SET state=CASE WHEN ? THEN 'receiving' ELSE 'failed' END,error_code=? WHERE staging_node_id=? AND state='receiving'")
+                    .bind(uncertain).bind(tgdrive_contract::error_code::UPSTREAM_UNAVAILABLE).bind(node_id).execute(&this.db.pool).await;
+                match this.db.abort_upload(node_id).await {
+                    Ok(freed) => this.delete_messages_best_effort(freed),
+                    Err(error) => tracing::warn!(error = %error, "清理应用上传暂存失败"),
+                }
+            }
+            result
+        });
+        Ok(UploadHandle {
+            tx,
+            join,
+            cancel,
+            abort_on_drop: false,
+        })
     }
 
     /// 为一个可恢复会话启动独立分块请求。请求体必须恰好等于该分块的期望大小；
@@ -998,6 +1059,7 @@ impl Uploader {
         Ok(summary)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn pipeline(
         &self,
         node_id: i64,
@@ -1006,6 +1068,7 @@ impl Uploader {
         target: TgBinding,
         upstream_pending: Arc<AtomicU64>,
         mut rx: mpsc::Receiver<UploadMsg>,
+        staged: bool,
     ) -> AppResult<Node> {
         let mut uploads: JoinSet<AppResult<()>> = JoinSet::new();
         let result = self
@@ -1017,6 +1080,7 @@ impl Uploader {
                 target,
                 upstream_pending,
                 &mut rx,
+                staged,
             )
             .await;
         if result.is_err() {
@@ -1041,6 +1105,7 @@ impl Uploader {
         target: TgBinding,
         upstream_pending: Arc<AtomicU64>,
         rx: &mut mpsc::Receiver<UploadMsg>,
+        staged: bool,
     ) -> AppResult<Node> {
         // 整次上传用同一份分块参数快照,中途改配置不会切出大小不一的块
         let mut buf = ChunkBuf::new(
@@ -1104,7 +1169,7 @@ impl Uploader {
                 name,
                 idx,
                 last,
-                idx == 0,
+                idx == 0 && !staged,
                 if idx == 0 { thumbnail } else { None },
                 target,
                 upstream_pending,
@@ -1116,6 +1181,12 @@ impl Uploader {
         }
 
         let sha = to_hex(&sha2::Digest::finalize(hasher));
+        if staged {
+            return self
+                .db
+                .finish_app_staging(node_id, total as i64, &sha)
+                .await;
+        }
         // 节点随 finalize 事务一并读出，提交成功后不再做可能失败的数据库操作。
         // 否则可能出现“已经提交成功，却因随后一次查询失败而被外层回滚”的假失败。
         let (node, freed) = self
@@ -1185,6 +1256,13 @@ impl Uploader {
                 )
                 .await
             {
+                // 先持久入通用清理队列；即时补偿失败或进程退出也不能遗失已知消息。
+                let _ = db
+                    .enqueue_delete_message(StoredMessage {
+                        storage_target_id,
+                        message_id: msg.message_id,
+                    })
+                    .await;
                 // Telegram 已成功但元数据登记失败时立即补偿删除，避免频道残留孤儿分块。
                 if let Err(cleanup) = tg.delete_message(msg.message_id).await {
                     tracing::error!(

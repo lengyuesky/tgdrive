@@ -115,8 +115,8 @@ impl Db {
     }
 
     /// 候选消息中，删除元数据后已无任何分块引用的消息；在同一事务内先写入删除队列。
-    pub(super) async fn freed_messages(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pub(crate) async fn freed_messages(
+        tx: &mut sqlx::SqliteConnection,
         candidates: Vec<StoredMessage>,
     ) -> AppResult<Vec<StoredMessage>> {
         let uniq: HashSet<StoredMessage> = candidates.into_iter().collect();
@@ -128,7 +128,7 @@ impl Db {
             )
             .bind(message.storage_target_id)
             .bind(message.message_id)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&mut *tx)
             .await?;
             if still.is_none() {
                 sqlx::query(
@@ -141,7 +141,7 @@ impl Db {
                 .bind(message.message_id)
                 .bind(now_ts() + DELETE_GRACE_SECS)
                 .bind(now_ts())
-                .execute(&mut **tx)
+                .execute(&mut *tx)
                 .await?;
                 freed.push(message);
             }

@@ -5,50 +5,42 @@ use super::*;
 impl Db {
     /// 软删除:整棵子树置 trashed(保持 ready ⇒ 可见的不变式),该子树的分享一并删除
     pub async fn trash_node(&self, id: i64, orig_path: &str) -> AppResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::trash_in(&mut tx, id, orig_path).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    pub(crate) async fn trash_in(
+        connection: &mut sqlx::SqliteConnection,
+        id: i64,
+        orig_path: &str,
+    ) -> AppResult<()> {
         if id == ROOT_ID {
             return Err(AppError::BadRequest("不能删除根目录".into()));
         }
-        let node = self.node(id).await?;
+        let node = Self::node_in(connection, id).await?;
         let parent_id = node.parent_id.ok_or(AppError::NotFound)?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("INSERT INTO app_change_batches(root_id) VALUES(?)")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
+        sqlx::query("WITH RECURSIVE sub(id) AS (SELECT ? UNION ALL SELECT n.id FROM nodes n JOIN sub s ON n.parent_id=s.id) UPDATE nodes SET status='trashed' WHERE id IN(SELECT id FROM sub) AND status='ready'")
+            .bind(id).execute(&mut *connection).await?;
+        sqlx::query("WITH RECURSIVE sub(id) AS (SELECT ? UNION ALL SELECT n.id FROM nodes n JOIN sub s ON n.parent_id=s.id) DELETE FROM shares WHERE node_id IN(SELECT id FROM sub)")
+            .bind(id).execute(&mut *connection).await?;
         sqlx::query(
-            "WITH RECURSIVE sub(id) AS (
-               SELECT ? UNION ALL
-               SELECT n.id FROM nodes n JOIN sub s ON n.parent_id = s.id
-             )
-             UPDATE nodes SET status = 'trashed' WHERE id IN (SELECT id FROM sub) AND status = 'ready'",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "WITH RECURSIVE sub(id) AS (
-               SELECT ? UNION ALL
-               SELECT n.id FROM nodes n JOIN sub s ON n.parent_id = s.id
-             )
-             DELETE FROM shares WHERE node_id IN (SELECT id FROM sub)",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO trash (node_id, orig_parent_id, orig_path, trashed_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO trash(node_id,orig_parent_id,orig_path,trashed_at) VALUES(?,?,?,?)",
         )
         .bind(id)
         .bind(parent_id)
         .bind(orig_path)
         .bind(now_ts())
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
         sqlx::query("DELETE FROM app_change_batches WHERE root_id=?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(connection)
             .await?;
-        tx.commit().await?;
         Ok(())
     }
 

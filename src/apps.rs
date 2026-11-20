@@ -37,6 +37,14 @@ mod sse;
 mod store;
 #[cfg(test)]
 mod tests;
+mod uploads;
+mod write;
+#[cfg(test)]
+mod write_conformance_tests;
+#[cfg(test)]
+mod write_performance;
+#[cfg(test)]
+mod write_tests;
 
 use crate::api::AppState;
 use std::path::PathBuf;
@@ -55,6 +63,7 @@ pub(crate) struct AppPlatform {
     sessions: runtime::Sessions,
     events: events::EventHub,
     media: media::MediaState,
+    uploads: uploads::Uploads,
     cache_indexes:
         Mutex<std::collections::BTreeMap<String, std::sync::Arc<Mutex<cache::CacheIndex>>>>,
 }
@@ -92,6 +101,7 @@ impl AppPlatform {
             sessions: runtime::Sessions::new(),
             events: events::EventHub::new(),
             media: media::MediaState::new(),
+            uploads: uploads::Uploads::new(),
             cache_indexes: Mutex::new(std::collections::BTreeMap::new()),
             host,
         }

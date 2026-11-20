@@ -245,7 +245,7 @@ pub(crate) fn capabilities() -> Vec<&'static str> {
     CAPABILITIES
         .iter()
         .copied()
-        .filter(|name| !matches!(*name, "files.mutate" | "files.upload" | "kv.device"))
+        .filter(|name| !matches!(*name, "kv.device"))
         .filter(|name| !name.starts_with("backend.") || super::backend_system::available())
         .collect()
 }

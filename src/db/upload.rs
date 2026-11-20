@@ -336,7 +336,8 @@ impl Db {
         let ids: Vec<(i64,)> = sqlx::query_as(
             "SELECT n.id FROM nodes n
              LEFT JOIN upload_sessions s ON s.node_id = n.id
-             WHERE n.status = 'uploading' AND s.id IS NULL",
+             WHERE n.status = 'uploading' AND s.id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM app_uploads a WHERE a.staging_node_id=n.id AND a.state IN('receiving','ready'))",
         )
         .fetch_all(&self.pool)
         .await?;

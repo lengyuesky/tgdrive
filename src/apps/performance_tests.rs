@@ -169,6 +169,7 @@ async fn two_hundred_thousand_nodes_use_keysets_and_indexed_random() {
         "性能：400 次键集分页完整读取 200000 文件，用时 {:.2?}",
         start.elapsed()
     );
+    super::write_performance::benchmark(&platform, &app, root.id).await;
     let request:RandomFilesRequest=serde_json::from_value(serde_json::json!({"roots":[root.id.to_string()],"filter":{"extensions":["jpg"],"name_contains":"没有匹配"},"limit":20})).unwrap();
     assert_eq!(
         platform

@@ -841,6 +841,7 @@ async fn supervise(weak: Weak<AppPlatform>) {
             futures_util::future::join_all(ids.iter().map(|id| platform.backends.stop(id))).await;
             return;
         }
+        let _ = platform.prune_uploads().await;
         let records: Vec<store::Installation> =
             match sqlx::query_as("SELECT * FROM app_installations")
                 .fetch_all(&platform.host.vfs.db.pool)

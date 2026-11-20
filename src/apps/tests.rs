@@ -30,11 +30,21 @@ impl TgApi for Synthetic {
         _: &str,
         _: Option<String>,
         _: Option<&bytes::Bytes>,
-        _: &UploadBody,
+        body: &UploadBody,
     ) -> crate::error::AppResult<TgMessage> {
-        Err(crate::error::AppError::BadRequest(
-            "测试不上传 Telegram".into(),
-        ))
+        let bytes = match body {
+            UploadBody::Memory(bytes) => bytes.to_vec(),
+            UploadBody::TempFile { file, .. } => tokio::fs::read(file.path()).await?,
+        };
+        let mut contents = self.contents.lock().unwrap();
+        let message_id = contents.len() as i64 + 1_000_000;
+        let file_id = format!("uploaded-{}", opaque());
+        contents.insert(file_id.clone(), bytes);
+        Ok(TgMessage {
+            message_id,
+            file_id,
+            thumbnail_file_id: None,
+        })
     }
     async fn delete_message(&self, _: i64) -> crate::error::AppResult<()> {
         Ok(())
