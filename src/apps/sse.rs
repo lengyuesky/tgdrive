@@ -1,6 +1,6 @@
 //! SSE 与数据库提交观察。事件只提示本应用的变化，不取代持久文件日志与实时授权。
 
-use super::runtime::PageSession;
+use super::runtime::CallerSession;
 use super::store::{self, Installation};
 use super::{AppPlatform, PlatformError, PlatformResult};
 use axum::http::HeaderMap;
@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, broadcast};
 
 struct Subscription {
     platform: Arc<AppPlatform>,
-    session: Arc<PageSession>,
+    session: Arc<CallerSession>,
     pending: VecDeque<HostEvent>,
     receiver: broadcast::Receiver<HostEvent>,
     _permit: OwnedSemaphorePermit,
@@ -25,7 +25,7 @@ struct Subscription {
 
 pub(crate) async fn response(
     platform: Arc<AppPlatform>,
-    session: Arc<PageSession>,
+    session: Arc<CallerSession>,
     headers: &HeaderMap,
 ) -> PlatformResult<Response> {
     let permit = session.events.clone().try_acquire_owned().map_err(|_| {
@@ -53,7 +53,8 @@ pub(crate) async fn response(
             loop {
                 if state.session.cancelled.is_cancelled()
                     || state.session.expires_at.load(Ordering::Acquire) <= super::now().0
-                    || state.session.owner_epoch != state.platform.host.auth.device_epoch()
+                    || (state.session.is_page()
+                        && state.session.owner_epoch != state.platform.host.auth.device_epoch())
                 {
                     return None;
                 }
@@ -79,7 +80,7 @@ pub(crate) async fn response(
                 }
                 let cancelled = state.session.cancelled.clone();
                 tokio::select! {
-                    _=state.revocations.changed()=>return None,
+                    _=state.revocations.changed(),if state.session.is_page()=>return None,
                     _=cancelled.cancelled()=>return None,
                     _=state.platform.host.restore.shutdown.cancelled()=>return None,
                     received=state.receiver.recv()=>match received {

@@ -34,7 +34,11 @@ async fn request(
 }
 async fn session(
     platform: &Arc<AppPlatform>,
-) -> (InstalledApp, LaunchPageResponse, Arc<runtime::PageSession>) {
+) -> (
+    InstalledApp,
+    LaunchPageResponse,
+    Arc<runtime::CallerSession>,
+) {
     let app = authorize_all(platform).await;
     let launch = platform
         .launch(

@@ -1,6 +1,6 @@
 //! 限时表示票据、可撤销读取租约、统一 Range/条件响应与有界原始字节流。
 
-use super::runtime::PageSession;
+use super::runtime::CallerSession;
 use super::store;
 use super::{AppPlatform, PlatformError, PlatformResult, now, opaque};
 use axum::body::Body;
@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tgdrive_contract::data::*;
@@ -17,14 +17,14 @@ use tgdrive_contract::http::*;
 use tgdrive_contract::validation::{
     resolve_single_range, valid_content_type, valid_drive_name, valid_kv_key, validate_content_ref,
 };
-use tgdrive_contract::{Timestamp, error_code};
+use tgdrive_contract::{ByteCount, Timestamp, error_code};
 use tokio::io::AsyncReadExt;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Lease {
     pub id: String,
-    pub session: Arc<PageSession>,
+    pub session: Arc<CallerSession>,
     pub expires_at: AtomicI64,
     pub revoked: CancellationToken,
 }
@@ -53,16 +53,37 @@ enum TicketKind {
 }
 #[derive(Clone)]
 struct Ticket {
-    session: Arc<PageSession>,
+    session: Arc<CallerSession>,
     expires_at: i64,
     kind: TicketKind,
+}
+struct LocalTicket {
+    session: Arc<CallerSession>,
+    file: ContentRef,
+    scope_revision: String,
+    expires_at: i64,
+    lease: Option<Arc<Lease>>,
+    revoked: CancellationToken,
+    budget: Arc<crate::telegram::ReadBudget>,
+    requests: AtomicU64,
+}
+#[derive(Default)]
+struct FileRead {
+    expiry: Option<i64>,
+    head: bool,
+    control: Option<(StreamDirective, String)>,
+    local: Option<Arc<LocalTicket>>,
+    local_remaining: u64,
 }
 struct MediaInner {
     leases: BTreeMap<String, Arc<Lease>>,
     tickets: BTreeMap<String, Ticket>,
+    local: BTreeMap<String, Arc<LocalTicket>>,
 }
 pub(crate) struct MediaState {
     inner: Mutex<MediaInner>,
+    loopback_port: tokio::sync::OnceCell<u16>,
+    shutdown: CancellationToken,
 }
 impl MediaState {
     pub fn new() -> Self {
@@ -70,7 +91,10 @@ impl MediaState {
             inner: Mutex::new(MediaInner {
                 leases: BTreeMap::new(),
                 tickets: BTreeMap::new(),
+                local: BTreeMap::new(),
             }),
+            loopback_port: tokio::sync::OnceCell::new(),
+            shutdown: CancellationToken::new(),
         }
     }
     fn prune(inner: &mut MediaInner) {
@@ -84,8 +108,17 @@ impl MediaState {
         inner
             .tickets
             .retain(|_, ticket| ticket.expires_at > at && !ticket.session.cancelled.is_cancelled());
+        inner.local.retain(|_, ticket| {
+            let valid = ticket.expires_at > at
+                && !ticket.session.cancelled.is_cancelled()
+                && !ticket.revoked.is_cancelled();
+            if !valid {
+                ticket.revoked.cancel();
+            }
+            valid
+        });
     }
-    fn lease(&self, session: &PageSession, id: &str) -> PlatformResult<Arc<Lease>> {
+    fn lease(&self, session: &CallerSession, id: &str) -> PlatformResult<Arc<Lease>> {
         let inner = self.inner.lock().unwrap();
         let lease = inner
             .leases
@@ -94,7 +127,9 @@ impl MediaState {
             .filter(|lease| {
                 lease.session.app_id == session.app_id
                     && lease.session.generation == session.generation
-                    && lease.session.owner_epoch == session.owner_epoch
+                    && (!lease.session.is_page()
+                        || !session.is_page()
+                        || lease.session.owner_epoch == session.owner_epoch)
             })
             .ok_or_else(|| {
                 PlatformError::new(error_code::LEASE_EXPIRED, "读取租约不存在或已撤销")
@@ -114,11 +149,16 @@ impl MediaState {
     fn insert_ticket(&self, ticket: Ticket) -> PlatformResult<String> {
         let mut inner = self.inner.lock().unwrap();
         Self::prune(&mut inner);
-        if inner
+        if (inner
             .tickets
             .values()
             .filter(|value| value.session.app_id == ticket.session.app_id)
-            .count() as u64
+            .count()
+            + inner
+                .local
+                .values()
+                .filter(|value| value.session.app_id == ticket.session.app_id)
+                .count()) as u64
             >= MAX_MEDIA_TICKETS
         {
             return Err(PlatformError::new(
@@ -145,10 +185,214 @@ impl MediaState {
     }
 }
 
+impl Drop for MediaState {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
 impl AppPlatform {
+    async fn loopback_port(self: &Arc<Self>) -> PlatformResult<u16> {
+        let port = self.media.loopback_port.get_or_try_init(|| async {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+            let port = listener.local_addr()?.port();
+            let weak = Arc::downgrade(self);
+            let stop = self.media.shutdown.clone();
+            let host_stop = self.host.restore.shutdown.clone();
+            let routes = axum::Router::new()
+                .route(&super::endpoint_path("local.ticket", &[]), axum::routing::any(local_http))
+                .with_state(weak);
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, routes)
+                    .with_graceful_shutdown(async move { tokio::select! { _ = stop.cancelled() => {}, _ = host_stop.cancelled() => {} } })
+                    .await;
+            });
+            Ok::<_, PlatformError>(port)
+        }).await?;
+        Ok(*port)
+    }
+    pub async fn local_url(
+        self: &Arc<Self>,
+        session: &Arc<CallerSession>,
+        request: LocalFileUrlRequest,
+    ) -> PlatformResult<LocalFileUrl> {
+        if session.is_page() {
+            return Err(PlatformError::new(
+                error_code::CALLER_NOT_ALLOWED,
+                "本机地址仅供应用后端",
+            ));
+        }
+        validate_content_ref(&request.file)?;
+        let ttl = u64::from(
+            request
+                .ttl_seconds
+                .unwrap_or(DEFAULT_LOCAL_TICKET_SECONDS as u16),
+        );
+        let bytes = request
+            .byte_budget
+            .unwrap_or(ByteCount(DEFAULT_LOCAL_BYTE_BUDGET))
+            .0;
+        let requests = u64::from(
+            request
+                .request_budget
+                .unwrap_or(DEFAULT_LOCAL_REQUEST_BUDGET as u16),
+        );
+        if !(1..=MAX_LOCAL_TICKET_SECONDS).contains(&ttl)
+            || !(1..=MAX_LOCAL_BYTE_BUDGET).contains(&bytes)
+            || !(1..=MAX_LOCAL_REQUEST_BUDGET).contains(&requests)
+        {
+            return Err(PlatformError::new(
+                error_code::INVALID_REQUEST,
+                "本机地址 TTL 或预算无效",
+            ));
+        }
+        let mut tx = self.host.vfs.db.pool.begin().await?;
+        let app = store::installation(&mut tx, &session.app_id).await?;
+        app.check(&session.generation)?;
+        content_node(&mut tx, &app, &request.file).await?;
+        let lease = request
+            .lease_id
+            .as_deref()
+            .map(|id| self.media.lease(session, id))
+            .transpose()?;
+        let mut expires = now().0 + ttl as i64 * 1000;
+        if let Some(lease) = &lease {
+            expires = expires.min(lease.expires_at.load(Ordering::Acquire));
+        }
+        tx.commit().await?;
+        let port = self.loopback_port().await?;
+        let id = opaque();
+        let mut inner = self.media.inner.lock().unwrap();
+        MediaState::prune(&mut inner);
+        let count = inner
+            .tickets
+            .values()
+            .filter(|ticket| ticket.session.app_id == session.app_id)
+            .count()
+            + inner
+                .local
+                .values()
+                .filter(|ticket| ticket.session.app_id == session.app_id)
+                .count();
+        if count as u64 >= MAX_MEDIA_TICKETS {
+            return Err(PlatformError::new(
+                error_code::QUOTA_EXCEEDED,
+                "本应用票据数量已满",
+            ));
+        }
+        inner.local.insert(
+            id.clone(),
+            Arc::new(LocalTicket {
+                session: session.clone(),
+                file: request.file,
+                scope_revision: app.scope_revision,
+                expires_at: expires,
+                lease,
+                revoked: CancellationToken::new(),
+                budget: Arc::new(crate::telegram::ReadBudget::new(bytes)),
+                requests: AtomicU64::new(requests),
+            }),
+        );
+        Ok(LocalFileUrl {
+            url: format!(
+                "http://127.0.0.1:{port}{}",
+                super::endpoint_path("local.ticket", &[("ticket", &id)])
+            ),
+            id,
+            expires_at: Timestamp(expires),
+            byte_budget: ByteCount(bytes),
+            request_budget: requests as u16,
+        })
+    }
+    pub fn revoke_local_url(&self, session: &CallerSession, id: &str) -> PlatformResult<()> {
+        if session.is_page() {
+            return Err(PlatformError::new(
+                error_code::CALLER_NOT_ALLOWED,
+                "本机地址仅供应用后端",
+            ));
+        }
+        if !tgdrive_contract::validation::valid_opaque_id(id) {
+            return Err(PlatformError::new(
+                error_code::INVALID_REQUEST,
+                "本机地址 ID 无效",
+            ));
+        }
+        let mut inner = self.media.inner.lock().unwrap();
+        if inner.local.get(id).is_some_and(|ticket| {
+            ticket.session.app_id == session.app_id && ticket.session.id == session.id
+        }) && let Some(ticket) = inner.local.remove(id)
+        {
+            ticket.revoked.cancel();
+        }
+        Ok(())
+    }
+    pub(super) async fn local_bytes(
+        self: &Arc<Self>,
+        id: &str,
+        headers: &HeaderMap,
+        head: bool,
+    ) -> PlatformResult<Response> {
+        let ticket = self
+            .media
+            .inner
+            .lock()
+            .unwrap()
+            .local
+            .get(id)
+            .cloned()
+            .ok_or_else(|| PlatformError::new(error_code::TICKET_EXPIRED, "本机地址已撤销"))?;
+        if ticket.revoked.is_cancelled()
+            || ticket.session.cancelled.is_cancelled()
+            || ticket.expires_at <= now().0
+        {
+            return Err(PlatformError::new(
+                error_code::TICKET_EXPIRED,
+                "本机地址已失效",
+            ));
+        }
+        let left = ticket.budget.remaining();
+        if left == 0 {
+            return Err(PlatformError::new(
+                error_code::QUOTA_EXCEEDED,
+                "本机地址字节预算已耗尽",
+            ));
+        }
+        #[allow(deprecated)]
+        ticket
+            .requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .map_err(|_| {
+                PlatformError::new(error_code::QUOTA_EXCEEDED, "本机地址请求预算已耗尽")
+            })?;
+        let file = FileTicket {
+            file: ticket.file.clone(),
+            representation: FileRepresentation::Original,
+            filename: String::new(),
+            content_type: "application/octet-stream".into(),
+            disposition: Disposition::Inline,
+            thumbnail: None,
+            lease: ticket.lease.clone(),
+            scope_revision: ticket.scope_revision.clone(),
+        };
+        self.file_response(
+            ticket.session.clone(),
+            file,
+            headers,
+            FileRead {
+                expiry: Some(ticket.expires_at),
+                head,
+                local: Some(ticket),
+                local_remaining: left,
+                control: None,
+            },
+        )
+        .await
+    }
     pub async fn create_lease(
         &self,
-        session: &Arc<PageSession>,
+        session: &Arc<CallerSession>,
         request: CreateReadLeaseRequest,
     ) -> PlatformResult<ReadLease> {
         lease_ttl(request.ttl_seconds)?;
@@ -186,7 +430,7 @@ impl AppPlatform {
     }
     pub async fn renew_lease(
         &self,
-        session: &Arc<PageSession>,
+        session: &Arc<CallerSession>,
         id: &str,
         request: CreateReadLeaseRequest,
     ) -> PlatformResult<ReadLease> {
@@ -204,7 +448,7 @@ impl AppPlatform {
             expires_at: Timestamp(expires),
         })
     }
-    pub fn revoke_lease(&self, session: &PageSession, id: &str) -> PlatformResult<()> {
+    pub fn revoke_lease(&self, session: &CallerSession, id: &str) -> PlatformResult<()> {
         if !tgdrive_contract::validation::valid_opaque_id(id) {
             return Err(PlatformError::new(
                 error_code::INVALID_REQUEST,
@@ -224,9 +468,9 @@ impl AppPlatform {
     }
     pub async fn media_url(
         self: &Arc<Self>,
-        session: &Arc<PageSession>,
+        session: &Arc<CallerSession>,
         request: MediaUrlRequest,
-        origin: &str,
+        _origin: &str,
     ) -> PlatformResult<MediaUrl> {
         validate_content_ref(&request.file)?;
         let ttl = u64::from(
@@ -326,10 +570,7 @@ impl AppPlatform {
         };
         let id = self.media.insert_ticket(ticket)?;
         Ok(MediaUrl {
-            url: format!(
-                "{origin}{}",
-                super::endpoint_path("media.ticket", &[("ticket", &id)])
-            ),
+            url: super::endpoint_path("media.ticket", &[("ticket", &id)]),
             expires_at: Timestamp(expires),
             file: request.file,
             representation: request.representation,
@@ -337,9 +578,9 @@ impl AppPlatform {
     }
     pub async fn cache_lookup(
         self: &Arc<Self>,
-        session: &Arc<PageSession>,
+        session: &Arc<CallerSession>,
         request: CacheLookupRequest,
-        origin: &str,
+        _origin: &str,
     ) -> PlatformResult<CacheLookupResponse> {
         let mut unique = std::collections::BTreeSet::new();
         if request.keys.is_empty()
@@ -373,10 +614,7 @@ impl AppPlatform {
             })?;
             hits.push(CacheHit {
                 entry: hit.entry,
-                url: format!(
-                    "{origin}{}",
-                    super::endpoint_path("cache.ticket", &[("ticket", &ticket)])
-                ),
+                url: super::endpoint_path("cache.ticket", &[("ticket", &ticket)]),
                 expires_at: Timestamp(expiry),
             });
         }
@@ -384,7 +622,7 @@ impl AppPlatform {
     }
     pub async fn direct_bytes(
         self: &Arc<Self>,
-        session: &Arc<PageSession>,
+        session: &Arc<CallerSession>,
         file: ContentRef,
         headers: &HeaderMap,
         head: bool,
@@ -399,8 +637,16 @@ impl AppPlatform {
             lease: None,
             scope_revision: String::new(),
         };
-        self.file_response(session.clone(), specification, None, headers, head)
-            .await
+        self.file_response(
+            session.clone(),
+            specification,
+            headers,
+            FileRead {
+                head,
+                ..Default::default()
+            },
+        )
+        .await
     }
     pub async fn ticket_bytes(
         self: &Arc<Self>,
@@ -413,8 +659,17 @@ impl AppPlatform {
         ticket.session.rate_limit()?;
         match ticket.kind {
             TicketKind::File(file) if !cache => {
-                self.file_response(ticket.session, file, Some(ticket.expires_at), headers, head)
-                    .await
+                self.file_response(
+                    ticket.session,
+                    file,
+                    headers,
+                    FileRead {
+                        expiry: Some(ticket.expires_at),
+                        head,
+                        ..Default::default()
+                    },
+                )
+                .await
             }
             TicketKind::Cache { key, revision } if cache => {
                 self.cache_response(
@@ -433,14 +688,58 @@ impl AppPlatform {
             )),
         }
     }
+    pub async fn directive_response(
+        self: &Arc<Self>,
+        session: Arc<CallerSession>,
+        directive: StreamDirective,
+        headers: &HeaderMap,
+        method: &axum::http::Method,
+        request_id: String,
+    ) -> PlatformResult<Response> {
+        let lease = directive
+            .lease_id
+            .as_deref()
+            .map(|id| self.media.lease(&session, id))
+            .transpose()?;
+        let ticket = FileTicket {
+            file: directive.file.clone(),
+            representation: FileRepresentation::Original,
+            filename: directive.filename.clone().unwrap_or_default(),
+            content_type: directive
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".into()),
+            disposition: directive.disposition,
+            thumbnail: None,
+            lease,
+            scope_revision: String::new(),
+        };
+        self.file_response(
+            session,
+            ticket,
+            headers,
+            FileRead {
+                head: *method == axum::http::Method::HEAD,
+                control: Some((directive, request_id)),
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn file_response(
         self: &Arc<Self>,
-        session: Arc<PageSession>,
+        session: Arc<CallerSession>,
         mut ticket: FileTicket,
-        expiry: Option<i64>,
         headers: &HeaderMap,
-        head: bool,
+        options: FileRead,
     ) -> PlatformResult<Response> {
+        let FileRead {
+            expiry,
+            head,
+            control,
+            local,
+            local_remaining,
+        } = options;
         validate_content_ref(&ticket.file)?;
         let permit = session.byte_slot()?;
         let mut tx = self.host.vfs.db.pool.begin().await?;
@@ -466,12 +765,26 @@ impl AppPlatform {
             ticket.filename = node.name;
         }
         tx.commit().await?;
-        let (size, etag) = if let Some(thumbnail) = &ticket.thumbnail {
+        let (mut size, mut etag) = if let Some(thumbnail) = &ticket.thumbnail {
             (thumbnail.size, thumbnail.etag.clone())
         } else {
             (node.size.0, format!("\"v{}\"", ticket.file.content_version))
         };
-        let plan = match plan(headers, size, &etag) {
+        let mut offset = 0u64;
+        let mut effective = headers.clone();
+        if let Some((directive, _)) = &control {
+            tgdrive_contract::validation::validate_stream_directive(directive, node.size.0)?;
+            if let Some(window) = &directive.window {
+                offset = window.offset.0;
+                size = window.length.0;
+                etag = format!("\"v{}:{}:{}\"", ticket.file.content_version, offset, size);
+            }
+            if directive.range == RangePolicy::Ignore {
+                effective.remove(header::RANGE);
+                effective.remove(header::IF_RANGE);
+            }
+        }
+        let plan = match plan_budget(&effective, size, &etag, local.as_ref().map(|_| local_remaining)) {
             Ok(plan) => plan,
             Err(error) => return Ok(range_error(error, size)),
         };
@@ -479,6 +792,7 @@ impl AppPlatform {
             platform: self.clone(),
             session: session.clone(),
             expiry,
+            additional_cancel: local.as_ref().map(|ticket| ticket.revoked.clone()),
             lease: ticket.lease.clone(),
             sources: vec![ticket.file.clone()],
             scope_revision: Some(ticket.scope_revision.clone()),
@@ -531,36 +845,87 @@ impl AppPlatform {
                 .chunks_of(store::node_id(&ticket.file.id)?)
                 .await
                 .map_err(|_| upstream())?;
-            let budget = Arc::new(crate::telegram::ReadBudget::new(strict_budget(
-                &chunks,
-                plan.range.start,
-                plan.range.length,
-            )));
+            let absolute_start = offset + plan.range.start;
+            let budget = local
+                .as_ref()
+                .map(|ticket| ticket.budget.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(crate::telegram::ReadBudget::new(strict_budget(
+                        &chunks,
+                        absolute_start,
+                        plan.range.length,
+                    )))
+                });
             let reader = crate::engine::reader::ChunkedReader::new(
                 self.host.vfs.tg.clone(),
                 &chunks,
-                plan.range.start,
+                absolute_start,
             )
             .with_read_limit(plan.range.length)
             .with_strict_ranges(Some(budget.clone()));
-            let body = stream_body(Box::pin(reader), guard, permit, plan.range.length).await?;
-            debug_assert!(
-                budget.used() <= strict_budget(&chunks, plan.range.start, plan.range.length)
-            );
+            let observation = control.as_ref().and_then(|(directive, request_id)| {
+                directive.correlation_id.as_ref().map(|correlation| {
+                    Observation::new(
+                        self.clone(),
+                        &session.app_id,
+                        request_id.clone(),
+                        correlation.clone(),
+                        ticket.file.clone(),
+                        ByteWindow {
+                            offset: ByteCount(absolute_start),
+                            length: ByteCount(plan.range.length),
+                        },
+                        directive.lease_id.clone(),
+                    )
+                })
+            });
+            let body = stream_body_observed(
+                Box::pin(reader),
+                guard,
+                permit,
+                plan.range.length,
+                observation,
+            )
+            .await?;
+            if local.is_none() {
+                debug_assert!(
+                    budget.used() <= strict_budget(&chunks, absolute_start, plan.range.length)
+                );
+            }
             body
         };
-        response(
+        let mut result = response(
             body,
             &plan,
             size,
             &etag,
             &ticket.content_type,
             Some((&ticket.filename, ticket.disposition)),
-        )
+        )?;
+        if let Some((directive, request_id)) = &control {
+            result.headers_mut().insert(
+                "x-tgdrive-request-id",
+                HeaderValue::from_str(request_id).expect("关联请求 ID 为 ASCII"),
+            );
+            result.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(if directive.cache == StreamCachePolicy::NoStore {
+                    "no-store"
+                } else {
+                    "private, no-cache"
+                }),
+            );
+            if directive.range == RangePolicy::Ignore {
+                result
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+            }
+        }
+        Ok(result)
     }
     pub async fn cache_response(
         self: &Arc<Self>,
-        session: Arc<PageSession>,
+        session: Arc<CallerSession>,
         key: &str,
         revision: Option<&str>,
         expiry: Option<i64>,
@@ -575,6 +940,7 @@ impl AppPlatform {
             platform: self.clone(),
             session: session.clone(),
             expiry,
+            additional_cancel: None,
             lease: None,
             sources: entry.sources.clone(),
             scope_revision: None,
@@ -631,6 +997,53 @@ impl AppPlatform {
         Ok(response)
     }
 }
+async fn local_http(
+    axum::extract::State(weak): axum::extract::State<std::sync::Weak<AppPlatform>>,
+    axum::extract::Path(ticket): axum::extract::Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    let Some(platform) = weak.upgrade() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = if !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) {
+        Err(PlatformError::new(
+            error_code::METHOD_NOT_ALLOWED,
+            "本机地址只支持 GET/HEAD",
+        ))
+    } else {
+        platform
+            .local_bytes(
+                &ticket,
+                request.headers(),
+                *request.method() == axum::http::Method::HEAD,
+            )
+            .await
+    };
+    let mut response = result.unwrap_or_else(IntoResponse::into_response);
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(EXTERNAL_CSP),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response.headers_mut().insert(
+        "x-tgdrive-request-id",
+        HeaderValue::from_str(&opaque()).expect("随机 ID 为 ASCII"),
+    );
+    if *request.method() == axum::http::Method::HEAD {
+        *response.body_mut() = Body::empty();
+    }
+    response
+}
+
 async fn content_node(
     connection: &mut sqlx::SqliteConnection,
     app: &store::Installation,
@@ -679,7 +1092,11 @@ struct ReadPlan {
     status: StatusCode,
     range: ResolvedRange,
 }
+#[cfg(test)]
 fn plan(headers: &HeaderMap, size: u64, etag: &str) -> PlatformResult<ReadPlan> {
+    plan_budget(headers, size, etag, None)
+}
+fn plan_budget(headers: &HeaderMap, size: u64, etag: &str, local_budget: Option<u64>) -> PlatformResult<ReadPlan> {
     if super::http::etag_matches(headers, etag) {
         return Ok(ReadPlan {
             status: StatusCode::NOT_MODIFIED,
@@ -703,7 +1120,9 @@ fn plan(headers: &HeaderMap, size: u64, etag: &str) -> PlatformResult<ReadPlan> 
             })
             .transpose()?
     };
-    let range = resolve_single_range(range, size)?;
+    let range = if let Some(budget) = local_budget {
+        tgdrive_contract::validation::resolve_local_range(range, size, budget)?
+    } else { resolve_single_range(range, size)? };
     Ok(ReadPlan {
         status: if range.partial {
             StatusCode::PARTIAL_CONTENT
@@ -795,8 +1214,9 @@ fn strict_budget(chunks: &[crate::db::Chunk], start: u64, length: u64) -> u64 {
 
 struct ReadGuard {
     platform: Arc<AppPlatform>,
-    session: Arc<PageSession>,
+    session: Arc<CallerSession>,
     expiry: Option<i64>,
+    additional_cancel: Option<CancellationToken>,
     lease: Option<Arc<Lease>>,
     sources: Vec<ContentRef>,
     scope_revision: Option<String>,
@@ -807,6 +1227,16 @@ struct ReadGuard {
 impl ReadGuard {
     async fn check(&mut self) -> PlatformResult<()> {
         let at = now().0;
+        if self
+            .additional_cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(PlatformError::new(
+                error_code::TICKET_EXPIRED,
+                "本机地址已撤销",
+            ));
+        }
         if self.expiry.is_some_and(|expiry| expiry <= at) {
             return Err(PlatformError::new(
                 error_code::TICKET_EXPIRED,
@@ -815,7 +1245,8 @@ impl ReadGuard {
         }
         if self.session.cancelled.is_cancelled()
             || self.session.expires_at.load(Ordering::Acquire) <= at
-            || self.session.owner_epoch != self.platform.host.auth.device_epoch()
+            || (self.session.is_page()
+                && self.session.owner_epoch != self.platform.host.auth.device_epoch())
         {
             return Err(PlatformError::new(
                 error_code::SESSION_EXPIRED,
@@ -906,6 +1337,7 @@ async fn read_guarded(
         .map(|lease| lease.revoked.clone())
         .unwrap_or_default();
     let shutdown = guard.platform.host.restore.shutdown.clone();
+    let extra = guard.additional_cancel.clone().unwrap_or_default();
     let mut changes = guard.platform.host.vfs.db.app_changes.subscribe();
     let mut revocations = guard.platform.host.auth.revocation_signal();
     let idle = tokio::time::Instant::now() + Duration::from_secs(STREAM_IDLE_TIMEOUT_SECONDS);
@@ -922,8 +1354,9 @@ async fn read_guarded(
         tokio::select! {
             _=cancelled.cancelled()=>return Err(PlatformError::new(error_code::SESSION_EXPIRED,"页面会话已撤销")),
             _=lease.cancelled()=>return Err(PlatformError::new(error_code::LEASE_EXPIRED,"读取租约已撤销")),
+            _=extra.cancelled()=>return Err(PlatformError::new(error_code::TICKET_EXPIRED,"本机地址已撤销")),
             _=shutdown.cancelled()=>return Err(PlatformError::new(error_code::HOST_MAINTENANCE,"宿主维护中")),
-            _=revocations.changed()=>return Err(PlatformError::new(error_code::SESSION_EXPIRED,"主人登录已撤销")),
+            _=revocations.changed(),if guard.session.is_page()=>return Err(PlatformError::new(error_code::SESSION_EXPIRED,"主人登录已撤销")),
             _=changes.changed()=>{guard.check().await?;},
             _=tokio::time::sleep(deadline)=>{guard.check().await?;},
             _=tokio::time::sleep_until(idle)=>return Err(PlatformError::new(error_code::REQUEST_TIMEOUT,"字节读取空闲超时")),
@@ -932,37 +1365,135 @@ async fn read_guarded(
     }
 }
 
+struct Observation {
+    platform: Arc<AppPlatform>,
+    app: String,
+    request_id: String,
+    correlation: String,
+    file: ContentRef,
+    range: ByteWindow,
+    lease: Option<String>,
+    started: bool,
+    bytes: u64,
+    outcome: tgdrive_contract::events::StreamOutcome,
+    error: Option<String>,
+}
+impl Observation {
+    fn new(
+        platform: Arc<AppPlatform>,
+        app: &str,
+        request_id: String,
+        correlation: String,
+        file: ContentRef,
+        range: ByteWindow,
+        lease: Option<String>,
+    ) -> Self {
+        Self {
+            platform,
+            app: app.into(),
+            request_id,
+            correlation,
+            file,
+            range,
+            lease,
+            started: false,
+            bytes: 0,
+            outcome: tgdrive_contract::events::StreamOutcome::Cancelled,
+            error: None,
+        }
+    }
+    fn emitted(&mut self, count: usize) {
+        if !self.started && count > 0 {
+            self.started = true;
+            let _ = self.platform.events.emit(
+                &self.app,
+                tgdrive_contract::events::event_name::STREAM_STARTED,
+                &tgdrive_contract::events::StreamStartedEvent {
+                    request_id: self.request_id.clone(),
+                    correlation_id: self.correlation.clone(),
+                    file: self.file.clone(),
+                    range: self.range.clone(),
+                    lease_id: self.lease.clone(),
+                },
+            );
+        }
+        self.bytes += count as u64;
+    }
+}
+impl Drop for Observation {
+    fn drop(&mut self) {
+        if self.started {
+            let _ = self.platform.events.emit(
+                &self.app,
+                tgdrive_contract::events::event_name::STREAM_FINISHED,
+                &tgdrive_contract::events::StreamFinishedEvent {
+                    request_id: self.request_id.clone(),
+                    correlation_id: self.correlation.clone(),
+                    file: self.file.clone(),
+                    bytes_sent: ByteCount(self.bytes),
+                    outcome: self.outcome,
+                    error_code: self.error.clone(),
+                },
+            );
+        }
+    }
+}
+
 struct StreamState {
+    observation: Option<Observation>,
     reader: crate::telegram::ByteReader,
     guard: ReadGuard,
     _permit: OwnedSemaphorePermit,
+    _activity: Option<super::backend::Activity>,
     remaining: u64,
     first: Option<Bytes>,
 }
 async fn stream_body(
+    reader: crate::telegram::ByteReader,
+    guard: ReadGuard,
+    permit: OwnedSemaphorePermit,
+    length: u64,
+) -> PlatformResult<Body> {
+    stream_body_observed(reader, guard, permit, length, None).await
+}
+async fn stream_body_observed(
     mut reader: crate::telegram::ByteReader,
     mut guard: ReadGuard,
     permit: OwnedSemaphorePermit,
     length: u64,
+    observation: Option<Observation>,
 ) -> PlatformResult<Body> {
     if length == 0 {
         return Ok(Body::empty());
     }
     guard.check().await?;
-    let mut buffer = vec![0u8; length.min(64 * 1024) as usize];
-    let read = read_guarded(&mut reader, &mut guard, &mut buffer).await?;
-    if read == 0 {
-        return Err(upstream());
-    }
-    buffer.truncate(read);
-    guard.check().await?;
+    let activity = (!guard.session.is_page())
+        .then(|| guard.platform.backends.run(&guard.session.app_id))
+        .flatten()
+        .filter(|run| run.caller.id == guard.session.id)
+        .map(|run| run.activity());
+    // 本机窗口只在请求开始裁剪，后续并发消耗只能中断流；不能改成新的配额 JSON。
+    let first = if guard.additional_cancel.is_some() {
+        None
+    } else {
+        let mut buffer = vec![0u8; length.min(64 * 1024) as usize];
+        let read = read_guarded(&mut reader, &mut guard, &mut buffer).await?;
+        if read == 0 {
+            return Err(upstream());
+        }
+        buffer.truncate(read);
+        guard.check().await?;
+        Some(Bytes::from(buffer))
+    };
     let stream = futures_util::stream::try_unfold(
         StreamState {
+            observation,
             reader,
             guard,
             _permit: permit,
+            _activity: activity,
             remaining: length,
-            first: Some(Bytes::from(buffer)),
+            first,
         },
         |mut state| async move {
             if state.remaining == 0 {
@@ -977,10 +1508,27 @@ async fn stream_body(
                 first
             } else {
                 let mut buffer = vec![0u8; state.remaining.min(64 * 1024) as usize];
-                let read = read_guarded(&mut state.reader, &mut state.guard, &mut buffer)
-                    .await
-                    .map_err(|_| std::io::Error::other("读取已经撤销或上游中断"))?;
+                let read =
+                    match read_guarded(&mut state.reader, &mut state.guard, &mut buffer).await {
+                        Ok(read) => read,
+                        Err(error) => {
+                            if let Some(observation) = &mut state.observation {
+                                observation.error = Some(error.code.clone());
+                                if error.code == error_code::UPSTREAM_UNAVAILABLE
+                                    || error.code == error_code::REQUEST_TIMEOUT
+                                {
+                                    observation.outcome =
+                                        tgdrive_contract::events::StreamOutcome::Failed;
+                                }
+                            }
+                            return Err(std::io::Error::other("读取已经撤销或上游中断"));
+                        }
+                    };
                 if read == 0 {
+                    if let Some(observation) = &mut state.observation {
+                        observation.outcome = tgdrive_contract::events::StreamOutcome::Failed;
+                        observation.error = Some(error_code::UPSTREAM_UNAVAILABLE.into());
+                    }
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "字节流提前结束",
@@ -994,7 +1542,15 @@ async fn stream_body(
                 .check()
                 .await
                 .map_err(|_| std::io::Error::other("读取已经撤销"))?;
+            if let Some(observation) = &mut state.observation {
+                observation.emitted(bytes.len());
+            }
             state.remaining -= bytes.len() as u64;
+            if state.remaining == 0 {
+                if let Some(observation) = &mut state.observation {
+                    observation.outcome = tgdrive_contract::events::StreamOutcome::Completed;
+                }
+            }
             Ok(Some((bytes, state)))
         },
     );

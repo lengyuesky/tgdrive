@@ -68,6 +68,14 @@ fn main() {
     } else {
         None
     };
+    if cmd == "internal-app-run" {
+        let path = std::env::args()
+            .nth(2)
+            .expect("启动辅助入口缺少私有配置路径");
+        let error = apps::backend_system::launch_helper(std::path::Path::new(&path)).unwrap_err();
+        tracing::error!("启动受限后端失败：{error}");
+        std::process::exit(1);
+    }
     let rt = tokio::runtime::Runtime::new().expect("无法创建 tokio 运行时");
     let result = match cmd.as_str() {
         "serve" => rt.block_on(serve()),
@@ -92,10 +100,17 @@ fn main() {
 }
 
 async fn serve() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::geteuid() } == 0 {
+        unsafe {
+            libc::umask(0o077);
+        }
+    }
     let env_cfg = Arc::new(Config::from_env()?);
     let safe_mode = restore::startup(&env_cfg).await?;
     let restore = restore::RestoreManager::new(&env_cfg.db_path)?;
     let db = Db::open(&env_cfg.db_path).await?;
+    apps::backend_system::harden_host(&env_cfg.db_path)?;
     db.set_background_blocked(safe_mode);
     if !safe_mode {
         db.recover_storage_migration().await?;
@@ -348,6 +363,7 @@ async fn shutdown_signal(
         _ = terminate => {},
         _ = restore_shutdown.cancelled() => {},
     }
+    restore_shutdown.cancel();
     // 长下载/SSE 或失联后台任务不能无限阻止重启。切库仍只发生在下一进程。
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;

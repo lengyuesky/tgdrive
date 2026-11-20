@@ -30,6 +30,13 @@ fn errno() -> std::io::Error {
     std::io::Error::last_os_error()
 }
 fn checked_file(fd: RawFd, directory: bool) -> PlatformResult<File> {
+    checked_file_owner(fd, directory, None)
+}
+fn checked_file_owner(
+    fd: RawFd,
+    directory: bool,
+    extra_owner: Option<u32>,
+) -> PlatformResult<File> {
     if fd < 0 {
         return Err(errno().into());
     }
@@ -38,7 +45,7 @@ fn checked_file(fd: RawFd, directory: bool) -> PlatformResult<File> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata()?;
     let owner = unsafe { libc::geteuid() };
-    if metadata.uid() != owner
+    if (metadata.uid() != owner && extra_owner != Some(metadata.uid()))
         || (directory && !metadata.is_dir())
         || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
     {
@@ -68,6 +75,14 @@ impl Directory {
         Ok(Self { file })
     }
     pub fn child(&self, value: &str, create: bool) -> PlatformResult<Self> {
+        self.child_owner(value, create, None)
+    }
+    pub fn child_owner(
+        &self,
+        value: &str,
+        create: bool,
+        owner: Option<u32>,
+    ) -> PlatformResult<Self> {
         let value = name(value)?;
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // 父 FD 持有已验证目录；O_NOFOLLOW 阻止逐级路径替换为链接。
@@ -80,8 +95,67 @@ impl Directory {
             fd = unsafe { libc::openat(self.file.as_raw_fd(), value.as_ptr(), flags) };
         }
         Ok(Self {
-            file: checked_file(fd, true)?,
+            file: checked_file_owner(fd, true, owner)?,
         })
+    }
+    pub fn permissions(&self, uid: u32, gid: u32, mode: u32) -> PlatformResult<()> {
+        if unsafe { libc::fchown(self.file.as_raw_fd(), uid, gid) } < 0
+            || unsafe { libc::fchmod(self.file.as_raw_fd(), mode as libc::mode_t) } < 0
+        {
+            return Err(errno().into());
+        }
+        Ok(())
+    }
+    pub fn file_permissions(
+        &self,
+        value: &str,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    ) -> PlatformResult<()> {
+        let file = self.read(value)?;
+        if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } < 0
+            || unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } < 0
+        {
+            return Err(errno().into());
+        }
+        Ok(())
+    }
+    pub fn usage(&self, extra_owner: Option<u32>) -> PlatformResult<u64> {
+        let mut total = 0u64;
+        for value in self.names()? {
+            let key = name(&value)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    key.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } < 0
+            {
+                if errno().kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(errno().into());
+            }
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                total = total.saturating_add(
+                    self.child_owner(&value, false, extra_owner)?
+                        .usage(extra_owner)?,
+                );
+            } else if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+                total = total.saturating_add(stat.st_size.max(0) as u64);
+            } else if stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                return Err(PlatformError::new(
+                    error_code::INVALID_PATH,
+                    "应用目录含特殊文件",
+                ));
+            }
+        }
+        Ok(total)
     }
     pub fn read(&self, value: &str) -> PlatformResult<File> {
         let value = name(value)?;
@@ -184,6 +258,9 @@ impl Directory {
         Ok(names)
     }
     fn clear(&self) -> PlatformResult<()> {
+        self.clear_owner(None)
+    }
+    fn clear_owner(&self, owner: Option<u32>) -> PlatformResult<()> {
         // 包目录不可变；卸载清理时只修改已打开、宿主拥有的目录 FD 权限。
         if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o700) } < 0 {
             return Err(errno().into());
@@ -207,8 +284,8 @@ impl Directory {
             }
             let stat = unsafe { stat.assume_init() };
             if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                let child = self.child(&value, false)?;
-                child.clear()?;
+                let child = self.child_owner(&value, false, owner)?;
+                child.clear_owner(owner)?;
                 if unsafe {
                     libc::unlinkat(self.file.as_raw_fd(), key.as_ptr(), libc::AT_REMOVEDIR)
                 } < 0
@@ -224,12 +301,19 @@ impl Directory {
 }
 
 pub(crate) fn remove_tree(root: &Path, value: &str) -> PlatformResult<()> {
+    remove_tree_owner(root, value, None)
+}
+pub(crate) fn remove_tree_owner(
+    root: &Path,
+    value: &str,
+    owner: Option<u32>,
+) -> PlatformResult<()> {
     if !root.exists() {
         return Ok(());
     }
     let parent = Directory::open(root, false)?;
     let key = name(value)?;
-    let child = match parent.child(value, false) {
+    let child = match parent.child_owner(value, false, owner) {
         Ok(child) => child,
         Err(error) if error.code == error_code::NOT_FOUND => return Ok(()),
         Err(error) if error.code == error_code::INTERNAL_ERROR => {
@@ -250,7 +334,11 @@ pub(crate) fn remove_tree(root: &Path, value: &str) -> PlatformResult<()> {
         }
         Err(error) => return Err(error),
     };
-    child.clear()?;
+    if owner.is_none() {
+        child.clear()?;
+    } else {
+        child.clear_owner(owner)?;
+    }
     if unsafe { libc::unlinkat(parent.file.as_raw_fd(), key.as_ptr(), libc::AT_REMOVEDIR) } < 0
         && errno().kind() != std::io::ErrorKind::NotFound
     {

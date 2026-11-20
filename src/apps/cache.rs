@@ -1,6 +1,6 @@
 //! 原子二进制小对象缓存。元数据可再生、不进主库，来源每次读取都重新核验。
 
-use super::runtime::PageSession;
+use super::runtime::CallerSession;
 use super::safe_fs::Directory;
 use super::store::{self, Installation};
 use super::{AppPlatform, PlatformError, PlatformResult, now, opaque};
@@ -174,7 +174,7 @@ impl AppPlatform {
     }
     pub async fn cache_put(
         &self,
-        session: &Arc<PageSession>,
+        session: &Arc<CallerSession>,
         key: &str,
         content_type: String,
         metadata: CachePutMetadata,
@@ -288,7 +288,7 @@ impl AppPlatform {
     }
     pub async fn cache_read(
         &self,
-        session: &Arc<PageSession>,
+        session: &Arc<CallerSession>,
         key: &str,
         body: bool,
         revision: Option<&str>,
@@ -348,7 +348,11 @@ impl AppPlatform {
             bytes,
         })
     }
-    pub async fn cache_delete(&self, session: &Arc<PageSession>, key: &str) -> PlatformResult<()> {
+    pub async fn cache_delete(
+        &self,
+        session: &Arc<CallerSession>,
+        key: &str,
+    ) -> PlatformResult<()> {
         if !valid_kv_key(key) {
             return Err(PlatformError::new(
                 error_code::INVALID_REQUEST,

@@ -1,5 +1,9 @@
 //! 新应用平台；线上定义只来自契约库，宿主只实现通用存储与生命周期。
 
+mod backend;
+pub(crate) mod backend_system;
+#[cfg(test)]
+mod backend_tests;
 #[cfg(test)]
 mod budget_tests;
 mod cache;
@@ -37,11 +41,11 @@ use tokio::sync::{Mutex, OnceCell};
 
 pub(crate) struct AppPlatform {
     pub host: AppState,
+    backends: backend::Manager,
     root: PathBuf,
     package_root: PathBuf,
     download_root: PathBuf,
     repository: String,
-    root_revision: String,
     lifecycle: Mutex<()>,
     catalog_client: OnceCell<catalog::CatalogClient>,
     cursors: cursor::CursorCodec,
@@ -58,17 +62,24 @@ impl AppPlatform {
     }
     fn with_repository(host: AppState, repository: String) -> Self {
         let database = PathBuf::from(&host.rt.env.db_path);
+        let database = if database.is_absolute() {
+            database
+        } else {
+            std::env::current_dir()
+                .expect("宿主工作目录可读取")
+                .join(database)
+        };
         let parent = database
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
         let root = parent.join("apps-v1");
         Self {
+            backends: backend::Manager::new(),
             package_root: root.join("packages"),
             download_root: root.join("downloads"),
             root,
             repository,
-            root_revision: opaque(),
             lifecycle: Mutex::new(()),
             catalog_client: OnceCell::new(),
             cursors: cursor::CursorCodec::new(
@@ -104,6 +115,19 @@ impl AppPlatform {
                 "应用 ID 无效",
             ));
         }
+        self.backends.stop(id).await?;
+        let owner: Option<i64> =
+            sqlx::query_scalar("SELECT uid FROM app_runtime_identities WHERE app_id=?")
+                .bind(id)
+                .fetch_optional(&self.host.vfs.db.pool)
+                .await?;
+        let owner = owner.map(|uid| {
+            if backend_system::real_isolation() {
+                uid as u32
+            } else {
+                unsafe { libc::geteuid() }
+            }
+        });
         let mut indices = self.cache_indexes.lock().await;
         let index = indices.remove(id);
         let mut guard = match index.as_ref() {
@@ -114,8 +138,8 @@ impl AppPlatform {
             guard.invalidate();
         }
         let directory = self.data_root().join(id);
-        safe_fs::remove_tree(&directory, "cache")?;
-        safe_fs::remove_tree(&directory, "tmp")?;
+        safe_fs::remove_tree_owner(&directory, "cache", owner)?;
+        safe_fs::remove_tree_owner(&directory, "tmp", owner)?;
         self.bump_cache_epoch();
         Ok(())
     }

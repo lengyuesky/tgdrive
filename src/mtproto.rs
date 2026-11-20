@@ -247,7 +247,7 @@ impl MtprotoClient {
             offset,
             self.config.download_concurrency(),
             self.request_slots.clone(),
-            budget,
+            budget.map(|budget| (budget, size)),
             move |part_offset| {
                 let state = state.clone();
                 let location = location.clone();
@@ -303,7 +303,7 @@ async fn open_parallel_stream_policy<F, Fut>(
     offset: u64,
     concurrency: usize,
     request_slots: Arc<Semaphore>,
-    budget: Option<Arc<ReadBudget>>,
+    budget: Option<(Arc<ReadBudget>, u64)>,
     fetch: F,
 ) -> AppResult<ByteReader>
 where
@@ -333,8 +333,16 @@ where
                 })?;
                 let part_offset = index * part_size;
                 let expected = (end - part_offset).min(part_size) as usize;
-                if let Some(budget) = budget { budget.reserve(part_size)?; }
+                let charge = budget.as_ref().map(|(_, size)| part_size.min(size.saturating_sub(part_offset)));
+                if let Some((budget, _)) = &budget { budget.reserve(charge.expect("有预算就有块长度"))?; }
                 let bytes = fetch(part_offset).await?;
+                if let Some((budget, _)) = &budget {
+                    let charge = charge.expect("有预算就有块长度");
+                    if bytes.len() as u64 > charge {
+                        return Err(AppError::Telegram("上游块超过读取边界".into()));
+                    }
+                    budget.refund(charge - bytes.len() as u64);
+                }
                 if bytes.len() < expected {
                     return Err(AppError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,

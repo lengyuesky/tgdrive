@@ -1,6 +1,6 @@
 //! 契约接口注册表直接生成路由；页面数据面是 Bearer fetch，不是宿主消息转发桥。
 
-use super::runtime::{PageSession, Sessions};
+use super::runtime::{CallerSession, Sessions};
 use super::store;
 use super::{AppPlatform, PlatformError, PlatformResult, opaque};
 use axum::Router;
@@ -42,6 +42,7 @@ pub(crate) fn router(host: crate::api::AppState) -> Router {
 }
 pub(super) fn router_platform(platform: Arc<AppPlatform>) -> Router {
     super::sse::start(&platform);
+    super::backend::start(&platform);
     let mut routes = Router::new();
     let mut paths = BTreeSet::new();
     for endpoint in ENDPOINTS.iter().chain(INTERNAL_ENDPOINTS) {
@@ -54,6 +55,27 @@ pub(super) fn router_platform(platform: Arc<AppPlatform>) -> Router {
         }
     }
     routes
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(middleware::from_fn_with_state(platform.clone(), envelope))
+        .with_state(platform)
+}
+
+pub(crate) fn self_router(platform: Arc<AppPlatform>, caller: Arc<CallerSession>) -> Router {
+    let mut routes = Router::new();
+    let mut paths = BTreeSet::new();
+    for endpoint in ENDPOINTS
+        .iter()
+        .filter(|endpoint| endpoint.path.starts_with(SELF_API_BASE))
+    {
+        let path = endpoint.path.replace("{path}", "{*path}");
+        if paths.insert(path.clone()) {
+            routes = routes.route(&path, axum::routing::any(dispatch));
+        }
+    }
+    routes
+        .layer(axum::Extension(super::runtime::TrustedBackendCaller(
+            caller,
+        )))
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(platform.clone(), envelope))
         .with_state(platform)
@@ -312,8 +334,38 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
     let headers = request.headers().clone();
     let method = request.method().clone();
     let uri = request.uri().clone();
-    let origin = public_origin(&platform, &request)?;
-    let session = if spec.access == EndpointAccess::OwnerOnly {
+    let origin = if request
+        .extensions()
+        .get::<super::runtime::TrustedBackendCaller>()
+        .is_some()
+    {
+        String::new()
+    } else {
+        public_origin(&platform, &request)?
+    };
+    let session = if let Some(trusted) = request
+        .extensions()
+        .get::<super::runtime::TrustedBackendCaller>()
+    {
+        if !spec.path.starts_with(SELF_API_BASE) || spec.access == EndpointAccess::OwnerOnly {
+            return Err(PlatformError::new(
+                error_code::CALLER_NOT_ALLOWED,
+                "后端套接字不提供主人或外部接口",
+            ));
+        }
+        let session = trusted.0.clone();
+        if session.cancelled.is_cancelled() {
+            return Err(PlatformError::new(
+                error_code::BACKEND_UNAVAILABLE,
+                "后端启动轮次已撤销",
+            ));
+        }
+        let mut connection = platform.host.vfs.db.pool.acquire().await?;
+        let app = store::installation(&mut connection, &session.app_id).await?;
+        app.check(&session.generation)?;
+        session.rate_limit()?;
+        Some(session)
+    } else if spec.access == EndpointAccess::OwnerOnly {
         if headers.get(header::ORIGIN).is_some_and(|v| v == "null")
             || !platform.host.auth.session_cookie_valid(&headers)
         {
@@ -359,6 +411,22 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
         session.rate_limit()?;
         Some(session)
     };
+    if session.as_ref().is_some_and(|session| !session.is_page())
+        && spec.access == EndpointAccess::PageOnly
+    {
+        return Err(PlatformError::new(
+            error_code::CALLER_NOT_ALLOWED,
+            "此接口仅允许应用页面会话",
+        ));
+    }
+    if session.as_ref().is_some_and(|session| session.is_page())
+        && spec.access == EndpointAccess::BackendOnly
+    {
+        return Err(PlatformError::new(
+            error_code::CALLER_NOT_ALLOWED,
+            "此接口仅允许应用后端套接字",
+        ));
+    }
     if platform.host.restore.maintenance() || platform.host.vfs.db.background_blocked() {
         return Err(PlatformError::new(
             error_code::HOST_MAINTENANCE,
@@ -387,6 +455,8 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
             | "center.app.restart"
             | "center.app.cache.clear"
             | "read_leases.revoke"
+            | "files.local_url.revoke"
+            | "files.upload.cancel"
     ) {
         let bytes = to_bytes(body, MAX_JSON_REQUEST_BYTES as usize)
             .await
@@ -404,10 +474,9 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
         body
     };
     let mut revocations = platform.host.auth.revocation_signal();
-    if session
-        .as_ref()
-        .is_some_and(|session| session.owner_epoch != platform.host.auth.device_epoch())
-    {
+    if session.as_ref().is_some_and(|session| {
+        session.is_page() && session.owner_epoch != platform.host.auth.device_epoch()
+    }) {
         return Err(PlatformError::new(
             error_code::SESSION_EXPIRED,
             "主人登录已撤销",
@@ -493,8 +562,16 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                 StatusCode::NO_CONTENT.into_response()
             }
             "center.app.cache.clear" => {
-                platform.installed(id).await?;
+                let app = platform.installed(id).await?;
+                let running = platform.backends.run(id).is_some();
                 platform.clear_app_cache(id).await?;
+                if app.enabled
+                    && app.manifest.backend.as_ref().is_some_and(|backend| {
+                        running || backend.run_mode == tgdrive_contract::manifest::RunMode::Resident
+                    })
+                {
+                    platform.backends.restart(&platform, id).await?;
+                }
                 StatusCode::NO_CONTENT.into_response()
             }
             "center.app.launch" => owner_json(
@@ -502,8 +579,40 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                     .launch(id, strict_json(body).await?, origin)
                     .await?,
             ),
-            "center.app.restart" | "center.root.read" | "center.root.update" => {
-                return Err(super::runtime::backend_unavailable());
+            "center.app.restart" => owner_json(platform.backends.restart(&platform, id).await?),
+            "center.root.read" => owner_json(platform.root_selection().await?),
+            "center.root.update" => {
+                owner_json(platform.root_update(strict_json(body).await?).await?)
+            }
+            "backend.keepalive" => {
+                let caller = caller(&session)?;
+                if caller.is_page() {
+                    return Err(PlatformError::new(
+                        error_code::CALLER_NOT_ALLOWED,
+                        "活动续期只允许应用后端",
+                    ));
+                }
+                let request: BackendKeepaliveRequest = strict_json(body).await?;
+                if request.ttl_seconds == 0
+                    || u64::from(request.ttl_seconds) > BACKEND_KEEPALIVE_SECONDS
+                {
+                    return Err(PlatformError::new(
+                        error_code::INVALID_REQUEST,
+                        "活动续期 TTL 无效",
+                    ));
+                }
+                let run = platform
+                    .backends
+                    .run(&caller.app_id)
+                    .filter(|run| run.caller.id == caller.id)
+                    .ok_or_else(|| {
+                        PlatformError::new(error_code::BACKEND_UNAVAILABLE, "后端启动轮次已改变")
+                    })?;
+                run.keep_until.store(
+                    super::now().0 + i64::from(request.ttl_seconds) * 1000,
+                    Ordering::Release,
+                );
+                StatusCode::NO_CONTENT.into_response()
             }
             "assets" => {
                 return assets(&platform, &parameters, &headers, method == Method::HEAD).await;
@@ -517,7 +626,27 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                 let mut tx = platform.host.vfs.db.pool.begin().await?;
                 let app = store::installation(&mut tx, &session.app_id).await?;
                 let scope = store::scope_info(&mut tx, &app).await?;
-                json(super::runtime::info(&app, scope)?)
+                let mut info = super::runtime::info(&app, scope, session.kind)?;
+                if let Some(backend) = app.manifest()?.backend {
+                    info.backend = Some(platform.backends.status(&app.id, backend.run_mode));
+                    if let Some(run) = platform.backends.run(&app.id) {
+                        info.limits.backend = Some(run.limits.read().unwrap().clone());
+                    }
+                    let root_assigned = platform.root_selection().await?.app_id.as_deref() == Some(app.id.as_str());
+                    let prefix_path = format!("{SERVICE_BASE}/{}", app.id);
+                    let public = (session.is_page() && !origin.is_empty()).then_some(origin.as_str());
+                    info.external_service = Some(ExternalServiceInfo {
+                        declared: backend.external_service,
+                        available: app.enabled && backend.external_service && super::backend_system::available()
+                            && info.backend.as_ref().is_some_and(|status| status.state != BackendState::Failed)
+                            && platform.package_root.join(&app.package_sha256).join(&backend.entry).is_file(),
+                        root_assigned,
+                        root_url: public.filter(|_| root_assigned).map(str::to_owned),
+                        prefix_url: public.filter(|_| backend.external_service).map(|origin| format!("{origin}{prefix_path}")),
+                        prefix_path,
+                    });
+                }
+                json(info)
             }
             "session.refresh" => {
                 let session = caller(&session)?;
@@ -676,6 +805,18 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                         .await?,
                 )
             }
+            "files.local_url" => json(
+                platform
+                    .local_url(caller(&session)?, strict_json(body).await?)
+                    .await?,
+            ),
+            "files.local_url.revoke" => {
+                platform.revoke_local_url(
+                    caller(&session)?,
+                    parameters.get("id").map(String::as_str).unwrap_or(""),
+                )?;
+                StatusCode::NO_CONTENT.into_response()
+            }
             "media.ticket" => {
                 platform
                     .ticket_bytes(
@@ -812,11 +953,11 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
     if let Some(session) = &session
         && spec.name != "session.close"
     {
-        return tokio::select! { _=revocations.changed()=>Err(PlatformError::new(error_code::SESSION_EXPIRED,"主人登录已撤销")), _=session.cancelled.cancelled()=>Err(PlatformError::new(error_code::SESSION_EXPIRED,"页面会话已撤销")), result=operation=>result };
+        return tokio::select! { _=revocations.changed(),if session.is_page()=>Err(PlatformError::new(error_code::SESSION_EXPIRED,"主人登录已撤销")), _=session.cancelled.cancelled()=>Err(PlatformError::new(error_code::SESSION_EXPIRED,"页面会话已撤销")), result=operation=>result };
     }
     operation.await
 }
-fn caller(session: &Option<Arc<PageSession>>) -> PlatformResult<&Arc<PageSession>> {
+fn caller(session: &Option<Arc<CallerSession>>) -> PlatformResult<&Arc<CallerSession>> {
     session
         .as_ref()
         .ok_or_else(|| PlatformError::new(error_code::UNAUTHORIZED, "缺少页面身份"))

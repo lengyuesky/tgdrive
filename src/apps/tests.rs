@@ -66,14 +66,16 @@ impl TgApi for Synthetic {
         budget: Option<Arc<crate::telegram::ReadBudget>>,
     ) -> crate::error::AppResult<ByteReader> {
         self.strict_reads.fetch_add(1, Ordering::SeqCst);
-        if let Some(budget) = budget {
-            budget.reserve(length)?;
-        }
         let contents = self.contents.lock().unwrap();
         let body = contents.get(file).ok_or(crate::error::AppError::NotFound)?;
-        Ok(Box::pin(std::io::Cursor::new(
+        let reader: ByteReader = Box::pin(std::io::Cursor::new(
             body[offset as usize..(offset + length) as usize].to_vec(),
-        )))
+        ));
+        Ok(if let Some(budget) = budget {
+            crate::telegram::budgeted_reader(reader, budget)
+        } else {
+            reader
+        })
     }
 }
 

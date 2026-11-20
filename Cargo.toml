@@ -26,6 +26,10 @@ hmac = "0.13.0"
 http = "1.5.0"
 http-body = "1"
 http-body-util = "0.1.4"
+hyper = { version = "1.11", default-features = false, features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+libsqlite3-sys = "0.37.0"
+tar = "0.4"
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
@@ -51,6 +55,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 # 主站静态资源测试生成真实压缩变体，不进入宿主的直接运行依赖。
 brotli = "8.0.4"
+tgdrive-backend-sdk = { path = "../tgdrive-app/backend-sdk" }
 
 [profile.release]
 # 单二进制服务：瘦 LTO 与去符号换更小的镜像，编译时间增加有限。

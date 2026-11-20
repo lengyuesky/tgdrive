@@ -57,9 +57,41 @@ impl ReadBudget {
             .map_err(|_| AppError::BadRequest("严格读取超过累计上游字节预算".into()))?;
         Ok(())
     }
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining.load(Ordering::Acquire)
+    }
+    pub(crate) fn refund(&self, bytes: u64) {
+        self.remaining.fetch_add(bytes, Ordering::AcqRel);
+    }
     pub(crate) fn used(&self) -> u64 {
         self.limit - self.remaining.load(Ordering::Acquire)
     }
+}
+
+/// 已有 Telegram 内容缓存也按每次实际读取的有界块计费，不预留整个 HTTP 窗口。
+/// 流丢弃后不再轮询下一块；在途块至多 64 KiB，未知取消结果按已领取块计费。
+pub(crate) fn budgeted_reader(reader: ByteReader, budget: Arc<ReadBudget>) -> ByteReader {
+    let stream =
+        futures_util::stream::try_unfold((reader, budget), |(mut reader, budget)| async move {
+            let maximum = budget.remaining().min(64 * 1024);
+            if maximum == 0 {
+                return Err(std::io::Error::other("本机累计字节预算已耗尽"));
+            }
+            budget.reserve(maximum).map_err(std::io::Error::other)?;
+            let mut bytes = vec![0u8; maximum as usize];
+            match tokio::io::AsyncReadExt::read(&mut reader, &mut bytes).await {
+                Ok(read) => {
+                    budget.refund(maximum - read as u64);
+                    if read == 0 {
+                        return Ok(None);
+                    }
+                    bytes.truncate(read);
+                    Ok(Some((Bytes::from(bytes), (reader, budget))))
+                }
+                Err(error) => Err(error),
+            }
+        });
+    Box::pin(tokio_util::io::StreamReader::new(stream))
 }
 
 /// reqwest 错误通常携带完整请求 URL，而 Telegram URL 中含 Bot Token。
@@ -1612,10 +1644,12 @@ impl TgApi for TgClient {
         if let Some(path) = cached_path.filter(|path| path.starts_with('/'))
             && let Some(reader) = self.open_known_path(&path, offset).await?
         {
-            if let Some(budget) = budget {
-                budget.reserve(length)?;
-            }
-            return Ok(Box::pin(reader.take(length)));
+            let reader: ByteReader = Box::pin(reader.take(length));
+            return Ok(if let Some(budget) = budget {
+                budgeted_reader(reader, budget)
+            } else {
+                reader
+            });
         }
         if let Some(mtproto) = &self.mtproto {
             let reader = if let Some(budget) = budget {

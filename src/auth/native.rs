@@ -23,6 +23,20 @@ fn sign_with(creds: &Creds, payload: &str) -> String {
 }
 
 impl Auth {
+    /// 转发剥离按真实签名判定，即使原生令牌刚过期也不能泄露给应用。
+    pub(crate) fn owns_native_bearer(&self, token: &str) -> bool {
+        if token.len() > 4096 {
+            return false;
+        }
+        let Some((payload, signature)) = token.split_once('.') else {
+            return false;
+        };
+        Self::ct_eq(
+            &sign_with(&self.creds(), &format!("native-v1:{payload}")),
+            signature,
+        )
+    }
+
     pub(crate) fn device_epoch(&self) -> String {
         sign_with(&self.creds(), "native-auth-epoch-v1")
     }

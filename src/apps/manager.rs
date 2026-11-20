@@ -11,6 +11,59 @@ use tgdrive_contract::validation::{check_manifest_compatibility, stable_version,
 use tgdrive_contract::{CONTRACT_VERSION, Timestamp, error_code};
 
 impl AppPlatform {
+    fn decorate_backend(&self, app: &mut InstalledApp) {
+        if let Some(backend) = &app.manifest.backend {
+            app.backend = Some(self.backends.status(&app.manifest.id, backend.run_mode));
+        }
+    }
+    pub async fn root_selection(&self) -> PlatformResult<RootAppSelection> {
+        let (app_id, revision): (Option<String>, String) =
+            sqlx::query_as("SELECT app_id,revision FROM app_root_selection WHERE id=1")
+                .fetch_one(&self.host.vfs.db.pool)
+                .await?;
+        Ok(RootAppSelection { app_id, revision })
+    }
+    pub async fn root_update(
+        &self,
+        request: RootAppUpdateRequest,
+    ) -> PlatformResult<RootAppSelection> {
+        let mut tx = self.host.vfs.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: String =
+            sqlx::query_scalar("SELECT revision FROM app_root_selection WHERE id=1")
+                .fetch_one(&mut *tx)
+                .await?;
+        if current != request.expected_revision {
+            return Err(PlatformError::new(
+                error_code::APP_CHANGED,
+                "根地址选择已改变",
+            ));
+        }
+        if let Some(id) = &request.app_id {
+            let app = installation(&mut tx, id).await?;
+            if !app.enabled
+                || !app
+                    .manifest()?
+                    .backend
+                    .is_some_and(|backend| backend.external_service)
+            {
+                return Err(PlatformError::new(
+                    error_code::CALLER_NOT_ALLOWED,
+                    "根地址需要已启用并声明对外服务的应用后端",
+                ));
+            }
+        }
+        let revision = opaque();
+        sqlx::query("UPDATE app_root_selection SET app_id=?,revision=? WHERE id=1")
+            .bind(&request.app_id)
+            .bind(&revision)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(RootAppSelection {
+            app_id: request.app_id,
+            revision,
+        })
+    }
     pub async fn installed(&self, id: &str) -> PlatformResult<InstalledApp> {
         if !valid_app_id(id) {
             return Err(PlatformError::new(
@@ -20,7 +73,9 @@ impl AppPlatform {
         }
         let mut connection = self.host.vfs.db.pool.acquire().await?;
         let record = installation(&mut connection, id).await?;
-        installed_app(&mut connection, record).await
+        let mut result = installed_app(&mut connection, record).await?;
+        self.decorate_backend(&mut result);
+        Ok(result)
     }
     pub async fn installed_apps(&self) -> PlatformResult<InstalledAppsResponse> {
         let mut tx = self.host.vfs.db.pool.begin().await?;
@@ -30,15 +85,14 @@ impl AppPlatform {
                 .await?;
         let mut apps = Vec::with_capacity(records.len());
         for record in records {
-            apps.push(installed_app(&mut tx, record).await?);
+            let mut result = installed_app(&mut tx, record).await?;
+            self.decorate_backend(&mut result);
+            apps.push(result);
         }
         tx.commit().await?;
         Ok(InstalledAppsResponse {
             apps,
-            root_app: RootAppSelection {
-                app_id: None,
-                revision: self.root_revision.clone(),
-            },
+            root_app: self.root_selection().await?,
         })
     }
     pub async fn verify_package(&self, path: &Path) -> PlatformResult<VerifiedPackage> {
@@ -188,7 +242,7 @@ impl AppPlatform {
             previous_state_revision: previous.map(|p| p.state_revision),
             added_file_read: verified.manifest.files.read && !old_permissions.read,
             added_file_write: verified.manifest.files.write && !old_permissions.write,
-            starts_backend: false,
+            starts_backend: verified.manifest.backend.is_some(),
             external_network: verified.manifest.backend.is_some(),
         };
         sqlx::query("INSERT INTO app_install_previews(id,preview,expires_at) VALUES(?,?,?)")
@@ -269,6 +323,7 @@ impl AppPlatform {
                 DirectoryScope::None => {}
             }
         }
+        self.backends.stop(&preview.manifest.id).await?;
         let at = now();
         let generation = opaque();
         let state_revision = opaque();
@@ -308,6 +363,10 @@ impl AppPlatform {
                 "启停或固定至少需要一个变化",
             ));
         }
+        if enabled != old.enabled {
+            self.backends.stop(id).await?;
+            self.backends.reset_failures(id);
+        }
         let generation = if enabled != old.enabled {
             opaque()
         } else {
@@ -338,6 +397,7 @@ impl AppPlatform {
                 "应用状态已改变",
             ));
         }
+        self.backends.stop(id).await?;
         sqlx::query("DELETE FROM app_installations WHERE id=?")
             .bind(id)
             .execute(&mut *tx)
@@ -355,8 +415,21 @@ impl AppPlatform {
         tx.commit().await?;
         self.sessions.revoke_app(id);
         self.clear_app_cache(id).await?;
+        let identity: Option<i64> =
+            sqlx::query_scalar("SELECT uid FROM app_runtime_identities WHERE app_id=?")
+                .bind(id)
+                .fetch_optional(&self.host.vfs.db.pool)
+                .await?;
+        let owner = identity.map(|uid| {
+            if super::backend_system::real_isolation() {
+                uid as u32
+            } else {
+                unsafe { libc::geteuid() }
+            }
+        });
+        super::safe_fs::remove_tree_owner(&self.data_root().join(id), "run", owner)?;
         if purge {
-            super::safe_fs::remove_tree(&self.data_root(), id)?;
+            super::safe_fs::remove_tree_owner(&self.data_root(), id, owner)?;
         }
         let references: i64 =
             sqlx::query_scalar("SELECT count(*) FROM app_installations WHERE package_sha256=?")

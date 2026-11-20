@@ -18,7 +18,8 @@ struct TokenBucket {
     last: Instant,
 }
 
-pub(crate) struct PageSession {
+pub(crate) struct CallerSession {
+    pub kind: RuntimeCaller,
     pub id: String,
     pub app_id: String,
     pub generation: String,
@@ -30,19 +31,50 @@ pub(crate) struct PageSession {
     pub events: Arc<Semaphore>,
     bucket: Mutex<TokenBucket>,
 }
-impl PageSession {
+impl CallerSession {
+    pub fn backend(app: &Installation, run_id: String) -> Arc<Self> {
+        Arc::new(Self {
+            kind: RuntimeCaller::Backend,
+            id: run_id,
+            app_id: app.id.clone(),
+            generation: app.generation.clone(),
+            owner_epoch: String::new(),
+            expires_at: AtomicI64::new(MAX_TIMESTAMP_MILLIS as i64),
+            cancelled: CancellationToken::new(),
+            control: Arc::new(Semaphore::new(BACKEND_CONTROL_CONCURRENCY as usize)),
+            bytes: Arc::new(Semaphore::new(BACKEND_BYTE_CONCURRENCY as usize)),
+            events: Arc::new(Semaphore::new(MAX_EVENT_CONNECTIONS_PER_CALLER as usize)),
+            bucket: Mutex::new(TokenBucket {
+                tokens: BACKEND_CONTROL_BURST as f64,
+                last: Instant::now(),
+            }),
+        })
+    }
+    pub fn is_page(&self) -> bool {
+        self.kind == RuntimeCaller::Page
+    }
     pub fn rate_limit(&self) -> PlatformResult<()> {
         let mut bucket = self.bucket.lock().unwrap();
         let now = Instant::now();
+        let rate = if self.is_page() {
+            PAGE_CONTROL_RATE
+        } else {
+            BACKEND_CONTROL_RATE
+        };
+        let burst = if self.is_page() {
+            PAGE_CONTROL_BURST
+        } else {
+            BACKEND_CONTROL_BURST
+        };
         bucket.tokens = (bucket.tokens
-            + now.duration_since(bucket.last).as_secs_f64() * PAGE_CONTROL_RATE as f64)
-            .min(PAGE_CONTROL_BURST as f64);
+            + now.duration_since(bucket.last).as_secs_f64() * rate as f64)
+            .min(burst as f64);
         bucket.last = now;
         if bucket.tokens < 1.0 {
             return Err(PlatformError::limited(
                 error_code::RATE_LIMITED,
                 "页面控制请求过于频繁",
-                (1000 / PAGE_CONTROL_RATE + 1) as u32,
+                (1000 / rate + 1) as u32,
             ));
         }
         bucket.tokens -= 1.0;
@@ -60,8 +92,11 @@ impl PageSession {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct TrustedBackendCaller(pub Arc<CallerSession>);
+
 pub(crate) struct Sessions {
-    sessions: Mutex<BTreeMap<String, Arc<PageSession>>>,
+    sessions: Mutex<BTreeMap<String, Arc<CallerSession>>>,
 }
 impl Sessions {
     pub fn new() -> Self {
@@ -69,8 +104,9 @@ impl Sessions {
             sessions: Mutex::new(BTreeMap::new()),
         }
     }
-    pub fn create(&self, app: &Installation, owner_epoch: String) -> Arc<PageSession> {
-        let session = Arc::new(PageSession {
+    pub fn create(&self, app: &Installation, owner_epoch: String) -> Arc<CallerSession> {
+        let session = Arc::new(CallerSession {
+            kind: RuntimeCaller::Page,
             id: opaque(),
             app_id: app.id.clone(),
             generation: app.generation.clone(),
@@ -98,7 +134,7 @@ impl Sessions {
         sessions.insert(session.id.clone(), session.clone());
         session
     }
-    pub fn token(codec: &CursorCodec, session: &PageSession) -> PlatformResult<String> {
+    pub fn token(codec: &CursorCodec, session: &CallerSession) -> PlatformResult<String> {
         codec.encode(&CursorData {
             kind: "session".into(),
             app: session.app_id.clone(),
@@ -117,7 +153,7 @@ impl Sessions {
         codec: &CursorCodec,
         token: &str,
         owner_epoch: &str,
-    ) -> PlatformResult<Arc<PageSession>> {
+    ) -> PlatformResult<Arc<CallerSession>> {
         let data = codec.decode(token).map_err(|error| {
             if error.code == error_code::CURSOR_EXPIRED {
                 PlatformError::new(
@@ -159,6 +195,9 @@ impl Sessions {
             ));
         }
         Ok(session)
+    }
+    pub fn owns(&self, codec: &CursorCodec, token: &str) -> bool {
+        codec.decode(token).is_ok_and(|data| data.kind == "session")
     }
     pub fn revoke(&self, id: &str) {
         if let Some(session) = self.sessions.lock().unwrap().remove(id) {
@@ -209,15 +248,14 @@ pub(crate) fn capabilities() -> Vec<&'static str> {
         .filter(|name| {
             !matches!(
                 *name,
-                "files.local_url"
-                    | "files.mutate"
+                "files.mutate"
                     | "files.upload"
                     | "kv.device"
                     | "backend.proxy"
-                    | "backend.keepalive"
                     | "backend.external"
             )
         })
+        .filter(|name| !name.starts_with("backend.") || super::backend_system::available())
         .collect()
 }
 
@@ -285,16 +323,35 @@ pub(crate) fn limits(app: &Installation) -> PlatformResult<RuntimeLimits> {
 pub(crate) fn info(
     app: &Installation,
     scope: tgdrive_contract::files::ScopeInfo,
+    caller: RuntimeCaller,
 ) -> PlatformResult<RuntimeInfo> {
     let manifest = app.manifest()?;
+    let mut actual_limits = limits(app)?;
+    if caller == RuntimeCaller::Backend {
+        actual_limits.control_concurrency = BACKEND_CONTROL_CONCURRENCY as u16;
+        actual_limits.byte_stream_concurrency = BACKEND_BYTE_CONCURRENCY as u16;
+        actual_limits.control_requests_per_second = BACKEND_CONTROL_RATE as u16;
+        actual_limits.control_burst = BACKEND_CONTROL_BURST as u16;
+    }
     Ok(RuntimeInfo {
         contract: CONTRACT_VERSION,
         app: app.identity()?,
-        caller: RuntimeCaller::Page,
-        capabilities: capabilities().into_iter().map(String::from).collect(),
+        caller,
+        capabilities: capabilities()
+            .into_iter()
+            .filter(|name| {
+                if caller == RuntimeCaller::Page {
+                    *name != "backend.keepalive" && *name != "files.local_url"
+                } else {
+                    !name.starts_with("ui.") && *name != "session.refresh"
+                }
+            })
+            .map(String::from)
+            .collect(),
         files: manifest.files,
         scope,
-        limits: limits(app)?,
+        limits: actual_limits,
         backend: app.backend()?,
+        external_service: None,
     })
 }
