@@ -79,7 +79,8 @@ fn main() {
             Ok(true) => std::process::exit(0),
             Ok(false) => std::process::exit(3),
             Err(_) => {
-                tracing::error!("应用在线快照失败");
+                // stdout 专用于 SQLite 快照字节，失败诊断不能混入二进制管道。
+                eprintln!("应用在线快照失败");
                 std::process::exit(1);
             }
         }

@@ -44,6 +44,24 @@ pub(crate) fn helper_executable() -> std::io::Result<PathBuf> {
     std::env::current_exe()
 }
 
+pub(crate) fn process_descriptor(pid: u32) -> PlatformResult<Option<std::os::fd::OwnedFd>> {
+    #[cfg(target_os = "linux")]
+    if real_isolation() {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+        if fd < 0 {
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "无法绑定后端进程",
+            ));
+        }
+        return Ok(Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+    Ok(None)
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct Identity {
     pub uid: u32,
@@ -230,10 +248,36 @@ pub(crate) fn harden_host(db_path: &str) -> PlatformResult<()> {
     // 禁用 root 敏感进程转储；应用无 ptrace 能力，也没有宿主进程的附加组。
     #[cfg(target_os = "linux")]
     unsafe {
-        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) < 0 {
-            return Err(std::io::Error::last_os_error().into());
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) < 0
+            || libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) < 0
+        {
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "无法保护宿主转储或收养应用子进程",
+            ));
         }
-        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+        let process = libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) as i32;
+        if process < 0 {
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "内核无法绑定应用进程身份",
+            ));
+        }
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let result = libc::waitid(
+            libc::P_PIDFD,
+            process as libc::id_t,
+            status.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG,
+        );
+        let error = std::io::Error::last_os_error();
+        libc::close(process);
+        if result < 0 && error.raw_os_error() != Some(libc::ECHILD) {
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "内核无法安全回收应用子进程",
+            ));
+        }
     }
     let path = Path::new(db_path);
     let parent = path
@@ -534,36 +578,133 @@ pub(crate) fn kill_group(pid: u32, identity: Identity, signal: i32) {
 }
 pub(crate) fn signal_identity(identity: Identity, signal: i32) {
     #[cfg(target_os = "linux")]
-    if real_isolation() && identity.uid >= 20000 && identity.gid == identity.uid {
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let Some(process) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|s| s.parse::<i32>().ok())
-                else {
-                    continue;
-                };
-                if process == std::process::id() as i32 {
-                    continue;
-                }
-                let uid = std::fs::read_to_string(entry.path().join("status"))
-                    .ok()
-                    .and_then(|status| {
-                        status.lines().find_map(|line| {
-                            line.strip_prefix("Uid:")
-                                .and_then(|line| line.split_whitespace().next())
-                                .and_then(|uid| uid.parse::<u32>().ok())
-                        })
-                    });
-                if uid == Some(identity.uid) {
-                    unsafe {
-                        libc::kill(process, signal);
-                    }
-                }
+    if let Ok(processes) = owned_processes(identity) {
+        use std::os::fd::AsRawFd;
+        for process in processes {
+            unsafe {
+                // pidfd 绑定被核验的进程，不能在 PID 重用时误伤其他应用。
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    process.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (identity, signal);
+}
+
+#[cfg(target_os = "linux")]
+fn owned_processes(identity: Identity) -> PlatformResult<Vec<std::os::fd::OwnedFd>> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if !real_isolation() || identity.uid < 20000 || identity.gid != identity.uid {
+        return Ok(Vec::new());
+    }
+    let mut processes = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        let path = entry.path().join("status");
+        let uid = process_uid(&path)?;
+        if uid != Some(identity.uid) {
+            continue;
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "无法绑定应用进程身份",
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // 在绑定后再次核验；若旧 PID 已退出并重用，不能把新身份混入回收范围。
+        if process_uid(&path)? == Some(identity.uid) {
+            processes.push(fd);
+        }
+    }
+    Ok(processes)
+}
+
+#[cfg(target_os = "linux")]
+fn process_uid(path: &Path) -> PlatformResult<Option<u32>> {
+    let status = match std::fs::read_to_string(path) {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(PlatformError::new(
+                error_code::CAPABILITY_UNAVAILABLE,
+                "无法核验应用进程集合",
+            ));
+        }
+    };
+    // Name 可包含换行；只取最后一条完整的内核 Uid，拒绝进程名伪造行。
+    Ok(status.lines().rev().find_map(|line| {
+        let mut fields = line.strip_prefix("Uid:")?.split_whitespace();
+        let uid = fields.next()?.parse::<u32>().ok()?;
+        for _ in 0..3 {
+            fields.next()?.parse::<u32>().ok()?;
+        }
+        fields.next().is_none().then_some(uid)
+    }))
+}
+
+pub(crate) async fn reap_identity(identity: Identity) -> PlatformResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let processes = owned_processes(identity)?;
+            if processes.is_empty() {
+                return Ok(());
+            }
+            for process in processes {
+                let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        process.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                    // subreaper 收养的孙进程也要 wait，不能把僵尸进程当成已经回收。
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        process.as_raw_fd() as libc::id_t,
+                        status.as_mut_ptr(),
+                        libc::WEXITED | libc::WNOHANG,
+                    );
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(PlatformError::new(
+                    error_code::BACKEND_UNAVAILABLE,
+                    "应用子进程未完全回收",
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = identity;
+        Ok(())
+    }
 }

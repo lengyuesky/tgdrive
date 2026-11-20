@@ -31,6 +31,10 @@ mod http;
 #[cfg(test)]
 mod internal_tests;
 mod kv;
+#[cfg(all(test, target_os = "linux"))]
+mod linux_acceptance_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod linux_end_to_end_tests;
 mod manager;
 mod media;
 mod package;
