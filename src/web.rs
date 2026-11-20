@@ -13,13 +13,18 @@ pub(crate) fn is_admin_path(path: &str) -> bool {
     path == "/admin" || path.starts_with("/admin/")
 }
 
-/// 根地址的唯一回退入口；后续应用根地址分发只需替换此处。
+/// 根地址的独立静态路由回退与应用平台采用同一方法语义。
 pub(crate) async fn root_address_fallback(request: Request) -> Response {
     if is_admin_path(request.uri().path()) {
         // 未安装前端或没有匹配的宿主接口时，不向自己反复跳转。
         return StatusCode::NOT_FOUND.into_response();
     }
-    Redirect::to("/admin/").into_response()
+    if matches!(request.method().as_str(), "GET" | "HEAD") {
+        (StatusCode::FOUND, [(header::LOCATION, "/admin/")]).into_response()
+    } else {
+        // 写请求不能以 307/308 将客户端正文重放给宿主管理端。
+        Redirect::to("/admin/").into_response()
+    }
 }
 
 pub fn router(directory: impl AsRef<Path>) -> Router {
@@ -407,7 +412,12 @@ mod tests {
         ] {
             for method in [Method::GET, Method::HEAD, Method::POST] {
                 let response = request(&app, method.clone(), path, &[]).await;
-                assert_eq!(response.status(), StatusCode::SEE_OTHER, "{method} {path}");
+                let expected = if matches!(method, Method::GET | Method::HEAD) {
+                    StatusCode::FOUND
+                } else {
+                    StatusCode::SEE_OTHER
+                };
+                assert_eq!(response.status(), expected, "{method} {path}");
                 assert_eq!(response.headers()[header::LOCATION], "/admin/");
             }
         }

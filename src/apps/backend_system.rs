@@ -14,8 +14,7 @@ pub(crate) static REAL_ISOLATION: std::sync::atomic::AtomicBool =
 pub(crate) fn real_isolation() -> bool {
     #[cfg(test)]
     {
-        return cfg!(target_os = "linux")
-            && REAL_ISOLATION.load(std::sync::atomic::Ordering::Relaxed);
+        cfg!(target_os = "linux") && REAL_ISOLATION.load(std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(test))]
     {

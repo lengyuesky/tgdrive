@@ -649,47 +649,47 @@ async fn ready_inner(
             .header("host", "tgdrive")
             .body(axum::body::Body::empty())
             .map_err(|_| unavailable())?;
-        if let Ok(response) = request(&run, req).await {
-            if response.status() == hyper::StatusCode::OK {
-                let body = axum::body::Body::new(response.into_body());
-                let bytes = axum::body::to_bytes(body, MAX_JSON_REQUEST_BYTES as usize)
-                    .await
-                    .map_err(|_| unavailable())?;
-                let raw = tgdrive_contract::validation::parse_unique_json(&bytes)
-                    .map_err(|_| unavailable())?;
-                let response: BackendReadyResponse =
-                    serde_json::from_value(raw).map_err(|_| unavailable())?;
-                let manifest = app.manifest()?;
-                if response.app_id != app.id
-                    || response.version != manifest.version
-                    || response.generation != app.generation
-                    || response.run_id != run.caller.id
-                {
-                    return Err(unavailable());
-                }
-                let negotiated = tgdrive_contract::validation::negotiate_contract(
-                    CONTRACT_VERSION,
-                    response.contract,
-                    manifest.contract,
-                )?;
-                *run.negotiated.write().unwrap() = negotiated;
-                if let Ok(bytes) = super::safe_fs::Directory::open(
-                    std::path::Path::new(&run.data_dir).join("run").as_path(),
-                    false,
-                )?
-                .read_bytes("context.json", MAX_JSON_REQUEST_BYTES)
-                {
-                    let context: BackendStartContext = serde_json::from_value(
-                        tgdrive_contract::validation::parse_unique_json(&bytes)?,
-                    )?;
-                    *run.limits.write().unwrap() = context.limits;
-                }
-                let mut conn = platform.host.vfs.db.pool.acquire().await?;
-                store::installation(&mut conn, &app.id)
-                    .await?
-                    .check(&app.generation)?;
-                return Ok(());
+        if let Ok(response) = request(&run, req).await
+            && response.status() == hyper::StatusCode::OK
+        {
+            let body = axum::body::Body::new(response.into_body());
+            let bytes = axum::body::to_bytes(body, MAX_JSON_REQUEST_BYTES as usize)
+                .await
+                .map_err(|_| unavailable())?;
+            let raw = tgdrive_contract::validation::parse_unique_json(&bytes)
+                .map_err(|_| unavailable())?;
+            let response: BackendReadyResponse =
+                serde_json::from_value(raw).map_err(|_| unavailable())?;
+            let manifest = app.manifest()?;
+            if response.app_id != app.id
+                || response.version != manifest.version
+                || response.generation != app.generation
+                || response.run_id != run.caller.id
+            {
+                return Err(unavailable());
             }
+            let negotiated = tgdrive_contract::validation::negotiate_contract(
+                CONTRACT_VERSION,
+                response.contract,
+                manifest.contract,
+            )?;
+            *run.negotiated.write().unwrap() = negotiated;
+            if let Ok(bytes) = super::safe_fs::Directory::open(
+                std::path::Path::new(&run.data_dir).join("run").as_path(),
+                false,
+            )?
+            .read_bytes("context.json", MAX_JSON_REQUEST_BYTES)
+            {
+                let context: BackendStartContext = serde_json::from_value(
+                    tgdrive_contract::validation::parse_unique_json(&bytes)?,
+                )?;
+                *run.limits.write().unwrap() = context.limits;
+            }
+            let mut conn = platform.host.vfs.db.pool.acquire().await?;
+            store::installation(&mut conn, &app.id)
+                .await?
+                .check(&app.generation)?;
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(unavailable());
@@ -789,10 +789,7 @@ fn capture_log(
         }
         let path = directory.join(format!("{source}.log"));
         let mut buffer = [0u8; 16 * 1024];
-        loop {
-            let Ok(n) = reader.read(&mut buffer).await else {
-                break;
-            };
+        while let Ok(n) = reader.read(&mut buffer).await {
             if n == 0 {
                 break;
             }

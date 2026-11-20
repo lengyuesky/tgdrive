@@ -490,7 +490,7 @@ async fn host_routes_and_root_fallback_share_the_production_router() {
         "/s/token",
         "/administrator/",
     ] {
-        for method in ["GET", "POST", "PUT", "DELETE", "PROPFIND"] {
+        for method in ["GET", "HEAD", "POST", "PUT", "DELETE", "PROPFIND"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -502,7 +502,12 @@ async fn host_routes_and_root_fallback_share_the_production_router() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{method} {path}");
+            let expected = if matches!(method, "GET" | "HEAD") {
+                StatusCode::FOUND
+            } else {
+                StatusCode::SEE_OTHER
+            };
+            assert_eq!(response.status(), expected, "{method} {path}");
             assert_eq!(response.headers()["location"], "/admin/");
         }
     }

@@ -1576,10 +1576,10 @@ async fn stream_body_observed(
                 observation.emitted(bytes.len());
             }
             state.remaining -= bytes.len() as u64;
-            if state.remaining == 0 {
-                if let Some(observation) = &mut state.observation {
-                    observation.outcome = tgdrive_contract::events::StreamOutcome::Completed;
-                }
+            if state.remaining == 0
+                && let Some(observation) = &mut state.observation
+            {
+                observation.outcome = tgdrive_contract::events::StreamOutcome::Completed;
             }
             Ok(Some((bytes, state)))
         },

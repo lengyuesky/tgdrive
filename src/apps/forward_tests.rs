@@ -309,7 +309,7 @@ async fn directive_windows_conditions_events_and_revocation_are_host_owned() {
     )
     .await;
     assert!(
-        response
+        !response
             .body_mut()
             .frame()
             .await
@@ -317,8 +317,7 @@ async fn directive_windows_conditions_events_and_revocation_are_host_owned() {
             .unwrap()
             .into_data()
             .unwrap()
-            .len()
-            > 0
+            .is_empty()
     );
     platform.revoke_lease(&run.caller, &lease.id).unwrap();
     assert!(response.body_mut().frame().await.unwrap().is_err());
