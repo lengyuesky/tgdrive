@@ -1,4 +1,4 @@
-# 手动选择源码和镜像，原生构建双架构；可下载镜像包或推送提交号标签。
+# 手动选择源码和镜像，原生构建双架构；推送时更新 latest，无需版本标签。
 name: docker-build
 run-name: 构建镜像 · ${{ inputs.image }} · ${{ inputs.ref || github.ref_name }}
 
@@ -18,7 +18,7 @@ on:
           - all
         default: tgdrive
       push:
-        description: "推送到 GHCR 的 sha-提交号标签；不勾选则提供镜像包下载"
+        description: "推送到 GHCR 并更新 latest（同时保留提交号标签）；不勾选则提供镜像包下载"
         type: boolean
         default: false
 
@@ -26,7 +26,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.image }}-${{ inputs.push }}
+  # 推送运行串行，避免多个手动构建按完成顺序覆盖 latest。
+  group: ${{ github.workflow }}-${{ inputs.push && 'publish' || format('{0}-{1}-{2}', github.ref, inputs.ref, inputs.image) }}
   cancel-in-progress: false
 
 jobs:
@@ -279,7 +280,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 合并并核验提交号标签
+      - name: 合并并核验 latest 和提交号标签
         working-directory: ${{ runner.temp }}/digests
         shell: bash
         run: |
@@ -294,9 +295,11 @@ jobs:
             [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
             refs+=("$IMAGE@sha256:$digest")
           done
-          docker buildx imagetools create --tag "$IMAGE:$TAG" "${refs[@]}"
-          docker buildx imagetools inspect "$IMAGE:$TAG" --raw > "$RUNNER_TEMP/manifest.json"
-          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' \
-            "$RUNNER_TEMP/manifest.json"
-          printf '已推送双架构镜像：`%s:%s`\n\n拉取命令：`docker pull %s:%s`\n' \
-            "$IMAGE" "$TAG" "$IMAGE" "$TAG" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools create --tag "$IMAGE:$TAG" --tag "$IMAGE:latest" "${refs[@]}"
+          for tag in "$TAG" latest; do
+            docker buildx imagetools inspect "$IMAGE:$tag" --raw > "$RUNNER_TEMP/manifest.json"
+            jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' \
+              "$RUNNER_TEMP/manifest.json"
+          done
+          printf '已更新双架构镜像：`%s:latest`\n\n提交号标签：`%s:%s`\n\n拉取命令：`docker pull %s:latest`\n' \
+            "$IMAGE" "$IMAGE" "$TAG" "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
