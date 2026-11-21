@@ -35,9 +35,9 @@ Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/
 
 镜像附带 `ffmpeg`、`ffprobe`、运行库和 CA 证书。宿主必须以 root 启动：它直接维护 `/etc/passwd`、`/etc/group` 的无登录应用账号，清空附加组并切换每应用独立 UID/GID，不依赖镜像内的 shell 或 `useradd`。默认 Compose 保留 `user: "0:0"` 和 `init: true`；不要改成统一的非 root 用户，也不要让应用继承宿主的 Docker capabilities。容器需要能写应用数据、账号文件，并保留切换身份/设置所有权的权限；Linux 内核还须支持进程收养和 pidfd 身份绑定/回收（通常为 Linux 5.4+）。硬隔离无法满足时后端拒绝启动，不假装成功。主库及凭据只允许 root 读取，镜像的共享 `/tmp` 和 `/var/tmp` 只读，应用使用各自的私有临时目录。
 
-本地和工作流共用根目录的同一份 `Dockerfile` 与同名附加上下文 `tgdrive-app`。唯一版本记录是 `docker/tgdrive-app-revision`，Rust 与前端必须共用该提交的同一份源码，不跟随浮动分支。当前记录应用仓库本地 main 的提交 `430b6e621252fe64c9f7a409042445d9c516ab03`，该提交尚未推送到远端。
+本地和工作流共用根目录的同一份 `Dockerfile` 与同名附加上下文 `tgdrive-app`。唯一版本记录是 `docker/tgdrive-app-revision`，Rust 与前端必须共用该提交的同一份源码，不跟随浮动分支。具体提交以该文件内容为准，构建前应确认它已推送到应用仓库远端。
 
-**推送宿主前必须先推送应用仓库，并把 `docker/tgdrive-app-revision` 更新为已推送的确定提交。** 两个镜像工作流读取这一个文件，以无令牌 HTTPS 获取公开应用仓库的精确提交；本次没有运行远端工作流或推送。
+**推送宿主前必须先推送应用仓库，并把 `docker/tgdrive-app-revision` 更新为已推送的确定提交。** 两个镜像工作流读取这一个文件，以无令牌 HTTPS 获取公开应用仓库的精确提交。
 
 ```bash
 # 两个仓库为相邻目录 tgdrive/ 与 tgdrive-app/；从宿主记录的提交取只读源码快照。
