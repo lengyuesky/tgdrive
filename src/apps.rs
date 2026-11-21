@@ -37,6 +37,8 @@ mod linux_acceptance_tests;
 mod linux_end_to_end_tests;
 mod manager;
 mod media;
+#[cfg(test)]
+mod owner_origin_tests;
 mod package;
 #[cfg(test)]
 mod performance_tests;
@@ -151,6 +153,7 @@ impl AppPlatform {
                     self.repository.clone(),
                     runtime::capabilities(),
                     self.download_root.clone(),
+                    self.host.vfs.tg.proxy_client(),
                 )
             })
             .await

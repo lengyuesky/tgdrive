@@ -409,7 +409,7 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
     let headers = request.headers().clone();
     let method = request.method().clone();
     let uri = request.uri().clone();
-    let origin = if request
+    let mut origin = if request
         .extensions()
         .get::<super::runtime::TrustedBackendCaller>()
         .is_some()
@@ -455,19 +455,7 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                 "应用中心需要主人网页登录",
             ));
         }
-        if !method.is_safe()
-            && ((headers
-                .get("sec-fetch-site")
-                .is_some_and(|site| site != "same-origin" && site != "none"))
-                || headers
-                    .get(header::ORIGIN)
-                    .is_some_and(|value| value.to_str().map_or(true, |value| value != origin)))
-        {
-            return Err(PlatformError::new(
-                error_code::CALLER_NOT_ALLOWED,
-                "拒绝跨源应用中心操作",
-            ));
-        }
+        origin = owner_origin(&headers, &method, origin)?;
         None
     } else if matches!(
         spec.access,
@@ -590,7 +578,7 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
             "center.app.backend" => owner_json(platform.backend_management(id).await?),
             "center.app.logs" => owner_json(platform.backend_logs(id).await?),
             "center.app.usage" => owner_json(platform.owner_or_page_usage(id, None).await?),
-            "center.catalog" => owner_json(platform.catalog().await?.current().await),
+            "center.catalog" => owner_json(platform.catalog().await?.refresh(false).await?),
             "center.catalog.refresh" => {
                 let request: CatalogRefreshRequest = strict_json(body).await?;
                 owner_json(platform.catalog().await?.refresh(request.force).await?)
@@ -1323,9 +1311,16 @@ pub(crate) fn public_origin(platform: &AppPlatform, request: &Request) -> Platfo
             "公开地址协议无效",
         ));
     }
-    let url = reqwest::Url::parse(&format!("{scheme}://{authority}"))
+    Ok(parse_origin(&format!("{scheme}://{authority}"))?
+        .origin()
+        .ascii_serialization())
+}
+
+fn parse_origin(value: &str) -> PlatformResult<reqwest::Url> {
+    let url = reqwest::Url::parse(value)
         .map_err(|_| PlatformError::new(error_code::INVALID_REQUEST, "公开地址格式无效"))?;
-    if !url.username().is_empty()
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
         || url.password().is_some()
         || url.path() != "/"
         || url.query().is_some()
@@ -1336,7 +1331,36 @@ pub(crate) fn public_origin(platform: &AppPlatform, request: &Request) -> Platfo
             "公开地址格式无效",
         ));
     }
-    Ok(url.origin().ascii_serialization())
+    Ok(url)
+}
+
+fn owner_origin(headers: &HeaderMap, method: &Method, inferred: String) -> PlatformResult<String> {
+    if method.is_safe() {
+        return Ok(inferred);
+    }
+    let denied = || PlatformError::new(error_code::CALLER_NOT_ALLOWED, "拒绝跨源应用中心操作");
+    let site = headers.get("sec-fetch-site");
+    if site.is_some_and(|site| site != "same-origin" && site != "none") {
+        return Err(denied());
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(inferred);
+    };
+    let supplied = parse_origin(origin.to_str().map_err(|_| denied())?).map_err(|_| denied())?;
+    let serialized = supplied.origin().ascii_serialization();
+    if serialized == inferred {
+        return Ok(inferred);
+    }
+    // TLS 可在反向代理终止；同源浏览器提供真实协议，但主机与端口仍须匹配可信地址。
+    // 这也让 launch 返回正确的 HTTPS 源，而不是让应用沙箱握手继续使用内部 HTTP。
+    let expected = parse_origin(&inferred)?;
+    if site.is_some_and(|site| site == "same-origin")
+        && supplied.host_str() == expected.host_str()
+        && supplied.port() == expected.port()
+    {
+        return Ok(serialized);
+    }
+    Err(denied())
 }
 fn queries(uri: &axum::http::Uri) -> PlatformResult<BTreeMap<String, String>> {
     let url = reqwest::Url::parse(&format!("http://localhost{uri}"))
