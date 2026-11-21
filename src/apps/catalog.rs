@@ -107,6 +107,30 @@ impl CatalogClient {
         self.cache.lock().await.response.clone()
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn synthetic_snapshot(&self, raw: &str) -> PlatformResult<()> {
+        let parsed = parse_catalog_for_host(
+            raw.as_bytes(),
+            &self.repository,
+            CONTRACT_VERSION,
+            &self.capabilities,
+        )?;
+        self.persist_history(&parsed, raw).await?;
+        let mut cache = self.cache.lock().await;
+        cache.response = CatalogResponse {
+            status: CatalogStatus {
+                state: CatalogState::Ready,
+                repository: self.repository.clone(),
+                last_success_at: Some(now()),
+                error: None,
+            },
+            result: parsed,
+        };
+        // 冻结合成目录的检查时钟，浏览器更新仅使用已核验的缓存包，不访问真实分发站点。
+        cache.last_check = Some(Instant::now() + Duration::from_secs(300));
+        Ok(())
+    }
+
     // 每次检查/下载取得当前代理快照；在途请求保留快照，重定向仍由目录规则逐跳校验。
     pub(crate) fn http_client(&self) -> PlatformResult<(Arc<ProxySnapshot>, Client)> {
         let snapshot = self.network.current();

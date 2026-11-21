@@ -80,6 +80,12 @@ docker compose stop tgdrive && docker compose run --rm tgdrive reset-2fa && dock
 
 探针:`GET /admin/healthz`(存活)、`GET /admin/readyz`(就绪)、`GET /admin/api/metrics`(Prometheus 指标,需登录)。镜像基于 distroless,排查问题请用 `docker compose logs` 或 `docker cp`。
 
+## 应用更新
+
+更新宿主容器后，进入应用中心点击「一键更新」即可刷新目录并更新已安装应用；也可以在应用卡片点击「更新」。更新自动沿用原包的架构，保留启用、固定、目录授权和持久应用数据。界面逐项显示结果，失败项可以单独重试。应用首次新增读取、写入、后端或对外服务声明时，会先显示更新预览供主人确认。
+
+宿主镜像与已安装应用分别更新；拉取 `latest` 后，还需要在应用中心更新应用包。影视 `1.0.2` 修复了升级后使用旧索引游标而无法打开的问题，更新时保留媒体库、收藏和观看记录。
+
 ## 手动构建镜像
 
 在 GitHub Actions 的 [docker-build 工作流](https://github.com/lengyuesky/tgdrive/actions/workflows/docker-build.yml) 点击 **Run workflow**，可选择源码分支、标签或提交，以及 `tgdrive`、`telegram-bot-api` 或 `all`。工作流固定源码提交后，在原生 AMD64、ARM64 runner 上构建和验证镜像。
