@@ -50,6 +50,20 @@ beforeEach(() => {
 afterEach(() => { wrapper?.unmount(); wrapper = undefined; vi.useRealTimers() })
 
 describe('应用中心后端管理', () => {
+  it('目录读取成功但尚未发布应用时说明空目录状态', async () => {
+    installedApps.value = []
+    calls.catalog.mockResolvedValue({ status: { state: 'ready' }, result: { catalog: { entries: [] }, incompatible: [] } })
+    const view = await render()
+    expect(view.text()).toContain('当前目录尚未发布应用，可以上传 .tgapp 应用包安装。')
+    expect(view.text()).not.toContain('目录暂时不可用')
+  })
+  it('重新刷新成功后清除上次操作的错误', async () => {
+    calls.catalog.mockRejectedValueOnce(new Error('拒绝跨源应用中心操作'))
+    const view = await render()
+    expect(view.find('[title="拒绝跨源应用中心操作"]').exists()).toBe(true)
+    await click('刷新目录')
+    expect(view.find('[title="拒绝跨源应用中心操作"]').exists()).toBe(false)
+  })
   it('展示真实 enforced，而不是把目标配额称为硬限制', async () => {
     const view = await render(); await click('资源限制')
     expect(calls.backend).toHaveBeenCalledWith('example-backend')

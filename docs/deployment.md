@@ -15,7 +15,7 @@
 | 公开分享页 | `/admin/s/{token}` |
 | 存活与就绪检查 | `/admin/healthz`、`/admin/readyz` |
 
-Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/admin/`；直接运行二进制时默认监听 8080。反向代理必须原样转发 `/admin` 前缀，不能剥离。
+Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/admin/`；直接运行二进制时默认监听 8080。反向代理必须原样转发 `/admin` 前缀，不能剥离。HTTPS 部署应设置 `TGDRIVE_COOKIE_SECURE=true`。代理应保留公开 `Host`；如果重写为内部地址，须设置 `TGDRIVE_TRUSTED_PROXIES` 为实际代理 IP/CIDR，并由代理传入正确的 `X-Forwarded-Host` 和 `X-Forwarded-Proto`，用于应用启动和对外链接。
 
 `/admin` 以外的地址属于主人在应用中心指定的一个根地址应用，原路径和查询不变；固定应用服务入口是 `/admin/api/apps/v1/services/<app_id>/<path>`。它们与管理界面共用同一端口，不另开应用端口。只有已启用、声明 `backend.external_service=true` 的带后端应用可被指定。尚未指定时 GET/HEAD 返回 302 到 `/admin/`，其他方法返回 303；指定应用停用或失败时返回 `backend_unavailable`，不会偷偷改分给另一个应用；卸载时原子清除选择。
 
@@ -26,6 +26,8 @@ Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/
 应用中心位于 `/admin/apps`。`TGDRIVE_APP_CATALOG_REPOSITORY` 默认 `lengyuesky/tgdrive-app`，只接受合法的 GitHub `owner/repo`；宿主读取该仓库 `main/catalog.json`，按预览绑定的版本、目标、摘要和长度下载精确 Release 包，不需要 GitHub Token。
 
 显式配置 `TGDRIVE_APP_CATALOG_REPOSITORY=` 可禁用联网目录；未设置变量不是禁用。修改后需重启宿主。目录失败保留上次成功快照，不影响已安装应用；也可以在应用中心上传 `.tgapp` 包，预览并确认安装。
+
+进入应用中心会自动检查目录，普通检查缓存 5 分钟，手动刷新至少间隔 30 秒；目录和安装包下载共用后台当前的网络代理设置。读取成功但目录为空时会说明尚未发布应用，上传应用包仍可用。
 
 平台提供沙箱页面、目录授权、文件查询/读取/条件写入、KV、缓存、媒体票据和本机读取。新装应用默认不授权，目录只读/读写级别必须由主人确认；声明写入不等于获得授权。带后端应用使用与容器架构一致的 Linux 静态 ELF 包。`resident` 随宿主启动，`on_demand` 首次页面代理或服务请求时启动；管理界面可查看状态、资源实际强制标记、日志和执行重启。页面请求经 `/admin/api/apps/v1/self/backend/` 转发，主人身份由宿主上下文确认，不接受外部请求冒用。
 
@@ -183,7 +185,7 @@ Compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 | `TGDRIVE_DB_PATH` | | `/data/tgdrive.db`(镜像内) | | SQLite 路径(设置本身存在这个库里) |
 | `TGDRIVE_SECRET` | | 自动生成并存库 | | cookie 签名密钥,**仅首次启动时作为初始值**,之后以库中值为准 |
 | `TGDRIVE_COOKIE_SECURE` | | `false` | | 通过 HTTPS(含反向代理)访问时设为 `true`,为 Cookie 启用 Secure 并发送 HSTS 响应头;修改需重启 |
-| `TGDRIVE_TRUSTED_PROXIES` | | 空 | | 反向代理的 IP 或 CIDR(逗号分隔)。仅来自这些地址的 `X-Forwarded-For` 会被采信,用于登录与提取码限速;不配置时反代后所有人共用一个限速额度;修改需重启 |
+| `TGDRIVE_TRUSTED_PROXIES` | | 空 | | 反向代理的 IP 或 CIDR(逗号分隔)。仅来自这些地址的转发头会被采信,用于真实客户端 IP 与应用公开地址;不配置时反代后所有人共用一个限速额度;修改需重启 |
 | `TGDRIVE_APP_CATALOG_REPOSITORY` | | `lengyuesky/tgdrive-app` | | 应用目录 GitHub 仓库；只接受 owner/repo，显式空值禁用联网目录，包上传仍可用 |
 | `TGDRIVE_APP_CGROUP_ROOT` | | `/sys/fs/cgroup/tgdrive-apps` | | cgroup v2 专用委派根目录；必须可写且控制器实际可用才能强制内存/CPU |
 | `TGDRIVE_STATIC_DIR` | | `/app/static`(镜像内) | | 前端静态文件目录 |
@@ -212,9 +214,9 @@ Compose 已把 telegram-bot-api 的数据目录(`./telegram-bot-api-data`)以相
 
 项目内的 `telegram-bot-api` 也共用这份配置。它的 Telegram TCP 连接由 proxychains 转给 tgdrive 的内部认证入口,再由 tgdrive 使用当前 HTTP CONNECT / SOCKS5 代理连接 Telegram;关闭代理时由 tgdrive 直连。保存或恢复代理设置会断开 Bot API 的旧连接,由 TDLib 自动重连,在途上传或下载可能短暂停顿。代理失败时不会自动绕过代理直连。
 
-内部入口不映射到宿主机端口,也不需要 `NET_ADMIN`、TUN 或 Docker socket。Compose 使用 `TGDRIVE_BOT_API_PROXY_LISTEN=0.0.0.0:1082`、`TGDRIVE_BOT_API_PROXY_CONFIG=/bot-api-control/proxychains.conf` 和共享目录自动建立连接。配置文件只含启动时生成的内部认证密钥,不含上游代理凭据,且不进入镜像。tgdrive 重建后 Bot API 自动重新读取入口配置。请保留这两个环境变量和共享挂载,不要把该端口公开到公网;自行部署到项目外的 Bot API 不受此配置管理。
+内部入口不映射到宿主机端口,也不需要 `NET_ADMIN`、TUN 或 Docker socket。Compose 使用 `TGDRIVE_BOT_API_PROXY_LISTEN=0.0.0.0:1082`、`TGDRIVE_BOT_API_PROXY_CONFIG=/bot-api-control/proxychains.conf` 和共享目录自动建立连接。配置文件只含启动时生成的内部认证密钥,不含上游代理凭据,且不进入镜像。tgdrive 重建后 Bot API 自动重新读取入口配置；运行中也会检测 Docker 地址变化并重新连接。等待配置、无法解析容器地址或 Bot API 进程退出时，启动器会在日志中说明原因。请保留这两个环境变量和共享挂载,不要把该端口公开到公网;自行部署到项目外的 Bot API 不受此配置管理。
 
-开发验证:构建两个项目镜像后运行 `node docker/test-shared-proxy.mjs`。测试创建独立的内部网络、空数据库和临时容器,验证代理切换、失败时不回退、恢复配置以及重启联动,结束后清理测试资源,不连接生产实例或 Telegram。
+开发验证:构建两个项目镜像后运行 `node docker/test-shared-proxy.mjs [宿主镜像] [Bot API 镜像]`，默认使用本地的 `tgdrive:latest` 和 `tgdrive-telegram-bot-api:latest`。测试创建独立的内部网络、空数据库和临时容器,验证代理切换、真实 Bot API 的出站连接、失败时不回退、恢复配置、Docker 地址变化以及重启联动,结束后清理测试资源。真实 Bot API 使用无效测试凭据，内部网络阻断外网，不连接生产实例或 Telegram。
 
 注意:
 - 本项目 Compose 中的 `telegram-bot-api` 自动共用代理;其他外部 Bot API 服务及浏览器的网络设置需要分别管理。Bot API 原生 `--proxy` 只代理 webhook,不能替代这里的 Telegram 出站代理。

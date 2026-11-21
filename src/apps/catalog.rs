@@ -2,6 +2,7 @@
 
 use super::{PlatformError, PlatformResult, now};
 use crate::db::Db;
+use crate::proxy::{ProxyClient, ProxySnapshot};
 use futures_util::StreamExt;
 use reqwest::{Client, Url};
 use std::collections::BTreeMap;
@@ -29,7 +30,7 @@ pub(crate) struct CatalogClient {
     db: Db,
     repository: String,
     capabilities: Vec<&'static str>,
-    client: Client,
+    network: Arc<ProxyClient>,
     cache: Mutex<CatalogCache>,
     downloads: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     root: PathBuf,
@@ -41,6 +42,7 @@ impl CatalogClient {
         repository: String,
         capabilities: Vec<&'static str>,
         root: PathBuf,
+        network: Arc<ProxyClient>,
     ) -> PlatformResult<Self> {
         if !repository.is_empty() && !valid_repository(&repository) {
             return Err(PlatformError::new(
@@ -87,16 +89,11 @@ impl CatalogClient {
                 incompatible: Vec::new(),
             }),
         };
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("package-client")
-            .build()
-            .map_err(|_| PlatformError::new(error_code::INTERNAL_ERROR, "目录客户端初始化失败"))?;
         Ok(Self {
             db,
             repository,
             capabilities,
-            client,
+            network,
             cache: Mutex::new(CatalogCache {
                 response,
                 last_check: None,
@@ -108,6 +105,20 @@ impl CatalogClient {
 
     pub async fn current(&self) -> CatalogResponse {
         self.cache.lock().await.response.clone()
+    }
+
+    // 每次检查/下载取得当前代理快照；在途请求保留快照，重定向仍由目录规则逐跳校验。
+    pub(crate) fn http_client(&self) -> PlatformResult<(Arc<ProxySnapshot>, Client)> {
+        let snapshot = self.network.current();
+        let client = snapshot
+            .config
+            .http_builder()
+            .map_err(|_| PlatformError::new(error_code::INTERNAL_ERROR, "目录代理配置无效"))?
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("package-client")
+            .build()
+            .map_err(|_| PlatformError::new(error_code::INTERNAL_ERROR, "目录客户端初始化失败"))?;
+        Ok((snapshot, client))
     }
 
     /// 刷新锁同时合并并发请求，普通检查和手动刷新分别执行契约最小间隔。
@@ -169,8 +180,8 @@ impl CatalogClient {
             "https://raw.githubusercontent.com/{}/main/catalog.json",
             self.repository
         );
-        let response = self
-            .client
+        let (_snapshot, client) = self.http_client()?;
+        let response = client
             .get(url)
             .timeout(Duration::from_secs(CATALOG_TIMEOUT_SECONDS))
             .send()
@@ -324,8 +335,9 @@ impl CatalogClient {
         let mut url = Url::parse(&artifact.url)
             .map_err(|_| PlatformError::new(error_code::INVALID_CATALOG, "包地址格式无效"))?;
         validate_redirect(&url, false)?;
+        let (_snapshot, client) = self.http_client()?;
         for hops in 0..=MAX_DOWNLOAD_REDIRECTS {
-            let response = self.client.get(url.clone()).send().await.map_err(|_| {
+            let response = client.get(url.clone()).send().await.map_err(|_| {
                 PlatformError::new(error_code::UPSTREAM_UNAVAILABLE, "包下载连接失败")
             })?;
             if response.status().is_redirection() {
