@@ -516,10 +516,52 @@ async fn linux_static_packages_end_to_end() {
 #[ignore = "仅供独立 Linux 容器中的真实影视浏览器回归，必须显式提供静态页面和已核验应用包"]
 async fn linux_cinema_library_browser() {
     let _isolation = super::linux_acceptance_tests::RealIsolation::new();
-    let (_data, platform, _) = super::tests::fixture().await;
+    let (_data, original, fake) = super::tests::fixture().await;
+    let upgrade = std::env::var_os("TGDRIVE_TEST_CINEMA_UPGRADE");
+    let platform = if upgrade.is_some() {
+        Arc::new(AppPlatform::with_repository(
+            original.host.clone(),
+            "example/apps".into(),
+        ))
+    } else {
+        original
+    };
     let movie = platform.host.vfs.db.mkdir(1, "电影").await.unwrap();
     let series = platform.host.vfs.db.mkdir(1, "电视剧").await.unwrap();
     platform.host.vfs.db.mkdir(1, "私人文件").await.unwrap();
+    if upgrade.is_some() {
+        let video = _data.path().join("synthetic.mp4");
+        let status = std::process::Command::new("/usr/local/bin/ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=64x64:r=25",
+                "-t",
+                "4",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success(), "必须生成真实可探测的合成 MP4");
+        super::tests::file(
+            &platform,
+            &fake,
+            movie.id,
+            "合成影片.mp4",
+            &std::fs::read(video).unwrap(),
+        )
+        .await;
+    }
     let package = std::env::var_os("TGDRIVE_TEST_CINEMA_PACKAGE").unwrap();
     let staged = _data.path().join("cinema-input.tgapp");
     std::fs::copy(package, &staged).unwrap();
@@ -540,6 +582,54 @@ async fn linux_cinema_library_browser() {
         .unwrap();
     assert_eq!(installed.manifest.id, "cinema");
     assert_eq!(installed.scope.scope, DirectoryScope::None);
+    let first_run = platform.backends.ensure(&platform, "cinema").await.unwrap();
+    let mut upgrade_version = None;
+    if let Some(package) = upgrade {
+        let staged = _data.path().join("cinema-upgrade-input.tgapp");
+        std::fs::copy(package, &staged).unwrap();
+        let receipt = platform.upload_package(&staged).await.unwrap();
+        assert_eq!(receipt.manifest.id, installed.manifest.id);
+        assert_eq!(receipt.package.target, installed.package.target);
+        assert!(
+            tgdrive_contract::validation::stable_version(&receipt.manifest.version)
+                > tgdrive_contract::validation::stable_version(&installed.manifest.version)
+        );
+        upgrade_version = Some(receipt.manifest.version.clone());
+        let target = receipt.package.target.as_str();
+        let artifact = serde_json::json!({
+            "url": tgdrive_contract::validation::package_release_url(
+                &platform.repository, "cinema", &receipt.manifest.version, target
+            ),
+            "sha256": receipt.package.sha256, "size": receipt.package.size
+        });
+        let mut packages = std::collections::BTreeMap::from([(target, artifact)]);
+        // 契约要求目录声明双架构；另一架构只构造合成绑定，本测试只下载和执行本机的真实包。
+        for other in ["linux-amd64", "linux-arm64"] {
+            if other != target {
+                packages.insert(
+                    other,
+                    serde_json::json!({
+                        "url": tgdrive_contract::validation::package_release_url(
+                            &platform.repository, "cinema", &receipt.manifest.version, other
+                        ),
+                        "sha256": "a".repeat(64), "size": "100"
+                    }),
+                );
+            }
+        }
+        let raw = serde_json::to_string(&serde_json::json!({
+            "format": tgdrive_contract::CATALOG_FORMAT, "repository": platform.repository,
+            "entries": [{"manifest": receipt.manifest, "packages": packages}]
+        }))
+        .unwrap();
+        platform
+            .catalog()
+            .await
+            .unwrap()
+            .synthetic_snapshot(&raw)
+            .await
+            .unwrap();
+    }
     let static_directory = std::env::var_os("TGDRIVE_TEST_STATIC_DIR").unwrap();
     let router = crate::http_router_with_platform(
         platform.host.clone(),
@@ -556,7 +646,14 @@ async fn linux_cinema_library_browser() {
         .unwrap();
     });
     let ready = std::env::var_os("TGDRIVE_TEST_BROWSER_READY").unwrap();
-    std::fs::write(ready, b"ready\n").unwrap();
+    std::fs::write(
+        ready,
+        serde_json::to_vec(&serde_json::json!({
+            "initial_version": installed.manifest.version, "upgrade_version": upgrade_version
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let done = std::env::var_os("TGDRIVE_TEST_BROWSER_DONE").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(240), async {
         while !Path::new(&done).exists() {
@@ -576,6 +673,17 @@ async fn linux_cinema_library_browser() {
         }));
     }
     let run = platform.backends.run("cinema").unwrap();
+    if let Some(version) = upgrade_version {
+        let current = platform.installed("cinema").await.unwrap();
+        assert_eq!(current.manifest.version, version);
+        assert_ne!(current.generation, installed.generation);
+        assert!(current.pinned);
+        assert!(first_run.finished.is_cancelled());
+        super::linux_acceptance_tests::gone(first_run.pid).await;
+        println!(
+            "浏览器升级回归：旧版建立媒体库与观看记录后，一键安装同架构新包；旧后端已回收，授权、固定状态和用户数据保留"
+        );
+    }
     platform.shutdown().await.unwrap();
     super::linux_acceptance_tests::gone(run.pid).await;
     platform.host.restore.shutdown.cancel();

@@ -162,3 +162,53 @@ test('主人确认具体目录、查看占用并从文件打开应用', async ({
   expect(await opened.locator('body').getAttribute('data-opened')).toBe('2')
   await page.screenshot({ path: '/tmp/tgdrive-app-owner-internal.png', fullPage: true })
 })
+
+test('应用中心一键刷新更新、单项失败继续和重试保留逐项结果', async ({ page }, testInfo) => {
+  await mock(page)
+  let apps: InstalledApp[] = ['browser-page', 'second-page'].map((id, index) => ({
+    manifest: { ...manifest, id, name: index ? '第二个应用' : '第一个应用' }, generation: `generation-${id}`, state_revision: `state-${id}`,
+    enabled: index === 0, pinned: index === 0, scope: { revision: `scope-${id}`, scope: { mode: 'all', access: 'read_only' }, roots: [] },
+    package: { target: 'web', sha256: sha, size: '100' }, backend: null, installed_at: 1, updated_at: 1,
+  }))
+  let refreshed = false, failFirst = true
+  const previewSources: Array<{ app_id: string; version: string; target: string; sha256: string }> = []
+  const latest = apps.map(app => ({ manifest: { ...app.manifest, version: '1.0.1' }, packages: { web: { url: `https://github.com/test/apps/releases/download/${app.manifest.id}-v1.0.1/${app.manifest.id}-1.0.1-web.tgapp`, sha256: 'b'.repeat(64), size: '200' } } }))
+  await page.route(`**${APP_CENTER_BASE}/**`, async route => {
+    const path = new URL(route.request().url()).pathname
+    if (path === `${APP_CENTER_BASE}/apps`) return route.fulfill({ json: { apps, root_app: { app_id: null, revision: 'root-1' } } })
+    if (path === `${APP_CENTER_BASE}/catalog` || path === `${APP_CENTER_BASE}/catalog/refresh`) {
+      if (route.request().method() === 'POST') refreshed = true
+      return route.fulfill({ json: { status: { state: 'ready', repository: 'test/apps', last_success_at: 1, error: null }, result: { catalog: { format: CONTRACT_VERSION, repository: 'test/apps', entries: refreshed ? latest : [] }, incompatible: [] } } })
+    }
+    if (path === `${APP_CENTER_BASE}/install/preview`) {
+      const { source } = route.request().postDataJSON()
+      previewSources.push(source)
+      const app = apps.find(app => app.manifest.id === source.app_id)!
+      return route.fulfill({ json: { preview_id: app.manifest.id, expires_at: Date.now() + 600000, manifest: { ...app.manifest, version: source.version }, package: { target: source.target, sha256: source.sha256, size: '200' }, previous_state_revision: app.state_revision, added_file_read: false, added_file_write: false, starts_backend: false, external_network: false } })
+    }
+    if (path === `${APP_CENTER_BASE}/install`) {
+      const { preview_id } = route.request().postDataJSON()
+      if (preview_id === 'browser-page' && failFirst) { failFirst = false; return route.fulfill({ status: 503, json: { error: { code: 'upstream_unavailable', message: '测试包下载中断', request_id: 'request' } } }) }
+      const app = apps.find(app => app.manifest.id === preview_id)!
+      const updated: InstalledApp = { ...app, manifest: { ...app.manifest, version: '1.0.1' }, generation: `updated-${preview_id}`, state_revision: `updated-state-${preview_id}`, package: { target: 'web', sha256: 'b'.repeat(64), size: '200' } }
+      apps = apps.map(app => app.manifest.id === preview_id ? updated : app)
+      return route.fulfill({ json: updated })
+    }
+    return route.fallback()
+  })
+  await page.goto('/admin/apps')
+  await page.getByRole('button', { name: '一键更新', exact: true }).click()
+  const results = page.locator('.update-results li')
+  await expect(results).toHaveCount(2)
+  await expect(results.nth(0)).toContainText('测试包下载中断')
+  await expect(results.nth(1)).toContainText('更新完成')
+  expect(previewSources.map(source => [source.app_id, source.version, source.target])).toEqual([['browser-page', '1.0.1', 'web'], ['second-page', '1.0.1', 'web']])
+  await page.getByRole('button', { name: '重试更新', exact: true }).click()
+  await expect(results).toHaveCount(2)
+  await expect(results.filter({ hasText: '更新完成' })).toHaveCount(2)
+  expect(previewSources.map(source => source.app_id)).toEqual(['browser-page', 'second-page', 'browser-page'])
+  expect(apps[0].pinned).toBe(true)
+  expect(apps[1].enabled).toBe(false)
+  expect(apps.every(app => app.scope.scope.mode === 'all')).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('updated-apps.png'), fullPage: true })
+})
