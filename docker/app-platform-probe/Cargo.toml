@@ -1,0 +1,15 @@
+[package]
+name = "tgdrive-isolation-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tgdrive-backend-sdk = { path = "../../../tgdrive-app/backend-sdk" }
+tgdrive-contract = { path = "../../../tgdrive-app/contract" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+libc = "0.2"
+libsqlite3-sys = { version = "0.37.0", features = ["bundled"] }
+
+[workspace]

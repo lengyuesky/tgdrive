@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "vue": ["./node_modules/vue"],
+      "vue-router": ["./node_modules/vue-router"],
+      "element-plus": ["./node_modules/element-plus"],
+      "@element-plus/icons-vue": ["./node_modules/@element-plus/icons-vue"],
+      "vitest": ["./node_modules/vitest"]
+    },
+    "strict": true,
+    "jsx": "preserve",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.vue"]
+}

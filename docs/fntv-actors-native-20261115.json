@@ -1,0 +1,125 @@
+{
+  "fixture": "tgdrive-fntv-native",
+  "synthetic": true,
+  "host_version": "0.3.12",
+  "client": "com.trim.media.ios",
+  "client_version": "1.12.3 (1123003)",
+  "requests": [
+    {
+      "at": 1794673870,
+      "items": null,
+      "method": "POST",
+      "path": "/v/api/v1/person/list/24e852c76ba6c134d519e7580d299128",
+      "sort": null,
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    },
+    {
+      "at": 1794673870,
+      "items": null,
+      "method": "GET",
+      "path": "/v/api/v1/sys/img/tgdrive-person/fac7f3097805db6af434e043721d45dd",
+      "sort": null,
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    },
+    {
+      "at": 1794673891,
+      "items": null,
+      "method": "GET",
+      "path": "/v/api/v1/person/a1893a93a33951dfb7db2c5c3ed6d4b0",
+      "sort": null,
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    },
+    {
+      "at": 1794673891,
+      "items": [],
+      "method": "POST",
+      "path": "/v/api/v1/person/item/list",
+      "sort": {
+        "job": "Director",
+        "page": 1,
+        "page_size": 200,
+        "person_guid": "a1893a93a33951dfb7db2c5c3ed6d4b0",
+        "sort_column": "update_time",
+        "sort_type": "desc"
+      },
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    },
+    {
+      "at": 1794673891,
+      "items": [
+        {
+          "create_time": 1700345600000,
+          "guid": "1b1a8225514a69ef05149ded10f4d960",
+          "title": "合成演员剧"
+        },
+        {
+          "create_time": 1700172800000,
+          "guid": "8e2cd2aac7551b9ce0380bd9d811cb25",
+          "title": "演员验证第二部"
+        },
+        {
+          "create_time": 1700086400000,
+          "guid": "24e852c76ba6c134d519e7580d299128",
+          "title": "演员验证第一部"
+        }
+      ],
+      "method": "POST",
+      "path": "/v/api/v1/person/item/list",
+      "sort": {
+        "job": "Actor",
+        "page": 1,
+        "page_size": 200,
+        "person_guid": "a1893a93a33951dfb7db2c5c3ed6d4b0",
+        "sort_column": "update_time",
+        "sort_type": "desc"
+      },
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    },
+    {
+      "at": 1794673891,
+      "items": [],
+      "method": "POST",
+      "path": "/v/api/v1/person/item/list",
+      "sort": {
+        "job": "Producer",
+        "page": 1,
+        "page_size": 200,
+        "person_guid": "a1893a93a33951dfb7db2c5c3ed6d4b0",
+        "sort_column": "update_time",
+        "sort_type": "desc"
+      },
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    },
+    {
+      "at": 1794673891,
+      "items": [],
+      "method": "POST",
+      "path": "/v/api/v1/person/item/list",
+      "sort": {
+        "job": "Screenplay",
+        "page": 1,
+        "page_size": 200,
+        "person_guid": "a1893a93a33951dfb7db2c5c3ed6d4b0",
+        "sort_column": "update_time",
+        "sort_type": "desc"
+      },
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    },
+    {
+      "at": 1794673891,
+      "items": null,
+      "method": "GET",
+      "path": "/v/api/v1/sys/img/tgdrive-person/fac7f3097805db6af434e043721d45dd",
+      "sort": null,
+      "status": 200,
+      "user_agent": "1.12.3 (com.trim.media.ios; build:1123003; iOS 27.2) Flutter/3.11.5"
+    }
+  ]
+}

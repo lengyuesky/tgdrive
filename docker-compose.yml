@@ -1,0 +1,52 @@
+services:
+  tgdrive:
+    # 默认使用发布镜像；本地构建用 docker compose build tgdrive。
+    image: ${TGDRIVE_IMAGE:-ghcr.io/lengyuesky/tgdrive:latest}
+    build:
+      context: .
+      additional_contexts:
+        tgdrive-app: ../tgdrive-app
+    # 宿主以 root 管理应用身份，应用进程由宿主单独降权。
+    user: "0:0"
+    init: true
+    restart: unless-stopped
+    ports:
+      # 宿主界面位于 http://localhost:3358/admin/；健康检查使用二进制的 /admin/healthz 探针。
+      - "3358:8080"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/data
+      # local 模式下直读 telegram-bot-api 的文件;官方 API 模式挂着也无害
+      # 重要:挂载路径必须与 telegram-bot-api 容器内一致(getFile 返回绝对路径)
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+      - ./bot-api-control:/bot-api-control
+    environment:
+      TGDRIVE_BOT_API_RESTART_FILE: /bot-api-control/restart
+      TGDRIVE_BOT_API_PROXY_LISTEN: 0.0.0.0:1082
+      TGDRIVE_BOT_API_PROXY_CONFIG: /bot-api-control/proxychains.conf
+
+  # 自部署 Bot API 服务器,仅在启用 local-bot-api profile 时启动。
+  # 需要在 .env 里配置 TELEGRAM_API_ID / TELEGRAM_API_HASH(https://my.telegram.org 申请);
+  # 启动命令:docker compose --profile local-bot-api up -d
+  telegram-bot-api:
+    profiles: ["local-bot-api"]
+    depends_on:
+      tgdrive:
+        condition: service_started
+    image: ${TGDRIVE_BOT_API_IMAGE:-ghcr.io/lengyuesky/tgdrive-telegram-bot-api:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.telegram-bot-api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      # local 模式:上传上限 2000MB,getFile 返回本地路径,tgdrive 经共享卷直读
+      TELEGRAM_LOCAL: "1"
+      TGDRIVE_BOT_API_RESTART_FILE: /bot-api-control/restart
+      TGDRIVE_BOT_API_PROXY_CONFIG: /bot-api-control/proxychains.conf
+    volumes:
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api
+      - ./bot-api-control:/bot-api-control

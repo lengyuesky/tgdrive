@@ -1,0 +1,13 @@
+# 验收只使用本机镜像；首次构建从 Rust 官方源补齐工具，不连接 Telegram/GitHub。
+ARG RUNTIME_IMAGE=tgdrive-stage2-local:latest
+ARG BUILDER_IMAGE=app-native-builder:arm64
+FROM ${RUNTIME_IMAGE} AS runtime
+FROM ${BUILDER_IMAGE}
+USER 0:0
+RUN rustup component add rustfmt clippy
+COPY --from=runtime /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=runtime /usr/local/bin/ffprobe /usr/local/bin/ffprobe
+COPY --from=runtime /usr/lib/ /usr/lib/
+ENV RUSTFLAGS="" CC=cc AR=ar
+WORKDIR /work/tgdrive
+ENTRYPOINT ["/bin/sh"]

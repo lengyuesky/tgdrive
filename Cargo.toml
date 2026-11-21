@@ -1,0 +1,77 @@
+[package]
+name = "tgdrive"
+version = "0.3.14"
+edition = "2024"
+
+[dependencies]
+age = "0.12.1"
+anyhow = "1.0.104"
+argon2 = "0.6"
+async-trait = "0.1.92"
+axum = { version = "0.8.9", features = ["multipart"] }
+base64 = "0.23.1"
+bytes = "1.12.1"
+crc32fast = "1.5.5"
+flate2 = "1.1.9"
+libc = "0.2.191"
+data-encoding = "2"
+dav-server = "0.11.0"
+dotenvy = "0.15.7"
+futures-util = "0.3.34"
+grammers-client = { version = "0.10.0", default-features = false }
+grammers-mtsender = "0.10.0"
+grammers-session = { version = "0.10.0", default-features = false, features = ["serde"] }
+grammers-tl-types = "0.10.0"
+hmac = "0.13.0"
+http = "1.5.0"
+http-body = "1"
+http-body-util = "0.1.4"
+hyper = { version = "1.11", default-features = false, features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+libsqlite3-sys = "0.37.0"
+tar = "0.4"
+mime_guess = "2.0.5"
+percent-encoding = "2.3.2"
+pin-project-lite = "0.2.17"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+rand = "0.10.2"
+reqwest = { version = "0.13.4", features = ["json", "multipart", "query", "socks", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha1 = "0.11"
+sha2 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2.6.1"
+tempfile = "3.27.0"
+tgdrive-contract = { path = "../tgdrive-app/contract" }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+# 主站静态资源测试生成真实压缩变体，不进入宿主的直接运行依赖。
+brotli = "8.0.4"
+tgdrive-backend-sdk = { path = "../tgdrive-app/backend-sdk" }
+
+[profile.release]
+# 单二进制服务：瘦 LTO 与去符号换更小的镜像，编译时间增加有限。
+lto = "thin"
+strip = true
+
+# argon2 / scrypt 在未优化构建下慢一两个数量级，测试里的登录与备份加密会被拖慢。
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3

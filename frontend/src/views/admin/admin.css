@@ -1,0 +1,886 @@
+/* 系统设置页样式：原 Admin.vue 的 scoped 样式，改用 .admin-page / .admin-panel 前缀限定，
+ * 优先级与 scoped 属性选择器相同，分区子组件共用。 */
+.page.admin-page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 16px 20px 96px;
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+:is(.admin-page, .admin-panel) .topbar {
+  position: sticky;
+  top: 12px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  margin-bottom: 14px;
+  border-radius: 16px;
+}
+:is(.admin-page, .admin-panel) .brand {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+}
+:is(.admin-page, .admin-panel) .ver {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+:is(.admin-page, .admin-panel) .spacer {
+  flex: 1;
+}
+:is(.admin-page, .admin-panel) .muted {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+/* ---- 分区导航 ---- */
+:is(.admin-page, .admin-panel) .layout {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+:is(.admin-page, .admin-panel) .nav {
+  width: 236px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  padding: 8px;
+  border-radius: 16px;
+  position: sticky;
+  top: 76px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+:is(.admin-page, .admin-panel) .nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+:is(.admin-page, .admin-panel) .nav-item:hover {
+  background: var(--tile-bg-hover);
+}
+:is(.admin-page, .admin-panel) .nav-item.on {
+  background: linear-gradient(120deg, rgba(99, 102, 241, 0.18), rgba(14, 165, 233, 0.14));
+  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.3);
+}
+:is(.admin-page, .admin-panel) .nav-ico {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  font-size: 15px;
+  color: var(--text-soft);
+  background: var(--tile-bg);
+  border: 1px solid var(--glass-border);
+}
+:is(.admin-page, .admin-panel) .nav-item.on .nav-ico {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+  box-shadow: 0 4px 10px rgba(99, 102, 241, 0.35);
+}
+:is(.admin-page, .admin-panel) .nav-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+:is(.admin-page, .admin-panel) .nav-label {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+:is(.admin-page, .admin-panel) .nav-desc {
+  font-size: 11px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+:is(.admin-page, .admin-panel) .nav-tail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+:is(.admin-page, .admin-panel) .nav-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--el-color-primary);
+  box-shadow: 0 0 6px rgba(64, 158, 255, 0.85);
+}
+:is(.admin-page, .admin-panel) .nav-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+:is(.admin-page, .admin-panel) .nav-badge.danger {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.16);
+}
+:is(.admin-page, .admin-panel) .nav-badge.warn {
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.18);
+}
+
+/* ---- 内容面板 ---- */
+:is(.admin-page, .admin-panel) .pane {
+  flex: 1;
+  min-width: 0;
+  border-radius: 16px;
+  padding: 16px 18px 20px;
+}
+:is(.admin-page, .admin-panel) .pane-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--glass-border);
+}
+:is(.admin-page, .admin-panel) .pane-ico {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  font-size: 19px;
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+  box-shadow: 0 6px 16px rgba(99, 102, 241, 0.32);
+}
+:is(.admin-page, .admin-panel) .pane-title h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+}
+:is(.admin-page, .admin-panel) .pane-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .pane-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+:is(.admin-page, .admin-panel) .pane-enter-active,
+:is(.admin-page, .admin-panel) .pane-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+:is(.admin-page, .admin-panel) .pane-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+:is(.admin-page, .admin-panel) .pane-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+/* ---- 通用块 ---- */
+:is(.admin-page, .admin-panel) .fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+:is(.admin-page, .admin-panel) .ctl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+:is(.admin-page, .admin-panel) .ctl-row .el-input {
+  flex: 1;
+  min-width: 0;
+}
+:is(.admin-page, .admin-panel) .ctl-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+:is(.admin-page, .admin-panel) .row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+:is(.admin-page, .admin-panel) .block {
+  margin-top: 18px;
+}
+:is(.admin-page, .admin-panel) .block-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13.5px;
+  font-weight: 700;
+}
+:is(.admin-page, .admin-panel) .tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+:is(.admin-page, .admin-panel) .log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+:is(.admin-page, .admin-panel) .queue-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+:is(.admin-page, .admin-panel) .queue-card {
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+  background: var(--tile-bg);
+  padding: 14px 16px;
+}
+:is(.admin-page, .admin-panel) .migration-card {
+  margin-bottom: 14px;
+}
+:is(.admin-page, .admin-panel) .migration-sources {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+:is(.admin-page, .admin-panel) .migration-sources > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.7fr) minmax(190px, 1.5fr) minmax(90px, 0.5fr);
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  background: var(--tile-bg-hover);
+  color: var(--text-soft);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+:is(.admin-page, .admin-panel) .queue-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+:is(.admin-page, .admin-panel) .queue-ico {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+}
+:is(.admin-page, .admin-panel) .queue-title {
+  flex: 1;
+  min-width: 0;
+}
+:is(.admin-page, .admin-panel) .queue-title b {
+  display: block;
+  font-size: 14px;
+  font-weight: 700;
+}
+:is(.admin-page, .admin-panel) .queue-title em {
+  display: block;
+  margin-top: 2px;
+  font-style: normal;
+  font-size: 12px;
+  color: var(--text-soft);
+  line-height: 1.55;
+}
+:is(.admin-page, .admin-panel) .queue-stats {
+  display: flex;
+  gap: 10px;
+  margin: 12px 0 0;
+}
+:is(.admin-page, .admin-panel) .queue-stat {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--tile-bg-hover);
+  text-align: center;
+}
+:is(.admin-page, .admin-panel) .queue-stat b {
+  display: block;
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+:is(.admin-page, .admin-panel) .queue-stat b.warn {
+  color: var(--el-color-warning);
+}
+:is(.admin-page, .admin-panel) .queue-stat em {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .queue-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border-left: 3px solid var(--el-color-danger);
+  background: var(--tile-bg-hover);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+:is(.admin-page, .admin-panel) .queue-result {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .queue-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+:is(.admin-page, .admin-panel) .queue-hint,
+:is(.admin-page, .admin-panel) .queue-dirty {
+  flex: 1;
+  min-width: 160px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+:is(.admin-page, .admin-panel) .queue-dirty {
+  color: var(--el-color-warning);
+  font-weight: 600;
+}
+:is(.admin-page, .admin-panel) .link {
+  color: var(--el-color-primary);
+  cursor: pointer;
+}
+:is(.admin-page, .admin-panel) .log-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+:is(.admin-page, .admin-panel) .log-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+:is(.admin-page, .admin-panel) .log-filter-sel {
+  width: 150px;
+}
+:is(.admin-page, .admin-panel) .log-filter-kw {
+  width: 240px;
+}
+:is(.admin-page, .admin-panel) .log-count {
+  margin-left: auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+:is(.admin-page, .admin-panel) .log-list {
+  max-height: min(62vh, 640px);
+  overflow-y: auto;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+}
+:is(.admin-page, .admin-panel) .log-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--glass-border);
+  border-left: 3px solid transparent;
+}
+:is(.admin-page, .admin-panel) .log-item:last-child {
+  border-bottom: none;
+}
+:is(.admin-page, .admin-panel) .log-item.warn {
+  border-left-color: var(--el-color-warning);
+}
+:is(.admin-page, .admin-panel) .log-item.error {
+  border-left-color: var(--el-color-danger);
+}
+:is(.admin-page, .admin-panel) .log-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .log-cat {
+  font-weight: 600;
+}
+:is(.admin-page, .admin-panel) .log-time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+:is(.admin-page, .admin-panel) .log-msg {
+  font-size: 13px;
+  line-height: 1.6;
+  /* 后台事件常带完整报错,必须整段折行,不能省略号截断 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+:is(.admin-page, .admin-panel) .log-more {
+  display: flex;
+  justify-content: center;
+  margin-top: 12px;
+}
+:is(.admin-page, .admin-panel) .note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 14px;
+  margin-bottom: 14px;
+  border: 1px solid var(--glass-border);
+  border-left: 3px solid var(--el-color-primary);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .note > .el-icon {
+  flex-shrink: 0;
+  margin-top: 3px;
+  font-size: 15px;
+  color: var(--el-color-primary);
+}
+:is(.admin-page, .admin-panel) .note > .el-button {
+  flex-shrink: 0;
+  align-self: center;
+  margin-left: auto;
+}
+:is(.admin-page, .admin-panel) .note.warn {
+  border-left-color: #f59e0b;
+}
+:is(.admin-page, .admin-panel) .note.warn > .el-icon {
+  color: #f59e0b;
+}
+:is(.admin-page, .admin-panel) .note code,
+:is(.admin-page, .admin-panel) .block code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--tile-media-bg);
+  word-break: break-all;
+}
+:is(.admin-page, .admin-panel) .setup-note {
+  align-items: center;
+}
+
+/* ---- 概览 ---- */
+:is(.admin-page, .admin-panel) .hero {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  border-radius: 14px;
+  border: 1px solid var(--glass-border);
+  background: linear-gradient(120deg, rgba(99, 102, 241, 0.14), rgba(14, 165, 233, 0.1));
+}
+:is(.admin-page, .admin-panel) .hero-text {
+  min-width: 0;
+}
+:is(.admin-page, .admin-panel) .hero-title {
+  font-size: 16px;
+  font-weight: 700;
+}
+:is(.admin-page, .admin-panel) .hero-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .hero .el-button {
+  margin-left: auto;
+}
+:is(.admin-page, .admin-panel) .tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 10px;
+}
+:is(.admin-page, .admin-panel) .tile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  transition: background 0.16s ease, transform 0.16s ease;
+}
+:is(.admin-page, .admin-panel) .tile.clickable:hover {
+  background: var(--tile-bg-hover);
+  transform: translateY(-1px);
+}
+:is(.admin-page, .admin-panel) .tile-ico {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  font-size: 16px;
+  color: var(--el-color-primary);
+  background: rgba(99, 102, 241, 0.13);
+}
+:is(.admin-page, .admin-panel) .tile.warn .tile-ico {
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.18);
+}
+:is(.admin-page, .admin-panel) .tile-body {
+  min-width: 0;
+}
+:is(.admin-page, .admin-panel) .tile-val {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+:is(.admin-page, .admin-panel) .tile-label {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .quick {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
+  gap: 10px;
+}
+:is(.admin-page, .admin-panel) .quick-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+:is(.admin-page, .admin-panel) .quick-item:hover {
+  background: var(--tile-bg-hover);
+}
+:is(.admin-page, .admin-panel) .quick-item > .el-icon {
+  flex-shrink: 0;
+  font-size: 17px;
+  color: var(--el-color-primary);
+}
+:is(.admin-page, .admin-panel) .quick-item.danger > .el-icon {
+  color: var(--el-color-danger);
+}
+:is(.admin-page, .admin-panel) .quick-text {
+  min-width: 0;
+}
+:is(.admin-page, .admin-panel) .quick-text b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+}
+:is(.admin-page, .admin-panel) .quick-text em {
+  display: block;
+  margin-top: 1px;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+
+/* ---- 步骤条 ---- */
+:is(.admin-page, .admin-panel) .steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+:is(.admin-page, .admin-panel) .step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+  font-size: 13px;
+}
+:is(.admin-page, .admin-panel) .step > span {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--el-color-primary);
+}
+
+/* ---- 备份渠道 / 收件规则:内嵌的设置项去掉外框,避免套娃 ---- */
+:is(.admin-page, .admin-panel) .channels,
+:is(.admin-page, .admin-panel) .rules {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+:is(.admin-page, .admin-panel) .channel,
+:is(.admin-page, .admin-panel) .rule {
+  padding: 14px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--tile-bg);
+}
+:is(.admin-page, .admin-panel) .channel.on {
+  border-color: rgba(99, 102, 241, 0.32);
+}
+:is(.admin-page, .admin-panel) .channel-head,
+:is(.admin-page, .admin-panel) .rule-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+:is(.admin-page, .admin-panel) .channel-ico {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  font-size: 16px;
+  color: var(--text-soft);
+  background: var(--tile-media-bg);
+}
+:is(.admin-page, .admin-panel) .channel.on .channel-ico {
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1, #0ea5e9);
+}
+:is(.admin-page, .admin-panel) .channel-name {
+  min-width: 0;
+}
+:is(.admin-page, .admin-panel) .channel-name b {
+  display: block;
+  font-size: 13.5px;
+}
+:is(.admin-page, .admin-panel) .channel-name span {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .channel-head > .el-switch,
+:is(.admin-page, .admin-panel) .rule-head > .el-button {
+  margin-left: auto;
+}
+:is(.admin-page, .admin-panel) .channel-fields {
+  padding-top: 12px;
+  margin-top: 12px;
+  border-top: 1px solid var(--glass-border);
+  gap: 10px 14px;
+}
+:is(.admin-page, .admin-panel) .channel-fields .field {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+:is(.admin-page, .admin-panel) .ext-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+:is(.admin-page, .admin-panel) .rule-empty {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 14px;
+  border: 1px dashed var(--glass-border);
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+:is(.admin-page, .admin-panel) .rule-empty:hover {
+  border-color: var(--el-color-primary);
+  background: var(--tile-bg);
+}
+:is(.admin-page, .admin-panel) .rule-empty > .el-icon {
+  flex-shrink: 0;
+  font-size: 17px;
+  color: var(--el-color-primary);
+}
+
+/* ---- 只读项 ---- */
+:is(.admin-page, .admin-panel) .ro-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+:is(.admin-page, .admin-panel) .ro-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 11px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: var(--tile-bg);
+  font-size: 12.5px;
+}
+:is(.admin-page, .admin-panel) .ro-key {
+  color: var(--text-soft);
+}
+:is(.admin-page, .admin-panel) .ro-val {
+  font-weight: 600;
+  text-align: right;
+  word-break: break-all;
+}
+
+/* ---- 浮动保存条 ---- */
+:is(.admin-page, .admin-panel) .savebar {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  z-index: 40;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 9px 10px 9px 16px;
+  border-radius: 999px;
+}
+:is(.admin-page, .admin-panel) .savebar-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--el-color-primary);
+  box-shadow: 0 0 8px rgba(64, 158, 255, 0.9);
+}
+:is(.admin-page, .admin-panel) .savebar-text {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+:is(.admin-page, .admin-panel) .savebar-enter-active,
+:is(.admin-page, .admin-panel) .savebar-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+:is(.admin-page, .admin-panel) .savebar-enter-from,
+:is(.admin-page, .admin-panel) .savebar-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 18px);
+}
+:is(.admin-page, .admin-panel) .detect-foot {
+  margin-top: 8px;
+}
+
+@media (max-width: 1020px) {
+  :is(.admin-page, .admin-panel) .fields {
+    grid-template-columns: 1fr;
+  }
+  :is(.admin-page, .admin-panel) .log-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  /* 窄屏下下拉和搜索框各占一行,免得挤成一列看不清 */
+  :is(.admin-page, .admin-panel) .log-filter-sel,
+:is(.admin-page, .admin-panel) .log-filter-kw {
+    flex: 1 1 150px;
+    width: auto;
+  }
+  :is(.admin-page, .admin-panel) .log-count {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
+  :is(.admin-page, .admin-panel) .log-time {
+    margin-left: 0;
+  }
+  :is(.admin-page, .admin-panel) .migration-sources > div {
+    grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.2fr);
+  }
+  :is(.admin-page, .admin-panel) .migration-sources > div > span:last-child {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 900px) {
+  :is(.admin-page, .admin-panel) .layout {
+    flex-direction: column;
+  }
+  :is(.admin-page, .admin-panel) .nav {
+    position: static;
+    width: 100%;
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 6px;
+  }
+  :is(.admin-page, .admin-panel) .nav-item {
+    width: auto;
+    flex-shrink: 0;
+  }
+  :is(.admin-page, .admin-panel) .nav-desc {
+    display: none;
+  }
+  :is(.admin-page, .admin-panel) .pane {
+    width: 100%;
+    box-sizing: border-box;
+  }
+}
+@media (max-width: 560px) {
+  :is(.admin-page, .admin-panel) .migration-sources > div {
+    grid-template-columns: 1fr;
+  }
+  :is(.admin-page, .admin-panel) .migration-sources > div > span:last-child {
+    grid-column: auto;
+  }
+}
+@media (max-width: 767px) {
+  .page.admin-page { min-height: 0; padding: 12px 12px 100px; }
+  :is(.admin-page, .admin-panel) .topbar { gap: 6px; flex-wrap: wrap; padding: 8px; }
+  :is(.admin-page, .admin-panel) .layout { gap: 12px; }:is(.admin-page, .admin-panel) .pane { min-width: 0; padding: 16px; }
+  :is(.admin-page, .admin-panel) .nav { box-sizing: border-box; }:is(.admin-page, .admin-panel) .nav-item { min-height: 44px; }
+  :is(.admin-page, .admin-panel) .fields,
+:is(.admin-page, .admin-panel) .ro-grid { grid-template-columns: minmax(0, 1fr); }
+  :is(.admin-page, .admin-panel) .row,
+:is(.admin-page, .admin-panel) .ctl-row,
+:is(.admin-page, .admin-panel) .block-head { flex-wrap: wrap; }
+  :is(.admin-page, .admin-panel) .ctl-row > *,
+:is(.admin-page, .admin-panel) .fields > *,
+:is(.admin-page, .admin-panel) .ro-item { min-width: 0; max-width: 100%; box-sizing: border-box; }
+  :is(.admin-page, .admin-panel) .ro-val,
+:is(.admin-page, .admin-panel) code { overflow-wrap: anywhere; }
+  :is(.admin-page, .admin-panel) .savebar { bottom: calc(64px + var(--safe-bottom)); width: calc(100% - 24px - var(--safe-left) - var(--safe-right)); box-sizing: border-box; flex-wrap: wrap; justify-content: center; padding: 10px; gap: 8px; }
+  :is(.admin-page, .admin-panel) .savebar-text { min-width: 0; }:is(.admin-page, .admin-panel) .log-content { max-width: 100%; overflow: auto; }
+}
+.keyboard-open :is(.admin-page, .admin-panel) .savebar { bottom: calc(var(--app-height) - var(--visual-height) - var(--visual-top) + 8px); }
