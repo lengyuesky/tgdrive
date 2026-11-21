@@ -511,3 +511,76 @@ async fn linux_static_packages_end_to_end() {
     platform.host.restore.shutdown.cancel();
     platform.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "仅供独立 Linux 容器中的真实影视浏览器回归，必须显式提供静态页面和已核验应用包"]
+async fn linux_cinema_library_browser() {
+    let _isolation = super::linux_acceptance_tests::RealIsolation::new();
+    let (_data, platform, _) = super::tests::fixture().await;
+    let movie = platform.host.vfs.db.mkdir(1, "电影").await.unwrap();
+    let series = platform.host.vfs.db.mkdir(1, "电视剧").await.unwrap();
+    platform.host.vfs.db.mkdir(1, "私人文件").await.unwrap();
+    let package = std::env::var_os("TGDRIVE_TEST_CINEMA_PACKAGE").unwrap();
+    let staged = _data.path().join("cinema-input.tgapp");
+    std::fs::copy(package, &staged).unwrap();
+    let uploaded = platform.upload_package(&staged).await.unwrap();
+    let preview = platform
+        .preview(InstallPreviewRequest {
+            source: InstallSource::Uploaded {
+                package_id: uploaded.package_id,
+            },
+        })
+        .await
+        .unwrap();
+    let installed = platform
+        .install(InstallRequest {
+            preview_id: preview.preview_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(installed.manifest.id, "cinema");
+    assert_eq!(installed.scope.scope, DirectoryScope::None);
+    let static_directory = std::env::var_os("TGDRIVE_TEST_STATIC_DIR").unwrap();
+    let router = crate::http_router_with_platform(
+        platform.host.clone(),
+        Some(Path::new(&static_directory)),
+        platform.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let ready = std::env::var_os("TGDRIVE_TEST_BROWSER_READY").unwrap();
+    std::fs::write(ready, b"ready\n").unwrap();
+    let done = std::env::var_os("TGDRIVE_TEST_BROWSER_DONE").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(240), async {
+        while !Path::new(&done).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let scope = platform.app_scope("cinema").await.unwrap();
+    let DirectoryScope::Selected { directories } = scope.scope else {
+        panic!("浏览器添加媒体库后只能保留指定目录授权");
+    };
+    assert_eq!(directories.len(), 2);
+    for id in [movie.id, series.id] {
+        assert!(directories.iter().any(|grant| {
+            grant.directory_id == id.to_string() && grant.access == AccessLevel::ReadOnly
+        }));
+    }
+    let run = platform.backends.run("cinema").unwrap();
+    platform.shutdown().await.unwrap();
+    super::linux_acceptance_tests::gone(run.pid).await;
+    platform.host.restore.shutdown.cancel();
+    server.abort();
+    println!(
+        "浏览器回归：真实影视包、页面 SDK、宿主 HTTP/SQLite 和独立 UID 后端完成媒体库添加；只授权两个选定目录，未授权私人目录；进程已回收"
+    );
+}

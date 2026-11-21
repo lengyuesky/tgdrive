@@ -31,6 +31,8 @@ Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/
 
 平台提供沙箱页面、目录授权、文件查询/读取/条件写入、KV、缓存、媒体票据和本机读取。新装应用默认不授权，目录只读/读写级别必须由主人确认；声明写入不等于获得授权。带后端应用使用与容器架构一致的 Linux 静态 ELF 包。`resident` 随宿主启动，`on_demand` 首次页面代理或服务请求时启动；管理界面可查看状态、资源实际强制标记、日志和执行重启。页面请求经 `/admin/api/apps/v1/self/backend/` 转发，主人身份由宿主上下文确认，不接受外部请求冒用。
 
+应用先选择文件夹再请求授权时，宿主会在授权窗口预填刚选的目录并保留已有范围，确认后返回原应用。只提出授权请求时直接显示目录列表，无需先从“不授权”切换到“指定目录”。取消保持原有权限；工具栏显示实际已授权的文件夹数量。
+
 正式镜像仍只使用 Telegram 存储；自建 Bot API 的 local 文件是 Telegram 下载缓存，不是本地存储后端。仅测试构建中的合成文件替身不进入发布构建，见 [ADR-0013](adr/0013-local-files-only-in-tests.md)。
 
 ### 镜像构建与系统身份
@@ -128,6 +130,15 @@ node docker/test-app-platform.mjs --runtime-image tgdrive:local \
 
 - `apps::linux_acceptance_tests::linux_root_isolation`：真实生产 `internal-app-run`、`internal-app-backup` 辅助二进制与独立 UID 探针；检查文件/套接字/环境隔离、RLIMIT 的实际失败、禁用转储、停止/崩溃/卸载时子孙与僵尸回收、被取消的停止请求、1/2/4/8/16 秒退避及重启上限。探针包含忽略 SIGTERM、setsid、伪造进程名 Uid 行的子孙进程，不在测试中模拟降权。
 - `apps::linux_end_to_end_tests::linux_static_packages_end_to_end`：使用真实静态包，经 TCP HTTP 登录、原始 ZIP 上传、预览、安装、目录授权、页面 owner 代理、external 固定前缀/根入口、真实 204 直传指令、条件建目录、在线快照和停用/卸载回收；可选影视包另测安装、启动就绪与页面接口。示例只输出直传指令，因此轮次媒体票据额外用同一生产签发函数验证撤销，不宣称示例实现了票据接口。
+
+影视添加媒体库另有真实浏览器回归，使用构建后的管理页、已经核验的影视包、合成目录、真实宿主 HTTP/SQLite 和独立 UID 后端，不拦截接口响应、不连接 Telegram 或生产数据。端口只发布到 `127.0.0.1`，测试结束清理容器、独立测试网络和测试镜像。需要 Node.js 22.22.0、本机 Playwright Chromium 和上述本地 Linux 镜像。
+
+```bash
+npm --prefix frontend run build
+node docker/test-cinema-library.mjs --cinema /绝对路径/cinema-1.0.1-linux-arm64.tgapp
+```
+
+该入口显式执行 `apps::linux_end_to_end_tests::linux_cinema_library_browser`：验证首次选择、取消授权保留草稿、电影和电视剧两库保存、第二次授权保留第一库、只读范围不包含第三个私人目录、重开页面持久保留及后端回收。源码快照、截图和日志保存在新的输出目录。
 
 没有可写 cgroup 时验收明确报告内存/CPU 未强制，不把它写成实际硬限额通过；提供 `--cgroup-root` 后要求两个 enforced 都为 true，并验证内存 OOM kill 和 CPU 节流。测试的合成网盘文件位于 `#[cfg(test)]` 模块，探针为独立测试 workspace；发布镜像只运行普通 `cargo build --release --locked`，不启用任何本地存储替身或测试开关。
 
