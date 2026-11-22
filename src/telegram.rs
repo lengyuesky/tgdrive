@@ -2,7 +2,7 @@
 //!
 //! 端点可切换:官方 api.telegram.org 或自部署 telegram-bot-api。
 //! 自部署 --local 模式下，已知且仍存在的共享卷文件直接读盘；否则文档型文件
-//! 通过 MTProto 按 512 KiB 读取，避免 `getFile` 先拉取完整的大分块。
+//! 通过 MTProto 按需分段读取，避免 `getFile` 先拉取完整的大分块。
 
 use crate::db::StorageTarget;
 use crate::error::{AppError, AppResult};

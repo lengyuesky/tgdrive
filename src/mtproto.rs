@@ -1,8 +1,9 @@
 //! 通过 MTProto 按需读取 Telegram 文件。
 //!
 //! 本地 Bot API 的 `getFile` 会在返回路径前先下载完整文件，不适合浏览器 Range
-//! 播放。这里直接解析 Bot API `file_id`，并行请求 1~8 个 512 KiB 分段，
-//! 按顺序交给现有 `ChunkedReader`；有界预读随读取流一起释放。
+//! 播放。这里直接解析 Bot API `file_id` 的文件位置与数据中心，首段使用
+//! 64 KiB、后续逐步扩大到 512 KiB，按宿主并发设置读取并顺序输出。
+//! 有界预读随读取流一起释放。
 
 mod history;
 
@@ -17,7 +18,6 @@ use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use grammers_client::Client;
-use grammers_client::media::Downloadable;
 use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
 use grammers_session::types::{
     ChannelState, DcOption, PeerId, PeerInfo, UpdateState, UpdatesState,
@@ -28,12 +28,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddrV4;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::Semaphore;
 
-/// 当前 grammers 下载接口支持的最大分段；Telegram 协议本身可支持更大的请求。
+/// 连续读取的常规最大分段；首段与短 Range 使用更小的对齐窗口。
 pub(crate) const REQUEST_SIZE: i32 = 512 * 1024;
+/// 首段与短 Range 使用较小窗口，先交出字节，再恢复大块并行读取。
+const FIRST_REQUEST_SIZE: i32 = 64 * 1024;
 const SESSION_VERSION: u8 = 1;
 
 const WEB_LOCATION_FLAG: i32 = 1 << 24;
@@ -114,11 +116,124 @@ pub struct MtprotoClient {
 }
 
 struct ClientState {
+    session: Arc<PersistentSession>,
+    authorizations: DcAuthorizations,
     proxy: ProxyConfig,
     _snapshot: Arc<crate::proxy::ProxySnapshot>,
     client: Client,
     handle: SenderPoolFatHandle,
     runner_task: tokio::task::JoinHandle<()>,
+}
+
+type AuthorizationCell = Arc<tokio::sync::OnceCell<()>>;
+
+#[derive(Default)]
+struct DcAuthorizations {
+    cells: Mutex<HashMap<i32, AuthorizationCell>>,
+}
+
+struct AuthorizationAttempt {
+    cell: AuthorizationCell,
+    was_authorized: bool,
+}
+
+impl DcAuthorizations {
+    fn attempt(&self, dc: i32) -> AuthorizationAttempt {
+        let cell = self
+            .cells
+            .lock()
+            .unwrap()
+            .entry(dc)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
+        let was_authorized = cell.get().is_some();
+        AuthorizationAttempt {
+            cell,
+            was_authorized,
+        }
+    }
+
+    async fn refresh<F, Fut>(
+        &self,
+        dc: i32,
+        attempt: AuthorizationAttempt,
+        copy: F,
+    ) -> AppResult<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = AppResult<()>>,
+    {
+        let cell = {
+            let mut cells = self.cells.lock().unwrap();
+            let current = cells.entry(dc).or_insert_with(|| attempt.cell.clone());
+            // 只替换请求发出时已经完成的旧授权；较晚返回的同批失败共用新一轮授权。
+            if attempt.was_authorized && Arc::ptr_eq(current, &attempt.cell) {
+                *current = Arc::new(tokio::sync::OnceCell::new());
+            }
+            current.clone()
+        };
+        cell.get_or_try_init(copy).await?;
+        Ok(())
+    }
+}
+
+enum FilePartReply {
+    Bytes(Vec<u8>),
+    Migrate(i32),
+}
+
+impl ClientState {
+    async fn file_part(
+        &self,
+        dc: i32,
+        request: tl::functions::upload::GetFile,
+    ) -> AppResult<FilePartReply> {
+        let home_dc = self
+            .session
+            .home_dc_id()
+            .map_err(|error| mtproto_error("读取登录数据中心失败", error))?;
+        for retry in 0..2 {
+            let authorization = (dc != home_dc).then(|| self.authorizations.attempt(dc));
+            match self.client.invoke_in_dc(dc, &request).await {
+                Ok(tl::enums::upload::File::File(file)) => {
+                    return Ok(FilePartReply::Bytes(file.bytes));
+                }
+                Ok(tl::enums::upload::File::CdnRedirect(_)) => {
+                    return Err(AppError::Telegram(
+                        "未启用的 Telegram CDN 返回了文件重定向".into(),
+                    ));
+                }
+                Err(grammers_mtsender::InvocationError::Rpc(error))
+                    if error.name == "AUTH_KEY_UNREGISTERED"
+                        && retry == 0
+                        && authorization.is_some() =>
+                {
+                    self.authorizations.refresh(dc, authorization.expect("异地读取具有授权状态"), || async {
+                        let tl::enums::auth::ExportedAuthorization::Authorization(exported) = self.client
+                            .invoke(&tl::functions::auth::ExportAuthorization { dc_id: dc })
+                            .await.map_err(|error| mtproto_error("导出文件数据中心授权失败", error))?;
+                        self.client.invoke_in_dc(dc, &tl::functions::auth::ImportAuthorization {
+                            id: exported.id,
+                            bytes: exported.bytes,
+                        }).await.map_err(|error| mtproto_error("导入文件数据中心授权失败", error))?;
+                        Ok(())
+                    }).await?;
+                }
+                Err(grammers_mtsender::InvocationError::Rpc(error))
+                    if error.code == 303 && error.name == "FILE_MIGRATE" =>
+                {
+                    let dc = error
+                        .value
+                        .and_then(|dc| i32::try_from(dc).ok())
+                        .filter(|dc| *dc > 0)
+                        .ok_or_else(|| AppError::Telegram("文件数据中心重定向无效".into()))?;
+                    return Ok(FilePartReply::Migrate(dc));
+                }
+                Err(error) => return Err(mtproto_error("读取数据块失败", error)),
+            }
+        }
+        Err(AppError::Telegram("文件数据中心授权刷新未完成".into()))
+    }
 }
 
 impl Drop for ClientState {
@@ -158,9 +273,12 @@ impl MtprotoClient {
         let key = format!("mtproto.session.{}", self.storage_target_id);
         let mut session = PersistentSession::load(self.config.db.clone(), key).await?;
         session.proxy = snapshot.config.clone();
+        let session = Arc::new(session);
         let SenderPool { runner, handle, .. } =
-            SenderPool::new(Arc::new(session), self.config.api_id);
+            SenderPool::new(session.clone(), self.config.api_id);
         let state = Arc::new(ClientState {
+            session,
+            authorizations: DcAuthorizations::default(),
             proxy: snapshot.config.clone(),
             _snapshot: snapshot,
             client: Client::new(handle.clone()),
@@ -248,31 +366,29 @@ impl MtprotoClient {
             self.config.download_concurrency(),
             self.request_slots.clone(),
             budget.map(|budget| (budget, size)),
-            move |part_offset| {
+            move |part_offset, request_size| {
                 let state = state.clone();
                 let location = location.clone();
                 async move {
-                    let skip_chunks = i32::try_from(part_offset / REQUEST_SIZE as u64)
-                        .map_err(|_| AppError::Telegram("分块偏移过大".into()))?;
-                    let mut download = state
-                        .client
-                        .iter_download(location.as_ref())
-                        .chunk_size(REQUEST_SIZE)
-                        .skip_chunks(skip_chunks);
-                    download
-                        .next()
-                        .await
-                        .map_err(|error| {
-                            tracing::warn!(
-                                storage_target_id,
-                                message_id,
-                                part_offset,
-                                error = %error,
-                                "MTProto 分段读取中断"
-                            );
-                            mtproto_error("读取数据块失败", error)
-                        })
-                        .map(|bytes| bytes.unwrap_or_default())
+                    file_part_at_location(
+                        location,
+                        part_offset,
+                        request_size,
+                        move |dc, request| {
+                            let state = state.clone();
+                            async move { state.file_part(dc, request).await }
+                        },
+                    )
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            storage_target_id,
+                            message_id,
+                            part_offset,
+                            error = %error,
+                            "MTProto 分段读取中断"
+                        );
+                    })
                 }
             },
         )
@@ -281,7 +397,59 @@ impl MtprotoClient {
     }
 }
 
-/// 按需填充固定大小的请求窗口，乱序完成的数据仍按文件偏移输出。
+#[derive(Clone, Copy, Debug)]
+struct PartRequest {
+    offset: u64,
+    limit: i32,
+}
+
+struct PartRequests {
+    next: u64,
+    end: u64,
+    first: bool,
+}
+
+impl PartRequests {
+    fn new(offset: u64, end: u64) -> Self {
+        let first_size = FIRST_REQUEST_SIZE as u64;
+        Self {
+            next: offset / first_size * first_size,
+            end,
+            first: true,
+        }
+    }
+}
+
+impl Iterator for PartRequests {
+    type Item = PartRequest;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.end {
+            return None;
+        }
+        let maximum = REQUEST_SIZE as u64;
+        // Telegram 的请求大小和起点保持二次幂对齐，大小不会超过 512 KiB。
+        let alignment = 1u64 << self.next.trailing_zeros().min(maximum.trailing_zeros());
+        let wanted = (self.end - self.next)
+            .min(maximum)
+            .next_power_of_two()
+            .max(FIRST_REQUEST_SIZE as u64);
+        let limit = if self.first {
+            FIRST_REQUEST_SIZE as u64
+        } else {
+            wanted.min(alignment)
+        };
+        let request = PartRequest {
+            offset: self.next,
+            limit: limit as i32,
+        };
+        self.next = self.next.saturating_add(limit);
+        self.first = false;
+        Some(request)
+    }
+}
+
+/// 按需填充有界请求窗口，首段缩小、后续放大，乱序完成仍按文件偏移输出。
 /// 没有独立预取任务：暂停读取不再补充请求，丢弃 reader 同时丢弃全部待取分段。
 #[cfg(test)]
 async fn open_parallel_stream<F, Fut>(
@@ -292,7 +460,7 @@ async fn open_parallel_stream<F, Fut>(
     fetch: F,
 ) -> AppResult<ByteReader>
 where
-    F: Fn(u64) -> Fut + Send + Sync + 'static,
+    F: Fn(u64, i32) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = AppResult<Vec<u8>>> + Send + 'static,
 {
     open_parallel_stream_policy(end, offset, concurrency, request_slots, None, fetch).await
@@ -307,7 +475,7 @@ async fn open_parallel_stream_policy<F, Fut>(
     fetch: F,
 ) -> AppResult<ByteReader>
 where
-    F: Fn(u64) -> Fut + Send + Sync + 'static,
+    F: Fn(u64, i32) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = AppResult<Vec<u8>>> + Send + 'static,
 {
     if offset > end {
@@ -316,13 +484,10 @@ where
     if offset == end {
         return Ok(Box::pin(std::io::Cursor::new(Vec::<u8>::new())));
     }
-    let part_size = REQUEST_SIZE as u64;
-    let first_part = offset / part_size;
-    let part_count = end.div_ceil(part_size);
     let fetch = Arc::new(fetch);
     // 所有读取共用宿主下载并发和 Bot 请求槽；预算只限制累计上游字节。
-    let mut parts = stream::iter(first_part..part_count)
-        .map(move |index| {
+    let mut parts = stream::iter(PartRequests::new(offset, end))
+        .map(move |request| {
             let fetch = fetch.clone();
             let request_slots = request_slots.clone();
             let budget = budget.clone();
@@ -330,11 +495,15 @@ where
                 let _permit = request_slots.acquire_owned().await.map_err(|_| {
                     AppError::Telegram("下载并发控制已关闭".into())
                 })?;
-                let part_offset = index * part_size;
+                let part_offset = request.offset;
+                let part_size = request.limit as u64;
                 let expected = (end - part_offset).min(part_size) as usize;
                 let charge = budget.as_ref().map(|(_, size)| part_size.min(size.saturating_sub(part_offset)));
                 if let Some((budget, _)) = &budget { budget.reserve(charge.expect("有预算就有块长度"))?; }
-                let bytes = fetch(part_offset).await?;
+                let bytes = fetch(part_offset, request.limit).await?;
+                if bytes.len() as u64 > part_size {
+                    return Err(AppError::Telegram("上游块超过请求窗口".into()));
+                }
                 if let Some((budget, _)) = &budget {
                     let charge = charge.expect("有预算就有块长度");
                     if bytes.len() as u64 > charge {
@@ -378,18 +547,59 @@ fn mtproto_error(context: &str, error: impl std::fmt::Display) -> AppError {
 }
 
 struct FileLocation {
+    dc: AtomicI32,
     raw: tl::enums::InputFileLocation,
     size: usize,
 }
 
-impl Downloadable for FileLocation {
-    fn to_raw_input_location(&self) -> Option<tl::enums::InputFileLocation> {
-        Some(self.raw.clone())
+impl FileLocation {
+    fn request(&self, offset: u64, limit: i32) -> AppResult<tl::functions::upload::GetFile> {
+        if offset >= self.size as u64
+            || !(4096..=REQUEST_SIZE).contains(&limit)
+            || !(limit as u32).is_power_of_two()
+            || !offset.is_multiple_of(limit as u64)
+        {
+            return Err(AppError::Telegram("Telegram 分段请求边界无效".into()));
+        }
+        Ok(tl::functions::upload::GetFile {
+            precise: true,
+            cdn_supported: false,
+            location: self.raw.clone(),
+            offset: i64::try_from(offset).map_err(|_| AppError::Telegram("分块偏移过大".into()))?,
+            limit,
+        })
     }
+}
 
-    fn size(&self) -> Option<usize> {
-        Some(self.size)
+async fn file_part_at_location<F, Fut>(
+    location: Arc<FileLocation>,
+    offset: u64,
+    limit: i32,
+    fetch: F,
+) -> AppResult<Vec<u8>>
+where
+    F: Fn(i32, tl::functions::upload::GetFile) -> Fut,
+    Fut: Future<Output = AppResult<FilePartReply>>,
+{
+    let request = location.request(offset, limit)?;
+    // 直接使用 file_id 的文件数据中心，不为每个分段重复访问登录数据中心。
+    for _ in 0..3 {
+        let dc = location.dc.load(Ordering::Acquire);
+        match fetch(dc, request.clone()).await? {
+            FilePartReply::Bytes(bytes) => return Ok(bytes),
+            FilePartReply::Migrate(next) if next > 0 && next != dc => {
+                let _ = location
+                    .dc
+                    .compare_exchange(dc, next, Ordering::AcqRel, Ordering::Acquire);
+            }
+            FilePartReply::Migrate(_) => {
+                return Err(AppError::Telegram("文件数据中心重定向未推进".into()));
+            }
+        }
     }
+    Err(AppError::Telegram(
+        "文件数据中心多次重定向，已停止当前读取".into(),
+    ))
 }
 
 fn decode_document(file_id: &str, size: u64) -> AppResult<Option<FileLocation>> {
@@ -400,7 +610,7 @@ fn decode_document(file_id: &str, size: u64) -> AppResult<Option<FileLocation>> 
     let decoded = zero_rle_decode(&packed)?;
     let mut pos = 0usize;
     let raw_type = read_i32(&decoded, &mut pos)?;
-    let _dc_id = read_i32(&decoded, &mut pos)?;
+    let dc_id = read_i32(&decoded, &mut pos)?;
 
     if raw_type & WEB_LOCATION_FLAG != 0 {
         return Ok(None);
@@ -409,6 +619,9 @@ fn decode_document(file_id: &str, size: u64) -> AppResult<Option<FileLocation>> 
     // Bot API 的语音、视频、文档、贴纸、音频、动画及视频便笺都使用 document location。
     if !matches!(file_type, 3 | 4 | 5 | 8 | 9 | 10 | 14) {
         return Ok(None);
+    }
+    if dc_id <= 0 {
+        return Err(AppError::Telegram("Telegram file_id 的数据中心无效".into()));
     }
     let file_reference = if raw_type & FILE_REFERENCE_FLAG != 0 {
         read_tl_bytes(&decoded, &mut pos)?
@@ -421,6 +634,7 @@ fn decode_document(file_id: &str, size: u64) -> AppResult<Option<FileLocation>> 
         .map_err(|_| AppError::Telegram("当前平台无法表示该分块大小".into()))?;
 
     Ok(Some(FileLocation {
+        dc: AtomicI32::new(dc_id),
         raw: tl::types::InputDocumentFileLocation {
             id,
             access_hash,
@@ -744,6 +958,132 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_windows_deliver_a_small_head_then_aligned_large_parts() {
+        let head = FIRST_REQUEST_SIZE as u64;
+        let maximum = REQUEST_SIZE as u64;
+        for offset in [0, 19, head - 7, maximum - 7, maximum + 193] {
+            let end = offset + maximum * 10 + 137;
+            let requests = PartRequests::new(offset, end).collect::<Vec<_>>();
+            assert_eq!(requests[0].offset, offset / head * head);
+            assert_eq!(requests[0].limit, FIRST_REQUEST_SIZE);
+            assert!(requests.iter().any(|request| request.limit == REQUEST_SIZE));
+            for request in &requests {
+                let limit = request.limit as u64;
+                assert!(limit.is_power_of_two());
+                assert!((head..=maximum).contains(&limit));
+                assert_eq!(request.offset % limit, 0);
+                assert_eq!(
+                    request.offset / (2 * maximum),
+                    (request.offset + limit - 1) / (2 * maximum)
+                );
+            }
+            for pair in requests.windows(2) {
+                assert_eq!(pair[0].offset + pair[0].limit as u64, pair[1].offset);
+            }
+            let last = requests.last().unwrap();
+            assert!(last.offset < end);
+            assert!(last.offset + last.limit as u64 >= end);
+            assert!(last.offset + last.limit as u64 <= end.div_ceil(maximum) * maximum);
+        }
+    }
+
+    #[tokio::test]
+    async fn seeks_receive_first_bytes_while_prefetch_is_pending_and_release_old_slots() {
+        let end = REQUEST_SIZE as u64 * 100;
+        for concurrency in [1, 4, 8] {
+            let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
+            let active = Arc::new(AtomicUsize::new(0));
+            for offset in [0, REQUEST_SIZE as u64 * 25 + 193, REQUEST_SIZE as u64 - 7] {
+                let first = offset / FIRST_REQUEST_SIZE as u64 * FIRST_REQUEST_SIZE as u64;
+                let opening = open_parallel_stream(end, offset, concurrency, slots.clone(), {
+                    let active = active.clone();
+                    move |part_offset, request_size| {
+                        let active = active.clone();
+                        async move {
+                            active.fetch_add(1, Ordering::SeqCst);
+                            let _guard = ActiveFetch(active);
+                            if part_offset == first {
+                                assert_eq!(request_size, FIRST_REQUEST_SIZE);
+                                tokio::task::yield_now().await;
+                                Ok((part_offset..part_offset + request_size as u64)
+                                    .map(|position| (position % 251) as u8)
+                                    .collect())
+                            } else {
+                                std::future::pending().await
+                            }
+                        }
+                    }
+                });
+                // 后续预读永远不完成，首字节仍须独立返回；旧的 512 KiB 首段会卡在这里。
+                let mut reader = tokio::time::timeout(Duration::from_secs(1), opening)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let length = 37.min((first + FIRST_REQUEST_SIZE as u64 - offset) as usize);
+                let mut prefix = vec![0; length];
+                reader.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(
+                    prefix,
+                    (offset..offset + length as u64)
+                        .map(|position| (position % 251) as u8)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(active.load(Ordering::SeqCst), concurrency - 1);
+                drop(reader);
+                assert_eq!(active.load(Ordering::SeqCst), 0);
+                assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_dc_authorization_and_late_failures_share_one_refresh() {
+        let authorizations = DcAuthorizations::default();
+        let copies = Arc::new(AtomicUsize::new(0));
+        for round in 1..=2 {
+            let attempts = (0..8)
+                .map(|_| authorizations.attempt(3))
+                .collect::<Vec<_>>();
+            let results = futures_util::future::join_all(attempts.into_iter().map(|attempt| {
+                let copies = copies.clone();
+                authorizations.refresh(3, attempt, move || async move {
+                    copies.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(())
+                })
+            }))
+            .await;
+            assert!(results.into_iter().all(|result| result.is_ok()));
+            assert_eq!(copies.load(Ordering::SeqCst), round);
+        }
+    }
+
+    #[tokio::test]
+    async fn dc_authorization_does_not_block_other_dcs_and_cancelled_refresh_can_resume() {
+        let authorizations = DcAuthorizations::default();
+        let mut blocked = Box::pin(authorizations.refresh(
+            3,
+            authorizations.attempt(3),
+            || async { std::future::pending::<AppResult<()>>().await },
+        ));
+        assert!(futures_util::poll!(blocked.as_mut()).is_pending());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            authorizations.refresh(4, authorizations.attempt(4), || async { Ok(()) }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(blocked);
+        authorizations
+            .refresh(3, authorizations.attempt(3), || async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(authorizations.attempt(3).was_authorized);
+        assert!(authorizations.attempt(4).was_authorized);
+    }
+
     #[tokio::test]
     async fn parallel_reads_preserve_range_bytes_and_bound_concurrency() {
         let part_size = REQUEST_SIZE as usize;
@@ -761,6 +1101,9 @@ mod tests {
                 let peak = Arc::new(AtomicUsize::new(0));
                 let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
                 let upstream_bytes = (data.len() - offset / part_size * part_size) as u64;
+                let fetched_bytes = (data.len()
+                    - offset / FIRST_REQUEST_SIZE as usize * FIRST_REQUEST_SIZE as usize)
+                    as u64;
                 let budget = budgeted.then(|| Arc::new(ReadBudget::new(upstream_bytes)));
                 let mut reader = open_parallel_stream_policy(
                     data.len() as u64,
@@ -774,7 +1117,7 @@ mod tests {
                         let data = data.clone();
                         let active = active.clone();
                         let peak = peak.clone();
-                        move |part_offset| {
+                        move |part_offset, request_size| {
                             let data = data.clone();
                             let active = active.clone();
                             let peak = peak.clone();
@@ -791,7 +1134,8 @@ mod tests {
                                 };
                                 tokio::time::sleep(Duration::from_millis(delay)).await;
                                 let start = part_offset as usize;
-                                Ok(data[start..(start + part_size).min(data.len())].to_vec())
+                                Ok(data[start..(start + request_size as usize).min(data.len())]
+                                    .to_vec())
                             }
                         }
                     },
@@ -810,8 +1154,8 @@ mod tests {
                     );
                 }
                 if let Some(budget) = budget {
-                    assert_eq!(budget.used(), upstream_bytes);
-                    assert_eq!(budget.remaining(), 0);
+                    assert_eq!(budget.used(), fetched_bytes);
+                    assert_eq!(budget.remaining(), upstream_bytes - fetched_bytes);
                 }
                 assert_eq!(active.load(Ordering::SeqCst), 0);
                 assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
@@ -827,6 +1171,7 @@ mod tests {
         {
             let started = Arc::new(AtomicUsize::new(0));
             let active = Arc::new(AtomicUsize::new(0));
+            let requested_bytes = Arc::new(AtomicU64::new(0));
             let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
             let length = REQUEST_SIZE as u64 * 100;
             let budget = budgeted.then(|| Arc::new(ReadBudget::new(length)));
@@ -839,16 +1184,19 @@ mod tests {
                 {
                     let started = started.clone();
                     let active = active.clone();
-                    move |part_offset| {
+                    let requested_bytes = requested_bytes.clone();
+                    move |part_offset, request_size| {
                         let started = started.clone();
                         let active = active.clone();
+                        let requested_bytes = requested_bytes.clone();
                         async move {
                             started.fetch_add(1, Ordering::SeqCst);
+                            requested_bytes.fetch_add(request_size as u64, Ordering::SeqCst);
                             active.fetch_add(1, Ordering::SeqCst);
                             let _guard = ActiveFetch(active);
                             if part_offset == 0 {
                                 tokio::task::yield_now().await;
-                                Ok(vec![7; REQUEST_SIZE as usize])
+                                Ok(vec![7; request_size as usize])
                             } else {
                                 std::future::pending().await
                             }
@@ -865,7 +1213,7 @@ mod tests {
             assert_eq!(started.load(Ordering::SeqCst), concurrency);
             assert_eq!(active.load(Ordering::SeqCst), concurrency - 1);
             if let Some(budget) = &budget {
-                assert_eq!(budget.used(), REQUEST_SIZE as u64 * concurrency as u64);
+                assert_eq!(budget.used(), requested_bytes.load(Ordering::SeqCst));
             }
             // 模拟关闭预览或 seek 丢弃旧流；所有未完成分段及其并发许可立即释放。
             drop(reader);
@@ -887,7 +1235,7 @@ mod tests {
             open_parallel_stream_policy(length, 0, 4, slots.clone(), budget, {
                 let active = active.clone();
                 let started = started.clone();
-                move |_| {
+                move |_, _| {
                     let active = active.clone();
                     let started = started.clone();
                     async move {
@@ -914,7 +1262,7 @@ mod tests {
         let length = part_size * 6;
         let budget = Arc::new(ReadBudget::new(part_size * 3));
         let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
-        let fetched = Arc::new(AtomicUsize::new(0));
+        let fetched = Arc::new(AtomicU64::new(0));
         let readers = (0..2).map(|_| {
             let budget = budget.clone();
             let slots = slots.clone();
@@ -926,12 +1274,12 @@ mod tests {
                     4,
                     slots,
                     Some((budget, length)),
-                    move |_| {
+                    move |_, request_size| {
                         let fetched = fetched.clone();
                         async move {
-                            fetched.fetch_add(1, Ordering::SeqCst);
+                            fetched.fetch_add(request_size as u64, Ordering::SeqCst);
                             tokio::task::yield_now().await;
-                            Ok(vec![7; REQUEST_SIZE as usize])
+                            Ok(vec![7; request_size as usize])
                         }
                     },
                 )
@@ -954,7 +1302,7 @@ mod tests {
             outputs.iter().map(Vec::len).sum::<usize>(),
             part_size as usize * 3
         );
-        assert_eq!(fetched.load(Ordering::SeqCst), 3);
+        assert_eq!(fetched.load(Ordering::SeqCst), part_size * 3);
         assert_eq!(budget.used(), part_size * 3);
         assert_eq!(budget.remaining(), 0);
         assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
@@ -968,9 +1316,11 @@ mod tests {
                 0,
                 4,
                 Arc::new(Semaphore::new(8)),
-                move |offset| async move {
+                move |offset, request_size| async move {
                     if offset == 0 {
-                        Ok(vec![0; REQUEST_SIZE as usize - usize::from(first_bad)])
+                        Ok(vec![0; request_size as usize - usize::from(first_bad)])
+                    } else if offset < REQUEST_SIZE as u64 {
+                        Ok(vec![0; request_size as usize])
                     } else {
                         Ok(vec![0; 12])
                     }
@@ -995,9 +1345,9 @@ mod tests {
             0,
             4,
             Arc::new(Semaphore::new(8)),
-            |offset| async move {
+            |offset, request_size| async move {
                 if offset == 0 {
-                    Ok(vec![0; REQUEST_SIZE as usize])
+                    Ok(vec![0; request_size as usize])
                 } else {
                     Err(AppError::Telegram("注入下载错误".into()))
                 }
@@ -1008,7 +1358,7 @@ mod tests {
         let mut actual = Vec::new();
         let error = reader.read_to_end(&mut actual).await.unwrap_err();
         assert!(error.to_string().contains("注入下载错误"));
-        assert_eq!(actual.len(), REQUEST_SIZE as usize);
+        assert_eq!(actual.len(), FIRST_REQUEST_SIZE as usize);
     }
 
     #[tokio::test]
@@ -1017,7 +1367,7 @@ mod tests {
         for offset in [17, 18] {
             let result = open_parallel_stream(17, offset, 4, Arc::new(Semaphore::new(8)), {
                 let calls = calls.clone();
-                move |_| {
+                move |_, _| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     async { Ok(Vec::new()) }
                 }
@@ -1100,10 +1450,10 @@ mod tests {
                 budget.as_ref().map(|budget| (budget.clone(), file_size)),
                 {
                     let requests = requests.clone();
-                    move |start| {
+                    move |start, request_size| {
                         requests.lock().unwrap().push(start);
                         async move {
-                            Ok((start..start + part_size)
+                            Ok((start..start + request_size as u64)
                                 .map(|i| (i % 251) as u8)
                                 .collect())
                         }
@@ -1120,20 +1470,31 @@ mod tests {
                     .map(|i| (i % 251) as u8)
                     .collect::<Vec<_>>()
             );
-            let expected = (offset / part_size..(offset + length).div_ceil(part_size))
-                .map(|i| i * part_size)
+            let first_size = FIRST_REQUEST_SIZE as u64;
+            let expected = (offset / first_size..(offset + length).div_ceil(first_size))
+                .map(|i| i * first_size)
                 .collect::<Vec<_>>();
             assert_eq!(*requests.lock().unwrap(), expected);
             if let Some(budget) = budget {
-                assert_eq!(budget.used(), upstream_bytes);
+                assert_eq!(budget.used(), expected.len() as u64 * first_size);
             }
         }
     }
 
     fn encode_file_id(file_type: i32, file_reference: &[u8], id: i64, hash: i64) -> String {
+        encode_file_id_in_dc(file_type, 4, file_reference, id, hash)
+    }
+
+    fn encode_file_id_in_dc(
+        file_type: i32,
+        dc: i32,
+        file_reference: &[u8],
+        id: i64,
+        hash: i64,
+    ) -> String {
         let mut raw = Vec::new();
         raw.extend_from_slice(&(file_type | FILE_REFERENCE_FLAG).to_le_bytes());
-        raw.extend_from_slice(&4i32.to_le_bytes());
+        raw.extend_from_slice(&dc.to_le_bytes());
         raw.push(file_reference.len() as u8);
         raw.extend_from_slice(file_reference);
         raw.resize(raw.len().div_ceil(4) * 4, 0);
@@ -1164,6 +1525,7 @@ mod tests {
         let file_id = encode_file_id(4, &[1, 2, 3], 123, 456);
         let location = decode_document(&file_id, 99).unwrap().unwrap();
         assert_eq!(location.size, 99);
+        assert_eq!(location.dc.load(Ordering::Acquire), 4);
         match location.raw {
             tl::enums::InputFileLocation::InputDocumentFileLocation(location) => {
                 assert_eq!(location.id, 123);
@@ -1172,6 +1534,86 @@ mod tests {
             }
             _ => panic!("应解析为文档 location"),
         }
+    }
+
+    #[tokio::test]
+    async fn file_parts_go_directly_to_the_file_dc_with_exact_offsets() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        for dc in [1, 3, 5] {
+            let file_id = encode_file_id_in_dc(4, dc, &[1, 2, 3], 123, 456);
+            let location = Arc::new(
+                decode_document(&file_id, REQUEST_SIZE as u64 * 2)
+                    .unwrap()
+                    .unwrap(),
+            );
+            for offset in [0, FIRST_REQUEST_SIZE as u64, REQUEST_SIZE as u64] {
+                let output = file_part_at_location(location.clone(), offset, FIRST_REQUEST_SIZE, {
+                    let calls = calls.clone();
+                    move |target, request| {
+                        calls.lock().unwrap().push((target, request.offset, request.limit));
+                        assert!(request.precise);
+                        assert!(!request.cdn_supported);
+                        let tl::enums::InputFileLocation::InputDocumentFileLocation(document) = request.location else {
+                            panic!("应使用原文档位置");
+                        };
+                        assert_eq!(document.id, 123);
+                        assert_eq!(document.access_hash, 456);
+                        assert_eq!(document.file_reference, [1, 2, 3]);
+                        async move { Ok(FilePartReply::Bytes(vec![7; FIRST_REQUEST_SIZE as usize])) }
+                    }
+                }).await.unwrap();
+                assert_eq!(output, vec![7; FIRST_REQUEST_SIZE as usize]);
+                assert_eq!(
+                    calls.lock().unwrap().last().copied(),
+                    Some((dc, offset as i64, FIRST_REQUEST_SIZE))
+                );
+            }
+        }
+        assert_eq!(calls.lock().unwrap().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn file_dc_migration_is_reused_by_later_parts_and_redirects_are_bounded() {
+        let file_id = encode_file_id(4, &[], 123, 456);
+        let location = Arc::new(
+            decode_document(&file_id, REQUEST_SIZE as u64 * 2)
+                .unwrap()
+                .unwrap(),
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        for offset in [0, REQUEST_SIZE as u64] {
+            let bytes = file_part_at_location(location.clone(), offset, FIRST_REQUEST_SIZE, {
+                let calls = calls.clone();
+                move |dc, _| {
+                    calls.lock().unwrap().push(dc);
+                    async move {
+                        Ok(if dc == 4 {
+                            FilePartReply::Migrate(3)
+                        } else {
+                            FilePartReply::Bytes(vec![7; FIRST_REQUEST_SIZE as usize])
+                        })
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(bytes.len(), FIRST_REQUEST_SIZE as usize);
+        }
+        assert_eq!(*calls.lock().unwrap(), [4, 3, 3]);
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let error = file_part_at_location(location, 0, FIRST_REQUEST_SIZE, {
+            let count = count.clone();
+            move |dc, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(FilePartReply::Migrate(if dc == 3 { 4 } else { 3 })) }
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("多次重定向"));
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert!(decode_document(&encode_file_id_in_dc(4, 0, &[], 123, 456), 99).is_err());
     }
 
     #[test]
