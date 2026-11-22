@@ -1654,7 +1654,7 @@ impl TgApi for TgClient {
         if let Some(mtproto) = &self.mtproto {
             let reader = if let Some(budget) = budget {
                 mtproto
-                    .open_probe_stream(file_id, message_id, chunk_size, offset, length, budget)
+                    .open_budgeted_stream(file_id, message_id, chunk_size, offset, length, budget)
                     .await?
             } else {
                 mtproto

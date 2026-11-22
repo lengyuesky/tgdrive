@@ -86,6 +86,8 @@ docker compose stop tgdrive && docker compose run --rm tgdrive reset-2fa && dock
 
 宿主镜像与已安装应用分别更新；拉取 `latest` 后，还需要在应用中心更新应用包。影视 `1.0.2` 修复了升级后使用旧索引游标而无法打开的问题，更新时保留媒体库、收藏和观看记录。
 
+所有应用的原文件读取统一使用宿主「系统设置 → 流式播放 → 下载并发」：普通下载、应用字节接口、媒体票据、外部客户端直传和后端本机读取均按同一设置并行获取 Telegram 分段，默认 4 并发，最高 8 并发。同一 Bot 共用上游请求槽；读取预算只限制累计字节，Range 边界、暂停背压和取消继续生效。此项由宿主统一生效，更新宿主即可用于已安装应用。
+
 ## 手动构建镜像
 
 在 GitHub Actions 的 [docker-build 工作流](https://github.com/lengyuesky/tgdrive/actions/workflows/docker-build.yml) 点击 **Run workflow**，可选择源码分支、标签或提交，以及 `tgdrive`、`telegram-bot-api` 或 `all`。工作流固定源码提交后，在原生 AMD64、ARM64 runner 上构建和验证镜像。

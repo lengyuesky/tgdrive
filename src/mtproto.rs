@@ -204,7 +204,7 @@ impl MtprotoClient {
             .await
     }
 
-    pub(crate) async fn open_probe_stream(
+    pub(crate) async fn open_budgeted_stream(
         &self,
         file_id: &str,
         message_id: i64,
@@ -320,8 +320,7 @@ where
     let first_part = offset / part_size;
     let part_count = end.div_ceil(part_size);
     let fetch = Arc::new(fetch);
-    // 有预算的严格读取不并行预取，每个上游请求先预留整个对齐分段。
-    let concurrency = if budget.is_some() { 1 } else { concurrency };
+    // 所有读取共用宿主下载并发和 Bot 请求槽；预算只限制累计上游字节。
     let mut parts = stream::iter(first_part..part_count)
         .map(move |index| {
             let fetch = fetch.clone();
@@ -753,16 +752,24 @@ mod tests {
                 .map(|i| (i % 251) as u8)
                 .collect::<Vec<_>>(),
         );
-        for concurrency in [1, 4, 8] {
+        for (concurrency, budgeted) in [1, 4, 8]
+            .into_iter()
+            .flat_map(|concurrency| [(concurrency, false), (concurrency, true)])
+        {
             for offset in [0, 19, part_size + 31, data.len() - 7] {
                 let active = Arc::new(AtomicUsize::new(0));
                 let peak = Arc::new(AtomicUsize::new(0));
                 let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
-                let mut reader = open_parallel_stream(
+                let upstream_bytes = (data.len() - offset / part_size * part_size) as u64;
+                let budget = budgeted.then(|| Arc::new(ReadBudget::new(upstream_bytes)));
+                let mut reader = open_parallel_stream_policy(
                     data.len() as u64,
                     offset as u64,
                     concurrency,
                     slots.clone(),
+                    budget
+                        .as_ref()
+                        .map(|budget| (budget.clone(), data.len() as u64)),
                     {
                         let data = data.clone();
                         let active = active.clone();
@@ -796,7 +803,15 @@ mod tests {
                 assert_eq!(actual, data[offset..]);
                 assert!(peak.load(Ordering::SeqCst) <= concurrency);
                 if offset == 0 {
-                    assert_eq!(peak.load(Ordering::SeqCst), concurrency);
+                    assert_eq!(
+                        peak.load(Ordering::SeqCst),
+                        concurrency,
+                        "budgeted={budgeted}"
+                    );
+                }
+                if let Some(budget) = budget {
+                    assert_eq!(budget.used(), upstream_bytes);
+                    assert_eq!(budget.remaining(), 0);
                 }
                 assert_eq!(active.load(Ordering::SeqCst), 0);
                 assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
@@ -806,12 +821,22 @@ mod tests {
 
     #[tokio::test]
     async fn pausing_bounds_prefetch_and_dropping_cancels_pending_reads() {
-        for concurrency in [1, 4, 8] {
+        for (concurrency, budgeted) in [1, 4, 8]
+            .into_iter()
+            .flat_map(|concurrency| [(concurrency, false), (concurrency, true)])
+        {
             let started = Arc::new(AtomicUsize::new(0));
             let active = Arc::new(AtomicUsize::new(0));
             let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
-            let mut reader =
-                open_parallel_stream(REQUEST_SIZE as u64 * 100, 0, concurrency, slots.clone(), {
+            let length = REQUEST_SIZE as u64 * 100;
+            let budget = budgeted.then(|| Arc::new(ReadBudget::new(length)));
+            let mut reader = open_parallel_stream_policy(
+                length,
+                0,
+                concurrency,
+                slots.clone(),
+                budget.as_ref().map(|budget| (budget.clone(), length)),
+                {
                     let started = started.clone();
                     let active = active.clone();
                     move |part_offset| {
@@ -829,15 +854,19 @@ mod tests {
                             }
                         }
                     }
-                })
-                .await
-                .unwrap();
+                },
+            )
+            .await
+            .unwrap();
             let mut prefix = [0; 37];
             reader.read_exact(&mut prefix).await.unwrap();
             assert_eq!(prefix, [7; 37]);
             tokio::task::yield_now().await;
             assert_eq!(started.load(Ordering::SeqCst), concurrency);
             assert_eq!(active.load(Ordering::SeqCst), concurrency - 1);
+            if let Some(budget) = &budget {
+                assert_eq!(budget.used(), REQUEST_SIZE as u64 * concurrency as u64);
+            }
             // 模拟关闭预览或 seek 丢弃旧流；所有未完成分段及其并发许可立即释放。
             drop(reader);
             assert_eq!(active.load(Ordering::SeqCst), 0);
@@ -851,8 +880,11 @@ mod tests {
         let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
         let active = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(AtomicUsize::new(0));
-        let readers = (0..3).map(|_| {
-            open_parallel_stream(REQUEST_SIZE as u64 * 100, 0, 8, slots.clone(), {
+        let length = REQUEST_SIZE as u64 * 100;
+        // 普通下载和两个应用读取共用同一个 Bot 的请求槽。
+        let readers = (0..3).map(|index| {
+            let budget = (index > 0).then(|| (Arc::new(ReadBudget::new(length)), length));
+            open_parallel_stream_policy(length, 0, 4, slots.clone(), budget, {
                 let active = active.clone();
                 let started = started.clone();
                 move |_| {
@@ -873,6 +905,58 @@ mod tests {
         assert_eq!(active.load(Ordering::SeqCst), MAX_DOWNLOAD_CONCURRENCY);
         drop(opening);
         assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn concurrent_budgeted_streams_never_exceed_the_shared_upstream_budget() {
+        let part_size = REQUEST_SIZE as u64;
+        let length = part_size * 6;
+        let budget = Arc::new(ReadBudget::new(part_size * 3));
+        let slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let readers = (0..2).map(|_| {
+            let budget = budget.clone();
+            let slots = slots.clone();
+            let fetched = fetched.clone();
+            async move {
+                let reader = open_parallel_stream_policy(
+                    length,
+                    0,
+                    4,
+                    slots,
+                    Some((budget, length)),
+                    move |_| {
+                        let fetched = fetched.clone();
+                        async move {
+                            fetched.fetch_add(1, Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            Ok(vec![7; REQUEST_SIZE as usize])
+                        }
+                    },
+                )
+                .await;
+                let mut bytes = Vec::new();
+                let message = match reader {
+                    Ok(mut reader) => reader
+                        .read_to_end(&mut bytes)
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    Err(error) => error.to_string(),
+                };
+                assert!(message.contains("累计上游字节预算"));
+                bytes
+            }
+        });
+        let outputs = futures_util::future::join_all(readers).await;
+        assert_eq!(
+            outputs.iter().map(Vec::len).sum::<usize>(),
+            part_size as usize * 3
+        );
+        assert_eq!(fetched.load(Ordering::SeqCst), 3);
+        assert_eq!(budget.used(), part_size * 3);
+        assert_eq!(budget.remaining(), 0);
         assert_eq!(slots.available_permits(), MAX_DOWNLOAD_CONCURRENCY);
     }
 
@@ -1000,10 +1084,21 @@ mod tests {
     #[tokio::test]
     async fn short_ranges_only_fetch_the_parts_they_cover() {
         let part_size = REQUEST_SIZE as u64;
-        for (offset, length) in [(13, 1), (part_size - 7, 29), (part_size + 31, 17)] {
+        for (offset, length, budgeted) in [(13, 1), (part_size - 7, 29), (part_size + 31, 17)]
+            .into_iter()
+            .flat_map(|(offset, length)| [(offset, length, false), (offset, length, true)])
+        {
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let mut reader =
-                open_parallel_stream(offset + length, offset, 8, Arc::new(Semaphore::new(8)), {
+            let file_size = (offset + length).div_ceil(part_size) * part_size;
+            let upstream_bytes = file_size - offset / part_size * part_size;
+            let budget = budgeted.then(|| Arc::new(ReadBudget::new(upstream_bytes)));
+            let mut reader = open_parallel_stream_policy(
+                offset + length,
+                offset,
+                8,
+                Arc::new(Semaphore::new(8)),
+                budget.as_ref().map(|budget| (budget.clone(), file_size)),
+                {
                     let requests = requests.clone();
                     move |start| {
                         requests.lock().unwrap().push(start);
@@ -1013,9 +1108,10 @@ mod tests {
                                 .collect())
                         }
                     }
-                })
-                .await
-                .unwrap();
+                },
+            )
+            .await
+            .unwrap();
             let mut actual = Vec::new();
             reader.read_to_end(&mut actual).await.unwrap();
             assert_eq!(
@@ -1028,6 +1124,9 @@ mod tests {
                 .map(|i| i * part_size)
                 .collect::<Vec<_>>();
             assert_eq!(*requests.lock().unwrap(), expected);
+            if let Some(budget) = budget {
+                assert_eq!(budget.used(), upstream_bytes);
+            }
         }
     }
 
