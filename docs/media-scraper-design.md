@@ -173,7 +173,7 @@
 ## 已核对的项目现状
 
 - [领域术语](../GLOSSARY.md)中的“网盘目录”指 TGDrive 网盘目录树中的目录，区别于服务器本机目录；“页面应用”和“服务插件”也有不同含义。
-- 普通应用包是沙箱内运行的静态资源，不能直接连接任意外部服务。宿主能力通过方法白名单和权限检查开放，见历史提交 `598c371` 中的 `docs/apps.md`（旧应用开发说明）、`src/apps/runtime.rs` 与 `frontend/src/apps/bridge.ts`。
+- 普通应用包是沙箱内运行的静态资源，不能直接连接任意外部服务。宿主能力通过方法白名单和权限检查开放；所依据的旧应用开发说明 `docs/apps.md`、`src/apps/runtime.rs` 与 `frontend/src/apps/bridge.ts` 已随重写前的历史删除。
 - 当前清单允许 `files.read`、`media.read`、`favorites.write` 和固定应用使用的 `fntv.service`，没有通用网盘文件写入权限，见 `src/apps/package.rs`。
 - 飞牛影视兼容服务可读取同目录 NFO 和海报；现有索引不执行联网刮削，见 [飞牛影视兼容设计](fntv-compatibility.md)与 `src/apps/fntv/index.rs`。
 - 当前 Cinema 根据文件名得到标题和集数，不读取 NFO；FNTV 读取 NFO 的标题、简介和年份，电视剧另读取季、集与剧名，但尚不完整消费演员、评分、类型等描述信息。写入 NFO 不能直接视为两端都能完整展示，见插件仓 `cinema/model.ts` 与宿主 `src/apps/fntv/index.rs`、`src/apps/fntv/protocol.rs`。
