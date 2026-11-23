@@ -4,6 +4,9 @@
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <section v-if="updateResults.length" class="update-results" aria-live="polite"><h2>更新进度</h2><ul><li v-for="result in updateResults" :key="result.candidate.app.manifest.id" :class="result.status"><div><strong>{{ result.candidate.app.manifest.name }}</strong> {{ result.candidate.app.manifest.version }} → {{ result.candidate.entry.manifest.version }}<span>{{ updateLabel(result) }}</span></div><p v-if="result.note">{{ result.note }}</p><el-button v-if="result.status === 'confirmation'" :disabled="busy || loading" @click="reviewUpdate(result)">查看更新</el-button><el-button v-if="result.status === 'failed'" :disabled="busy || loading" @click="retryUpdate(result)">重试更新</el-button></li></ul></section>
     <section class="root-selection"><h2>根地址服务</h2><p>根地址只交给一个已声明对外服务的应用；应用自身仍负责客户端鉴权。未选择时访问根地址会返回宿主管理入口。</p><el-select :model-value="rootSelection?.app_id ?? ''" :disabled="busy" aria-label="根地址应用" @change="chooseRoot"><el-option label="不分配根地址" value=""/><el-option v-for="app in externalApps" :key="app.manifest.id" :label="`${app.manifest.name}${app.enabled ? '' : '（已停用）'}`" :value="app.manifest.id" :disabled="!app.enabled"/></el-select></section>
+    <section class="resource-limits"><h2>应用资源限制</h2><p>全部应用后端合计共用这一组上限，不按应用分别设置，应用自己也不能声明。填 0 表示不限制；保存后立即生效，不需要重启应用。</p>
+      <div class="limit-fields"><label>内存上限（MiB）<input v-model.number="limitForm.memory" type="number" min="0" step="64" :disabled="busy" aria-label="应用内存上限"/></label><label>CPU 上限（核）<input v-model.number="limitForm.cpu" type="number" min="0" step="0.1" :disabled="busy" aria-label="应用 CPU 上限"/></label><el-button type="primary" :disabled="busy || !limitsChanged" @click="saveLimits">保存限制</el-button></div>
+      <p v-if="resourceLimits" class="limit-state">当前：内存 {{ limitLabel(resourceLimits.memory_bytes === '0' ? '' : formatBytes(resourceLimits.memory_bytes), resourceLimits.memory_enforced) }}；CPU {{ limitLabel(resourceLimits.cpu_millis ? `${resourceLimits.cpu_millis / 1000} 核` : '', resourceLimits.cpu_enforced) }}</p></section>
     <section><h2>已安装</h2><p v-if="!installedApps.length" class="empty">尚未安装应用。可以从目录选择，也可以上传 .tgapp 包。</p>
       <div class="app-grid"><article v-for="app in installedApps" :key="app.manifest.id" class="app-card glass">
         <div class="app-heading"><img v-if="iconUrl(app)" :src="iconUrl(app)" alt="" crossorigin="anonymous" /><el-icon v-else class="app-icon"><Grid /></el-icon><div><h3>{{ app.manifest.name }}</h3><span>{{ app.manifest.version }} · {{ app.enabled ? '已启用' : '已停用' }}{{ app.pinned ? ' · 已固定' : '' }}</span></div></div>
@@ -23,12 +26,12 @@
     <ResponsivePanel :model-value="!!uninstallApp" title="卸载应用" width="500px" append-to-body @update:model-value="(open: boolean) => { if (!open) uninstallApp = undefined }"><p>卸载 {{ uninstallApp?.manifest.name }}，撤销所有页面访问；不会删除网盘文件。</p><el-checkbox v-model="purge">同时清除持久应用数据（默认保留）</el-checkbox><p v-if="purge" class="danger-note">将清除应用 KV 和固定数据库，重新安装不能找回。</p><template #footer><el-button @click="uninstallApp = undefined">取消</el-button><el-button type="danger" :loading="busy" @click="uninstall">确认卸载</el-button></template></ResponsivePanel>
     <ResponsivePanel v-model="usageVisible" title="应用占用" width="500px" append-to-body><dl v-if="occupancy" class="detail-list"><dt>键值记录</dt><dd>{{ occupancy.kv_entries }} / {{ occupancy.kv_entry_limit }}</dd><dt>键值字节</dt><dd>{{ formatBytes(occupancy.kv_bytes) }} / {{ formatBytes(occupancy.kv_byte_limit) }}</dd><dt>可再生缓存</dt><dd>{{ formatBytes(occupancy.cache_bytes) }} / {{ formatBytes(occupancy.cache_byte_limit) }}</dd><dt v-if="occupancy.database_bytes">后端数据库</dt><dd v-if="occupancy.database_bytes">{{ formatBytes(occupancy.database_bytes) }}</dd></dl></ResponsivePanel>
     <ResponsivePanel v-model="logsVisible" title="应用后端日志" width="800px" append-to-body><p>仅主人可查看。日志由应用生成，可能包含应用自己的敏感配置，请勿公开分享。</p><p v-if="logs?.truncated">仅显示最近的有界日志片段。</p><h3>标准输出</h3><pre class="backend-log">{{ logs?.stdout || '暂无输出' }}</pre><h3>标准错误</h3><pre class="backend-log">{{ logs?.stderr || '暂无输出' }}</pre></ResponsivePanel>
-    <ResponsivePanel v-model="limitsVisible" title="后端资源限制" width="600px" append-to-body><template v-if="backendInfo"><p>查询轮次：{{ backendInfo.status.run_id ?? '当前未运行' }}。配置目标与本轮实际强制分开显示。</p><dl class="detail-list"><dt>内存目标</dt><dd>{{ formatBytes(backendInfo.limits.memory_bytes) }} · {{ enforcement(backendInfo.limits.enforced.memory) }}</dd><dt>CPU 目标</dt><dd>{{ backendInfo.limits.cpu_millis }} 毫秒/秒 · {{ enforcement(backendInfo.limits.enforced.cpu) }}</dd><dt>进程数</dt><dd>{{ backendInfo.limits.pids }} · {{ enforcement(backendInfo.limits.enforced.pids) }}</dd><dt>打开文件数</dt><dd>{{ backendInfo.limits.open_files }} · {{ enforcement(backendInfo.limits.enforced.open_files) }}</dd><dt>数据库目标</dt><dd>{{ formatBytes(backendInfo.limits.database_bytes) }} · 监督式计量</dd><dt>缓存与临时</dt><dd>{{ formatBytes(backendInfo.limits.cache_bytes) }} · 监督式计量</dd></dl><p class="notice">内存/CPU 只有可写 cgroup v2 控制器实际设置成功才强制；未强制时仍照常运行。后端磁盘可能短暂超额，发现超额会停止后端，不是实时硬隔离。</p></template></ResponsivePanel>
+    <ResponsivePanel v-model="limitsVisible" title="后端资源限制" width="600px" append-to-body><template v-if="backendInfo"><p>查询轮次：{{ backendInfo.status.run_id ?? '当前未运行' }}。内存与 CPU 是全部应用后端合计共用的总体限制，在上方「应用资源限制」里修改；其余各项对每个应用固定。</p><dl class="detail-list"><dt>内存（全部应用合计）</dt><dd>{{ limitLabel(backendInfo.limits.memory_bytes === '0' ? '' : formatBytes(backendInfo.limits.memory_bytes), backendInfo.limits.enforced.memory) }}</dd><dt>CPU（全部应用合计）</dt><dd>{{ limitLabel(backendInfo.limits.cpu_millis ? `${backendInfo.limits.cpu_millis / 1000} 核` : '', backendInfo.limits.enforced.cpu) }}</dd><dt>进程数</dt><dd>{{ backendInfo.limits.pids }} · {{ enforcement(backendInfo.limits.enforced.pids) }}</dd><dt>打开文件数</dt><dd>{{ backendInfo.limits.open_files }} · {{ enforcement(backendInfo.limits.enforced.open_files) }}</dd><dt>数据库上限</dt><dd>{{ formatBytes(backendInfo.limits.database_bytes) }} · 监督式计量</dd><dt>缓存与临时</dt><dd>{{ formatBytes(backendInfo.limits.cache_bytes) }} · 监督式计量</dd></dl><p class="notice">内存/CPU 只有可写 cgroup v2 控制器实际设置成功才强制；未强制时仍照常运行。后端磁盘可能短暂超额，发现超额会停止后端，不是实时硬隔离。</p></template></ResponsivePanel>
     <ScopeEditor ref="scope" />
   </main>
 </template>
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, shallowReactive, shallowRef } from 'vue'
+import { computed, onMounted, onBeforeUnmount, reactive, ref, shallowReactive, shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Grid } from '@element-plus/icons-vue'
@@ -36,7 +39,8 @@ import ResponsivePanel from '../components/ResponsivePanel.vue'
 import ScopeEditor from './ScopeEditor.vue'
 import { center, installedApps, rootSelection, loadInstalled, iconUrl, formatBytes, usage, type BackendManagementInfo, type BackendLogs } from './client'
 import { SERVICE_BASE } from './contract'
-import type { InstalledApp, CatalogResponse, CatalogEntry, InstallPreview, PackageTarget, DataUsage, AppStatePatch } from './contract'
+import { LIMITS } from './contract'
+import type { InstalledApp, CatalogResponse, CatalogEntry, InstallPreview, PackageTarget, DataUsage, AppStatePatch, AppResourceLimits } from './contract'
 const router = useRouter(), input = ref<HTMLInputElement>(), scope = ref<InstanceType<typeof ScopeEditor>>()
 const loading = ref(false), busy = ref(false), error = ref(''), catalog = ref<CatalogResponse>()
 const targets = ref<Record<string, PackageTarget>>({}), preview = ref<InstallPreview>(), previewVisible = ref(false)
@@ -46,6 +50,24 @@ const updating = ref(false), updateResults = shallowRef<UpdateResult[]>([]), pre
 const uninstallApp = ref<InstalledApp>(), purge = ref(false), occupancy = ref<DataUsage>(), usageVisible = ref(false)
 const logs = ref<BackendLogs>(), logsVisible = ref(false)
 const backendInfo = ref<BackendManagementInfo>(), limitsVisible = ref(false)
+// 宿主唯一一组应用资源限制：表单用 MiB 与核，线上用字节与毫秒/秒；0 表示不限制。
+const MiB = 1024 * 1024
+const resourceLimits = shallowRef<AppResourceLimits>(), limitForm = reactive({ memory: 0, cpu: 0 })
+const limitsChanged = computed(() => !!resourceLimits.value && (limitBytes() !== Number(resourceLimits.value.memory_bytes) || limitMillis() !== resourceLimits.value.cpu_millis))
+function limitBytes() { return Math.round(Number(limitForm.memory) || 0) * MiB }
+function limitMillis() { return Math.round((Number(limitForm.cpu) || 0) * 1000) }
+function fillLimits(limits: AppResourceLimits) { resourceLimits.value = limits; limitForm.memory = Math.round(Number(limits.memory_bytes) / MiB); limitForm.cpu = limits.cpu_millis / 1000 }
+function limitLabel(value: string, enforced: boolean) { return value ? `${value} · ${enforced ? '已强制' : '未强制（没有可写的 cgroup）'}` : '不限制' }
+async function saveLimits() {
+  await execute(async () => {
+    // 空白或非数字不当作 0，避免误清空后把限制保存成不限制。
+    if ([limitForm.memory, limitForm.cpu].some((value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0)) throw new Error('请填写内存与 CPU 上限，0 表示不限制')
+    const memory = limitBytes(), cpu = limitMillis()
+    if (memory !== 0 && (memory < LIMITS.MIN_SHARED_BACKEND_MEMORY_BYTES || memory > LIMITS.MAX_SHARED_BACKEND_MEMORY_BYTES)) throw new Error('内存上限需为 0（不限制）或 64 MiB～1 TiB')
+    if (cpu !== 0 && (cpu < LIMITS.MIN_SHARED_BACKEND_CPU_MILLIS || cpu > LIMITS.MAX_SHARED_BACKEND_CPU_MILLIS)) throw new Error('CPU 上限需为 0（不限制）或 0.1～256 核')
+    fillLimits(await center.setLimits({ memory_bytes: String(memory), cpu_millis: cpu }))
+  })
+}
 const externalApps = computed(() => installedApps.value.filter((app) => app.manifest.backend?.external_service || rootSelection.value?.app_id === app.manifest.id))
 const statusTimer = window.setInterval(() => { if (!busy.value) void loadInstalled(true).catch(() => undefined) }, 5000)
 onBeforeUnmount(() => window.clearInterval(statusTimer))
@@ -69,7 +91,7 @@ function compareVersion(a: string, b: string) { const left = a.split('.').map(Bi
 function message(failure: unknown) { return failure instanceof Error ? failure.message : '应用操作失败' }
 async function execute(operation: () => Promise<unknown>) { if (busy.value) return; busy.value = true; error.value = ''; try { await operation() } catch (failure) { error.value = message(failure) } finally { busy.value = false } }
 async function refresh() { if (busy.value || loading.value) return; loading.value = true; error.value = ''; try { await loadInstalled(true); catalog.value = await center.refresh() } catch (failure) { error.value = message(failure) } finally { loading.value = false } }
-onMounted(async () => { loading.value = true; try { await loadInstalled(true); catalog.value = await center.catalog() } catch (failure) { error.value = message(failure) } finally { loading.value = false } })
+onMounted(async () => { loading.value = true; try { await loadInstalled(true); fillLimits(await center.limits()); catalog.value = await center.catalog() } catch (failure) { error.value = message(failure) } finally { loading.value = false } })
 async function upload(event: Event) { const file = (event.target as HTMLInputElement).files?.[0]; if (!file) return; await execute(async () => { const receipt = await center.upload(file); preview.value = await center.preview({ type: 'uploaded', package_id: receipt.package_id }); previewUpdate.value = undefined; previewVisible.value = true }); if (input.value) input.value.value = '' }
 async function catalogPreview(entry: CatalogEntry, target: PackageTarget) {
   const artifact = entry.packages[target]
@@ -198,6 +220,6 @@ function scopeLabel(app: InstalledApp) { const scope = app.scope.scope; return s
 </script>
 <style scoped>
 .update-available{color:var(--el-color-primary);font-size:13px}.update-results{padding:16px 20px;border:1px solid var(--el-border-color);border-radius:12px}.update-results h2{margin-top:0}.update-results ul{list-style:none;padding:0;margin:0;display:grid;gap:14px}.update-results li div{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.update-results li span{margin-left:auto;color:var(--el-text-color-secondary);font-size:13px}.update-results li.updated span{color:var(--el-color-success)}.update-results li.failed span,.update-results li.failed p{color:var(--el-color-danger)}.update-results li.confirmation span{color:var(--el-color-warning)}.update-results li p{margin:6px 0;font-size:13px;overflow-wrap:anywhere}.update-results .el-button{margin-top:6px}
-.root-selection p{color:var(--el-text-color-secondary);line-height:1.6}.root-selection .el-select{max-width:360px}.backend-log{white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;padding:12px;background:var(--el-fill-color-light);border-radius:8px;font-size:12px}
+.root-selection p,.resource-limits p{color:var(--el-text-color-secondary);line-height:1.6}.limit-fields{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px}.limit-fields label{display:grid;gap:6px;font-size:13px;color:var(--el-text-color-regular)}.limit-fields input{width:160px;height:32px;padding:0 11px;border:1px solid var(--el-border-color);border-radius:var(--el-border-radius-base);background:var(--el-fill-color-blank);color:var(--el-text-color-regular);font:inherit}.limit-fields input:focus{outline:none;border-color:var(--el-color-primary)}.limit-state{font-size:13px}.root-selection .el-select{max-width:360px}.backend-log{white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;padding:12px;background:var(--el-fill-color-light);border-radius:8px;font-size:12px}
 .app-center { max-width: 1280px; margin: auto; padding: 24px; }.center-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 24px; }.center-head h1 { flex: 1; margin: 0; font-size: 24px; }.back-link { color: var(--el-text-color-secondary); text-decoration: none; }section { margin: 28px 0; }h2 { font-size: 18px; }.app-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(290px,1fr)); gap: 18px; }.app-card { padding: 20px; border-radius: 16px; }.app-card h3 { margin: 0; font-size: 17px; }h3 small { font-weight: 400; font-size: 12px; color: var(--el-text-color-secondary); }.app-heading { display: flex; gap: 12px; align-items: center; }.app-heading img,.app-icon { width: 44px; height: 44px; object-fit: contain; font-size: 32px; }.app-heading span,.scope-summary,.backend-note { color: var(--el-text-color-secondary); font-size: 12px; }.app-card p { line-height: 1.6; }.card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }.card-actions .el-button { margin: 0; }.empty { color: var(--el-text-color-secondary); padding: 20px 0; }.detail-list { display: grid; grid-template-columns: 110px 1fr; gap: 12px; }dd { margin: 0; overflow-wrap: anywhere; }dt { color: var(--el-text-color-secondary); }.notice { color: var(--el-color-warning); }.danger-note { color: var(--el-color-danger); }@media(max-width:600px){.app-center{padding:16px}.center-head h1{order:-1;flex-basis:100%}.app-grid{grid-template-columns:1fr}.detail-list{grid-template-columns:90px 1fr}}
 </style>

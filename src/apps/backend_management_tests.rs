@@ -170,3 +170,100 @@ async fn only_declared_enabled_backends_can_own_root_and_unrelated_uninstall_kee
     assert!(cleared.app_id.is_none());
     assert_ne!(cleared.revision, selected.revision);
 }
+
+#[tokio::test]
+async fn one_shared_resource_limit_applies_to_all_backends_without_restart_and_persists() {
+    let (_db, _data, platform, _) = backend_fixture().await;
+    let run = platform
+        .backends
+        .ensure(&platform, "test-backend")
+        .await
+        .unwrap();
+    // 默认值：内存合计 2 GiB、CPU 不限制；应用清单不参与决定。
+    let initial = platform.backend_management("test-backend").await.unwrap();
+    assert_eq!(
+        initial.limits.memory_bytes.0,
+        tgdrive_contract::http::DEFAULT_SHARED_BACKEND_MEMORY_BYTES
+    );
+    assert_eq!(initial.limits.cpu_millis, 0);
+    let router = http::router_platform(platform.clone());
+    let cookie = platform
+        .host
+        .auth
+        .cookie_header(&platform.host.auth.issue_token())
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let path = format!("{APP_CENTER_BASE}/resource-limits");
+    let send = |method: &str, cookie: Option<&str>, body: Option<serde_json::Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(&path)
+            .header("host", "localhost")
+            .header("origin", "http://localhost");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        let body = match body {
+            Some(value) => {
+                request = request.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&value).unwrap())
+            }
+            None => Body::empty(),
+        };
+        router.clone().oneshot(request.body(body).unwrap())
+    };
+    assert_eq!(
+        send("GET", None, None).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let read = send("GET", Some(&cookie), None).await.unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let read: AppResourceLimits =
+        serde_json::from_slice(&to_bytes(read.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(read.memory_bytes, initial.limits.memory_bytes);
+    assert!(!read.memory_enforced && !read.cpu_enforced);
+    for invalid in [
+        serde_json::json!({"memory_bytes":"1048576","cpu_millis":0}),
+        serde_json::json!({"memory_bytes":"0","cpu_millis":50}),
+    ] {
+        let rejected = send("PUT", Some(&cookie), Some(invalid)).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        platform.shared_limits().await.unwrap().report(),
+        read,
+        "无效请求不能改变限制"
+    );
+    let saved = send(
+        "PUT",
+        Some(&cookie),
+        Some(serde_json::json!({"memory_bytes":"1073741824","cpu_millis":1500})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    // 运行中的后端不重启，报告的限额立即变为新的总体限制。
+    let current = platform.backend_management("test-backend").await.unwrap();
+    assert_eq!(
+        current.status.run_id.as_deref(),
+        Some(run.caller.id.as_str())
+    );
+    assert_eq!(current.limits.memory_bytes.0, 1024 * 1024 * 1024);
+    assert_eq!(current.limits.cpu_millis, 1500);
+    platform.backends.stop("test-backend").await.unwrap();
+    // 重新构造平台后从设置表读回，不回到默认值。
+    let reopened = AppPlatform::with_repository(platform.host.clone(), String::new());
+    let report = reopened.shared_limits().await.unwrap().report();
+    assert_eq!(report.memory_bytes.0, 1024 * 1024 * 1024);
+    assert_eq!(report.cpu_millis, 1500);
+    let unlimited = reopened
+        .resource_limits_update(AppResourceLimitsUpdateRequest {
+            memory_bytes: tgdrive_contract::ByteCount(0),
+            cpu_millis: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!((unlimited.memory_bytes.0, unlimited.cpu_millis), (0, 0));
+}

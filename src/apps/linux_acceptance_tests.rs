@@ -73,8 +73,7 @@ async fn install_probe(platform: &Arc<AppPlatform>, id: &str, digest: &str, exec
     let manifest = serde_json::json!({
         "id":id,"name":"隔离探针","version":"1.0.0","contract":{"major":1,"minor":0},
         "description":"仅 Linux 验收","author":"测试","files":{"read":true,"write":true},
-        "backend":{"entry":"backend/app","run_mode":"on_demand","external_service":true,
-        "resources":{"memory_bytes":"67108864","cpu_millis":100,"pids":32}}
+        "backend":{"entry":"backend/app","run_mode":"on_demand","external_service":true}
     });
     let target = match std::env::consts::ARCH {
         "aarch64" => "linux-arm64",
@@ -201,7 +200,22 @@ fn counter(path: &Path, key: &str) -> u64 {
         })
         .unwrap()
 }
-async fn resources(run: &Arc<backend::Run>) {
+async fn resources(platform: &AppPlatform, run: &Arc<backend::Run>) {
+    let delegated = std::env::var_os("TGDRIVE_TEST_REQUIRE_CGROUP").is_some();
+    if delegated {
+        // 后端运行中收紧宿主的总体限制：不重启即写入全部应用后端共同所在的根组。
+        let report = platform
+            .resource_limits_update(AppResourceLimitsUpdateRequest {
+                memory_bytes: tgdrive_contract::ByteCount(64 * 1024 * 1024),
+                cpu_millis: 100,
+            })
+            .await
+            .unwrap();
+        assert!(
+            report.memory_enforced && report.cpu_enforced,
+            "委派 cgroup 后总体限制仍未强制"
+        );
+    }
     let info: RuntimeInfo = serde_json::from_value(probe(run, "/host-info", None).await).unwrap();
     let limits = info.limits.backend.unwrap();
     assert!(limits.enforced.pids && limits.enforced.open_files);
@@ -224,12 +238,17 @@ async fn resources(run: &Arc<backend::Run>) {
         "隔离验收：RLIMIT_NPROC={} 实际 EAGAIN；RLIMIT_NOFILE={} 实际 EMFILE；core 上下限 0、不可提高且 SIGABRT 无转储",
         limits.pids, limits.open_files
     );
-    if std::env::var_os("TGDRIVE_TEST_REQUIRE_CGROUP").is_some() {
+    if delegated {
         assert!(
             limits.enforced.memory && limits.enforced.cpu,
             "委派 cgroup 后仍未强制限额"
         );
-        let group = backend_system::cgroup_path(run.identity.uid, &run.caller.id).unwrap();
+        assert_eq!(limits.memory_bytes.0, 64 * 1024 * 1024);
+        assert_eq!(limits.cpu_millis, 100);
+        // 上限设在根组，各后端合计共用；本轮子组只收纳进程，用于整组回收。
+        let leaf = backend_system::cgroup_path(run.identity.uid, &run.caller.id).unwrap();
+        let leaf = Path::new(&leaf);
+        let group = backend_system::cgroup_root().unwrap();
         let group = Path::new(&group);
         assert_eq!(
             std::fs::read_to_string(group.join("memory.max"))
@@ -243,8 +262,15 @@ async fn resources(run: &Arc<backend::Run>) {
                 .trim(),
             format!("{} 100000", u64::from(limits.cpu_millis) * 100)
         );
+        assert_eq!(
+            std::fs::read_to_string(group.join("memory.swap.max"))
+                .unwrap()
+                .trim(),
+            "0",
+            "有内存上限时不得换出到交换空间"
+        );
         assert!(
-            std::fs::read_to_string(group.join("cgroup.procs"))
+            std::fs::read_to_string(leaf.join("cgroup.procs"))
                 .unwrap()
                 .lines()
                 .any(|pid| pid == run.pid.to_string())
@@ -258,7 +284,24 @@ async fn resources(run: &Arc<backend::Run>) {
         let allowance = cpu["wall_ns"].as_u64().unwrap() * u64::from(limits.cpu_millis) / 1000 * 2
             + 100_000_000;
         assert!(cpu["cpu_ns"].as_u64().unwrap() < allowance);
-        println!("隔离验收：cgroup 内存实际 OOM kill、CPU 实际节流且 enforced=true");
+        println!(
+            "隔离验收：根组总体限制运行中生效，内存实际 OOM kill、CPU 实际节流且 enforced=true"
+        );
+        // 放开为不限制，后续步骤不受本项验收的小额度影响。
+        let report = platform
+            .resource_limits_update(AppResourceLimitsUpdateRequest {
+                memory_bytes: tgdrive_contract::ByteCount(0),
+                cpu_millis: 0,
+            })
+            .await
+            .unwrap();
+        assert!(!report.memory_enforced && !report.cpu_enforced);
+        for file in ["memory.max", "memory.swap.max"] {
+            assert_eq!(
+                std::fs::read_to_string(group.join(file)).unwrap().trim(),
+                "max"
+            );
+        }
     } else {
         assert!(!limits.enforced.memory && !limits.enforced.cpu);
         println!(
@@ -384,7 +427,7 @@ async fn acceptance() -> anyhow::Result<()> {
     println!(
         "隔离验收：其他 UID 即使能连接 host.sock 仍被 SO_PEERCRED 拒绝；宿主出向 UID 核验通过"
     );
-    resources(&first).await;
+    resources(&platform, &first).await;
     backup_checks(&platform, &first).await?;
     let mut children = descendants(&first, false).await;
     children.extend(descendants(&first, true).await);

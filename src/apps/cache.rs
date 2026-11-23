@@ -231,7 +231,7 @@ impl AppPlatform {
                 ));
             }
         }
-        let limits = super::runtime::limits(&app)?;
+        let limits = super::runtime::limits(&app, self.shared_limits().await?.values())?;
         let private_usage = if limits.backend.is_some() {
             let uid: Option<i64> =
                 sqlx::query_scalar("SELECT uid FROM app_runtime_identities WHERE app_id=?")

@@ -80,6 +80,8 @@ pub(crate) struct AppPlatform {
     uploads: uploads::Uploads,
     cache_indexes:
         Mutex<std::collections::BTreeMap<String, std::sync::Arc<Mutex<cache::CacheIndex>>>>,
+    /// 宿主设置里唯一一组应用资源限制，首次使用时从设置表载入。
+    shared_limits: OnceCell<runtime::SharedLimits>,
 }
 
 impl AppPlatform {
@@ -117,8 +119,36 @@ impl AppPlatform {
             media: media::MediaState::new(),
             uploads: uploads::Uploads::new(),
             cache_indexes: Mutex::new(std::collections::BTreeMap::new()),
+            shared_limits: OnceCell::new(),
             host,
         }
+    }
+    /// 全部应用后端合计共用的内存与 CPU 上限；首次读取时载入并写入根 cgroup。
+    pub(crate) async fn shared_limits(&self) -> PlatformResult<&runtime::SharedLimits> {
+        self.shared_limits
+            .get_or_try_init(|| async {
+                let rows: Vec<(String, String)> =
+                    sqlx::query_as("SELECT k,v FROM settings WHERE k IN (?,?)")
+                        .bind(runtime::SHARED_MEMORY_KEY)
+                        .bind(runtime::SHARED_CPU_KEY)
+                        .fetch_all(&self.host.vfs.db.pool)
+                        .await?;
+                let stored = |key: &str| rows.iter().find(|row| row.0 == key).map(|row| &row.1);
+                let default = runtime::SharedLimitValues::default();
+                // 设置表里的值无法解析或越界时回到默认值，不让应用因此无法启动。
+                let values = runtime::SharedLimitValues {
+                    memory_bytes: stored(runtime::SHARED_MEMORY_KEY)
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(default.memory_bytes),
+                    cpu_millis: stored(runtime::SHARED_CPU_KEY)
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(default.cpu_millis),
+                }
+                .validate()
+                .unwrap_or(default);
+                Ok(runtime::SharedLimits::new(values))
+            })
+            .await
     }
     pub(crate) async fn shutdown(&self) -> PlatformResult<()> {
         self.sessions.revoke_all();

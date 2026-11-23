@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CONTRACT_VERSION, type CatalogEntry, type CatalogResponse, type InstalledApp, type InstallPreview, type InstallSource, type PackageTarget } from './contract'
 
 const calls = vi.hoisted(() => ({
-  load: vi.fn(), catalog: vi.fn(), setRoot: vi.fn(), backend: vi.fn(), logs: vi.fn(), restart: vi.fn(), push: vi.fn(),
+  load: vi.fn(), catalog: vi.fn(), setRoot: vi.fn(), limits: vi.fn(), setLimits: vi.fn(), backend: vi.fn(), logs: vi.fn(), restart: vi.fn(), push: vi.fn(),
   preview: vi.fn(), install: vi.fn(),
 }))
 vi.mock('vue-router', async (importOriginal) => ({ ...await importOriginal<typeof import('vue-router')>(), useRouter: () => ({ push: calls.push }) }))
@@ -13,7 +13,7 @@ vi.mock('./client', async () => {
   return {
     installedApps: shallowRef<InstalledApp[]>([]), rootSelection: shallowRef({ app_id: null as string | null, revision: 'root-1' }),
     loadInstalled: calls.load, iconUrl: () => undefined, formatBytes: (value: string) => `${value} B`, usage: vi.fn(),
-    center: { catalog: calls.catalog, refresh: calls.catalog, setRoot: calls.setRoot, backend: calls.backend, logs: calls.logs, restart: calls.restart, preview: calls.preview, install: calls.install },
+    center: { catalog: calls.catalog, refresh: calls.catalog, setRoot: calls.setRoot, limits: calls.limits, setLimits: calls.setLimits, backend: calls.backend, logs: calls.logs, restart: calls.restart, preview: calls.preview, install: calls.install },
   }
 })
 import AppCenter from './AppCenter.vue'
@@ -27,7 +27,7 @@ const basic = defineComponent({ setup(_, { slots }) { return () => h('div', slot
 let wrapper: VueWrapper | undefined
 const previews = new Map<string, InstallPreview>()
 function app(id = 'example-backend', enabled = true): InstalledApp {
-  return { manifest: { id, name: '测试服务', version: '1.0.0', description: '测试', contract: { major: 1, minor: 0 }, author: '测试', required_capabilities: [], open_with: { extensions: [], directories: false }, files: { read: true, write: true }, backend: { entry: 'backend/app', run_mode: 'resident', external_service: true, resources: {} } }, enabled, pinned: false, generation: 'g1', state_revision: 's1', package: { target: 'linux-arm64', sha256: 'a'.repeat(64), size: '1' }, installed_at: 1, updated_at: 1, scope: { revision: 'scope-1', scope: { mode: 'none' }, roots: [] }, backend: { state: 'ready', run_id: 'run-1', run_mode: 'resident', error_code: null } } as InstalledApp
+  return { manifest: { id, name: '测试服务', version: '1.0.0', description: '测试', contract: { major: 1, minor: 0 }, author: '测试', required_capabilities: [], open_with: { extensions: [], directories: false }, files: { read: true, write: true }, backend: { entry: 'backend/app', run_mode: 'resident', external_service: true } }, enabled, pinned: false, generation: 'g1', state_revision: 's1', package: { target: 'linux-arm64', sha256: 'a'.repeat(64), size: '1' }, installed_at: 1, updated_at: 1, scope: { revision: 'scope-1', scope: { mode: 'none' }, roots: [] }, backend: { state: 'ready', run_id: 'run-1', run_mode: 'resident', error_code: null } } as InstalledApp
 }
 function entry(id = 'example-backend', version = '1.0.1', targets: PackageTarget[] = ['linux-arm64', 'linux-amd64']): CatalogEntry {
   return { manifest: { ...app(id).manifest, version }, packages: Object.fromEntries(targets.map((target) => [target, { url: `https://github.com/test/apps/releases/download/${id}-v${version}/${id}-${version}-${target}.tgapp`, sha256: (target === 'linux-arm64' ? 'b' : 'c').repeat(64), size: '1024' }])) }
@@ -52,7 +52,9 @@ beforeEach(() => {
   calls.load.mockImplementation(async () => installedApps.value)
   calls.catalog.mockResolvedValue({ status: { state: 'disabled' }, result: { catalog: { entries: [] }, incompatible: [] } })
   calls.setRoot.mockImplementation(async (body) => ({ app_id: body.app_id, revision: 'root-2' }))
-  calls.backend.mockResolvedValue({ status: { state: 'ready', run_id: 'run-1' }, limits: { memory_bytes: '536870912', cpu_millis: 1000, pids: 64, open_files: 1024, cache_bytes: '1073741824', database_bytes: '536870912', enforced: { memory: false, cpu: false, pids: true, open_files: true } } })
+  calls.limits.mockResolvedValue({ memory_bytes: '2147483648', cpu_millis: 0, memory_enforced: false, cpu_enforced: false })
+  calls.setLimits.mockImplementation(async (body) => ({ ...body, memory_enforced: body.memory_bytes !== '0', cpu_enforced: false }))
+  calls.backend.mockResolvedValue({ status: { state: 'ready', run_id: 'run-1' }, limits: { memory_bytes: '2147483648', cpu_millis: 0, pids: 64, open_files: 1024, cache_bytes: '1073741824', database_bytes: '536870912', enforced: { memory: false, cpu: false, pids: true, open_files: true } } })
   calls.logs.mockResolvedValue({ stdout: '<script>不执行</script>', stderr: '诊断', truncated: true })
   calls.restart.mockResolvedValue({ state: 'ready', run_id: 'run-2' })
   calls.preview.mockImplementation(async (source: InstallSource) => {
@@ -169,7 +171,8 @@ describe('应用中心后端管理', () => {
   it('展示真实 enforced，而不是把目标配额称为硬限制', async () => {
     const view = await render(); await click('资源限制')
     expect(calls.backend).toHaveBeenCalledWith('example-backend')
-    expect(view.text()).toContain('enforced=false')
+    expect(view.text()).toContain('内存（全部应用合计）2147483648 B · 未强制（没有可写的 cgroup）')
+    expect(view.text()).toContain('CPU（全部应用合计）不限制')
     expect(view.text()).toContain('本轮已强制')
     expect(view.text()).toContain('监督式计量')
     expect(view.text()).toContain('不是实时硬隔离')
@@ -182,6 +185,28 @@ describe('应用中心后端管理', () => {
     expect(calls.setRoot).toHaveBeenLastCalledWith({ expected_revision: 'root-1', app_id: 'example-backend' })
     await view.find('select').setValue(''); await flushPromises()
     expect(calls.setRoot).toHaveBeenLastCalledWith({ expected_revision: 'root-2', app_id: null })
+  })
+  it('应用资源限制只有一组总体设置，按 MiB 与核填写并换算保存，0 表示不限制', async () => {
+    const view = await render()
+    const memory = view.find('input[aria-label="应用内存上限"]'), cpu = view.find('input[aria-label="应用 CPU 上限"]')
+    expect((memory.element as HTMLInputElement).value).toBe('2048')
+    expect((cpu.element as HTMLInputElement).value).toBe('0')
+    expect(view.find('.limit-state').text()).toBe('当前：内存 2147483648 B · 未强制（没有可写的 cgroup）；CPU 不限制')
+    const save = () => view.findAll('button').find(button => button.text() === '保存限制')!
+    expect(save().attributes('disabled')).toBeDefined()
+    await memory.setValue('32'); await click('保存限制')
+    expect(calls.setLimits).not.toHaveBeenCalled()
+    expect(view.find('[title="内存上限需为 0（不限制）或 64 MiB～1 TiB"]').exists()).toBe(true)
+    await memory.setValue(''); await click('保存限制')
+    expect(calls.setLimits).not.toHaveBeenCalled()
+    expect(view.find('[title="请填写内存与 CPU 上限，0 表示不限制"]').exists()).toBe(true)
+    await memory.setValue('4096'); await cpu.setValue('1.5'); await click('保存限制')
+    expect(calls.setLimits).toHaveBeenLastCalledWith({ memory_bytes: '4294967296', cpu_millis: 1500 })
+    expect(view.find('.limit-state').text()).toBe('当前：内存 4294967296 B · 已强制；CPU 1.5 核 · 未强制（没有可写的 cgroup）')
+    expect(save().attributes('disabled')).toBeDefined()
+    await memory.setValue('0'); await cpu.setValue('0'); await click('保存限制')
+    expect(calls.setLimits).toHaveBeenLastCalledWith({ memory_bytes: '0', cpu_millis: 0 })
+    expect(view.find('.limit-state').text()).toBe('当前：内存 不限制；CPU 不限制')
   })
   it('日志只作为文本显示，重启后重读状态，卸载页面时停止状态定时器', async () => {
     const view = await render(); await click('后端日志')

@@ -58,7 +58,9 @@ node docker/test-platform-image.mjs tgdrive:local
 
 Bot API 镜像无需应用契约上下文。
 
-### cgroup v2 限额
+### 应用资源限制与 cgroup v2
+
+应用的内存和 CPU 只有一组总体限制，在应用中心的「应用资源限制」里填写：全部应用后端合计共用，不按应用分别设置，应用自己也不能在清单里声明。默认内存合计 2 GiB、CPU 不限制，填 0 表示不限制；保存后写入全部应用后端共同所在的 cgroup，立即生效，不需要重启应用。设了内存上限时同时禁止这些后端使用交换空间；内存合计超出时内核会在这些后端里终止占用最多的进程，可能连带影响别的应用。进程数、打开文件数、数据库与缓存容量对每个应用使用固定值。
 
 内存和 CPU 限额是尽力而为，不是后端启动的硬条件。默认容器的 `/sys/fs/cgroup` 通常只读，此时后端照常启动，并在 `RuntimeInfo.limits.backend.enforced` 及启动上下文中报告 `memory=false,cpu=false`、记录告警。独立 UID 下的 `RLIMIT_NPROC`、`RLIMIT_NOFILE` 分别控制进程数和打开文件数，并各自报告 `pids`、`open_files` 的实际设置结果；core dump 禁用。配置目标不等于实际强制。
 
@@ -81,7 +83,7 @@ services:
 docker compose -f docker-compose.yml -f compose.cgroup.yml up -d tgdrive
 ```
 
-不要把整个宿主 cgroup 树开放给容器，也不需要 `privileged: true`。宿主会按 `<UID>/<run_id>` 创建子组，将真实后端 PID 加入后设置 `memory.max`、`cpu.max`；只有相应文件实际设置成功才报告 `true`。委派权限、控制器或设置失败仍是 `false`，不会因为提供了覆盖文件就宣称生效。Docker Desktop、rootless/受管容器平台的委派条件由平台决定；不能提供可写子树时保持默认运行方式。
+不要把整个宿主 cgroup 树开放给容器，也不需要 `privileged: true`。宿主把总体限制写到这个专用子树自身的 `memory.max`、`cpu.max`，再按 `<UID>/<run_id>` 创建子组收纳真实后端 PID，子组只用于整组回收；只有相应文件实际设置成功且该项不是「不限制」才报告 `true`。委派权限、控制器或设置失败仍是 `false`，不会因为提供了覆盖文件就宣称生效。Docker Desktop、rootless/受管容器平台的委派条件由平台决定；不能提供可写子树时保持默认运行方式。
 
 数据库与 `cache/work`、`tmp` 的磁盘用量是监督式计量：超额可能短暂发生，宿主发现后停止后端、阻止重启，等待主人清理或调整；不会静默删除业务 SQLite，也不是实时文件系统配额。
 
@@ -140,7 +142,7 @@ node docker/test-cinema-library.mjs --cinema /绝对路径/cinema-1.0.1-linux-ar
 
 该入口显式执行 `apps::linux_end_to_end_tests::linux_cinema_library_browser`：验证首次选择、取消授权保留草稿、电影和电视剧两库保存、第二次授权保留第一库、只读范围不包含第三个私人目录、重开页面持久保留及后端回收。源码快照、截图和日志保存在新的输出目录。
 
-没有可写 cgroup 时验收明确报告内存/CPU 未强制，不把它写成实际硬限额通过；提供 `--cgroup-root` 后要求两个 enforced 都为 true，并验证内存 OOM kill 和 CPU 节流。测试的合成网盘文件位于 `#[cfg(test)]` 模块，探针为独立测试 workspace；发布镜像只运行普通 `cargo build --release --locked`，不启用任何本地存储替身或测试开关。
+没有可写 cgroup 时验收明确报告内存/CPU 未强制，不把它写成实际硬限额通过；提供 `--cgroup-root` 后在后端运行中收紧总体限制，要求两个 enforced 都为 true，并验证内存 OOM kill 和 CPU 节流。测试的合成网盘文件位于 `#[cfg(test)]` 模块，探针为独立测试 workspace；发布镜像只运行普通 `cargo build --release --locked`，不启用任何本地存储替身或测试开关。
 
 ## 官方端点与自建端点
 

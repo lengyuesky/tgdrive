@@ -27,7 +27,7 @@ impl AppPlatform {
             .manifest()?
             .backend
             .ok_or_else(|| PlatformError::new(error_code::CALLER_NOT_ALLOWED, "应用没有后端"))?;
-        let mut limits = super::runtime::limits(&app)?
+        let mut limits = super::runtime::limits(&app, self.shared_limits().await?.values())?
             .backend
             .expect("已核对后端声明");
         if let Some(run) = self.backends.run(id) {
@@ -42,6 +42,43 @@ impl AppPlatform {
         if let Some(backend) = &app.manifest.backend {
             app.backend = Some(self.backends.status(&app.manifest.id, backend.run_mode));
         }
+    }
+    /// 保存宿主唯一一组应用资源限制，并立刻对运行中的全部后端生效。
+    pub async fn resource_limits_update(
+        &self,
+        request: AppResourceLimitsUpdateRequest,
+    ) -> PlatformResult<AppResourceLimits> {
+        let values = super::runtime::SharedLimitValues {
+            memory_bytes: request.memory_bytes.0,
+            cpu_millis: request.cpu_millis,
+        }
+        .validate()?;
+        let limits = self.shared_limits().await?;
+        let _saving = limits.update.lock().await;
+        let mut tx = self.host.vfs.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (key, value) in [
+            (
+                super::runtime::SHARED_MEMORY_KEY,
+                values.memory_bytes.to_string(),
+            ),
+            (
+                super::runtime::SHARED_CPU_KEY,
+                values.cpu_millis.to_string(),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        limits.set(values);
+        let report = limits.report();
+        self.backends.update_shared_limits(&report);
+        Ok(report)
     }
     pub async fn root_selection(&self) -> PlatformResult<RootAppSelection> {
         let (app_id, revision): (Option<String>, String) =

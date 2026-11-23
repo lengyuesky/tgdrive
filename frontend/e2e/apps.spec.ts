@@ -1,6 +1,7 @@
 import { test, expect, type Page } from '@playwright/test'
 import { CONTRACT_VERSION, PAGE_CSP, SELF_API_BASE, APP_CENTER_BASE, ASSET_BASE, UI_CHANNEL, LIMITS,
-  type InstalledApp, type Manifest, type ScopeInfo, type PageBootstrap, type DirectoryGrant, type RuntimeLimits } from '../src/apps/contract'
+  type InstalledApp, type Manifest, type ScopeInfo, type PageBootstrap, type DirectoryGrant, type RuntimeLimits,
+  type AppResourceLimits, type AppResourceLimitsUpdateRequest } from '../src/apps/contract'
 
 const manifest: Manifest = { id: 'browser-page', name: '浏览器测试应用', version: '1.0.0', description: '测试内构造的纯页面应用', author: '测试', contract: CONTRACT_VERSION,
   files: { read: true, write: false }, page: { entry: 'page/index.html' }, required_capabilities: [], open_with: { extensions: ['bin'], directories: true } }
@@ -49,6 +50,8 @@ async function mock(page: Page) {
   const app = (): InstalledApp => ({ manifest, generation: 'generation-1', state_revision: 'state-1', enabled: true, pinned: false, scope, package: { target: 'web', sha256: sha, size: '100' }, backend: null, installed_at: 1, updated_at: 1 })
   const requests: { path: string; method: string; authorization?: string; origin?: string }[] = [], outside: string[] = [], order: string[] = []
   let closed = false
+  let limits: AppResourceLimits = { memory_bytes: String(LIMITS.DEFAULT_SHARED_BACKEND_MEMORY_BYTES), cpu_millis: LIMITS.DEFAULT_SHARED_BACKEND_CPU_MILLIS, memory_enforced: false, cpu_enforced: false }
+  const limitUpdates: AppResourceLimitsUpdateRequest[] = []
   page.on('request', (request) => { if (!request.url().startsWith('http://127.0.0.1:4178/')) outside.push(request.url()) })
   await page.route('**/*', async (route) => {
     const url = new URL(route.request().url())
@@ -72,6 +75,15 @@ async function mock(page: Page) {
       return route.fulfill({ json: { kv_entries: 2, kv_bytes: '1024', kv_entry_limit: LIMITS.DEFAULT_KV_ENTRIES, kv_byte_limit: String(LIMITS.DEFAULT_KV_BYTES), cache_bytes: '2048', cache_byte_limit: String(LIMITS.DEFAULT_PAGE_CACHE_BYTES), database_bytes: null, database_byte_limit: null } })
     }
     if (url.pathname === `${APP_CENTER_BASE}/apps`) return route.fulfill({ json: { apps: [app()], root_app: { app_id: null, revision: 'root-1' } } })
+    if (url.pathname === `${APP_CENTER_BASE}/resource-limits`) {
+      if (route.request().method() === 'PUT') {
+        const body = route.request().postDataJSON() as AppResourceLimitsUpdateRequest
+        limitUpdates.push(body)
+        // 模拟已委派 cgroup 的宿主：设了上限的项即被强制。
+        limits = { ...body, memory_enforced: body.memory_bytes !== '0', cpu_enforced: body.cpu_millis !== 0 }
+      }
+      return route.fulfill({ json: limits })
+    }
     if (url.pathname === `${APP_CENTER_BASE}/catalog`) return route.fulfill({ json: { status: { state: 'disabled', repository: '', last_success_at: null, error: null }, result: { catalog: { format: CONTRACT_VERSION, repository: '', entries: [] }, incompatible: [] } } })
     if (url.pathname === `${APP_CENTER_BASE}/apps/${manifest.id}`) return route.fulfill({ json: app() })
     if (url.pathname.endsWith('/scope') && url.pathname.startsWith(APP_CENTER_BASE)) {
@@ -97,7 +109,7 @@ async function mock(page: Page) {
     }
     return route.fulfill({ json: { ok: true } })
   })
-  return { requests, outside, order }
+  return { requests, outside, order, limitUpdates }
 }
 
 test('纯页面真实沙箱握手、全部界面方法与关闭保存', async ({ page }) => {
@@ -161,6 +173,27 @@ test('主人确认具体目录、查看占用并从文件打开应用', async ({
   await expect(opened.locator('#status')).toHaveText('握手完成')
   expect(await opened.locator('body').getAttribute('data-opened')).toBe('2')
   await page.screenshot({ path: '/tmp/tgdrive-app-owner-internal.png', fullPage: true })
+})
+
+test('应用资源限制只有一组总体设置，保存后立即显示当前值', async ({ page }, testInfo) => {
+  const state = await mock(page)
+  await page.goto('/admin/apps')
+  const section = page.locator('.resource-limits')
+  const memory = section.getByLabel('应用内存上限'), cpu = section.getByLabel('应用 CPU 上限')
+  await expect(memory).toHaveValue('2048'); await expect(cpu).toHaveValue('0')
+  await expect(section.locator('.limit-state')).toHaveText('当前：内存 2.0 GiB · 未强制（没有可写的 cgroup）；CPU 不限制')
+  const save = section.getByRole('button', { name: '保存限制', exact: true })
+  await expect(save).toBeDisabled()
+  await memory.fill('4096'); await cpu.fill('1.5'); await save.click()
+  await expect(section.locator('.limit-state')).toHaveText('当前：内存 4.0 GiB · 已强制；CPU 1.5 核 · 已强制')
+  expect(state.limitUpdates).toEqual([{ memory_bytes: '4294967296', cpu_millis: 1500 }])
+  await expect(save).toBeDisabled()
+  await page.screenshot({ path: testInfo.outputPath('resource-limits.png'), fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.screenshot({ path: testInfo.outputPath('resource-limits-mobile.png'), fullPage: true })
+  await memory.fill('0'); await cpu.fill('0'); await save.click()
+  await expect(section.locator('.limit-state')).toHaveText('当前：内存 不限制；CPU 不限制')
+  expect(state.limitUpdates[1]).toEqual({ memory_bytes: '0', cpu_millis: 0 })
 })
 
 test('应用中心一键刷新更新、单项失败继续和重试保留逐项结果', async ({ page }, testInfo) => {

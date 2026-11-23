@@ -43,6 +43,18 @@ pub(crate) struct Run {
     ready: AtomicBool,
 }
 impl Run {
+    /// 用当前总体限制刷新本轮对外报告的限额；只有进程确实在共同的 cgroup 里才算被强制。
+    fn sync_shared_limits(&self, shared: &AppResourceLimits) {
+        let joined = self
+            .cgroup
+            .as_deref()
+            .is_some_and(|cgroup| system::in_cgroup(cgroup, self.pid));
+        let mut limits = self.limits.write().unwrap();
+        limits.memory_bytes = shared.memory_bytes;
+        limits.cpu_millis = shared.cpu_millis;
+        limits.enforced.memory = joined && shared.memory_enforced;
+        limits.enforced.cpu = joined && shared.cpu_enforced;
+    }
     pub fn activity(self: &Arc<Self>) -> Activity {
         self.active.fetch_add(1, Ordering::AcqRel);
         self.touch();
@@ -275,9 +287,10 @@ impl Manager {
             0o550,
         )?;
         let data = system::prepare_layout(&platform.data_root(), &app.id, identity)?;
-        let limits = super::runtime::limits(app)?.backend.ok_or_else(|| {
-            PlatformError::new(error_code::CALLER_NOT_ALLOWED, "应用没有后端资源声明")
-        })?;
+        let shared = platform.shared_limits().await?.values();
+        let limits = super::runtime::limits(app, shared)?
+            .backend
+            .ok_or_else(|| PlatformError::new(error_code::CALLER_NOT_ALLOWED, "应用没有后端"))?;
         let usage = system::disk_usage(&data, identity)?;
         if usage.0 > limits.database_bytes.0 || usage.1 > limits.cache_bytes.0 {
             self.slot(&app.id)
@@ -523,7 +536,8 @@ impl Manager {
             let identity = system::identity(&platform.host.vfs.db, id).await?;
             let mut conn = platform.host.vfs.db.pool.acquire().await?;
             let installation = store::installation(&mut conn, id).await?;
-            let limits = super::runtime::limits(&installation)?
+            let shared = platform.shared_limits().await?.values();
+            let limits = super::runtime::limits(&installation, shared)?
                 .backend
                 .expect("已检查后端声明");
             let usage = system::disk_usage(&platform.data_root().join(id), identity)?;
@@ -818,6 +832,8 @@ async fn ready_inner(
                 )?;
                 *run.limits.write().unwrap() = context.limits;
             }
+            // 启动上下文是启动时的快照；启动途中主人改过总体限制时以当前值为准。
+            run.sync_shared_limits(&platform.shared_limits().await?.report());
             let mut conn = platform.host.vfs.db.pool.acquire().await?;
             store::installation(&mut conn, &app.id)
                 .await?
@@ -1056,6 +1072,16 @@ fn disk_exceeded(run: &Run) -> PlatformResult<bool> {
     let (state, cache) = system::disk_usage(std::path::Path::new(&run.data_dir), run.identity)?;
     let limits = run.limits.read().unwrap();
     Ok(state > limits.database_bytes.0 || cache > limits.cache_bytes.0)
+}
+impl Manager {
+    /// 总体限制变更后同步运行中各后端对外报告的限额，上限本身已写在共同的根 cgroup 上。
+    pub(crate) fn update_shared_limits(&self, shared: &AppResourceLimits) {
+        for slot in self.slots.lock().unwrap().values() {
+            if let Some(run) = slot.run.read().unwrap().as_ref() {
+                run.sync_shared_limits(shared);
+            }
+        }
+    }
 }
 impl Drop for Manager {
     fn drop(&mut self) {

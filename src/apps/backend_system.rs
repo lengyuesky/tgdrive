@@ -392,33 +392,25 @@ pub(crate) fn launch_helper(path: &Path) -> anyhow::Result<std::convert::Infalli
     if let Some(cgroup) = &config.cgroup
         && is_cgroup_v2(Path::new(cgroup))
     {
-        // 在管理父组启用控制器；失败只是尽力而为限制不可用，不阻止硬隔离启动。
-        if let Some(uid_group) = Path::new(cgroup).parent()
-            && let Some(root) = uid_group.parent()
-        {
-            let _ = std::fs::create_dir_all(uid_group);
-            let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory +cpu");
-            let _ = std::fs::write(uid_group.join("cgroup.subtree_control"), "+memory +cpu");
-        }
+        // 本轮子组只用于整组回收；内存与 CPU 上限由宿主进程写在全部应用后端共同所在的根组上，
+        // 这里只加入并如实读取当前是否有上限在生效。加入失败只是限制不可用，不阻止硬隔离启动。
         if std::fs::create_dir_all(cgroup).is_ok()
             && std::fs::write(
                 Path::new(cgroup).join("cgroup.procs"),
                 std::process::id().to_string(),
             )
             .is_ok()
+            && let Some(root) = Path::new(cgroup).parent().and_then(Path::parent)
         {
-            enforced.memory = std::fs::write(
-                Path::new(cgroup).join("memory.max"),
-                config.context.limits.memory_bytes.0.to_string(),
-            )
-            .is_ok();
-            let quota = u64::from(config.context.limits.cpu_millis) * 100;
-            enforced.cpu =
-                std::fs::write(Path::new(cgroup).join("cpu.max"), format!("{quota} 100000"))
-                    .is_ok();
+            (enforced.memory, enforced.cpu) = shared_limits_in_force(root);
         }
     }
-    if !enforced.memory || !enforced.cpu || !enforced.pids || !enforced.open_files {
+    let limits = &config.context.limits;
+    if (!enforced.memory && limits.memory_bytes.0 != 0)
+        || (!enforced.cpu && limits.cpu_millis != 0)
+        || !enforced.pids
+        || !enforced.open_files
+    {
         eprintln!(
             "后端部分资源限制未强制：memory={} cpu={} pids={} open_files={}",
             enforced.memory, enforced.cpu, enforced.pids, enforced.open_files
@@ -562,13 +554,56 @@ fn clear_capabilities() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 全部应用后端共同所在的 cgroup；没有真实隔离时不存在。
+pub(crate) fn cgroup_root() -> Option<String> {
+    real_isolation().then(|| {
+        crate::config::env_opt("TGDRIVE_APP_CGROUP_ROOT")
+            .unwrap_or_else(|| "/sys/fs/cgroup/tgdrive-apps".into())
+    })
+}
 pub(crate) fn cgroup_path(uid: u32, run: &str) -> Option<String> {
-    let root = crate::config::env_opt("TGDRIVE_APP_CGROUP_ROOT")
-        .unwrap_or_else(|| "/sys/fs/cgroup/tgdrive-apps".into());
-    if !real_isolation() {
-        return None;
+    cgroup_root().map(|root| format!("{root}/{uid}/{run}"))
+}
+/// 把总体内存与 CPU 上限写到根组，0 写成不限制；返回两项上限是否实际生效。
+/// 根组不可写、控制器不可用或该项设为不限制时为 false。
+pub(crate) fn apply_shared_limits(root: &Path, memory_bytes: u64, cpu_millis: u32) -> (bool, bool) {
+    if !is_cgroup_v2(root) || std::fs::create_dir_all(root).is_err() {
+        return (false, false);
     }
-    Some(format!("{root}/{uid}/{run}"))
+    let memory = if memory_bytes == 0 {
+        "max".to_owned()
+    } else {
+        memory_bytes.to_string()
+    };
+    let cpu = if cpu_millis == 0 {
+        "max 100000".to_owned()
+    } else {
+        format!("{} 100000", u64::from(cpu_millis) * 100)
+    };
+    let memory_written = std::fs::write(root.join("memory.max"), memory).is_ok();
+    // 有内存上限时不让后端把超出的部分换出到交换空间，否则上限只会变成拖慢整机的换页；
+    // 内核未开启交换记账时没有这个文件，忽略即可。
+    let _ = std::fs::write(
+        root.join("memory.swap.max"),
+        if memory_bytes == 0 { "max" } else { "0" },
+    );
+    (
+        memory_written && memory_bytes != 0,
+        std::fs::write(root.join("cpu.max"), cpu).is_ok() && cpu_millis != 0,
+    )
+}
+/// 根组上当前是否真的设有内存、CPU 上限。
+fn shared_limits_in_force(root: &Path) -> (bool, bool) {
+    let limited = |file: &str| {
+        std::fs::read_to_string(root.join(file))
+            .is_ok_and(|value| !value.trim().is_empty() && !value.trim().starts_with("max"))
+    };
+    (limited("memory.max"), limited("cpu.max"))
+}
+/// 该进程是否确实在本轮子组里，也就是受根组的总体限制约束。
+pub(crate) fn in_cgroup(cgroup: &str, pid: u32) -> bool {
+    std::fs::read_to_string(Path::new(cgroup).join("cgroup.procs"))
+        .is_ok_and(|procs| procs.lines().any(|line| line.trim() == pid.to_string()))
 }
 pub(crate) fn kill_group(pid: u32, identity: Identity, signal: i32) {
     unsafe {

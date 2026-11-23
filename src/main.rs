@@ -310,6 +310,11 @@ async fn serve() -> anyhow::Result<()> {
         None => tracing::warn!("未找到静态前端目录,仅提供 API(开发模式请用 vite dev server)"),
     }
     let platform = Arc::new(apps::AppPlatform::new(state.clone()));
+    // 开始服务前先载入应用资源限制并写入 cgroup，请求不必在各自的事务里等待首次载入。
+    // 读取失败不阻止宿主启动，之后首次用到时会重试。
+    if let Err(error) = platform.shared_limits().await {
+        tracing::warn!("应用资源限制载入失败，将在首次使用时重试: {error}");
+    }
     let app = http_router_with_platform(
         state.clone(),
         static_dir.as_deref().map(std::path::Path::new),

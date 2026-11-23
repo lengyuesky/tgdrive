@@ -668,6 +668,12 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
             "center.root.update" => {
                 owner_json(platform.root_update(strict_json(body).await?).await?)
             }
+            "center.limits.read" => owner_json(platform.shared_limits().await?.report()),
+            "center.limits.update" => owner_json(
+                platform
+                    .resource_limits_update(strict_json(body).await?)
+                    .await?,
+            ),
             "backend.keepalive" => {
                 let caller = caller(&session)?;
                 if caller.is_page() {
@@ -710,7 +716,8 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                 let mut tx = platform.host.vfs.db.pool.begin().await?;
                 let app = store::installation(&mut tx, &session.app_id).await?;
                 let scope = store::scope_info(&mut tx, &app).await?;
-                let mut info = super::runtime::info(&app, scope, session.kind)?;
+                let shared = platform.shared_limits().await?.values();
+                let mut info = super::runtime::info(&app, scope, session.kind, shared)?;
                 if let Some(backend) = app.manifest()?.backend {
                     info.backend = Some(platform.backends.status(&app.id, backend.run_mode));
                     if let Some(run) = platform.backends.run(&app.id) {

@@ -3,7 +3,8 @@ import { invalidateSession } from '../session'
 import { ENDPOINTS, APP_CENTER_BASE, ASSET_BASE, type ApiError, type ErrorResponse, type InstalledApp, type InstalledAppsResponse,
   type InstallPreview, type InstallSource, type InstallRequest, type ScopeInfo, type ScopeUpdateRequest,
   type AppStatePatch, type CatalogResponse, type PackageUploadReceipt, type LaunchPageRequest,
-  type LaunchPageResponse, type NodeReference, type FileNode, type DataUsage, type BackendStatus, type BackendResourceLimits, type RootAppSelection, type RootAppUpdateRequest } from './contract'
+  type LaunchPageResponse, type NodeReference, type FileNode, type DataUsage, type BackendStatus, type BackendResourceLimits, type RootAppSelection, type RootAppUpdateRequest,
+  type AppResourceLimits, type AppResourceLimitsUpdateRequest } from './contract'
 
 export interface BackendManagementInfo { status: BackendStatus; limits: BackendResourceLimits }
 export interface BackendLogs { stdout: string; stderr: string; truncated: boolean }
@@ -91,6 +92,8 @@ export const center = {
   restart: (id: string) => owner<BackendStatus>('center.app.restart', { app_id: id }),
   root: () => owner<RootAppSelection>('center.root.read'),
   setRoot: (body: RootAppUpdateRequest) => owner<RootAppSelection>('center.root.update', {}, body),
+  limits: () => owner<AppResourceLimits>('center.limits.read'),
+  setLimits: (body: AppResourceLimitsUpdateRequest) => owner<AppResourceLimits>('center.limits.update', {}, body),
   backend: (id: string) => owner<BackendManagementInfo>('center.app.backend', { app_id: id }),
   logs: (id: string) => owner<BackendLogs>('center.app.logs', { app_id: id }),
   launch: (id: string, body: LaunchPageRequest) => owner<LaunchPageResponse>('center.app.launch', { app_id: id }, body),

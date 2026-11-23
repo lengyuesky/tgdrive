@@ -283,7 +283,7 @@ impl AppPlatform {
                 .bind(app_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let limits = super::runtime::limits(&app)?;
+        let limits = super::runtime::limits(&app, self.shared_limits().await?.values())?;
         let (entries, bytes) = usage.unwrap_or((0, 0));
         tx.commit().await?;
         let mut cache = self.cache_usage(app_id).await?;

@@ -4,7 +4,7 @@ use super::cursor::{CursorCodec, CursorData};
 use super::store::Installation;
 use super::{PlatformError, PlatformResult, now, opaque};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tgdrive_contract::http::*;
@@ -250,31 +250,113 @@ pub(crate) fn capabilities() -> Vec<&'static str> {
         .collect()
 }
 
-pub(crate) fn limits(app: &Installation) -> PlatformResult<RuntimeLimits> {
-    let backend = app.manifest()?.backend.map(|backend| {
-        let requested = backend.resources;
-        BackendResourceLimits {
-            memory_bytes: requested
-                .memory_bytes
-                .unwrap_or(ByteCount(DEFAULT_BACKEND_MEMORY_BYTES)),
-            cpu_millis: requested
-                .cpu_millis
-                .unwrap_or(DEFAULT_BACKEND_CPU_MILLIS as u32),
-            pids: requested.pids.unwrap_or(DEFAULT_BACKEND_PIDS as u16),
-            open_files: DEFAULT_BACKEND_OPEN_FILES as u32,
-            cache_bytes: requested
-                .cache_bytes
-                .unwrap_or(ByteCount(DEFAULT_BACKEND_CACHE_BYTES)),
-            database_bytes: requested
-                .database_bytes
-                .unwrap_or(ByteCount(DEFAULT_BACKEND_DATABASE_BYTES)),
-            enforced: BackendLimitEnforcement {
-                memory: false,
-                cpu: false,
-                pids: false,
-                open_files: false,
-            },
+/// 宿主设置里唯一一组应用资源限制：全部应用后端合计共用，0 表示不限制。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SharedLimitValues {
+    pub memory_bytes: u64,
+    pub cpu_millis: u32,
+}
+impl Default for SharedLimitValues {
+    fn default() -> Self {
+        Self {
+            memory_bytes: DEFAULT_SHARED_BACKEND_MEMORY_BYTES,
+            cpu_millis: DEFAULT_SHARED_BACKEND_CPU_MILLIS as u32,
         }
+    }
+}
+impl SharedLimitValues {
+    pub fn validate(self) -> PlatformResult<Self> {
+        let memory = self.memory_bytes == 0
+            || (MIN_SHARED_BACKEND_MEMORY_BYTES..=MAX_SHARED_BACKEND_MEMORY_BYTES)
+                .contains(&self.memory_bytes);
+        let cpu = self.cpu_millis == 0
+            || (MIN_SHARED_BACKEND_CPU_MILLIS..=MAX_SHARED_BACKEND_CPU_MILLIS)
+                .contains(&u64::from(self.cpu_millis));
+        if memory && cpu {
+            Ok(self)
+        } else {
+            Err(PlatformError::new(
+                error_code::INVALID_REQUEST,
+                "应用内存上限需为 0 或 64 MiB～1 TiB，CPU 上限需为 0 或 0.1～256 核",
+            ))
+        }
+    }
+}
+
+pub(crate) const SHARED_MEMORY_KEY: &str = "apps.shared_memory_bytes";
+pub(crate) const SHARED_CPU_KEY: &str = "apps.shared_cpu_millis";
+
+/// 当前生效的总体限制及其在 cgroup 上的实际强制状态。
+pub(crate) struct SharedLimits {
+    memory_bytes: AtomicU64,
+    cpu_millis: AtomicU32,
+    memory_enforced: AtomicBool,
+    cpu_enforced: AtomicBool,
+    /// 串行化保存，使设置表、内存值与 cgroup 的写入顺序一致。
+    pub update: tokio::sync::Mutex<()>,
+}
+impl SharedLimits {
+    pub fn new(values: SharedLimitValues) -> Self {
+        let limits = Self {
+            memory_bytes: AtomicU64::new(0),
+            cpu_millis: AtomicU32::new(0),
+            memory_enforced: AtomicBool::new(false),
+            cpu_enforced: AtomicBool::new(false),
+            update: tokio::sync::Mutex::new(()),
+        };
+        limits.set(values);
+        limits
+    }
+    pub fn values(&self) -> SharedLimitValues {
+        SharedLimitValues {
+            memory_bytes: self.memory_bytes.load(Ordering::Acquire),
+            cpu_millis: self.cpu_millis.load(Ordering::Acquire),
+        }
+    }
+    /// 记录新值并立刻写入根组，运行中的后端无需重启。
+    pub fn set(&self, values: SharedLimitValues) {
+        self.memory_bytes
+            .store(values.memory_bytes, Ordering::Release);
+        self.cpu_millis.store(values.cpu_millis, Ordering::Release);
+        let (memory, cpu) = super::backend_system::cgroup_root().map_or((false, false), |root| {
+            super::backend_system::apply_shared_limits(
+                std::path::Path::new(&root),
+                values.memory_bytes,
+                values.cpu_millis,
+            )
+        });
+        self.memory_enforced.store(memory, Ordering::Release);
+        self.cpu_enforced.store(cpu, Ordering::Release);
+    }
+    pub fn report(&self) -> AppResourceLimits {
+        let values = self.values();
+        AppResourceLimits {
+            memory_bytes: ByteCount(values.memory_bytes),
+            cpu_millis: values.cpu_millis,
+            memory_enforced: self.memory_enforced.load(Ordering::Acquire),
+            cpu_enforced: self.cpu_enforced.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// 内存与 CPU 来自宿主的总体设置；其余各项是宿主对每个应用统一使用的固定值，应用不能声明。
+pub(crate) fn limits(
+    app: &Installation,
+    shared: SharedLimitValues,
+) -> PlatformResult<RuntimeLimits> {
+    let backend = app.manifest()?.backend.map(|_| BackendResourceLimits {
+        memory_bytes: ByteCount(shared.memory_bytes),
+        cpu_millis: shared.cpu_millis,
+        pids: DEFAULT_BACKEND_PIDS as u16,
+        open_files: DEFAULT_BACKEND_OPEN_FILES as u32,
+        cache_bytes: ByteCount(DEFAULT_BACKEND_CACHE_BYTES),
+        database_bytes: ByteCount(DEFAULT_BACKEND_DATABASE_BYTES),
+        enforced: BackendLimitEnforcement {
+            memory: false,
+            cpu: false,
+            pids: false,
+            open_files: false,
+        },
     });
     let cache_byte_limit = backend
         .as_ref()
@@ -315,9 +397,10 @@ pub(crate) fn info(
     app: &Installation,
     scope: tgdrive_contract::files::ScopeInfo,
     caller: RuntimeCaller,
+    shared: SharedLimitValues,
 ) -> PlatformResult<RuntimeInfo> {
     let manifest = app.manifest()?;
-    let mut actual_limits = limits(app)?;
+    let mut actual_limits = limits(app, shared)?;
     if caller == RuntimeCaller::Backend {
         actual_limits.control_concurrency = BACKEND_CONTROL_CONCURRENCY as u16;
         actual_limits.byte_stream_concurrency = BACKEND_BYTE_CONCURRENCY as u16;
