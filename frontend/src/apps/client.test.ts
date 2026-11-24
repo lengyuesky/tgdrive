@@ -32,7 +32,7 @@ describe('仅主人使用的后端管理客户端', () => {
       [`${APP_CENTER_BASE}/apps/example-backend/backend/restart`, 'POST'],
     ])
     for (const [, options] of fetchMock.mock.calls) {
-      expect(options).toMatchObject({ mode: 'same-origin', credentials: 'same-origin', redirect: 'error' })
+      expect(options).toMatchObject({ mode: 'same-origin', referrerPolicy: 'same-origin', credentials: 'same-origin', redirect: 'error' })
       expect(options.headers.has('Authorization')).toBe(false)
     }
   })

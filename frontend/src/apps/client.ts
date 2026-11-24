@@ -34,8 +34,10 @@ async function owner<T>(name: string, parameters: Record<string, string> = {}, b
   if (!definition) throw new Error('宿主契约未提供所需接口')
   const headers = new Headers(init.headers)
   if (body !== undefined && !(body instanceof Blob)) headers.set('Content-Type', 'application/json')
+  // 页面策略是 no-referrer：非 CORS 模式的写请求在 WebKit（iOS 全部浏览器）上会把 Origin 写成 null，
+  // 被宿主当作沙箱应用页面拒绝；逐请求改用 same-origin 策略才会带上真实来源。
   const response = await fetch(endpoint(name, parameters) + query, {
-    ...init, mode: 'same-origin', method: definition.methods[0], headers,
+    ...init, mode: 'same-origin', referrerPolicy: 'same-origin', method: definition.methods[0], headers,
     body: body === undefined ? undefined : body instanceof Blob ? body : JSON.stringify(body),
     credentials: 'same-origin', redirect: 'error',
   })
