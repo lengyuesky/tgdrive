@@ -33,6 +33,7 @@ async fn page(platform: &Arc<AppPlatform>) -> LaunchPageResponse {
             "test-backend",
             LaunchPageRequest { open_node_id: None },
             "http://drive.invalid".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap()

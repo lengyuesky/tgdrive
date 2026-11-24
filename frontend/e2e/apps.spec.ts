@@ -95,7 +95,7 @@ async function mock(page: Page, withBackend = false) {
       const request = route.request().postDataJSON(); closed = false
       if (request.open_node_id && scope.scope.mode === 'none') return route.fulfill({ status: 403, json: { error: { code: 'scope_denied', message: '尚未授权', request_id: 'request' } } })
       const bootstrap: PageBootstrap = { contract: CONTRACT_VERSION, app: { id: manifest.id, name: manifest.name, version: manifest.version, generation: 'generation-1' }, session_token: 'test-page-token', expires_at: Date.now() + 6 * 3600 * 1000, host_origin: url.origin, api_base: `${url.origin}${SELF_API_BASE}`, backend_base: null, ui_nonce: 'test-page-nonce', theme: 'light', launch: request.open_node_id ? { action: 'open', file: fileNode } : { action: 'browse' } }
-      return route.fulfill({ json: { frame_url: `${ASSET_BASE}/${manifest.id}/${sha}/page/index.html`, bootstrap } })
+      return route.fulfill({ json: { frame_url: `${ASSET_BASE}/${manifest.id}/${sha}/page/index.html?policy=0123456789abcdef`, bootstrap } })
     }
     if (url.pathname.startsWith(SELF_API_BASE)) {
       const headers = await route.request().allHeaders(); requests.push({ path: url.pathname, method: route.request().method(), authorization: headers.authorization, origin: headers.origin })

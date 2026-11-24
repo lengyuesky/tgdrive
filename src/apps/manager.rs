@@ -557,6 +557,7 @@ impl AppPlatform {
         id: &str,
         request: LaunchPageRequest,
         host_origin: String,
+        policy_revision: &str,
     ) -> PlatformResult<LaunchPageResponse> {
         let mut tx = self.host.vfs.db.pool.begin().await?;
         let app = installation(&mut tx, id).await?;
@@ -611,8 +612,10 @@ impl AppPlatform {
                 ("path", &page.entry),
             ],
         );
+        // 地址写明页面策略修订：浏览器把文档连同策略头长期缓存，策略一变地址随之改变，旧缓存自然作废。
         let frame_url = format!(
-            "{asset}#{}={fragment}",
+            "{asset}?{}={policy_revision}#{}={fragment}",
+            super::http::PAGE_POLICY_QUERY,
             tgdrive_contract::ui::BOOTSTRAP_FRAGMENT_KEY
         );
         tx.commit().await?;

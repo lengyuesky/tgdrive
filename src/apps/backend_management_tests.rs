@@ -43,6 +43,7 @@ async fn bounded_backend_logs_are_owner_only_and_backend_management_route_is_abs
             "test-backend",
             LaunchPageRequest { open_node_id: None },
             "http://localhost".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap();

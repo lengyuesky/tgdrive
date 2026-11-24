@@ -45,6 +45,7 @@ async fn session(
             &app.manifest.id,
             LaunchPageRequest { open_node_id: None },
             "http://localhost".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap();
@@ -162,6 +163,7 @@ async fn session_refresh_keeps_token_and_close_revokes_only_that_page_and_lease(
             &app.manifest.id,
             LaunchPageRequest { open_node_id: None },
             "http://localhost".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap();

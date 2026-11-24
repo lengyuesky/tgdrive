@@ -15,7 +15,7 @@
 | 公开分享页 | `/admin/s/{token}` |
 | 存活与就绪检查 | `/admin/healthz`、`/admin/readyz` |
 
-Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/admin/`；直接运行二进制时默认监听 8080。反向代理必须原样转发 `/admin` 前缀，不能剥离。HTTPS 部署应设置 `TGDRIVE_COOKIE_SECURE=true`。代理应保留公开 `Host`；如果重写为内部地址，须设置 `TGDRIVE_TRUSTED_PROXIES` 为实际代理 IP/CIDR，并由代理传入正确的 `X-Forwarded-Host` 和 `X-Forwarded-Proto`，用于应用启动和对外链接。
+Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/admin/`；直接运行二进制时默认监听 8080。反向代理必须原样转发 `/admin` 前缀，不能剥离。HTTPS 部署应设置 `TGDRIVE_COOKIE_SECURE=true`。代理应保留公开 `Host`；如果重写为内部地址，须设置 `TGDRIVE_TRUSTED_PROXIES` 为实际代理 IP/CIDR，并由代理传入正确的 `X-Forwarded-Host` 和 `X-Forwarded-Proto`，用于应用启动和对外链接。这个公开地址还会写进应用页面的内容安全策略：iOS 上的浏览器（WebKit）只认策略里写明的地址，宿主看到的主机名若与浏览器访问的不一致，应用页面的全部数据请求都会被浏览器拦截（页面报「宿主网络请求未能完成」）；协议不必一致，代理终止 TLS 而宿主只看到 http 时同样可用。
 
 `/admin` 以外的地址属于主人在应用中心指定的一个根地址应用，原路径和查询不变；固定应用服务入口是 `/admin/api/apps/v1/services/<app_id>/<path>`。它们与管理界面共用同一端口，不另开应用端口。只有已启用、声明 `backend.external_service=true` 的带后端应用可被指定。尚未指定时 GET/HEAD 返回 302 到 `/admin/`，其他方法返回 303；指定应用停用或失败时返回 `backend_unavailable`，不会偷偷改分给另一个应用；卸载时原子清除选择。
 
@@ -135,12 +135,15 @@ node docker/test-app-platform.mjs --runtime-image tgdrive:local \
 - `apps::linux_acceptance_tests::linux_root_isolation`：真实生产 `internal-app-run`、`internal-app-backup` 辅助二进制与独立 UID 探针；检查文件/套接字/环境隔离、进程数上限沿用宿主且打开文件数软上限等于硬上限（实际打开 2048 个文件、派生 128 个子进程均成功）、禁用转储、停止/崩溃/卸载时子孙与僵尸回收、被取消的停止请求、1/2/4/8/16 秒退避及重启上限。探针包含忽略 SIGTERM、setsid、伪造进程名 Uid 行的子孙进程，不在测试中模拟降权。
 - `apps::linux_end_to_end_tests::linux_static_packages_end_to_end`：使用真实静态包，经 TCP HTTP 登录、原始 ZIP 上传、预览、安装、目录授权、页面 owner 代理、external 固定前缀/根入口、真实 204 直传指令、条件建目录、在线快照和停用/卸载回收；可选影视包另测安装、启动就绪与页面接口。示例只输出直传指令，因此轮次媒体票据额外用同一生产签发函数验证撤销，不宣称示例实现了票据接口。
 
-影视添加媒体库另有真实浏览器回归，使用构建后的管理页、已经核验的影视包、合成目录、真实宿主 HTTP/SQLite 和独立 UID 后端，不拦截接口响应、不连接 Telegram 或生产数据。端口只发布到 `127.0.0.1`，测试结束清理容器、独立测试网络和测试镜像。需要 Node.js 22.22.0、本机 Playwright Chromium 和上述本地 Linux 镜像。
+影视添加媒体库另有真实浏览器回归，使用构建后的管理页、已经核验的影视包、合成目录、真实宿主 HTTP/SQLite 和独立 UID 后端，不拦截接口响应、不连接 Telegram 或生产数据。端口只发布到 `127.0.0.1`，测试结束清理容器、独立测试网络和测试镜像。需要 Node.js 22.22.0、本机 Playwright Chromium 与 WebKit 和上述本地 Linux 镜像。
 
 ```bash
 npm --prefix frontend run build
 node docker/test-cinema-library.mjs --cinema /绝对路径/cinema-1.0.1-linux-arm64.tgapp
+node docker/test-cinema-library.mjs --cinema /绝对路径/cinema-1.0.1-linux-arm64.tgapp --browser webkit
 ```
+
+iOS 上的浏览器全部使用 WebKit，它对沙箱页面的内容安全策略、文档缓存和来源头的处理与 Chromium 不同：只按请求方的源求 `connect-src 'self'`，把带 `immutable` 的页面文档连同旧策略一直缓存到期（刷新也不重取），非 CORS 写请求在 `no-referrer` 下发 `Origin: null`。改动应用页面的响应头、启动地址、资源缓存或来源检查后，两种内核都要跑。
 
 该入口显式执行 `apps::linux_end_to_end_tests::linux_cinema_library_browser`：验证首次选择、取消授权保留草稿、电影和电视剧两库保存、第二次授权保留第一库、只读范围不包含第三个私人目录、重开页面持久保留及后端回收。源码快照、截图和日志保存在新的输出目录。
 

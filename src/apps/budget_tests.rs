@@ -53,6 +53,7 @@ async fn cache_lru_evicts_to_ninety_percent_and_keeps_new_object() {
             &app.manifest.id,
             LaunchPageRequest { open_node_id: None },
             "http://localhost".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap();

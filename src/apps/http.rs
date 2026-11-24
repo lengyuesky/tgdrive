@@ -228,6 +228,8 @@ async fn envelope(
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let page_policy = (access == Some(EndpointAccess::Public))
+        .then(|| PagePolicy::new(public_origin(&platform, &request).ok().as_deref()));
     let response = if request.uri().to_string().len() > MAX_URI_BYTES as usize
         || request
             .headers()
@@ -294,11 +296,8 @@ async fn envelope(
             headers.insert(header::VARY, HeaderValue::from_static("Origin"));
         }
     }
-    if access == Some(EndpointAccess::Public) {
-        headers.insert(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(PAGE_CSP),
-        );
+    if let Some(policy) = page_policy {
+        headers.insert(header::CONTENT_SECURITY_POLICY, policy.header);
         headers.insert(
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("SAMEORIGIN"),
@@ -401,7 +400,9 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
     let headers = request.headers().clone();
     let method = request.method().clone();
     let uri = request.uri().clone();
-    let mut origin = if request
+    // 页面策略按推导来源生成；主人请求随后可能按浏览器的 Origin 升级协议，
+    // 而资源请求没有 Origin，两处必须用同一份推导值才能得到同一个策略修订。
+    let inferred_origin = if request
         .extensions()
         .get::<super::runtime::TrustedBackendCaller>()
         .is_some()
@@ -410,6 +411,7 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
     } else {
         public_origin(&platform, &request)?
     };
+    let mut origin = inferred_origin.clone();
     let session = if let Some(trusted) = request
         .extensions()
         .get::<super::runtime::TrustedBackendCaller>()
@@ -651,7 +653,12 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
             }
             "center.app.launch" => owner_json(
                 platform
-                    .launch(id, strict_json(body).await?, origin)
+                    .launch(
+                        id,
+                        strict_json(body).await?,
+                        origin,
+                        &PagePolicy::new(Some(&inferred_origin)).revision,
+                    )
                     .await?,
             ),
             "center.app.restart" => owner_json(platform.backends.restart(&platform, id).await?),
@@ -696,7 +703,18 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                 StatusCode::NO_CONTENT.into_response()
             }
             "assets" => {
-                return assets(&platform, &parameters, &headers, method == Method::HEAD).await;
+                // 查询参数只用来区分缓存；格式不合要求时按未标明修订处理，不因此拒绝资源请求。
+                let revision = PagePolicy::new(Some(&inferred_origin)).revision;
+                let pinned = queries(&uri)
+                    .is_ok_and(|query| query.get(PAGE_POLICY_QUERY) == Some(&revision));
+                return assets(
+                    &platform,
+                    &parameters,
+                    &headers,
+                    method == Method::HEAD,
+                    pinned,
+                )
+                .await;
             }
             "events" => {
                 let session = caller(&session)?;
@@ -1264,6 +1282,60 @@ async fn upload_body(
     Ok(staging)
 }
 
+/// 启动地址里标明页面策略修订的查询参数名。
+pub(crate) const PAGE_POLICY_QUERY: &str = "policy";
+
+/// 一次请求对应的应用页面内容安全策略，以及标识它的修订。
+///
+/// 页面在没有 allow-same-origin 的沙箱里，源是不透明的。WebKit 在网络进程检查 fetch、XHR 与
+/// EventSource 时按请求方的源求 `'self'`，不透明源下什么都匹配不上，页面访问宿主接口的请求
+/// 全部被拦；其它浏览器按文档地址求值所以正常。因此除 `'self'` 外再写明本次请求推导出的公开源：
+/// 它就是浏览器取这份文档所用的地址，含义与 `'self'` 相同。协议无法确知时推导为 http，
+/// 而 http 来源同样匹配同主机同端口的 https 请求。
+pub(crate) struct PagePolicy {
+    pub header: HeaderValue,
+    pub revision: String,
+}
+
+impl PagePolicy {
+    pub(crate) fn new(origin: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        const SELF_ONLY: &str = "connect-src 'self'";
+        let value = match origin.filter(|origin| csp_host_source(origin)) {
+            Some(origin) => PAGE_CSP.replacen(SELF_ONLY, &format!("{SELF_ONLY} {origin}"), 1),
+            None => PAGE_CSP.to_owned(),
+        };
+        let mut revision = crate::engine::upload::to_hex(&Sha256::digest(value.as_bytes()));
+        revision.truncate(16);
+        Self {
+            header: HeaderValue::from_str(&value).expect("页面策略只含已校验的 ASCII"),
+            revision,
+        }
+    }
+}
+
+/// 只接受内容安全策略语法能表达的来源：http/https、由字母数字与连字符组成的主机标签、可选端口。
+/// Host 头里其余合法但策略写不出的形式（IPv6 字面量、下划线等）一律不写入，避免把任意文本拼进策略。
+fn csp_host_source(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (host, port) = authority.rsplit_once(':').unwrap_or((authority, "0"));
+    !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
 pub(crate) fn public_origin(platform: &AppPlatform, request: &Request) -> PlatformResult<String> {
     let trusted = request
         .extensions()
@@ -1389,11 +1461,15 @@ pub(crate) fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         })
 }
 
+/// `policy_pinned`：请求地址的策略修订与当前页面策略一致。浏览器把文档连同策略头一起缓存，
+/// 且不会用 304 更新 `content-*` 头，所以页面文档只有在地址写明当前修订时才能长期缓存，
+/// 否则每次都完整返回且不入缓存；脚本、样式等资源不携带生效的策略，仍按摘要长期缓存。
 async fn assets(
     platform: &AppPlatform,
     parameters: &BTreeMap<String, String>,
     headers: &HeaderMap,
     head: bool,
+    policy_pinned: bool,
 ) -> PlatformResult<Response> {
     use sha2::{Digest, Sha256};
     let id = parameters.get("app_id").map(String::as_str).unwrap_or("");
@@ -1426,7 +1502,9 @@ async fn assets(
                 "\"p{sha}:{}:identity\"",
                 crate::engine::upload::to_hex(&Sha256::digest(path.as_bytes()))
             );
-            let not_modified = etag_matches(headers, &etag);
+            let content_type = mime_guess::from_path(path).first_or_octet_stream();
+            let cacheable = policy_pinned || content_type != mime_guess::mime::TEXT_HTML;
+            let not_modified = cacheable && etag_matches(headers, &etag);
             let body = if head || not_modified {
                 Body::empty()
             } else {
@@ -1441,13 +1519,14 @@ async fn assets(
                     StatusCode::OK
                 })
                 .header(header::ETAG, etag)
-                .header(
-                    header::CONTENT_TYPE,
-                    mime_guess::from_path(path).first_or_octet_stream().as_ref(),
-                )
+                .header(header::CONTENT_TYPE, content_type.as_ref())
                 .header(
                     header::CACHE_CONTROL,
-                    "private, max-age=31536000, immutable",
+                    if cacheable {
+                        "private, max-age=31536000, immutable"
+                    } else {
+                        "no-store"
+                    },
                 )
                 .body(body)
                 .expect("资源头已验证");

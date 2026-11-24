@@ -526,6 +526,7 @@ async fn management_requires_cookie_and_page_cors_has_no_credentials() {
             &app.manifest.id,
             LaunchPageRequest { open_node_id: None },
             "http://localhost".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap();

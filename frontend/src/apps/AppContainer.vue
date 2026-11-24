@@ -46,7 +46,8 @@ async function start() {
     const value = launch.bootstrap; value.theme = isDark.value ? 'dark' : 'light'
     const url = new URL(launch.frame_url, origin())
     const expected = endpoint('assets', { app_id: value.app.id, sha256: app.value.package.sha256, path: app.value.manifest.page!.entry })
-    if (value.host_origin !== origin() || url.origin !== origin() || url.pathname !== expected || url.search) throw new Error('应用启动地址或消息源不匹配')
+    // 查询参数是宿主标明的页面策略修订：策略一变地址随之改变，浏览器不会沿用带旧策略的缓存文档。
+    if (value.host_origin !== origin() || url.origin !== origin() || url.pathname !== expected || !/^\?policy=[0-9a-f]{16}$/.test(url.search)) throw new Error('应用启动地址或消息源不匹配')
     url.hash = `${BOOTSTRAP_FRAGMENT_KEY}=${encode(value)}`; bootstrap.value = value; frameUrl.value = url.href; title.value = value.app.name; document.title = title.value
     let selectedDirectory: FileNode | undefined
     channel = createUiChannel(() => frame.value?.contentWindow ?? null, value.ui_nonce, {

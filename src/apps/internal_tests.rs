@@ -44,6 +44,7 @@ async fn private_node_and_usage_require_owner_and_support_selected_scope_and_ope
             &app.manifest.id,
             LaunchPageRequest { open_node_id: None },
             "http://localhost".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap();
@@ -108,7 +109,8 @@ async fn private_node_and_usage_require_owner_and_support_selected_scope_and_ope
                 LaunchPageRequest {
                     open_node_id: Some(file_id.to_string())
                 },
-                "http://localhost".into()
+                "http://localhost".into(),
+                &super::http::PagePolicy::new(None).revision
             )
             .await
             .is_err()
@@ -145,6 +147,7 @@ async fn private_node_and_usage_require_owner_and_support_selected_scope_and_ope
                 open_node_id: Some(file_id.to_string()),
             },
             "http://localhost".into(),
+            &super::http::PagePolicy::new(None).revision,
         )
         .await
         .unwrap();

@@ -37,6 +37,18 @@ async fn owner_request(
     router.clone().oneshot(request).await.unwrap()
 }
 
+async fn get(router: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
+    let mut request = Request::builder().method(Method::GET).uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
 fn owner_cookie(platform: &AppPlatform) -> String {
     platform
         .host
@@ -130,6 +142,134 @@ async fn https_owner_can_upload_preview_install_and_launch_through_http_proxy() 
         launched.bootstrap.api_base,
         format!("https://drive.invalid{SELF_API_BASE}")
     );
+
+    // 资源请求没有 Origin，宿主只能推导出代理转发来的 http；启动地址必须按同一推导标明策略修订，
+    // 页面文档才会带着写明宿主来源的策略被长期缓存。
+    let policy = http::PagePolicy::new(Some("http://drive.invalid"));
+    let (document, fragment) = launched.frame_url.split_once('#').unwrap();
+    assert!(fragment.starts_with("tgdrive="));
+    let bare = endpoint_path(
+        "assets",
+        &[
+            ("app_id", &installed.manifest.id),
+            ("sha256", &installed.package.sha256),
+            ("path", "page/index.html"),
+        ],
+    );
+    assert_eq!(document, format!("{bare}?policy={}", policy.revision));
+    let host = [("host", "drive.invalid")];
+    let pinned = get(&router, document, &host).await;
+    assert_eq!(pinned.status(), StatusCode::OK);
+    assert_eq!(pinned.headers()["content-security-policy"], policy.header);
+    assert_eq!(
+        pinned.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
+    let etag = pinned.headers()["etag"].to_str().unwrap().to_owned();
+    let conditional = [("host", "drive.invalid"), ("if-none-match", etag.as_str())];
+    assert_eq!(
+        get(&router, document, &conditional).await.status(),
+        StatusCode::NOT_MODIFIED
+    );
+
+    // 没有标明当前修订的页面文档（旧宿主留下的地址、过期修订、换了访问地址）每次完整返回且不入缓存：
+    // 浏览器不会用 304 更新已缓存文档的策略头。
+    let stale = format!("{bare}?policy=0000000000000000");
+    for (uri, headers) in [
+        (bare.as_str(), &conditional[..]),
+        (stale.as_str(), &conditional[..]),
+        (
+            document,
+            &[("host", "other.invalid"), ("if-none-match", etag.as_str())][..],
+        ),
+    ] {
+        let response = get(&router, uri, headers).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri} {headers:?}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let expected = http::PagePolicy::new(Some(&format!("http://{}", headers[0].1)));
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            expected.header
+        );
+    }
+
+    // 脚本、样式等资源不携带生效的策略，仍按包摘要长期缓存并支持 304。
+    let script = bare.replace("index.html", "app.js");
+    let response = get(&router, &script, &host).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    assert_eq!(
+        get(
+            &router,
+            &script,
+            &[("host", "drive.invalid"), ("if-none-match", etag.as_str())]
+        )
+        .await
+        .status(),
+        StatusCode::NOT_MODIFIED
+    );
+}
+
+#[test]
+fn page_policy_names_only_origins_the_policy_syntax_can_express() {
+    // 替换依赖模板里恰好出现一次只含 'self' 的 connect-src。
+    assert_eq!(PAGE_CSP.matches("connect-src 'self';").count(), 1);
+    for origin in [
+        "http://drive.invalid",
+        "https://drive.invalid",
+        "http://drive.invalid:8443",
+        "http://192.0.2.7:3358",
+        "https://xn--fiq228c.invalid",
+    ] {
+        let policy = http::PagePolicy::new(Some(origin));
+        let value = policy.header.to_str().unwrap();
+        assert!(
+            value.contains(&format!("; connect-src 'self' {origin}; worker-src ")),
+            "{value}"
+        );
+        assert_eq!(value.replacen(&format!(" {origin}"), "", 1), PAGE_CSP);
+        assert_eq!(policy.revision.len(), 16);
+        assert!(policy.revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            policy.revision,
+            http::PagePolicy::new(Some(origin)).revision
+        );
+    }
+    assert_ne!(
+        http::PagePolicy::new(Some("http://drive.invalid")).revision,
+        http::PagePolicy::new(Some("https://drive.invalid")).revision
+    );
+    // 策略语法写不出、或可能把策略切开的主机一律不写入，只保留 'self'。
+    let fallback = http::PagePolicy::new(None);
+    assert_eq!(fallback.header, PAGE_CSP);
+    for origin in [
+        "http://[::1]:8080",
+        "http://my_host",
+        "http://drive.invalid;script-src",
+        "http://drive.invalid,default-src",
+        "http://drive.invalid *",
+        "http://*.invalid",
+        "http://drive..invalid",
+        "http://drive.invalid.",
+        "http://drive.invalid:",
+        "http://drive.invalid:port",
+        "http://drive.invalid:123456",
+        "http://drive.invalid/path",
+        "http://DRIVE.invalid",
+        "http://",
+        "ftp://drive.invalid",
+        "drive.invalid",
+        "null",
+        "",
+    ] {
+        let policy = http::PagePolicy::new(Some(origin));
+        assert_eq!(policy.header, PAGE_CSP, "{origin}");
+        assert_eq!(policy.revision, fallback.revision, "{origin}");
+    }
 }
 
 #[tokio::test]

@@ -10,8 +10,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const { values } = parseArgs({ options: {
   'runtime-image': { type: 'string', default: 'tgdrive-stage2-local:latest' },
   'builder-image': { type: 'string' }, cinema: { type: 'string' }, upgrade: { type: 'string' }, output: { type: 'string' }, 'cargo-target': { type: 'string' },
+  // iOS 上的浏览器全是 WebKit，它对沙箱页面的策略、缓存与来源头的处理和 Chromium 不同。
+  browser: { type: 'string', default: 'chromium' },
 } })
 if (!values.cinema) throw new Error('须用 --cinema 指定已经核验的真实影视 Linux 应用包')
+if (!['chromium', 'webkit'].includes(values.browser)) throw new Error('--browser 只支持 chromium 或 webkit')
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 }).trim()
 const quietly = (...args) => { try { docker(...args) } catch {} }
 async function containerLogs(container, tail) {
@@ -86,7 +89,7 @@ try {
   if (!/^127\.0\.0\.1:\d+$/.test(binding)) throw new Error('测试端口必须只发布到本机')
   let browserFailure
   try {
-    await run('npm', ['exec', '--', 'playwright', 'test', '--config', 'playwright.integration.config.ts'], 'browser.log', {
+    await run('npm', ['exec', '--', 'playwright', 'test', '--config', 'playwright.integration.config.ts', '--browser', values.browser], 'browser.log', {
       cwd: join(root, 'frontend'), env: { ...process.env, TGDRIVE_SYNTHETIC_ORIGIN: `http://${binding}`, TGDRIVE_CINEMA_INITIAL_VERSION: ready.initial_version, TGDRIVE_CINEMA_UPGRADE_VERSION: ready.upgrade_version ?? '', PLAYWRIGHT_OUTPUT_DIR: join(output, 'browser-results') },
     })
   } catch (error) { browserFailure = error }
@@ -95,7 +98,7 @@ try {
   await writeFile(join(logs, 'server.log'), await containerLogs(container))
   if (browserFailure) throw browserFailure
   if (exit.trim() !== '0') throw new Error('浏览器结束后的真实授权或进程回收断言失败')
-  console.log('通过：真实影视页面、SDK、HTTP/SQLite、独立 UID 后端；取消授权保留草稿；两库新增并只授权选定目录；重开持久保留')
+  console.log(`通过（${values.browser}）：真实影视页面、SDK、HTTP/SQLite、独立 UID 后端；取消授权保留草稿；两库新增并只授权选定目录；重开持久保留`)
   if (values.upgrade) console.log('通过：旧版影视建立真实索引和用户记录后，使用应用中心一键升级同架构新包；页面重新打开且数据保留')
 } catch (error) {
   if (containerCreated) await writeFile(join(logs, 'server-failure.log'), await containerLogs(container, '60'))
