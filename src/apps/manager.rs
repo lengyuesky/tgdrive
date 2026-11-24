@@ -10,34 +10,7 @@ use tgdrive_contract::runtime::*;
 use tgdrive_contract::validation::{check_manifest_compatibility, stable_version, valid_app_id};
 use tgdrive_contract::{CONTRACT_VERSION, Timestamp, error_code};
 
-#[derive(serde::Serialize)]
-pub(crate) struct BackendManagementInfo {
-    pub status: BackendStatus,
-    pub limits: BackendResourceLimits,
-}
-
 impl AppPlatform {
-    pub(crate) async fn backend_management(
-        &self,
-        id: &str,
-    ) -> PlatformResult<BackendManagementInfo> {
-        let mut connection = self.host.vfs.db.pool.acquire().await?;
-        let app = installation(&mut connection, id).await?;
-        let backend = app
-            .manifest()?
-            .backend
-            .ok_or_else(|| PlatformError::new(error_code::CALLER_NOT_ALLOWED, "应用没有后端"))?;
-        let mut limits = super::runtime::limits(&app, self.shared_limits().await?.values())?
-            .backend
-            .expect("已核对后端声明");
-        if let Some(run) = self.backends.run(id) {
-            limits = run.limits.read().unwrap().clone();
-        }
-        Ok(BackendManagementInfo {
-            status: self.backends.status(id, backend.run_mode),
-            limits,
-        })
-    }
     fn decorate_backend(&self, app: &mut InstalledApp) {
         if let Some(backend) = &app.manifest.backend {
             app.backend = Some(self.backends.status(&app.manifest.id, backend.run_mode));

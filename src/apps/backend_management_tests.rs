@@ -1,5 +1,5 @@
-//! 主人后端管理、真实日志边界与根选择原子清除的 HTTP/SQLite 验收。
-use super::backend_tests::backend_fixture;
+//! 后端日志访问边界、总体限额同步与根选择原子清除的 HTTP/SQLite 验收。
+use super::backend_tests::{backend_fixture, runtime_info};
 use super::tests::install_page;
 use super::*;
 use axum::body::{Body, to_bytes};
@@ -8,17 +8,19 @@ use tgdrive_contract::{error_code, http::APP_CENTER_BASE, runtime::*};
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn backend_management_and_bounded_logs_are_owner_only_and_report_actual_enforcement() {
+async fn bounded_backend_logs_are_owner_only_and_backend_management_route_is_absent() {
     let (_db, _data, platform, _) = backend_fixture().await;
     let run = platform
         .backends
         .ensure(&platform, "test-backend")
         .await
         .unwrap();
-    let info = platform.backend_management("test-backend").await.unwrap();
-    assert_eq!(info.status.state, BackendState::Ready);
-    assert_eq!(info.status.run_id.as_deref(), Some(run.caller.id.as_str()));
-    assert!(!info.limits.enforced.memory && !info.limits.enforced.cpu);
+    let info = runtime_info(&run).await;
+    let status = info.backend.unwrap();
+    assert_eq!(status.state, BackendState::Ready);
+    assert_eq!(status.run_id.as_deref(), Some(run.caller.id.as_str()));
+    let limits = info.limits.backend.unwrap();
+    assert!(!limits.enforced.memory && !limits.enforced.cpu);
     let directory = platform.root.join("logs/test-backend");
     std::fs::create_dir_all(&directory).unwrap();
     let stdout = format!("{}newest", "x".repeat(96 * 1024));
@@ -44,57 +46,74 @@ async fn backend_management_and_bounded_logs_are_owner_only_and_report_actual_en
         )
         .await
         .unwrap();
-    for suffix in ["backend", "backend/logs"] {
-        let path = format!("{APP_CENTER_BASE}/apps/test-backend/{suffix}");
-        let denied = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(&path)
-                    .header("host", "localhost")
-                    .header(
-                        "authorization",
-                        format!("Bearer {}", launch.bootstrap.session_token),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+    let path = format!("{APP_CENTER_BASE}/apps/test-backend/backend/logs");
+    let denied = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header("host", "localhost")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", launch.bootstrap.session_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let sandbox = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header("host", "localhost")
+                .header("origin", "null")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sandbox.status(), StatusCode::UNAUTHORIZED);
+    let allowed = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header("host", "localhost")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let logs: serde_json::Value = serde_json::from_slice(
+        &to_bytes(allowed.into_body(), 2 * 1024 * 1024)
             .await
-            .unwrap();
-        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-        let sandbox = router
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(logs["stdout"].as_str().unwrap().len(), 64 * 1024);
+    assert!(logs["stdout"].as_str().unwrap().ends_with("newest"));
+    assert_eq!(logs["truncated"], true);
+    // 已删除的管理接口应与其他未知应用中心路径一致返回 404，主人 Cookie 也不能恢复它。
+    for suffix in ["backend", "unknown-management-route"] {
+        let absent = router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(&path)
+                    .uri(format!("{APP_CENTER_BASE}/apps/test-backend/{suffix}"))
                     .header("host", "localhost")
-                    .header("origin", "null")
                     .header("cookie", &cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(sandbox.status(), StatusCode::UNAUTHORIZED);
-        let allowed = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(&path)
-                    .header("host", "localhost")
-                    .header("cookie", &cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(allowed.status(), StatusCode::OK);
-        assert!(
-            !to_bytes(allowed.into_body(), 2 * 1024 * 1024)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
     }
     let restarted = platform
         .backends
@@ -179,13 +198,26 @@ async fn one_shared_resource_limit_applies_to_all_backends_without_restart_and_p
         .ensure(&platform, "test-backend")
         .await
         .unwrap();
+    sqlx::query("INSERT INTO app_installations(id,manifest,generation,state_revision,enabled,pinned,scope,scope_revision,target,package_sha256,package_size,installed_at,updated_at) SELECT ?,json_set(manifest,'$.id',?),generation,state_revision,enabled,pinned,scope,scope_revision,target,package_sha256,package_size,installed_at,updated_at FROM app_installations WHERE id=?")
+        .bind("second-backend")
+        .bind("second-backend")
+        .bind("test-backend")
+        .execute(&platform.host.vfs.db.pool)
+        .await
+        .unwrap();
+    let second = platform
+        .backends
+        .ensure(&platform, "second-backend")
+        .await
+        .unwrap();
     // 默认值：内存合计 2 GiB、CPU 不限制；应用清单不参与决定。
-    let initial = platform.backend_management("test-backend").await.unwrap();
+    let initial = runtime_info(&run).await.limits.backend.unwrap();
     assert_eq!(
-        initial.limits.memory_bytes.0,
+        initial.memory_bytes.0,
         tgdrive_contract::http::DEFAULT_SHARED_BACKEND_MEMORY_BYTES
     );
-    assert_eq!(initial.limits.cpu_millis, 0);
+    assert_eq!(initial.cpu_millis, 0);
+    assert_eq!(runtime_info(&second).await.limits.backend.unwrap(), initial);
     let router = http::router_platform(platform.clone());
     let cookie = platform
         .host
@@ -222,7 +254,7 @@ async fn one_shared_resource_limit_applies_to_all_backends_without_restart_and_p
     assert_eq!(read.status(), StatusCode::OK);
     let read: AppResourceLimits =
         serde_json::from_slice(&to_bytes(read.into_body(), 4096).await.unwrap()).unwrap();
-    assert_eq!(read.memory_bytes, initial.limits.memory_bytes);
+    assert_eq!(read.memory_bytes, initial.memory_bytes);
     assert!(!read.memory_enforced && !read.cpu_enforced);
     for invalid in [
         serde_json::json!({"memory_bytes":"1048576","cpu_millis":0}),
@@ -244,15 +276,21 @@ async fn one_shared_resource_limit_applies_to_all_backends_without_restart_and_p
     .await
     .unwrap();
     assert_eq!(saved.status(), StatusCode::OK);
-    // 运行中的后端不重启，报告的限额立即变为新的总体限制。
-    let current = platform.backend_management("test-backend").await.unwrap();
-    assert_eq!(
-        current.status.run_id.as_deref(),
-        Some(run.caller.id.as_str())
-    );
-    assert_eq!(current.limits.memory_bytes.0, 1024 * 1024 * 1024);
-    assert_eq!(current.limits.cpu_millis, 1500);
+    // 运行中的两个后端不重启，实际调用 RuntimeInfo 立即看到相同的新总体限制。
+    for running in [&run, &second] {
+        let current = runtime_info(running).await;
+        assert_eq!(
+            current.backend.unwrap().run_id.as_deref(),
+            Some(running.caller.id.as_str())
+        );
+        let limits = current.limits.backend.unwrap();
+        assert_eq!(limits.memory_bytes.0, 1024 * 1024 * 1024);
+        assert_eq!(limits.cpu_millis, 1500);
+        assert!(!limits.enforced.memory && !limits.enforced.cpu);
+        assert_eq!(*running.limits.read().unwrap(), limits);
+    }
     platform.backends.stop("test-backend").await.unwrap();
+    platform.backends.stop("second-backend").await.unwrap();
     // 重新构造平台后从设置表读回，不回到默认值。
     let reopened = AppPlatform::with_repository(platform.host.clone(), String::new());
     let report = reopened.shared_limits().await.unwrap().report();

@@ -21,7 +21,6 @@ struct Slot {
     run: RwLock<Option<Arc<Run>>>,
     retiring_runs: StdMutex<Vec<Weak<Run>>>,
     failures: StdMutex<Vec<i64>>,
-    disk_blocked: AtomicBool,
     crash_blocked: AtomicBool,
     pending_starts: Arc<tokio::sync::Semaphore>,
 }
@@ -89,7 +88,6 @@ impl Manager {
                     run: RwLock::new(None),
                     retiring_runs: StdMutex::new(Vec::new()),
                     failures: StdMutex::new(Vec::new()),
-                    disk_blocked: AtomicBool::new(false),
                     crash_blocked: AtomicBool::new(false),
                     pending_starts: Arc::new(tokio::sync::Semaphore::new(
                         BACKEND_CONTROL_CONCURRENCY as usize,
@@ -139,12 +137,6 @@ impl Manager {
             return Err(PlatformError::new(
                 error_code::HOST_MAINTENANCE,
                 "宿主正在维护或停止",
-            ));
-        }
-        if slot.disk_blocked.load(Ordering::Acquire) {
-            return Err(PlatformError::new(
-                error_code::QUOTA_EXCEEDED,
-                "应用磁盘超额，需要主人清理后重启",
             ));
         }
         if slot.crash_blocked.load(Ordering::Acquire) {
@@ -291,16 +283,6 @@ impl Manager {
         let limits = super::runtime::limits(app, shared)?
             .backend
             .ok_or_else(|| PlatformError::new(error_code::CALLER_NOT_ALLOWED, "应用没有后端"))?;
-        let usage = system::disk_usage(&data, identity)?;
-        if usage.0 > limits.database_bytes.0 || usage.1 > limits.cache_bytes.0 {
-            self.slot(&app.id)
-                .disk_blocked
-                .store(true, Ordering::Release);
-            return Err(PlatformError::new(
-                error_code::QUOTA_EXCEEDED,
-                "应用磁盘超额，不能启动后端",
-            ));
-        }
         super::safe_fs::remove_tree_owner(&data.join("run"), "backend", Some(identity.uid))?;
         let run_dir = super::safe_fs::Directory::open(&data.join("run"), false)?;
         run_dir.remove("host.sock")?;
@@ -530,24 +512,6 @@ impl Manager {
                 error_code::CALLER_NOT_ALLOWED,
                 "应用没有后端",
             ));
-        }
-        let slot = self.slot(id);
-        if slot.disk_blocked.load(Ordering::Acquire) {
-            let identity = system::identity(&platform.host.vfs.db, id).await?;
-            let mut conn = platform.host.vfs.db.pool.acquire().await?;
-            let installation = store::installation(&mut conn, id).await?;
-            let shared = platform.shared_limits().await?.values();
-            let limits = super::runtime::limits(&installation, shared)?
-                .backend
-                .expect("已检查后端声明");
-            let usage = system::disk_usage(&platform.data_root().join(id), identity)?;
-            if usage.0 > limits.database_bytes.0 || usage.1 > limits.cache_bytes.0 {
-                return Err(PlatformError::new(
-                    error_code::QUOTA_EXCEEDED,
-                    "应用磁盘仍超额",
-                ));
-            }
-            slot.disk_blocked.store(false, Ordering::Release);
         }
         self.reset_failures(id);
         let run = self.ensure(platform, id).await?;
@@ -1031,17 +995,6 @@ async fn supervise(weak: Weak<AppPlatform>) {
                     let _ = platform.backends.stop(&app.id).await;
                     continue;
                 }
-                if disk_exceeded(&run).unwrap_or(true) {
-                    let _ = platform.backends.stop(&app.id).await;
-                    let slot = platform.backends.slot(&app.id);
-                    slot.disk_blocked.store(true, Ordering::Release);
-                    *slot.state.write().unwrap() = Some(BackendStatus {
-                        state: BackendState::Failed,
-                        run_mode: backend.run_mode,
-                        run_id: None,
-                        error_code: Some(error_code::QUOTA_EXCEEDED.into()),
-                    });
-                }
             } else if backend.run_mode == RunMode::Resident && app.enabled && system::available() {
                 let slot = platform.backends.slot(&app.id);
                 let ready = {
@@ -1051,7 +1004,6 @@ async fn supervise(weak: Weak<AppPlatform>) {
                     })
                 };
                 if ready
-                    && !slot.disk_blocked.load(Ordering::Acquire)
                     && !slot.crash_blocked.load(Ordering::Acquire)
                     && platform.backends.status(&app.id, backend.run_mode).state
                         != BackendState::Starting
@@ -1067,11 +1019,6 @@ async fn supervise(weak: Weak<AppPlatform>) {
         drop(platform);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-}
-fn disk_exceeded(run: &Run) -> PlatformResult<bool> {
-    let (state, cache) = system::disk_usage(std::path::Path::new(&run.data_dir), run.identity)?;
-    let limits = run.limits.read().unwrap();
-    Ok(state > limits.database_bytes.0 || cache > limits.cache_bytes.0)
 }
 impl Manager {
     /// 总体限制变更后同步运行中各后端对外报告的限额，上限本身已写在共同的根 cgroup 上。

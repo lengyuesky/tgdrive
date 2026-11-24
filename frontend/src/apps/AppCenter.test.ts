@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CONTRACT_VERSION, type CatalogEntry, type CatalogResponse, type InstalledApp, type InstallPreview, type InstallSource, type PackageTarget } from './contract'
 
 const calls = vi.hoisted(() => ({
-  load: vi.fn(), catalog: vi.fn(), setRoot: vi.fn(), limits: vi.fn(), setLimits: vi.fn(), backend: vi.fn(), logs: vi.fn(), restart: vi.fn(), push: vi.fn(),
+  load: vi.fn(), catalog: vi.fn(), setRoot: vi.fn(), limits: vi.fn(), setLimits: vi.fn(), logs: vi.fn(), restart: vi.fn(), push: vi.fn(), usage: vi.fn(),
   preview: vi.fn(), install: vi.fn(),
 }))
 vi.mock('vue-router', async (importOriginal) => ({ ...await importOriginal<typeof import('vue-router')>(), useRouter: () => ({ push: calls.push }) }))
@@ -12,8 +12,8 @@ vi.mock('./client', async () => {
   const { shallowRef } = await import('vue')
   return {
     installedApps: shallowRef<InstalledApp[]>([]), rootSelection: shallowRef({ app_id: null as string | null, revision: 'root-1' }),
-    loadInstalled: calls.load, iconUrl: () => undefined, formatBytes: (value: string) => `${value} B`, usage: vi.fn(),
-    center: { catalog: calls.catalog, refresh: calls.catalog, setRoot: calls.setRoot, limits: calls.limits, setLimits: calls.setLimits, backend: calls.backend, logs: calls.logs, restart: calls.restart, preview: calls.preview, install: calls.install },
+    loadInstalled: calls.load, iconUrl: () => undefined, formatBytes: (value: string) => `${value} B`, usage: calls.usage,
+    center: { catalog: calls.catalog, refresh: calls.catalog, setRoot: calls.setRoot, limits: calls.limits, setLimits: calls.setLimits, logs: calls.logs, restart: calls.restart, preview: calls.preview, install: calls.install },
   }
 })
 import AppCenter from './AppCenter.vue'
@@ -54,7 +54,7 @@ beforeEach(() => {
   calls.setRoot.mockImplementation(async (body) => ({ app_id: body.app_id, revision: 'root-2' }))
   calls.limits.mockResolvedValue({ memory_bytes: '2147483648', cpu_millis: 0, memory_enforced: false, cpu_enforced: false })
   calls.setLimits.mockImplementation(async (body) => ({ ...body, memory_enforced: body.memory_bytes !== '0', cpu_enforced: false }))
-  calls.backend.mockResolvedValue({ status: { state: 'ready', run_id: 'run-1' }, limits: { memory_bytes: '2147483648', cpu_millis: 0, pids: 64, open_files: 1024, cache_bytes: '1073741824', database_bytes: '536870912', enforced: { memory: false, cpu: false, pids: true, open_files: true } } })
+  calls.usage.mockResolvedValue({ kv_entries: 2, kv_bytes: '1024', kv_entry_limit: 4096, kv_byte_limit: '16777216', cache_bytes: '2048', cache_byte_limit: '1073741824', database_bytes: '8589934592' })
   calls.logs.mockResolvedValue({ stdout: '<script>不执行</script>', stderr: '诊断', truncated: true })
   calls.restart.mockResolvedValue({ state: 'ready', run_id: 'run-2' })
   calls.preview.mockImplementation(async (source: InstallSource) => {
@@ -168,14 +168,22 @@ describe('应用中心后端管理', () => {
     await click('刷新目录')
     expect(view.find('[title="拒绝跨源应用中心操作"]').exists()).toBe(false)
   })
-  it('展示真实 enforced，而不是把目标配额称为硬限制', async () => {
-    const view = await render(); await click('资源限制')
-    expect(calls.backend).toHaveBeenCalledWith('example-backend')
-    expect(view.text()).toContain('内存（全部应用合计）2147483648 B · 未强制（没有可写的 cgroup）')
-    expect(view.text()).toContain('CPU（全部应用合计）不限制')
-    expect(view.text()).toContain('本轮已强制')
-    expect(view.text()).toContain('监督式计量')
-    expect(view.text()).toContain('不是实时硬隔离')
+  it('后端卡片不再提供单应用资源限制按钮或面板，保留日志与重启', async () => {
+    const view = await render()
+    const labels = view.find('.card-actions').findAll('button').map(button => button.text())
+    expect(labels).not.toContain('资源限制')
+    expect(labels).toContain('后端日志')
+    expect(labels).toContain('重启后端')
+    expect(view.text()).not.toContain('后端资源限制')
+    expect(view.findAll('.resource-limits')).toHaveLength(1)
+  })
+  it('占用面板显示对象缓存淘汰线与数据库用量，不显示数据库上限', async () => {
+    const view = await render(); await click('占用')
+    expect(calls.usage).toHaveBeenCalledWith(installedApps.value[0])
+    expect(view.text()).toContain('可再生缓存2048 B / 1073741824 B')
+    expect(view.text()).toContain('后端数据库8589934592 B')
+    expect(view.text()).not.toContain('数据库上限')
+    expect(view.text()).not.toContain('8589934592 B /')
   })
   it('根地址选择与清除使用当前修订，停用项不能选择', async () => {
     installedApps.value = [app(), app('disabled-backend', false)]

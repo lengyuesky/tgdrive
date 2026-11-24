@@ -339,7 +339,7 @@ impl SharedLimits {
     }
 }
 
-/// 内存与 CPU 来自宿主的总体设置；其余各项是宿主对每个应用统一使用的固定值，应用不能声明。
+/// 后端只报告内存与 CPU 总体限制；所有应用的可再生对象缓存使用同一条淘汰线。
 pub(crate) fn limits(
     app: &Installation,
     shared: SharedLimitValues,
@@ -347,22 +347,11 @@ pub(crate) fn limits(
     let backend = app.manifest()?.backend.map(|_| BackendResourceLimits {
         memory_bytes: ByteCount(shared.memory_bytes),
         cpu_millis: shared.cpu_millis,
-        pids: DEFAULT_BACKEND_PIDS as u16,
-        open_files: DEFAULT_BACKEND_OPEN_FILES as u32,
-        cache_bytes: ByteCount(DEFAULT_BACKEND_CACHE_BYTES),
-        database_bytes: ByteCount(DEFAULT_BACKEND_DATABASE_BYTES),
         enforced: BackendLimitEnforcement {
             memory: false,
             cpu: false,
-            pids: false,
-            open_files: false,
         },
     });
-    let cache_byte_limit = backend
-        .as_ref()
-        .map_or(ByteCount(DEFAULT_PAGE_CACHE_BYTES), |limits| {
-            limits.cache_bytes
-        });
     Ok(RuntimeLimits {
         json_request_bytes: ByteCount(MAX_JSON_REQUEST_BYTES),
         json_response_bytes: ByteCount(MAX_JSON_RESPONSE_BYTES),
@@ -381,7 +370,7 @@ pub(crate) fn limits(
         cache_object_bytes: ByteCount(MAX_CACHE_OBJECT_BYTES),
         cache_metadata_bytes: ByteCount(MAX_CACHE_METADATA_BYTES),
         cache_lookup_limit: MAX_CACHE_LOOKUP_KEYS as u16,
-        cache_byte_limit,
+        cache_byte_limit: ByteCount(DEFAULT_CACHE_BYTES),
         control_concurrency: PAGE_CONTROL_CONCURRENCY as u16,
         byte_stream_concurrency: PAGE_BYTE_CONCURRENCY as u16,
         control_requests_per_second: PAGE_CONTROL_RATE as u16,

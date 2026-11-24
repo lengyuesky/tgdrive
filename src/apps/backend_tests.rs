@@ -44,6 +44,28 @@ pub(super) async fn forwarded(
         .unwrap();
     backend::request(run, request).await.unwrap()
 }
+pub(super) async fn runtime_info(run: &Arc<backend::Run>) -> RuntimeInfo {
+    let response = forwarded(run, "/host-info").await;
+    assert_eq!(response.status(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), MAX_JSON_RESPONSE_BYTES as usize)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let info: RuntimeInfo = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(info.caller, RuntimeCaller::Backend);
+    let limits = info.limits.backend.as_ref().unwrap();
+    // 同时核验真实 HTTP 输出，避免反序列化丢弃旧字段后掩盖契约残留。
+    assert_eq!(
+        value["limits"]["backend"],
+        serde_json::json!({
+            "memory_bytes": limits.memory_bytes,
+            "cpu_millis": limits.cpu_millis,
+            "enforced": {"memory": limits.enforced.memory, "cpu": limits.enforced.cpu},
+        })
+    );
+    info
+}
+
 pub(super) fn forward(run: &backend::Run, caller: ForwardCaller, entry: ForwardEntry) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
@@ -99,6 +121,131 @@ async fn sdk_backend_becomes_ready_calls_host_and_stops() {
     platform.backends.stop("test-backend").await.unwrap();
     assert!(run.caller.cancelled.is_cancelled());
     assert!(run.finished.is_cancelled());
+}
+
+fn oversized_private_directories(platform: &AppPlatform) -> u64 {
+    let data = platform.data_root().join("test-backend");
+    let bytes = 8 * 1024 * 1024 * 1024;
+    for name in ["state", "cache/work", "tmp"] {
+        let directory = data.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::File::create(directory.join("large-private-file"))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        // 生产统计使用 st_size 而非已分配块数，稀疏文件也必须计入全部逻辑长度。
+        assert_eq!(
+            super::safe_fs::Directory::open(&directory, false)
+                .unwrap()
+                .usage(None)
+                .unwrap(),
+            bytes
+        );
+    }
+    bytes
+}
+
+#[tokio::test]
+async fn oversized_private_directories_do_not_block_start_or_stop_a_running_backend() {
+    let (_db, _data, platform, _) = backend_fixture().await;
+    oversized_private_directories(&platform);
+    backend::start(&platform);
+    let run = platform
+        .backends
+        .ensure(&platform, "test-backend")
+        .await
+        .unwrap();
+    // 监督循环每秒一次，跨过两个完整间隔后仍须保持同一运行轮次且可响应请求。
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    assert!(!run.caller.cancelled.is_cancelled());
+    assert!(!run.finished.is_cancelled());
+    let info = runtime_info(&run).await;
+    let status = info.backend.unwrap();
+    assert_eq!(status.state, BackendState::Ready);
+    assert_eq!(status.run_id.as_deref(), Some(run.caller.id.as_str()));
+    assert_eq!(
+        platform.backends.run("test-backend").unwrap().caller.id,
+        run.caller.id
+    );
+    platform.backends.stop("test-backend").await.unwrap();
+}
+
+#[tokio::test]
+async fn backend_private_usage_does_not_reduce_object_cache_or_mix_into_cache_usage() {
+    use tgdrive_contract::data::CachePutMetadata;
+    let (_db, _data, platform, _) = backend_fixture().await;
+    let private_bytes = oversized_private_directories(&platform);
+    let run = platform
+        .backends
+        .ensure(&platform, "test-backend")
+        .await
+        .unwrap();
+    let info = runtime_info(&run).await;
+    assert_eq!(info.limits.cache_byte_limit.0, DEFAULT_CACHE_BYTES);
+    let page = super::tests::install_page(&platform).await;
+    let mut connection = platform.host.vfs.db.pool.acquire().await.unwrap();
+    let page = store::installation(&mut connection, &page.manifest.id)
+        .await
+        .unwrap();
+    let page_limits =
+        super::runtime::limits(&page, platform.shared_limits().await.unwrap().values()).unwrap();
+    drop(connection);
+    assert_eq!(info.limits.cache_byte_limit, page_limits.cache_byte_limit);
+    assert!(page_limits.backend.is_none());
+    let before = platform
+        .data_usage("test-backend", &run.caller.generation)
+        .await
+        .unwrap();
+    assert_eq!(before.cache_bytes.0, 0);
+    assert!(before.database_bytes.unwrap().0 >= private_bytes);
+    let body = bytes::Bytes::from(vec![1; MAX_CACHE_OBJECT_BYTES as usize]);
+    for key in ["first", "second"] {
+        platform
+            .cache_put(
+                &run.caller,
+                key,
+                "application/octet-stream".into(),
+                CachePutMetadata::default(),
+                body.clone(),
+            )
+            .await
+            .unwrap();
+    }
+    // 私有目录早已超过旧配额，写入新对象仍不能拒绝或淘汰前一个对象。
+    for key in ["first", "second"] {
+        assert_eq!(
+            platform
+                .cache_read(&run.caller, key, true, None)
+                .await
+                .unwrap()
+                .bytes,
+            body
+        );
+    }
+    let data = std::path::Path::new(&run.data_dir);
+    let directory_bytes = |name| {
+        std::fs::read_dir(data.join(name))
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>()
+    };
+    let usage = platform
+        .data_usage("test-backend", &run.caller.generation)
+        .await
+        .unwrap();
+    assert_eq!(usage.cache_byte_limit.0, DEFAULT_CACHE_BYTES);
+    assert_eq!(usage.cache_bytes.0, directory_bytes("cache/objects"));
+    assert!(usage.cache_bytes.0 >= 2 * MAX_CACHE_OBJECT_BYTES);
+    assert!(usage.cache_bytes.0 < DEFAULT_CACHE_BYTES);
+    assert_eq!(usage.database_bytes.unwrap().0, directory_bytes("state"));
+    assert!(
+        serde_json::to_value(usage)
+            .unwrap()
+            .get("database_byte_limit")
+            .is_none()
+    );
+    assert!(!run.caller.cancelled.is_cancelled());
+    platform.backends.stop("test-backend").await.unwrap();
 }
 
 #[tokio::test]

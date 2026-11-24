@@ -37,14 +37,6 @@ const INTERNAL_ENDPOINTS: &[EndpointSpec] = &[
         backend_socket: false,
     },
     EndpointSpec {
-        name: "center.app.backend",
-        methods: &["GET"],
-        path: "/admin/api/app-center/v1/apps/{app_id}/backend",
-        access: EndpointAccess::OwnerOnly,
-        capability: None,
-        backend_socket: false,
-    },
-    EndpointSpec {
         name: "center.app.logs",
         methods: &["GET"],
         path: "/admin/api/app-center/v1/apps/{app_id}/backend/logs",
@@ -575,7 +567,6 @@ async fn dispatch_inner(platform: Arc<AppPlatform>, request: Request) -> Platfor
                 let mut tx = platform.host.vfs.db.pool.begin().await?;
                 owner_json(store::owner_reference(&mut tx, &reference).await?)
             }
-            "center.app.backend" => owner_json(platform.backend_management(id).await?),
             "center.app.logs" => owner_json(platform.backend_logs(id).await?),
             "center.app.usage" => owner_json(platform.owner_or_page_usage(id, None).await?),
             "center.catalog" => owner_json(platform.catalog().await?.refresh(false).await?),

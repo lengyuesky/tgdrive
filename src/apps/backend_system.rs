@@ -217,22 +217,16 @@ pub(crate) fn prepare_layout(
     Ok(data_root.join(id))
 }
 
-pub(crate) fn disk_usage(data_dir: &Path, identity: Identity) -> PlatformResult<(u64, u64)> {
+pub(crate) fn database_usage(data_dir: &Path, identity: Identity) -> PlatformResult<u64> {
     if !data_dir.exists() {
-        return Ok((0, 0));
+        return Ok(0);
     }
     let root = Directory::open(data_dir, false)?;
-    let usage = |name: &str| -> PlatformResult<u64> {
-        match root.child_owner(name, false, Some(identity.uid)) {
-            Ok(directory) => directory.usage(Some(identity.uid)),
-            Err(error) if error.code == error_code::NOT_FOUND => Ok(0),
-            Err(error) => Err(error),
-        }
-    };
-    Ok((
-        usage("state")?,
-        usage("cache")?.saturating_add(usage("tmp")?),
-    ))
+    match root.child_owner("state", false, Some(identity.uid)) {
+        Ok(directory) => directory.usage(Some(identity.uid)),
+        Err(error) if error.code == error_code::NOT_FOUND => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn harden_host(db_path: &str) -> PlatformResult<()> {
@@ -366,8 +360,6 @@ pub(crate) fn launch_helper(path: &Path) -> anyhow::Result<std::convert::Infalli
     let mut enforced = BackendLimitEnforcement {
         memory: false,
         cpu: false,
-        pids: false,
-        open_files: false,
     };
     unsafe {
         let core = libc::rlimit {
@@ -378,16 +370,15 @@ pub(crate) fn launch_helper(path: &Path) -> anyhow::Result<std::convert::Infalli
             libc::setrlimit(libc::RLIMIT_CORE, &core) == 0,
             "不能禁用进程转储"
         );
-        let fds = libc::rlimit {
-            rlim_cur: config.context.limits.open_files as libc::rlim_t,
-            rlim_max: config.context.limits.open_files as libc::rlim_t,
+        // 不另设进程数上限；打开文件数尽量沿用宿主硬上限，失败也不影响启动。
+        let mut fds = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
         };
-        enforced.open_files = libc::setrlimit(libc::RLIMIT_NOFILE, &fds) == 0;
-        let pids = libc::rlimit {
-            rlim_cur: config.context.limits.pids as libc::rlim_t,
-            rlim_max: config.context.limits.pids as libc::rlim_t,
-        };
-        enforced.pids = libc::setrlimit(libc::RLIMIT_NPROC, &pids) == 0;
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut fds) == 0 {
+            fds.rlim_cur = fds.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &fds);
+        }
     }
     if let Some(cgroup) = &config.cgroup
         && is_cgroup_v2(Path::new(cgroup))
@@ -406,14 +397,11 @@ pub(crate) fn launch_helper(path: &Path) -> anyhow::Result<std::convert::Infalli
         }
     }
     let limits = &config.context.limits;
-    if (!enforced.memory && limits.memory_bytes.0 != 0)
-        || (!enforced.cpu && limits.cpu_millis != 0)
-        || !enforced.pids
-        || !enforced.open_files
+    if (!enforced.memory && limits.memory_bytes.0 != 0) || (!enforced.cpu && limits.cpu_millis != 0)
     {
         eprintln!(
-            "后端部分资源限制未强制：memory={} cpu={} pids={} open_files={}",
-            enforced.memory, enforced.cpu, enforced.pids, enforced.open_files
+            "后端部分资源限制未强制：memory={} cpu={}",
+            enforced.memory, enforced.cpu
         );
     }
     config.context.limits.enforced = enforced;

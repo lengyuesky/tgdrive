@@ -194,17 +194,10 @@ async fn example(platform: &Arc<AppPlatform>, fake: &super::tests::Synthetic, ht
         .backends
         .run("example-backend")
         .expect("页面请求应触发真实按需启动");
-    let backend: serde_json::Value = json(
-        http.owner(
-            Method::GET,
-            &format!("{APP_CENTER_BASE}/apps/example-backend/backend"),
-        )
-        .send()
+    let status = app(http, "example-backend")
         .await
-        .unwrap(),
-    )
-    .await;
-    let status: BackendStatus = serde_json::from_value(backend["status"].clone()).unwrap();
+        .backend
+        .expect("真实示例后端应报告运行状态");
     assert_eq!(status.state, BackendState::Ready);
     assert_eq!(status.run_id.as_deref(), Some(run.caller.id.as_str()));
     println!(
@@ -438,19 +431,15 @@ async fn cinema(platform: &Arc<AppPlatform>, http: &Http) {
         .backends
         .run("cinema")
         .expect("影视真实后端应已经启动就绪");
-    let management: serde_json::Value = json(
-        http.owner(
-            Method::GET,
-            &format!("{APP_CENTER_BASE}/apps/cinema/backend"),
-        )
-        .send()
-        .await
-        .unwrap(),
-    )
-    .await;
-    let status: BackendStatus = serde_json::from_value(management["status"].clone()).unwrap();
-    assert_eq!(status.state, BackendState::Ready);
     let installed = app(http, "cinema").await;
+    assert_eq!(
+        installed
+            .backend
+            .as_ref()
+            .expect("影视真实后端应报告运行状态")
+            .state,
+        BackendState::Ready
+    );
     uninstall(http, "cinema", &installed.state_revision).await;
     super::linux_acceptance_tests::gone(run.pid).await;
     assert!(run.caller.cancelled.is_cancelled());

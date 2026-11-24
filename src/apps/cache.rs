@@ -231,28 +231,6 @@ impl AppPlatform {
                 ));
             }
         }
-        let limits = super::runtime::limits(&app, self.shared_limits().await?.values())?;
-        let private_usage = if limits.backend.is_some() {
-            let uid: Option<i64> =
-                sqlx::query_scalar("SELECT uid FROM app_runtime_identities WHERE app_id=?")
-                    .bind(&app.id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            let uid = if super::backend_system::real_isolation() {
-                uid.unwrap_or(0) as u32
-            } else {
-                unsafe { libc::geteuid() }
-            };
-            super::backend_system::disk_usage(
-                &self.data_root().join(&app.id),
-                super::backend_system::Identity { uid, gid: uid },
-            )?
-            .1
-            .saturating_sub(index.usage)
-        } else {
-            0
-        };
-        let available = limits.cache_byte_limit.0.saturating_sub(private_usage);
         let revision = opaque();
         let at = now();
         let entry = CacheEntry {
@@ -271,12 +249,6 @@ impl AppPlatform {
             last_access: at.0,
         };
         let length = stored.bytes()?;
-        if length > available {
-            return Err(PlatformError::new(
-                error_code::QUOTA_EXCEEDED,
-                "缓存对象超过应用总配额",
-            ));
-        }
         index.directory.write_atomic(&stored.file, &bytes)?;
         let encoded = serde_json::to_vec(&stored)?;
         index
@@ -287,9 +259,8 @@ impl AppPlatform {
             index.directory.remove(&old.file)?;
         }
         index.usage += length;
-        if index.usage > available {
-            let target = (limits.cache_byte_limit.0 / 100 * CACHE_EVICTION_TARGET_PERCENT)
-                .saturating_sub(private_usage);
+        if index.usage > DEFAULT_CACHE_BYTES {
+            let target = DEFAULT_CACHE_BYTES / 100 * CACHE_EVICTION_TARGET_PERCENT;
             let mut victims = index
                 .entries
                 .iter()

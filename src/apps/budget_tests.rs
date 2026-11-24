@@ -64,8 +64,13 @@ async fn cache_lru_evicts_to_ninety_percent_and_keeps_new_object() {
             &platform.host.auth.device_epoch(),
         )
         .unwrap();
-    let body = bytes::Bytes::from(vec![1; MAX_CACHE_OBJECT_BYTES as usize]);
-    for index in 0..128 {
+    // 给默认元数据留出余量，第 513 次写入的对象正文总量也实际超过 1 GiB。
+    let body = bytes::Bytes::from(vec![1; MAX_CACHE_OBJECT_BYTES as usize - 1024]);
+    let object_count = DEFAULT_CACHE_BYTES / body.len() as u64 + 1;
+    assert!(object_count >= 513);
+    assert!(object_count * body.len() as u64 > DEFAULT_CACHE_BYTES);
+    let started = std::time::Instant::now();
+    for index in 0..object_count {
         platform
             .cache_put(
                 &page,
@@ -76,14 +81,25 @@ async fn cache_lru_evicts_to_ninety_percent_and_keeps_new_object() {
             )
             .await
             .unwrap();
+        if index + 2 == object_count {
+            let usage = platform.cache_usage(&app.manifest.id).await.unwrap();
+            assert!(usage <= DEFAULT_CACHE_BYTES);
+            assert!(usage > DEFAULT_CACHE_BYTES / 100 * CACHE_EVICTION_TARGET_PERCENT);
+        }
     }
+    let elapsed = started.elapsed();
     assert!(
         platform.cache_usage(&app.manifest.id).await.unwrap()
-            <= DEFAULT_PAGE_CACHE_BYTES / 100 * CACHE_EVICTION_TARGET_PERCENT
+            <= DEFAULT_CACHE_BYTES / 100 * CACHE_EVICTION_TARGET_PERCENT
     );
     assert!(
         platform
-            .cache_read(&page, "object-127", false, None)
+            .cache_read(
+                &page,
+                &format!("object-{:03}", object_count - 1),
+                false,
+                None
+            )
             .await
             .is_ok()
     );
@@ -95,6 +111,11 @@ async fn cache_lru_evicts_to_ninety_percent_and_keeps_new_object() {
             .unwrap()
             .code,
         error_code::NOT_FOUND
+    );
+    println!(
+        "缓存淘汰验收：{object_count} 个真实对象、正文 {} 字节，写入与淘汰耗时 {:.3} 秒",
+        object_count * body.len() as u64,
+        elapsed.as_secs_f64()
     );
     platform
         .uninstall(&app.manifest.id, &app.state_revision, true)

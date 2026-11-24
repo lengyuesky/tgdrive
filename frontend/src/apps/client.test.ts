@@ -19,20 +19,28 @@ describe('仅主人使用的后端管理客户端', () => {
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ credentials: 'same-origin', redirect: 'error', method: 'GET' })
   })
 
-  it('根地址清除使用修订 CAS，后端与日志走主人内部接口', async () => {
+  it('根地址清除使用修订 CAS，日志与重启沿用主人身份', async () => {
     fetchMock.mockResolvedValue(response({ app_id: null, revision: 'root-2' }))
     const { center } = await import('./client')
     await center.setRoot({ expected_revision: 'root-1', app_id: null })
     expect(fetchMock.mock.calls[0][0]).toBe(`${APP_CENTER_BASE}/root-app`)
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'PUT', credentials: 'same-origin', redirect: 'error', body: JSON.stringify({ expected_revision: 'root-1', app_id: null }) })
-    await center.backend('example-backend')
     await center.logs('example-backend')
     await center.restart('example-backend')
     expect(fetchMock.mock.calls.slice(1).map(([url, options]) => [url, options.method])).toEqual([
-      [`${APP_CENTER_BASE}/apps/example-backend/backend`, 'GET'],
       [`${APP_CENTER_BASE}/apps/example-backend/backend/logs`, 'GET'],
       [`${APP_CENTER_BASE}/apps/example-backend/backend/restart`, 'POST'],
     ])
-    for (const [, options] of fetchMock.mock.calls) expect(options.headers.has('Authorization')).toBe(false)
+    for (const [, options] of fetchMock.mock.calls) {
+      expect(options).toMatchObject({ mode: 'same-origin', credentials: 'same-origin', redirect: 'error' })
+      expect(options.headers.has('Authorization')).toBe(false)
+    }
+  })
+
+  it('不提供单应用后端资源管理方法或内部接口', async () => {
+    const { center, endpoint } = await import('./client')
+    expect(center).not.toHaveProperty('backend')
+    expect(() => endpoint('center.app.backend', { app_id: 'example-backend' })).toThrow('宿主契约未提供所需接口')
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

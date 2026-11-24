@@ -230,14 +230,10 @@ fn limit(resource: libc::c_uint) -> Result<Value> {
     Ok(json!({"soft":value.rlim_cur,"hard":value.rlim_max}))
 }
 fn exercise_limits(temp: &str) -> Result<Value> {
-    let file_limit = limit(libc::RLIMIT_NOFILE)?["soft"].as_u64().unwrap();
-    let process_limit = limit(libc::RLIMIT_NPROC)?["soft"].as_u64().unwrap();
-    if file_limit > 1024 || process_limit > 64 {
-        return Err(Error::Protocol("验收负载超出有界范围"));
-    }
+    // 固定负载超过旧上限，但不再根据继承的系统上限循环到资源耗尽。
     let mut files = Vec::new();
     let mut file_error = None;
-    for _ in 0..=file_limit {
+    for _ in 0..2048 {
         match std::fs::File::open("/dev/null") {
             Ok(file) => files.push(file),
             Err(error) => {
@@ -250,7 +246,7 @@ fn exercise_limits(temp: &str) -> Result<Value> {
     drop(files);
     let mut children = Vec::new();
     let mut process_error = None;
-    for _ in 0..=process_limit {
+    for _ in 0..128 {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             wait_forever();

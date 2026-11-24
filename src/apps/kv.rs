@@ -286,11 +286,11 @@ impl AppPlatform {
         let limits = super::runtime::limits(&app, self.shared_limits().await?.values())?;
         let (entries, bytes) = usage.unwrap_or((0, 0));
         tx.commit().await?;
-        let mut cache = self.cache_usage(app_id).await?;
+        let cache = self.cache_usage(app_id).await?;
         let database = if limits.backend.is_some() {
-            let (database, combined) = self.backend_disk_usage(app_id).await?;
-            cache = combined;
-            Some(tgdrive_contract::ByteCount(database))
+            Some(tgdrive_contract::ByteCount(
+                self.backend_database_usage(app_id).await?,
+            ))
         } else {
             None
         };
@@ -302,7 +302,6 @@ impl AppPlatform {
             cache_bytes: tgdrive_contract::ByteCount(cache),
             cache_byte_limit: limits.cache_byte_limit,
             database_bytes: database,
-            database_byte_limit: limits.backend.map(|b| b.database_bytes),
         })
     }
 }

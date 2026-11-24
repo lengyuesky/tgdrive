@@ -200,6 +200,34 @@ fn counter(path: &Path, key: &str) -> u64 {
         })
         .unwrap()
 }
+fn resource_limit(resource: libc::c_uint) -> libc::rlimit {
+    let mut value = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(resource, &mut value) },
+        0,
+        "无法读取验收宿主的资源上限：{}",
+        std::io::Error::last_os_error()
+    );
+    value
+}
+fn assert_resource_environment() {
+    let files = resource_limit(libc::RLIMIT_NOFILE);
+    assert!(
+        files.rlim_max >= 4096,
+        "验收宿主的打开文件数硬上限必须至少为 4096，才能验证实际打开 2048 个文件；当前为 {}",
+        files.rlim_max
+    );
+    let processes = resource_limit(libc::RLIMIT_NPROC);
+    assert!(
+        processes.rlim_cur >= 256 && processes.rlim_max >= 256,
+        "验收宿主的进程数软/硬上限必须至少为 256，为 128 个子进程及后端线程留出余量；当前为 {}/{}",
+        processes.rlim_cur,
+        processes.rlim_max
+    );
+}
 async fn resources(platform: &AppPlatform, run: &Arc<backend::Run>) {
     let delegated = std::env::var_os("TGDRIVE_TEST_REQUIRE_CGROUP").is_some();
     if delegated {
@@ -216,27 +244,38 @@ async fn resources(platform: &AppPlatform, run: &Arc<backend::Run>) {
             "委派 cgroup 后总体限制仍未强制"
         );
     }
-    let info: RuntimeInfo = serde_json::from_value(probe(run, "/host-info", None).await).unwrap();
+    let runtime = probe(run, "/host-info", None).await;
+    let info: RuntimeInfo = serde_json::from_value(runtime.clone()).unwrap();
     let limits = info.limits.backend.unwrap();
-    assert!(limits.enforced.pids && limits.enforced.open_files);
+    assert_eq!(
+        runtime["limits"]["backend"],
+        serde_json::json!({
+            "memory_bytes": limits.memory_bytes,
+            "cpu_millis": limits.cpu_millis,
+            "enforced": {"memory": limits.enforced.memory, "cpu": limits.enforced.cpu},
+        })
+    );
+    let host_files = resource_limit(libc::RLIMIT_NOFILE);
+    let host_processes = resource_limit(libc::RLIMIT_NPROC);
     let environment = probe(run, "/environment", None).await;
+    assert_eq!(environment["nofile"]["soft"], environment["nofile"]["hard"]);
+    assert_eq!(environment["nofile"]["hard"], host_files.rlim_max);
+    assert_eq!(environment["nproc"]["soft"], host_processes.rlim_cur);
+    assert_eq!(environment["nproc"]["hard"], host_processes.rlim_max);
     for name in ["soft", "hard"] {
-        assert_eq!(environment["nproc"][name], limits.pids);
-        assert_eq!(environment["nofile"][name], limits.open_files);
         assert_eq!(environment["core"][name], 0);
     }
     let exercised = probe(run, "/limits", None).await;
-    assert_eq!(exercised["file_error"], libc::EMFILE);
-    assert!(exercised["opened"].as_u64().unwrap() < u64::from(limits.open_files));
-    assert_eq!(exercised["process_error"], libc::EAGAIN);
-    assert!(exercised["spawned"].as_u64().unwrap() < u64::from(limits.pids));
+    assert_eq!(exercised["opened"], 2048);
+    assert!(exercised["file_error"].is_null());
+    assert_eq!(exercised["spawned"], 128);
+    assert!(exercised["process_error"].is_null());
     assert_eq!(exercised["core_raise"], -1);
     assert_eq!(exercised["core_error"], libc::EPERM);
     assert_eq!(exercised["core_signal"], libc::SIGABRT);
     assert_eq!(exercised["core_dumped"], false);
     println!(
-        "隔离验收：RLIMIT_NPROC={} 实际 EAGAIN；RLIMIT_NOFILE={} 实际 EMFILE；core 上下限 0、不可提高且 SIGABRT 无转储",
-        limits.pids, limits.open_files
+        "隔离验收：不设进程数与打开文件数上限，实际打开 2048 个文件、派生 128 个子进程均成功；core 上下限 0、不可提高且 SIGABRT 无转储"
     );
     if delegated {
         assert!(
@@ -305,7 +344,7 @@ async fn resources(platform: &AppPlatform, run: &Arc<backend::Run>) {
     } else {
         assert!(!limits.enforced.memory && !limits.enforced.cpu);
         println!(
-            "隔离验收：无可写 cgroup 仍正常 ready，memory=false,cpu=false,pids=true,open_files=true；可写 cgroup 实际限额本轮未测"
+            "隔离验收：无可写 cgroup 仍正常 ready，memory=false,cpu=false；可写 cgroup 实际限额本轮未测"
         );
     }
 }
@@ -316,6 +355,7 @@ async fn linux_root_isolation() {
     acceptance().await.unwrap();
 }
 async fn acceptance() -> anyhow::Result<()> {
+    assert_resource_environment();
     let (_data, platform, _fake) = super::tests::fixture().await;
     let executable = std::env::var_os("TGDRIVE_TEST_PROBE_EXECUTABLE").expect("验收探针未构建");
     install_probe(

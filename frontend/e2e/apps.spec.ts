@@ -40,14 +40,14 @@ const pageLimits: RuntimeLimits = {
   json_request_bytes: String(LIMITS.MAX_JSON_REQUEST_BYTES), json_response_bytes: String(LIMITS.MAX_JSON_RESPONSE_BYTES), json_page_bytes: String(LIMITS.MAX_JSON_PAGE_BYTES),
   file_page_limit: LIMITS.MAX_PAGE_LIMIT, query_root_limit: LIMITS.MAX_QUERY_ROOTS, extension_limit: LIMITS.MAX_QUERY_EXTENSIONS, mutation_operation_limit: LIMITS.MAX_MUTATION_OPERATIONS, mutation_assertion_limit: LIMITS.MAX_MUTATION_ASSERTIONS,
   random_limit: LIMITS.MAX_RANDOM_LIMIT, random_exclusion_limit: LIMITS.MAX_RANDOM_EXCLUSIONS, kv_key_bytes: LIMITS.MAX_KV_KEY_BYTES, kv_value_bytes: String(LIMITS.MAX_KV_VALUE_BYTES), kv_entry_limit: LIMITS.DEFAULT_KV_ENTRIES, kv_byte_limit: String(LIMITS.DEFAULT_KV_BYTES),
-  cache_object_bytes: String(LIMITS.MAX_CACHE_OBJECT_BYTES), cache_metadata_bytes: String(LIMITS.MAX_CACHE_METADATA_BYTES), cache_lookup_limit: LIMITS.MAX_CACHE_LOOKUP_KEYS, cache_byte_limit: String(LIMITS.DEFAULT_PAGE_CACHE_BYTES),
+  cache_object_bytes: String(LIMITS.MAX_CACHE_OBJECT_BYTES), cache_metadata_bytes: String(LIMITS.MAX_CACHE_METADATA_BYTES), cache_lookup_limit: LIMITS.MAX_CACHE_LOOKUP_KEYS, cache_byte_limit: String(LIMITS.DEFAULT_CACHE_BYTES),
   control_concurrency: LIMITS.PAGE_CONTROL_CONCURRENCY, byte_stream_concurrency: LIMITS.PAGE_BYTE_CONCURRENCY, control_requests_per_second: LIMITS.PAGE_CONTROL_RATE, control_burst: LIMITS.PAGE_CONTROL_BURST,
   read_lease_limit: LIMITS.MAX_READ_LEASES, media_ticket_limit: LIMITS.MAX_MEDIA_TICKETS, upload_limit: LIMITS.MAX_UPLOADS, backend: null,
 }
 
-async function mock(page: Page) {
+async function mock(page: Page, withBackend = false) {
   let scope: ScopeInfo = { revision: 'scope-1', scope: { mode: 'none' }, roots: [] }
-  const app = (): InstalledApp => ({ manifest, generation: 'generation-1', state_revision: 'state-1', enabled: true, pinned: false, scope, package: { target: 'web', sha256: sha, size: '100' }, backend: null, installed_at: 1, updated_at: 1 })
+  const app = (): InstalledApp => ({ manifest: withBackend ? { ...manifest, backend: { entry: 'backend/app', run_mode: 'resident', external_service: true } } : manifest, generation: 'generation-1', state_revision: 'state-1', enabled: true, pinned: false, scope, package: { target: withBackend ? 'linux-arm64' : 'web', sha256: sha, size: '100' }, backend: withBackend ? { state: 'ready', run_mode: 'resident', run_id: 'run-1', error_code: null } : null, installed_at: 1, updated_at: 1 })
   const requests: { path: string; method: string; authorization?: string; origin?: string }[] = [], outside: string[] = [], order: string[] = []
   let closed = false
   let limits: AppResourceLimits = { memory_bytes: String(LIMITS.DEFAULT_SHARED_BACKEND_MEMORY_BYTES), cpu_millis: LIMITS.DEFAULT_SHARED_BACKEND_CPU_MILLIS, memory_enforced: false, cpu_enforced: false }
@@ -72,7 +72,7 @@ async function mock(page: Page) {
     }
     if (url.pathname === `${APP_CENTER_BASE}/apps/${manifest.id}/data/usage`) {
       requests.push({ path: url.pathname, method: route.request().method() })
-      return route.fulfill({ json: { kv_entries: 2, kv_bytes: '1024', kv_entry_limit: LIMITS.DEFAULT_KV_ENTRIES, kv_byte_limit: String(LIMITS.DEFAULT_KV_BYTES), cache_bytes: '2048', cache_byte_limit: String(LIMITS.DEFAULT_PAGE_CACHE_BYTES), database_bytes: null, database_byte_limit: null } })
+      return route.fulfill({ json: { kv_entries: 2, kv_bytes: '1024', kv_entry_limit: LIMITS.DEFAULT_KV_ENTRIES, kv_byte_limit: String(LIMITS.DEFAULT_KV_BYTES), cache_bytes: '2048', cache_byte_limit: String(LIMITS.DEFAULT_CACHE_BYTES), database_bytes: withBackend ? '8589934592' : null } })
     }
     if (url.pathname === `${APP_CENTER_BASE}/apps`) return route.fulfill({ json: { apps: [app()], root_app: { app_id: null, revision: 'root-1' } } })
     if (url.pathname === `${APP_CENTER_BASE}/resource-limits`) {
@@ -140,6 +140,7 @@ test('纯页面真实沙箱握手、全部界面方法与关闭保存', async ({
 test('主人确认具体目录、查看占用并从文件打开应用', async ({ page }) => {
   const state = await mock(page)
   await page.goto('/admin/apps')
+  await expect(page.locator('.app-card').getByRole('button', { name: '资源限制', exact: true })).toHaveCount(0)
   await page.getByRole('button', { name: '目录授权', exact: true }).click()
   const scope = page.getByRole('dialog', { name: '目录授权' })
   await scope.getByText('指定目录', { exact: true }).click()
@@ -151,6 +152,8 @@ test('主人确认具体目录、查看占用并从文件打开应用', async ({
   await page.getByRole('button', { name: '占用', exact: true }).click()
   const occupancy = page.getByRole('dialog', { name: '应用占用' })
   await expect(occupancy).toContainText('1.0 KiB')
+  await expect(occupancy.locator('dd').nth(2)).toHaveText('2.0 KiB / 1.0 GiB')
+  await expect(occupancy.getByText('后端数据库', { exact: true })).toHaveCount(0)
   expect(state.requests.some((request) => request.path.endsWith('/data/usage') && request.method === 'GET')).toBe(true)
   await page.keyboard.press('Escape')
   await expect(occupancy).not.toBeVisible()
@@ -175,9 +178,27 @@ test('主人确认具体目录、查看占用并从文件打开应用', async ({
   await page.screenshot({ path: '/tmp/tgdrive-app-owner-internal.png', fullPage: true })
 })
 
-test('应用资源限制只有一组总体设置，保存后立即显示当前值', async ({ page }, testInfo) => {
-  const state = await mock(page)
+test('后端占用显示对象缓存与数据库用量，数据库没有上限', async ({ page }) => {
+  const state = await mock(page, true)
   await page.goto('/admin/apps')
+  await page.getByRole('button', { name: '占用', exact: true }).click()
+  const occupancy = page.getByRole('dialog', { name: '应用占用' })
+  await expect(occupancy.locator('dt')).toHaveText(['键值记录', '键值字节', '可再生缓存', '后端数据库'])
+  await expect(occupancy.locator('dd').nth(2)).toHaveText('2.0 KiB / 1.0 GiB')
+  await expect(occupancy.locator('dd').nth(3)).toHaveText('8.0 GiB')
+  await expect(occupancy).not.toContainText('数据库上限')
+  expect(state.requests.some((request) => request.path.endsWith('/data/usage') && request.method === 'GET')).toBe(true)
+})
+
+test('应用资源限制只有一组总体设置，后端卡片无单独限制入口，保存后立即显示当前值', async ({ page }, testInfo) => {
+  const state = await mock(page, true)
+  await page.goto('/admin/apps')
+  const card = page.locator('.app-card')
+  await expect(card).toHaveCount(1)
+  await expect(card.getByRole('button', { name: '资源限制', exact: true })).toHaveCount(0)
+  await expect(card.getByRole('button', { name: '重启后端', exact: true })).toBeVisible()
+  await expect(card.getByRole('button', { name: '后端日志', exact: true })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: '后端资源限制', exact: true })).toHaveCount(0)
   const section = page.locator('.resource-limits')
   const memory = section.getByLabel('应用内存上限'), cpu = section.getByLabel('应用 CPU 上限')
   await expect(memory).toHaveValue('2048'); await expect(cpu).toHaveValue('0')

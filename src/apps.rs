@@ -159,7 +159,7 @@ impl AppPlatform {
     fn data_root(&self) -> PathBuf {
         self.root.join("data")
     }
-    async fn backend_disk_usage(&self, id: &str) -> PlatformResult<(u64, u64)> {
+    async fn backend_database_usage(&self, id: &str) -> PlatformResult<u64> {
         let uid: Option<i64> =
             sqlx::query_scalar("SELECT uid FROM app_runtime_identities WHERE app_id=?")
                 .bind(id)
@@ -170,7 +170,7 @@ impl AppPlatform {
         } else {
             unsafe { libc::geteuid() }
         };
-        backend_system::disk_usage(
+        backend_system::database_usage(
             &self.data_root().join(id),
             backend_system::Identity { uid, gid: uid },
         )
