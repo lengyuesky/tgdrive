@@ -41,7 +41,11 @@ async fn probe(run: &Arc<backend::Run>, route: &str, path: Option<&Path>) -> ser
     let response = backend::request(run, request.body(Body::empty()).unwrap())
         .await
         .unwrap();
-    serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(status, 200, "探针 {route} 返回失败：{value}");
+    value
 }
 pub(super) async fn gone(pid: u32) {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -523,10 +527,10 @@ async fn acceptance() -> anyhow::Result<()> {
         if attempt < 5 {
             run = platform.backends.ensure(&platform, "probe-one").await?;
             let minimum = 1u64 << attempt;
-            // 回收子孙的时间也属于崩溃后的退避，不能只测回收结束后的剩余等待。
+            // crashed 早于发送退出请求和宿主记录崩溃；回收子孙也属于完整退避间隔。
             let elapsed = crashed.elapsed();
             assert!(
-                elapsed >= Duration::from_millis(minimum * 1000 - 250),
+                elapsed >= Duration::from_secs(minimum),
                 "第 {} 次退避过短：{elapsed:?}",
                 attempt + 1
             );

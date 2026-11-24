@@ -30,10 +30,13 @@ async fn main() -> Result<()> {
                 .stderr(Stdio::null())
                 .spawn()?;
             wait_for_file(Path::new(&leaf_path)).await?;
+            // 报告出现时必须已写完，不能让 is_file() 的读者读到空文件或半截 JSON。
+            let pending = format!("{}.{}.pending", args[2], std::process::id());
             std::fs::write(
-                &args[2],
+                &pending,
                 json!([std::process::id(), child.id()]).to_string(),
             )?;
+            std::fs::rename(pending, &args[2])?;
             wait_forever();
         }
         Some("--memory") => {

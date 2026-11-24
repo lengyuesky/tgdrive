@@ -123,6 +123,72 @@ async fn sdk_backend_becomes_ready_calls_host_and_stops() {
     assert!(run.finished.is_cancelled());
 }
 
+#[tokio::test]
+async fn backend_crash_across_second_boundary_waits_a_full_backoff() {
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    let (_db, _data, platform, _) = backend_fixture().await;
+    let run = platform
+        .backends
+        .ensure(&platform, "test-backend")
+        .await
+        .unwrap();
+    let request = hyper::Request::builder()
+        .uri("/exit")
+        .header("host", "tgdrive")
+        .header(
+            FORWARD_CONTEXT_HEADER,
+            forward(&run, ForwardCaller::Owner, ForwardEntry::Page),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let wall_clock = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    // 时间窗仅用于稳定复现旧实现；调度错过窗口时仍继续核验完整的单调退避。
+    let crash_second = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let wall = wall_clock();
+            if (400..550).contains(&wall.subsec_millis()) {
+                break wall.as_secs();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| wall_clock().as_secs());
+    let crashed = Instant::now();
+    assert!(backend::request(&run, request).await.is_err());
+    tokio::time::timeout(Duration::from_secs(5), run.finished.cancelled())
+        .await
+        .unwrap();
+    assert_eq!(
+        platform
+            .backends
+            .status("test-backend", RunMode::OnDemand)
+            .state,
+        BackendState::Failed
+    );
+    // 跨秒调用让旧实现的整秒截止点过期；回收已跨秒或系统时钟跳变都不影响断言。
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        while wall_clock().as_secs() <= crash_second {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    let replacement = platform
+        .backends
+        .ensure(&platform, "test-backend")
+        .await
+        .unwrap();
+    let elapsed = crashed.elapsed();
+    assert_ne!(run.caller.id, replacement.caller.id);
+    platform.backends.stop("test-backend").await.unwrap();
+    println!("退避回归：跨秒重启，崩溃到新轮次就绪 {elapsed:.3?}");
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "跨秒重启的首次退避不足一秒：{elapsed:?}"
+    );
+}
+
 fn oversized_private_directories(platform: &AppPlatform) -> u64 {
     let data = platform.data_root().join("test-backend");
     let bytes = 8 * 1024 * 1024 * 1024;

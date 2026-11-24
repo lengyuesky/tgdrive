@@ -10,6 +10,7 @@ use std::time::Duration;
 use tgdrive_contract::{CONTRACT_VERSION, error_code, http::*, manifest::RunMode, runtime::*};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Manager {
@@ -20,7 +21,8 @@ struct Slot {
     state: RwLock<Option<BackendStatus>>,
     run: RwLock<Option<Arc<Run>>>,
     retiring_runs: StdMutex<Vec<Weak<Run>>>,
-    failures: StdMutex<Vec<i64>>,
+    // 崩溃记录只驻留内存，用单调时钟避免整秒截断和系统时钟跳变。
+    failures: StdMutex<Vec<Instant>>,
     crash_blocked: AtomicBool,
     pending_starts: Arc<tokio::sync::Semaphore>,
 }
@@ -161,7 +163,10 @@ impl Manager {
         }
         let retry_at = {
             let mut failures = slot.failures.lock().unwrap();
-            failures.retain(|at| *at > now().0 - BACKEND_RESTART_WINDOW_SECONDS as i64 * 1000);
+            let current = Instant::now();
+            failures.retain(|at| {
+                current.duration_since(*at) < Duration::from_secs(BACKEND_RESTART_WINDOW_SECONDS)
+            });
             if failures.len() as u64 > MAX_BACKEND_RESTARTS {
                 slot.crash_blocked.store(true, Ordering::Release);
                 return Err(PlatformError::new(
@@ -169,15 +174,12 @@ impl Manager {
                     "后端已达到自动重启上限",
                 ));
             }
-            failures
-                .last()
-                .map(|last| *last + 1000 * (1i64 << failures.len().saturating_sub(1).min(4)))
+            failures.last().map(|last| {
+                *last + Duration::from_secs(1u64 << failures.len().saturating_sub(1).min(4))
+            })
         };
         if let Some(retry_at) = retry_at {
-            tokio::time::sleep(Duration::from_millis(
-                retry_at.saturating_sub(now().0).max(0) as u64,
-            ))
-            .await;
+            tokio::time::sleep_until(retry_at).await;
         }
         *slot.state.write().unwrap() = Some(BackendStatus {
             state: BackendState::Starting,
@@ -215,7 +217,7 @@ impl Manager {
                 {
                     let mut failures = slot.failures.lock().unwrap();
                     if failures.len() == failure_count {
-                        failures.push(now().0);
+                        failures.push(Instant::now());
                     }
                     if failures.len() as u64 > MAX_BACKEND_RESTARTS {
                         slot.crash_blocked.store(true, Ordering::Release);
@@ -537,8 +539,11 @@ impl Manager {
         }
         if !expected && run.ready.load(Ordering::Acquire) {
             let mut failures = slot.failures.lock().unwrap();
-            failures.retain(|at| *at > now().0 - BACKEND_RESTART_WINDOW_SECONDS as i64 * 1000);
-            failures.push(now().0);
+            let current = Instant::now();
+            failures.retain(|at| {
+                current.duration_since(*at) < Duration::from_secs(BACKEND_RESTART_WINDOW_SECONDS)
+            });
+            failures.push(current);
             if failures.len() as u64 > MAX_BACKEND_RESTARTS {
                 slot.crash_blocked.store(true, Ordering::Release);
             }
@@ -1000,7 +1005,11 @@ async fn supervise(weak: Weak<AppPlatform>) {
                 let ready = {
                     let failures = slot.failures.lock().unwrap();
                     failures.last().is_none_or(|last| {
-                        now().0 - *last > 1000 * (1i64 << failures.len().saturating_sub(1).min(4))
+                        Instant::now()
+                            > *last
+                                + Duration::from_secs(
+                                    1u64 << failures.len().saturating_sub(1).min(4),
+                                )
                     })
                 };
                 if ready
