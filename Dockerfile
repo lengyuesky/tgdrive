@@ -43,29 +43,56 @@ RUN apk add --no-cache curl unzip \
     && chmod 755 /opt/usque/usque
 
 # ---------- 阶段 4:媒体工具 ----------
+# 自行编译而不装 Debian 的 ffmpeg 包：后者按桌面用途链接了 SDL、OpenGL、ICU、语音合成等
+# 两百多个运行库（约 215 MB），而应用只做探测、解码和取帧。这里保留全部原生解码器、
+# 封装格式与滤镜，外部库只留 AV1 解码（dav1d）、H.264 编码（x264）、zlib 和基础镜像已有的 OpenSSL。
 FROM debian:bookworm-slim AS media-probe
 ARG TARGETARCH
-# 依赖按 SONAME 平铺到标准库目录，不依赖构建层的 alternatives 和 ld.so.cache。
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && mkdir -p /probe-root/usr/local/bin /probe-root/usr/share/licenses/media-tools \
-    && cp /usr/bin/ffprobe /probe-root/usr/local/bin/ffprobe \
-    && cp /usr/bin/ffmpeg /probe-root/usr/local/bin/ffmpeg \
+ARG FFMPEG_VERSION=9.0.2
+# 发布包签名（FFmpeg release signing key，指纹末段 B4322F04D67658D8）引入此版本时已核验，构建时固定校验和。
+ARG FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils gcc libc6-dev make nasm pkg-config \
+      libx264-dev libdav1d-dev zlib1g-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fL --retry 3 "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o /tmp/ffmpeg.tar.xz \
+    && echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c - \
+    && mkdir /tmp/ffmpeg && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 \
+    && cd /tmp/ffmpeg \
+    && ./configure --prefix=/opt/ffmpeg --enable-shared --disable-static \
+         --disable-autodetect --disable-debug --disable-doc --disable-ffplay \
+         --disable-indevs --enable-indev=lavfi --disable-outdevs \
+         --enable-gpl --enable-version3 \
+         --enable-libx264 --enable-libdav1d --enable-zlib --enable-iconv --enable-openssl \
+    && make -j"$(nproc)" && make install \
+    && mkdir -p /opt/ffmpeg/licenses \
+    && cp COPYING.GPLv3 LICENSE.md /opt/ffmpeg/licenses/ \
+    && printf '源码：https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nSHA-256：%s\n' "$FFMPEG_VERSION" "$FFMPEG_SHA256" \
+         > /opt/ffmpeg/licenses/SOURCE.txt \
+    && cd / && rm -rf /tmp/ffmpeg /tmp/ffmpeg.tar.xz
+# 依赖按 SONAME 平铺到标准库目录，不依赖构建层的 alternatives 和 ld.so.cache；
+# glibc、OpenSSL 等基础镜像自带的库不重复复制。
+RUN mkdir -p /probe-root/usr/local/bin /probe-root/usr/share/licenses/media-tools \
+    && cp /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/ffmpeg /probe-root/usr/local/bin/ \
     && case "$TARGETARCH" in \
          amd64) library_dir=/usr/lib/x86_64-linux-gnu ;; \
          arm64) library_dir=/usr/lib/aarch64-linux-gnu ;; \
          *) echo "不支持的媒体探测架构：$TARGETARCH" >&2; exit 1 ;; \
        esac \
     && mkdir -p "/probe-root$library_dir" \
-    && ldd /usr/bin/ffprobe /usr/bin/ffmpeg | awk '/=> \// { print $3 }' | sort -u | while read -r library; do \
+    && LD_LIBRARY_PATH=/opt/ffmpeg/lib ldd /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/ffmpeg \
+       | awk '/=> \// { print $3 }' | sort -u | while read -r library; do \
          case "$(basename "$library")" in \
-           libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgcc_s.so.1|libstdc++.so.6) continue ;; \
+           libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgcc_s.so.1|libstdc++.so.6|libssl.so.3|libcrypto.so.3) continue ;; \
          esac; \
          cp -L "$library" "/probe-root$library_dir/$(basename "$library")"; \
        done \
-    && dpkg-query -W > /probe-root/usr/share/licenses/media-tools/packages.txt \
-    && cp -a /usr/share/doc /probe-root/usr/share/licenses/media-tools/debian-doc \
-    && cp -a /usr/share/common-licenses /probe-root/usr/share/common-licenses \
-    && rm -rf /var/lib/apt/lists/*
+    && cp -a /opt/ffmpeg/licenses "/probe-root/usr/share/licenses/media-tools/ffmpeg" \
+    && LD_LIBRARY_PATH=/opt/ffmpeg/lib /opt/ffmpeg/bin/ffmpeg -hide_banner -buildconf > /probe-root/usr/share/licenses/media-tools/ffmpeg/BUILDCONF.txt \
+    && for package in libx264-164 libdav1d6 zlib1g; do \
+         install -D -m 644 "/usr/share/doc/$package/copyright" "/probe-root/usr/share/licenses/media-tools/$package/copyright"; \
+       done \
+    && cp -a /usr/share/common-licenses /probe-root/usr/share/common-licenses
 # 与依赖下载分层；共享临时目录只读，后端只写自己的 tmp/。
 RUN mkdir -p /probe-root/tmp /probe-root/var/tmp \
     && chmod 555 /probe-root/tmp /probe-root/var/tmp

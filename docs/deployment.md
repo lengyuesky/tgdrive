@@ -37,7 +37,7 @@ Compose 只公开一个端口 `3358:8080`，本机访问 `http://localhost:3358/
 
 ### 镜像构建与系统身份
 
-镜像附带 `ffmpeg`、`ffprobe`、运行库和 CA 证书。宿主必须以 root 启动：它直接维护 `/etc/passwd`、`/etc/group` 的无登录应用账号，清空附加组并切换每应用独立 UID/GID，不依赖镜像内的 shell 或 `useradd`。默认 Compose 保留 `user: "0:0"` 和 `init: true`；不要改成统一的非 root 用户，也不要让应用继承宿主的 Docker capabilities。容器需要能写应用数据、账号文件，并保留切换身份/设置所有权的权限；Linux 内核还须支持进程收养和 pidfd 身份绑定/回收（通常为 Linux 5.4+）。硬隔离无法满足时后端拒绝启动，不假装成功。主库及凭据只允许 root 读取，镜像的共享 `/tmp` 和 `/var/tmp` 只读，应用使用各自的私有临时目录。
+镜像附带 `ffmpeg`、`ffprobe`、运行库和 CA 证书。媒体工具是构建镜像时从 FFmpeg 源码编译的精简版，面向探测、解码和取帧：含全部原生解码器、封装格式与滤镜，外部库只有 AV1 解码（dav1d）、H.264 编码（x264）、zlib 和 OpenSSL（HTTPS 输入）；不含 x265、SVT-AV1、libvpx 等其余外部编码库，也不含字幕烧录所需的 libass/字体库。版本与校验和固定在 `Dockerfile`，实际配置见镜像内 `/usr/share/licenses/media-tools/ffmpeg/BUILDCONF.txt`。宿主必须以 root 启动：它直接维护 `/etc/passwd`、`/etc/group` 的无登录应用账号，清空附加组并切换每应用独立 UID/GID，不依赖镜像内的 shell 或 `useradd`。默认 Compose 保留 `user: "0:0"` 和 `init: true`；不要改成统一的非 root 用户，也不要让应用继承宿主的 Docker capabilities。容器需要能写应用数据、账号文件，并保留切换身份/设置所有权的权限；Linux 内核还须支持进程收养和 pidfd 身份绑定/回收（通常为 Linux 5.4+）。硬隔离无法满足时后端拒绝启动，不假装成功。主库及凭据只允许 root 读取，镜像的共享 `/tmp` 和 `/var/tmp` 只读，应用使用各自的私有临时目录。
 
 本地和工作流共用根目录的同一份 `Dockerfile` 与同名附加上下文 `tgdrive-app`。唯一版本记录是 `docker/tgdrive-app-revision`，Rust 与前端必须共用该提交的同一份源码，不跟随浮动分支。具体提交以该文件内容为准，构建前应确认它已推送到应用仓库远端。
 
