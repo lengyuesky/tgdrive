@@ -8,6 +8,8 @@ pub const INBOX_TTL: i64 = 24 * 60 * 60;
 pub const INBOX_HISTORY_TTL: i64 = 30 * 24 * 60 * 60;
 pub const INBOX_USER_LIMIT: i64 = 50;
 pub const INBOX_TOTAL_LIMIT: i64 = 500;
+/// 连发视频的间隔上限：上一份视频在此时间内收到才算同一批。大文件逐个上传时相邻两份可能相隔较久。
+pub const INBOX_BATCH_WINDOW: i64 = 30 * 60;
 
 /// 只操作恢复候选或导出的快照，不能对在线数据库调用。
 pub(crate) async fn invalidate_restored_inbox(conn: &mut SqliteConnection) -> AppResult<()> {
@@ -58,6 +60,10 @@ pub struct InboxRequest {
     pub expires_at: i64,
     pub ended_at: Option<i64>,
     pub notice_attempts: i64,
+    /// 连发视频批次，取批内第一份收件的 ID；非视频为空。
+    pub batch_id: Option<String>,
+    /// 共同改名提示里固定的分段序号，只在等待改名期间有意义。
+    pub rename_part: Option<i64>,
 }
 
 impl InboxRequest {
@@ -496,27 +502,93 @@ impl Db {
     }
 
     pub async fn inbox_set_rename_prompt(&self, id: &str, message_id: i64) -> AppResult<bool> {
-        Ok(sqlx::query("UPDATE inbox_requests SET revision=revision+1,status='renaming',rename_prompt_id=?,updated_at=?,notice_pending=1,notice_after=0 WHERE id=? AND status IN ('pending','renaming','failed') AND expires_at>? AND ended_at IS NULL")
+        Ok(sqlx::query("UPDATE inbox_requests SET revision=revision+1,status='renaming',rename_prompt_id=?,rename_part=NULL,updated_at=?,notice_pending=1,notice_after=0 WHERE id=? AND status IN ('pending','renaming','failed') AND expires_at>? AND ended_at IS NULL")
             .bind(message_id).bind(now_ts()).bind(id).bind(now_ts()).execute(&self.pool).await?.rows_affected() > 0)
     }
 
-    pub async fn inbox_rename_request(
+    /// 连发视频归入同一批：同一会话里紧邻的上一份收件也是视频、且在间隔上限内收到时沿用它的批次，
+    /// 否则以自己开新批。中间夹了非视频文件即断开。重复更新不改变已有归属。
+    pub async fn inbox_join_batch(&self, id: &str) -> AppResult<InboxRequest> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: Option<(Option<String>, String, i64, i64)> = sqlx::query_as(
+            "SELECT batch_id,bot_id,chat_id,created_at FROM inbox_requests WHERE id=?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (batch, bot_id, chat_id, created_at) = current.ok_or(AppError::NotFound)?;
+        if batch.is_none() {
+            let previous: Option<(Option<String>, i64)> = sqlx::query_as(
+                "SELECT batch_id,created_at FROM inbox_requests WHERE bot_id=? AND chat_id=?
+                 AND rowid<(SELECT rowid FROM inbox_requests WHERE id=?) ORDER BY rowid DESC LIMIT 1",
+            )
+            .bind(&bot_id)
+            .bind(chat_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let batch = previous
+                .and_then(|(batch, at)| batch.filter(|_| at >= created_at - INBOX_BATCH_WINDOW))
+                .unwrap_or_else(|| id.to_string());
+            sqlx::query("UPDATE inbox_requests SET batch_id=? WHERE id=?")
+                .bind(batch)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        self.inbox_request(id).await
+    }
+
+    /// 批内仍可由用户修改的收件，按发送顺序排列；已确认、已结束或过期的不参与共同改名。
+    pub async fn inbox_batch_members(&self, batch_id: &str) -> AppResult<Vec<InboxRequest>> {
+        Ok(sqlx::query_as("SELECT * FROM inbox_requests WHERE batch_id=? AND status IN ('pending','renaming','failed') AND ended_at IS NULL AND expires_at>? ORDER BY source_message_id,id")
+            .bind(batch_id).bind(now_ts()).fetch_all(&self.pool).await?)
+    }
+
+    /// 把同一条共同改名提示绑定到各分段，并固定提示里展示的分段序号。
+    pub async fn inbox_set_batch_rename_prompt(
+        &self,
+        parts: &[(String, i64)],
+        message_id: i64,
+    ) -> AppResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (id, part) in parts {
+            sqlx::query("UPDATE inbox_requests SET revision=revision+1,status='renaming',rename_prompt_id=?,rename_part=?,updated_at=?,notice_pending=1,notice_after=0 WHERE id=? AND status IN ('pending','renaming','failed') AND expires_at>? AND ended_at IS NULL")
+                .bind(message_id).bind(part).bind(now_ts()).bind(id).bind(now_ts()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 等待这条改名提示的全部收件：单文件改名只有一份，共同改名是仍在等待的各分段。
+    pub async fn inbox_rename_requests(
         &self,
         bot_id: &str,
         chat_id: i64,
         prompt_id: i64,
-    ) -> AppResult<Option<InboxRequest>> {
-        Ok(sqlx::query_as("SELECT * FROM inbox_requests WHERE bot_id=? AND chat_id=? AND rename_prompt_id=? AND status='renaming' AND ended_at IS NULL AND expires_at>?")
-            .bind(bot_id).bind(chat_id).bind(prompt_id).bind(now_ts()).fetch_optional(&self.pool).await?)
+    ) -> AppResult<Vec<InboxRequest>> {
+        Ok(sqlx::query_as("SELECT * FROM inbox_requests WHERE bot_id=? AND chat_id=? AND rename_prompt_id=? AND status='renaming' AND ended_at IS NULL AND expires_at>? ORDER BY source_message_id,id")
+            .bind(bot_id).bind(chat_id).bind(prompt_id).bind(now_ts()).fetch_all(&self.pool).await?)
     }
 
-    pub async fn inbox_set_name(&self, id: &str, prompt_id: i64, name: &str) -> AppResult<bool> {
-        Ok(sqlx::query("UPDATE inbox_requests SET revision=revision+1,name=?,status='pending',rename_prompt_id=NULL,last_error=NULL,updated_at=?,notice_pending=1,notice_after=0 WHERE id=? AND rename_prompt_id=? AND status='renaming' AND expires_at>? AND ended_at IS NULL")
-            .bind(name).bind(now_ts()).bind(id).bind(prompt_id).bind(now_ts()).execute(&self.pool).await?.rows_affected() > 0)
+    /// 一次回复决定的名称在同一事务写入，共同改名不会只改掉一部分分段。
+    pub async fn inbox_set_names(
+        &self,
+        prompt_id: i64,
+        names: &[(String, String)],
+    ) -> AppResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (id, name) in names {
+            sqlx::query("UPDATE inbox_requests SET revision=revision+1,name=?,status='pending',rename_prompt_id=NULL,rename_part=NULL,last_error=NULL,updated_at=?,notice_pending=1,notice_after=0 WHERE id=? AND rename_prompt_id=? AND status='renaming' AND expires_at>? AND ended_at IS NULL")
+                .bind(name).bind(now_ts()).bind(id).bind(prompt_id).bind(now_ts()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn inbox_abort_rename(&self, id: &str) -> AppResult<bool> {
-        Ok(sqlx::query("UPDATE inbox_requests SET revision=revision+1,status=CASE WHEN last_error IS NULL THEN 'pending' ELSE 'failed' END,rename_prompt_id=NULL,updated_at=?,notice_pending=1,notice_after=0 WHERE id=? AND status='renaming' AND expires_at>? AND ended_at IS NULL")
+        Ok(sqlx::query("UPDATE inbox_requests SET revision=revision+1,status=CASE WHEN last_error IS NULL THEN 'pending' ELSE 'failed' END,rename_prompt_id=NULL,rename_part=NULL,updated_at=?,notice_pending=1,notice_after=0 WHERE id=? AND status='renaming' AND expires_at>? AND ended_at IS NULL")
             .bind(now_ts()).bind(id).bind(now_ts()).execute(&self.pool).await?.rows_affected() > 0)
     }
 

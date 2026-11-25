@@ -743,7 +743,7 @@ async fn rename_wait_blocks_confirmation_and_cancellation_preserves_previous_nam
         .await
         .unwrap();
     vfs.db
-        .inbox_set_name(&request.id, 800, "已改名.pdf")
+        .inbox_set_names(800, &[(request.id.clone(), "已改名.pdf".into())])
         .await
         .unwrap();
     let before_rename = vfs.db.inbox_request(&request.id).await.unwrap();
@@ -1005,5 +1005,203 @@ async fn same_update_id_in_different_bots_has_independent_failure_attempts() {
             .unwrap()
             .is_some()
     );
+    server.abort();
+}
+
+async fn reply_to_prompt(vfs: &Vfs, cfg: &RuntimeCfg, prompt: i64, text: &str) {
+    let update: Update = serde_json::from_value(json!({"update_id": 6000,"message": {
+        "message_id": 900,"chat": {"id": 42,"type": "private"},"from": {"id": 42},
+        "text": text,"reply_to_message": {"message_id": prompt}
+    }}))
+    .unwrap();
+    let ex = crate::extras::load(&vfs.db).await.unwrap();
+    handle_update(&client(cfg), vfs, cfg, &ex, &update)
+        .await
+        .unwrap();
+}
+
+/// 某份收件最近一次发出或更新的操作消息带了哪些按钮动作，用来确认用户实际看到的入口。
+fn offered_actions(mock: &MockApi, request: &InboxRequest) -> Vec<String> {
+    let prefix = format!("ib:{}:", request.id);
+    let bodies = mock.bodies.lock().unwrap();
+    bodies
+        .iter()
+        .rev()
+        .map(|(_, body)| {
+            body["reply_markup"]["inline_keyboard"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|row| row.as_array().cloned().unwrap_or_default())
+                .filter_map(|button| {
+                    button["callback_data"]
+                        .as_str()
+                        .and_then(|data| data.strip_prefix(&prefix))
+                        .map(|action| action.split(':').next().unwrap_or("").to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .find(|actions| !actions.is_empty())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn consecutive_videos_share_one_rename_and_get_part_suffixes_in_sending_order() {
+    let (vfs, cfg, mock, _pool, server, _dir) = test_vfs().await;
+    configure(&vfs).await;
+    let first = receive(&vfs, &cfg, 10, "raw-a.mkv").await;
+    // 只有一份视频时没有可以一起改名的对象。
+    click(&vfs, &cfg, &first, "g", None, 42).await;
+    assert_eq!(
+        vfs.db.inbox_request(&first.id).await.unwrap().status,
+        "pending"
+    );
+    let second = receive(&vfs, &cfg, 11, "raw-b.MP4").await;
+    let third = receive(&vfs, &cfg, 12, "raw-c.mkv").await;
+    assert_eq!(first.batch_id.as_deref(), Some(first.id.as_str()));
+    assert_eq!(second.batch_id, first.batch_id);
+    assert_eq!(third.batch_id, first.batch_id);
+    // 第二份到达后，先到的那条操作消息补上共同改名入口。
+    for request in [&first, &second, &third] {
+        assert!(offered_actions(&mock, request).contains(&"g".to_string()));
+    }
+
+    click(&vfs, &cfg, &second, "g", None, 42).await;
+    let waiting = [&first, &second, &third].map(|request| request.id.clone());
+    let mut prompts = Vec::new();
+    for (index, id) in waiting.iter().enumerate() {
+        let request = vfs.db.inbox_request(id).await.unwrap();
+        assert_eq!(request.status, "renaming");
+        assert_eq!(request.rename_part, Some(index as i64 + 1));
+        prompts.push(request.rename_prompt_id.unwrap());
+    }
+    assert!(prompts.iter().all(|prompt| *prompt == prompts[0]));
+    let prompt_text = mock
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(method, body)| {
+            method == "sendMessage" && body["reply_markup"]["force_reply"] == json!(true)
+        })
+        .map(|(_, body)| body["text"].as_str().unwrap().to_string())
+        .unwrap();
+    assert!(prompt_text.contains("part1：raw-a.mkv"));
+    assert!(prompt_text.contains("part2：raw-b.MP4"));
+    assert!(prompt_text.contains("part3：raw-c.mkv"));
+
+    // 路径不能当作文件名；整批保持等待，不会只改掉其中几份。
+    reply_to_prompt(&vfs, &cfg, prompts[0], "电影/正片").await;
+    for id in &waiting {
+        assert_eq!(vfs.db.inbox_request(id).await.unwrap().status, "renaming");
+    }
+    // 输入里带了某一份的后缀也只当作主体名，各分段保留自己的后缀。
+    reply_to_prompt(&vfs, &cfg, prompts[0], "流浪地球 (2019).mkv").await;
+    let names = [
+        "流浪地球 (2019) part1.mkv",
+        "流浪地球 (2019) part2.MP4",
+        "流浪地球 (2019) part3.mkv",
+    ];
+    for (id, name) in waiting.iter().zip(names) {
+        let request = vfs.db.inbox_request(id).await.unwrap();
+        assert_eq!(request.status, "pending");
+        assert_eq!(request.name, name);
+        assert_eq!(request.rename_part, None);
+    }
+    // 共同改名不替用户确认存储：仍然逐份确认后才转存。
+    assert_eq!(media_calls(&mock), 0);
+    let rt = runtime(&vfs, &cfg).await;
+    for id in &waiting {
+        let request = vfs.db.inbox_request(id).await.unwrap();
+        click(&vfs, &cfg, &request, "s", None, 42).await;
+        interactive::process_one(&vfs, &rt, None).await.unwrap();
+    }
+    for name in names {
+        assert!(vfs.resolve(&format!("/视频/{name}")).await.is_ok());
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn part_number_shown_in_the_prompt_survives_one_segment_leaving_the_shared_rename() {
+    let (vfs, cfg, _mock, _pool, server, _dir) = test_vfs().await;
+    configure(&vfs).await;
+    let first = receive(&vfs, &cfg, 10, "a.mp4").await;
+    let second = receive(&vfs, &cfg, 11, "b.mp4").await;
+    let third = receive(&vfs, &cfg, 12, "c.mp4").await;
+    click(&vfs, &cfg, &third, "g", None, 42).await;
+    let waiting = vfs.db.inbox_request(&first.id).await.unwrap();
+    let prompt = waiting.rename_prompt_id.unwrap();
+    click(&vfs, &cfg, &waiting, "n", None, 42).await;
+    reply_to_prompt(&vfs, &cfg, prompt, "合集").await;
+    assert_eq!(vfs.db.inbox_request(&first.id).await.unwrap().name, "a.mp4");
+    assert_eq!(
+        vfs.db.inbox_request(&second.id).await.unwrap().name,
+        "合集 part2.mp4"
+    );
+    assert_eq!(
+        vfs.db.inbox_request(&third.id).await.unwrap().name,
+        "合集 part3.mp4"
+    );
+    // 已经确认存储的分段不再参与下一次共同改名，序号按仍可修改的份数重新排。
+    let second = vfs.db.inbox_request(&second.id).await.unwrap();
+    click(&vfs, &cfg, &second, "s", None, 42).await;
+    let third = vfs.db.inbox_request(&third.id).await.unwrap();
+    click(&vfs, &cfg, &third, "g", None, 42).await;
+    assert_eq!(
+        vfs.db.inbox_request(&first.id).await.unwrap().rename_part,
+        Some(1)
+    );
+    assert_eq!(
+        vfs.db.inbox_request(&third.id).await.unwrap().rename_part,
+        Some(2)
+    );
+    assert_eq!(
+        vfs.db.inbox_request(&second.id).await.unwrap().status,
+        "queued"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn other_files_and_long_gaps_break_a_video_batch_and_single_rename_stays_unsuffixed() {
+    let (vfs, cfg, mock, pool, server, _dir) = test_vfs().await;
+    configure(&vfs).await;
+    let first = receive(&vfs, &cfg, 10, "a.mkv").await;
+    let book = receive(&vfs, &cfg, 11, "说明.pdf").await;
+    let second = receive(&vfs, &cfg, 12, "b.mkv").await;
+    assert_eq!(book.batch_id, None);
+    assert_ne!(second.batch_id, first.batch_id);
+    // 超过间隔上限后再发的视频另起一批。
+    sqlx::query("UPDATE inbox_requests SET created_at=created_at-? WHERE id=?")
+        .bind(crate::db::inbox::INBOX_BATCH_WINDOW + 1)
+        .bind(&second.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let third = receive(&vfs, &cfg, 13, "c.mkv").await;
+    assert_eq!(third.batch_id.as_deref(), Some(third.id.as_str()));
+    for request in [&first, &book, &second, &third] {
+        let actions = offered_actions(&mock, request);
+        assert!(actions.contains(&"s".to_string()) && !actions.contains(&"g".to_string()));
+    }
+    let fourth = receive(&vfs, &cfg, 14, "d.mkv").await;
+    assert_eq!(fourth.batch_id, third.batch_id);
+    // 重复投递同一条消息不改变批次归属。
+    assert_eq!(
+        receive(&vfs, &cfg, 14, "d.mkv").await.batch_id,
+        third.batch_id
+    );
+    // 批内单独改名不带分段序号。
+    click(&vfs, &cfg, &fourth, "r", None, 42).await;
+    let waiting = vfs.db.inbox_request(&fourth.id).await.unwrap();
+    assert_eq!(waiting.rename_part, None);
+    reply_to_prompt(&vfs, &cfg, waiting.rename_prompt_id.unwrap(), "花絮").await;
+    assert_eq!(
+        vfs.db.inbox_request(&fourth.id).await.unwrap().name,
+        "花絮.mkv"
+    );
+    assert_eq!(vfs.db.inbox_request(&third.id).await.unwrap().name, "c.mkv");
     server.abort();
 }

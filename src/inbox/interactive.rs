@@ -160,16 +160,21 @@ pub(super) fn suffix<'a>(ex: &Extras, original: &'a str) -> &'a str {
     }
 }
 
-fn renamed_file(extension: &str, input: &str) -> AppResult<String> {
-    let mut stem = input.trim();
+/// 用户把后缀一起输入时去掉它，后缀始终由系统保留。
+fn without_suffix<'a>(input: &'a str, extension: &str) -> &'a str {
     if !extension.is_empty() {
         let dots = extension.matches('.').count();
-        if let Some((index, _)) = stem.rmatch_indices('.').nth(dots.saturating_sub(1))
-            && stem[index..].to_lowercase() == extension.to_lowercase()
+        if let Some((index, _)) = input.rmatch_indices('.').nth(dots.saturating_sub(1))
+            && input[index..].to_lowercase() == extension.to_lowercase()
         {
-            stem = &stem[..index];
+            return &input[..index];
         }
     }
+    input
+}
+
+/// `part` 是共同改名时的分段序号，写成「主体名 part1.后缀」，媒体库按这种写法识别同一部影片的分段。
+fn renamed_file(extension: &str, stem: &str, part: Option<i64>) -> AppResult<String> {
     if stem.is_empty()
         || matches!(stem, "." | "..")
         || stem
@@ -180,11 +185,31 @@ fn renamed_file(extension: &str, input: &str) -> AppResult<String> {
             "请输入有效的文件主体名，不能包含目录路径或控制字符".into(),
         ));
     }
-    let name = format!("{stem}{extension}");
+    let name = match part {
+        Some(part) => format!("{} part{part}{extension}", stem.trim_end()),
+        None => format!("{stem}{extension}"),
+    };
     if name.len() > 255 || crate::vfs::normalize(&name)?.as_slice() != [name.as_str()] {
         return Err(AppError::BadRequest("文件名过长或无效，请重新输入".into()));
     }
     Ok(name)
+}
+
+/// 一次回复对应的全部新名称。共同改名时各分段后缀可能不同，输入里带了其中任何一个都去掉。
+fn renamed_files(requests: &[InboxRequest], input: &str) -> AppResult<Vec<(String, String)>> {
+    let input = input.trim();
+    let stem = requests
+        .iter()
+        .map(|request| without_suffix(input, &request.original_suffix))
+        .min_by_key(|stem| stem.len())
+        .unwrap_or(input);
+    requests
+        .iter()
+        .map(|request| {
+            renamed_file(&request.original_suffix, stem, request.rename_part)
+                .map(|name| (request.id.clone(), name))
+        })
+        .collect()
 }
 
 fn available_directories<'a>(ex: &'a Extras, request: &InboxRequest) -> Vec<&'a InboxDirectory> {
@@ -207,7 +232,8 @@ fn button(text: impl Into<String>, id: &str, action: &str, value: Option<i64>) -
     json!({"text": text.into(), "callback_data": callback_data(id, action, value)})
 }
 
-fn render(request: &InboxRequest, ex: &Extras, page: usize) -> (String, Value) {
+/// `batch` 是同批连发视频里仍可修改的份数，两份及以上才提供共同改名。
+fn render(request: &InboxRequest, ex: &Extras, page: usize, batch: usize) -> (String, Value) {
     let original = request.original_name.chars().take(180).collect::<String>();
     let name = request.name.chars().take(180).collect::<String>();
     let mut text = format!("📥 文件：{original}\n保存名称：{name}");
@@ -298,9 +324,12 @@ fn render(request: &InboxRequest, ex: &Extras, page: usize) -> (String, Value) {
             text.push_str("\n暂无有效候选目录，请管理员更新收件配置。");
         }
         if request.status == "renaming" {
-            text.push_str("\n请回复改名提示消息，输入文件主体名。");
-        }
-        if request.status == "renaming" {
+            text.push_str(&match request.rename_part {
+                Some(part) => format!(
+                    "\n请回复共同改名提示消息，输入共同的文件主体名；这份将命名为 part{part}。"
+                ),
+                None => "\n请回复改名提示消息，输入文件主体名。".into(),
+            });
             keyboard.push(vec![button("取消改名", &request.id, "n", None)]);
         } else {
             keyboard.push(vec![
@@ -316,6 +345,9 @@ fn render(request: &InboxRequest, ex: &Extras, page: usize) -> (String, Value) {
                     None,
                 ),
             ]);
+            if batch > 1 {
+                keyboard.push(vec![button("分段共同重命名", &request.id, "g", None)]);
+            }
         }
         keyboard.push(vec![button("取消", &request.id, "x", None)]);
         let minutes = ((request.expires_at - crate::db::now_ts()).max(0) as u64).div_ceil(60);
@@ -357,7 +389,11 @@ async fn deliver_notice_with_actions(
     {
         return Ok(());
     }
-    let (mut text, mut markup) = render(request, ex, page);
+    let batch = match &request.batch_id {
+        Some(batch) if request.editable() => vfs.db.inbox_batch_members(batch).await?.len(),
+        _ => 0,
+    };
+    let (mut text, mut markup) = render(request, ex, page, batch);
     if let Some(target) = request.storage_target_id {
         let target = vfs.db.storage_target(target).await?;
         text.push_str(&format!("\n存储频道：{}", target.chat_id));
@@ -434,7 +470,32 @@ pub(super) async fn enqueue(
         })
         .await;
     match request {
-        Ok(request) => deliver_notice(http, vfs, cfg, &request, &ex, 0).await?,
+        Ok(request) => {
+            let video = file.kind == MediaKind::Video || {
+                let lower = name.to_lowercase();
+                VIDEO_EXTENSIONS
+                    .iter()
+                    .any(|extension| has_extension(&lower, extension))
+            };
+            let request = if video {
+                vfs.db.inbox_join_batch(&request.id).await?
+            } else {
+                request
+            };
+            deliver_notice(http, vfs, cfg, &request, &ex, 0).await?;
+            // 批次从一份变成两份时，先到的那份还没有共同改名按钮，补一次刷新；
+            // 之后再有新分段加入，已有消息的按钮不变，不必逐条重发。
+            if let Some(batch) = &request.batch_id {
+                let members = vfs.db.inbox_batch_members(batch).await?;
+                if members.len() == 2 {
+                    for member in members.iter().filter(|member| member.id != request.id) {
+                        vfs.db.inbox_mark_notice(&member.id).await?;
+                        let latest = vfs.db.inbox_request(&member.id).await?;
+                        deliver_notice(http, vfs, cfg, &latest, &ex, 0).await?;
+                    }
+                }
+            }
+        }
         Err(AppError::Conflict(error)) => {
             reply(http, cfg, msg, &format!("❌ {error}；原文件消息保留。")).await
         }
@@ -602,6 +663,25 @@ pub(super) async fn handle_callback(
                 vfs.db.inbox_set_rename_prompt(&request.id, sent.message_id).await?;
                 Ok(0)
             }
+            "g" => {
+                let members = match &request.batch_id {
+                    Some(batch) => vfs.db.inbox_batch_members(batch).await?,
+                    None => Vec::new(),
+                };
+                if members.len() < 2 || !members.iter().any(|member| member.id == request.id) {
+                    return Err(AppError::BadRequest("没有其他等待确认的连发视频，请直接使用重命名".into()));
+                }
+                let mut prompt = format!("回复此消息，为这 {} 个分段视频输入共同的文件主体名。\n系统按发送顺序追加 part 序号，并保留各自的后缀：", members.len());
+                let mut parts = Vec::with_capacity(members.len());
+                for (index, member) in members.iter().enumerate() {
+                    prompt.push_str(&format!("\npart{}：{}", index + 1, member.original_name.chars().take(60).collect::<String>()));
+                    parts.push((member.id.clone(), index as i64 + 1));
+                }
+                let prompt: String = prompt.chars().take(4000).collect();
+                let sent = call::<SentMessage>(http, cfg, "sendMessage", json!({"chat_id": request.chat_id,"text": prompt,"reply_markup": {"force_reply": true,"selective": true,"input_field_placeholder": "输入共同的文件主体名"}}), false).await.map_err(|error| error.app_error())?;
+                vfs.db.inbox_set_batch_rename_prompt(&parts, sent.message_id).await?;
+                Ok(0)
+            }
             "s" => { queue_selected(vfs, cfg, &ex, &request).await?; Ok(0) }
             "n" => {
                 if !vfs.db.inbox_abort_rename(&request.id).await? { return Err(AppError::Conflict("改名状态已变化".into())); }
@@ -644,24 +724,37 @@ pub(super) async fn handle_rename_reply(
     {
         return Ok(());
     }
-    let Some(request) = vfs
+    let requests = vfs
         .db
-        .inbox_rename_request(&bot_id(cfg), msg.chat.id, reply_to.message_id)
-        .await?
-    else {
+        .inbox_rename_requests(&bot_id(cfg), msg.chat.id, reply_to.message_id)
+        .await?;
+    if requests.is_empty() {
         return Ok(());
-    };
-    match renamed_file(&request.original_suffix, msg.text.as_deref().unwrap_or("")) {
-        Ok(name) => {
-            vfs.db
-                .inbox_set_name(
-                    &request.id,
-                    request.rename_prompt_id.ok_or(AppError::NotFound)?,
-                    &name,
+    }
+    match renamed_files(&requests, msg.text.as_deref().unwrap_or("")) {
+        Ok(names) => {
+            // 只改仍绑定在这条提示上的收件；期间单独退出改名的分段不受影响。
+            let prompt = requests[0].rename_prompt_id.ok_or(AppError::NotFound)?;
+            vfs.db.inbox_set_names(prompt, &names).await?;
+            for (id, _) in &names {
+                let latest = vfs.db.inbox_request(id).await?;
+                deliver_notice(http, vfs, cfg, &latest, ex, 0).await?;
+            }
+            if let ([(_, first), .., (_, last)], true) = (
+                names.as_slice(),
+                requests.iter().any(|request| request.rename_part.is_some()),
+            ) {
+                reply(
+                    http,
+                    cfg,
+                    msg,
+                    &format!(
+                        "✅ 已为 {} 个分段命名：{first} … {last}\n请在各自的操作消息里选择目录并确认存储。",
+                        names.len()
+                    ),
                 )
-                .await?;
-            let latest = vfs.db.inbox_request(&request.id).await?;
-            deliver_notice(http, vfs, cfg, &latest, ex, 0).await?;
+                .await;
+            }
         }
         Err(error) => {
             reply(
