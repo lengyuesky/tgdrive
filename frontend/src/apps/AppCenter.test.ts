@@ -43,6 +43,8 @@ async function render() {
   await flushPromises(); await nextTick()
   return wrapper
 }
+// 应用的信息与操作默认收起，测试像用户一样先点图标下方的「更多」。
+async function expand(name = '测试服务') { const more = wrapper!.find(`button[aria-label="${name}：更多操作"]`); expect(more.exists()).toBe(true); await more.trigger('click'); await flushPromises() }
 async function click(label: string) { const target = wrapper!.findAll('button').find(button => button.text() === label); expect(target).toBeDefined(); await target!.trigger('click'); await flushPromises() }
 
 beforeEach(() => {
@@ -78,7 +80,7 @@ describe('应用中心一键更新', () => {
     current.scope = { revision: 'scope-2', scope: { mode: 'all', access: 'read_only' }, roots: [] }
     installedApps.value = [current]
     calls.catalog.mockResolvedValue(ready([entry(undefined, '1.0.2'), entry(undefined, '1.0.10')]))
-    const view = await render()
+    const view = await render(); await expand()
     expect(view.text()).toContain('可更新至 1.0.10')
     expect(view.findAll('button').filter((button) => button.text() === '安装预览')).toHaveLength(0)
     await click('更新')
@@ -112,7 +114,7 @@ describe('应用中心一键更新', () => {
   })
   it('当前架构缺少最高版本的包时选择已发布的最高同架构版本', async () => {
     calls.catalog.mockResolvedValue(ready([entry(undefined, '1.0.2'), entry(undefined, '1.0.3', ['linux-amd64'])]))
-    const view = await render()
+    const view = await render(); await expand()
     expect(view.text()).toContain('可更新至 1.0.2')
     await click('更新')
     expect(calls.preview).toHaveBeenCalledWith(expect.objectContaining({ version: '1.0.2', target: 'linux-arm64' }))
@@ -125,7 +127,7 @@ describe('应用中心一键更新', () => {
       selected.added_file_write = true
       return selected
     })
-    const view = await render()
+    const view = await render(); await expand()
     await click('更新')
     expect(calls.install).not.toHaveBeenCalled()
     expect(view.text()).toContain('更新预览')
@@ -138,7 +140,7 @@ describe('应用中心一键更新', () => {
     calls.catalog.mockResolvedValue(ready([entry()]))
     const preview = calls.preview.getMockImplementation()!
     calls.preview.mockImplementation(async (source) => ({ ...await preview(source), previous_state_revision: 'another-state' }))
-    const view = await render()
+    const view = await render(); await expand()
     await click('更新')
     expect(calls.install).not.toHaveBeenCalled()
     expect(view.text()).toContain('应用状态已改变，请刷新后再更新')
@@ -152,6 +154,48 @@ describe('应用中心一键更新', () => {
   })
 })
 afterEach(() => { wrapper?.unmount(); wrapper = undefined; vi.useRealTimers() })
+
+describe('应用中心图标', () => {
+  const withPage = (id: string, name: string, enabled = true) => { const item = app(id, enabled); item.manifest = { ...item.manifest, name, page: { entry: 'page/index.html' } }; return item }
+  it('点图标直接打开应用，信息与操作默认收起', async () => {
+    installedApps.value = [withPage('reader', '阅读馆')]
+    const view = await render()
+    expect(view.find('.app-panel').exists()).toBe(false)
+    expect(view.findAll('button').map(button => button.text())).not.toContain('卸载')
+    await view.find('button[aria-label="打开 阅读馆"]').trigger('click')
+    expect(calls.push).toHaveBeenCalledWith('/apps/reader')
+    expect(view.find('.app-panel').exists()).toBe(false)
+  })
+  it('更多一次只展开一个应用，再点一次或点收起即关闭', async () => {
+    installedApps.value = [withPage('reader', '阅读馆'), withPage('cinema', '影视')]
+    const view = await render()
+    await expand('阅读馆')
+    expect(view.findAll('.app-panel')).toHaveLength(1)
+    expect(view.find('.app-panel h3').text()).toBe('阅读馆')
+    expect(view.find('button[aria-label="阅读馆：更多操作"]').attributes('aria-expanded')).toBe('true')
+    await expand('影视')
+    expect(view.findAll('.app-panel')).toHaveLength(1)
+    expect(view.find('.app-panel h3').text()).toBe('影视')
+    expect(view.find('button[aria-label="阅读馆：更多操作"]').attributes('aria-expanded')).toBe('false')
+    await expand('影视')
+    expect(view.find('.app-panel').exists()).toBe(false)
+    await expand('阅读馆'); await view.find('button[aria-label="收起"]').trigger('click')
+    expect(view.find('.app-panel').exists()).toBe(false)
+    expect(calls.push).not.toHaveBeenCalled()
+  })
+  it('已停用或没有页面的应用点图标不跳转，改为展开详情', async () => {
+    installedApps.value = [withPage('reader', '阅读馆', false), app('service')]
+    const view = await render()
+    expect(view.findAll('.tile-note').map(note => note.text())).toEqual(['已停用', '后台服务'])
+    await view.find('button[aria-label="阅读馆（已停用），查看设置"]').trigger('click'); await flushPromises()
+    expect(view.find('.app-panel h3').text()).toBe('阅读馆')
+    expect(view.find('.card-actions').findAll('button').map(button => button.text())).toContain('启用')
+    await view.find('button[aria-label="测试服务（后台服务），查看设置"]').trigger('click'); await flushPromises()
+    expect(view.find('.app-panel h3').text()).toBe('测试服务')
+    expect(view.find('.app-panel').text()).toContain('查看固定前缀入口')
+    expect(calls.push).not.toHaveBeenCalled()
+  })
+})
 
 describe('应用中心后端管理', () => {
   it('目录读取成功但尚未发布应用时说明空目录状态', async () => {
@@ -169,7 +213,7 @@ describe('应用中心后端管理', () => {
     expect(view.find('[title="拒绝跨源应用中心操作"]').exists()).toBe(false)
   })
   it('后端卡片不再提供单应用资源限制按钮或面板，保留日志与重启', async () => {
-    const view = await render()
+    const view = await render(); await expand()
     const labels = view.find('.card-actions').findAll('button').map(button => button.text())
     expect(labels).not.toContain('资源限制')
     expect(labels).toContain('后端日志')
@@ -178,7 +222,7 @@ describe('应用中心后端管理', () => {
     expect(view.findAll('.resource-limits')).toHaveLength(1)
   })
   it('占用面板显示对象缓存淘汰线与数据库用量，不显示数据库上限', async () => {
-    const view = await render(); await click('占用')
+    const view = await render(); await expand(); await click('占用')
     expect(calls.usage).toHaveBeenCalledWith(installedApps.value[0])
     expect(view.text()).toContain('可再生缓存2048 B / 1073741824 B')
     expect(view.text()).toContain('后端数据库8589934592 B')
@@ -217,7 +261,7 @@ describe('应用中心后端管理', () => {
     expect(view.find('.limit-state').text()).toBe('当前：内存 不限制；CPU 不限制')
   })
   it('日志只作为文本显示，重启后重读状态，卸载页面时停止状态定时器', async () => {
-    const view = await render(); await click('后端日志')
+    const view = await render(); await expand(); await click('后端日志')
     expect(view.text()).toContain('<script>不执行</script>')
     expect(view.find('script').exists()).toBe(false)
     await click('重启后端')
